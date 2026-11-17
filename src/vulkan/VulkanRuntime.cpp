@@ -3,8 +3,9 @@
 // This is MFG-Unlocker's xess/vulkan/vk_provider.cpp (MIT, Copyright (c) 2026 Michael Robles, see NOTICE.md) ported to
 // this repository: XeFG is driven through XeFG.h, the ported model comes from MfgKernels, the model follows the menu's
 // network path, and the programs are the ones in xefg_mfg_programs\vulkan (VulkanPrograms.h). The tensor-core route of an
-// NVIDIA GPU is in (VulkanTensor.h), selected by the CUDA network path. Left out: its GPU timing and its registration as an
-// OptiScaler provider.
+// NVIDIA GPU is in (VulkanTensor.h), selected by the CUDA network path. The cooperative-matrix route of an AMD RDNA3/RDNA4
+// or Intel Arc GPU is in (VulkanCoopMat.h), selected by the XMX Port and XMX (native) network paths. Left out: its GPU timing
+// and its registration as an OptiScaler provider.
 //
 // Every evaluation records into the VkCommandBuffer the game gives NVSDK_NGX_VULKAN_EvaluateFeature. The game's images
 // are copied into images of the layer's own device, XeFG records its dispatches on a D3D12 command list of that device,
@@ -20,6 +21,7 @@
 #include "../Plugin.h"
 #include "../VulkanPrograms.h"
 #include "../XeFG.h"
+#include "VulkanCoopMat.h"
 #include "VulkanHost.h"
 #include "VulkanInputCopy.h"
 #include "VulkanPolicy.h"
@@ -120,6 +122,10 @@ namespace
 		// VulkanPolicy::DescribeTensor code
 		bool tensorInstalled = false;
 		std::string tensorReason = "not_attempted";
+		// The cooperative-matrix route (VulkanCoopMat.h) is installed on the layer's device. When it isn't, coopReason
+		// is the VulkanPolicy::DescribeCoopMatrix code
+		bool coopInstalled = false;
+		std::string coopReason = "not_attempted";
 
 #define VULKAN_RUNTIME_FIELD(name) PFN_##name name = nullptr;
 		VULKAN_RUNTIME_FNS(VULKAN_RUNTIME_FIELD)
@@ -140,9 +146,11 @@ namespace
 	std::string gDeviceReason = "not_initialized";
 	std::string gModelName;
 	std::string gTensorReason = "not_attempted";
+	std::string gCoopReason = "not_attempted";
 
 	// The route is replacing layers: installed, and the CUDA path selected with the ported model (ApplyTensorGate)
 	std::atomic_bool gTensorGate = false;
+	std::atomic_bool gCoopGate = false;
 
 	// One real frame's inputs, kept for the next batch as its previous frame
 	struct Slot
@@ -271,6 +279,7 @@ namespace
 		std::scoped_lock lock(gStatusMutex);
 		gDeviceReason = d.reason;
 		gTensorReason = d.tensorReason;
+		gCoopReason = d.coopReason;
 	}
 
 	void SetModelName(int32_t model)
@@ -457,6 +466,31 @@ namespace
 			d.tensorInstalled ? Plugin::CudaSupport::Supported : Plugin::CudaSupport::Unsupported);
 	}
 
+	// The cooperative-matrix route on the layer's device, on an AMD RDNA3/RDNA4 (WMMA) or Intel Arc/Battlemage (XMX) GPU
+	// the hooks gave VK_KHR_cooperative_matrix: tried once per device, with DP4a SPIR-V fallback on any layer. With gDevice.mutex held
+	void InstallCoopMatrixRoute(Device& d, const VulkanHost::DeviceRecord& record)
+	{
+		std::string coopStatusReason;
+
+		if (!d.portInstalled)
+		{
+			coopStatusReason = "no_port";
+			xefg_cuda::ReportCoopMatrix(xefg_cuda::State::Unavailable, 0, 0, 0, 0, coopStatusReason.c_str());
+			Log::Info("Vulkan cooperative matrix: unavailable, {}", VulkanPolicy::DescribeCoopMatrix(coopStatusReason));
+		}
+		else if (!record.coopMatrixExtensions && record.vendor == 0x10DE)
+		{
+			// NVIDIA GPUs use the native CUDA cubin tensor-core route (VK_NVX_binary_import) unless cooperative matrix is enabled
+			coopStatusReason = "no_extensions";
+		}
+		else
+		{
+			d.coopInstalled = VulkanCoopMat::Install(d.d3d.Get(), coopStatusReason);
+		}
+
+		d.coopReason = d.coopInstalled ? std::string() : coopStatusReason;
+	}
+
 	// The layer's device on the game's, XeFG with its model, and the copy pipelines. With gDevice.mutex held
 	bool PrepareDevice(Device& d)
 	{
@@ -520,6 +554,9 @@ namespace
 		desc.tensorExtensions = record.tensorExtensions;
 		desc.binaryImportSpec = record.binaryImportSpec;
 		desc.imageViewHandleSpec = record.imageViewHandleSpec;
+		// What the hooks enabled for the VK_KHR_cooperative_matrix route (AMD WMMA / Intel XMX)
+		desc.coopMatrixExtensions = record.coopMatrixExtensions;
+		desc.coopMatrixSpec = record.coopMatrixSpec;
 
 		if (FAILED(xvk::CreateDevice(desc, IID_PPV_ARGS(&d.d3d))) || !d.d3d)
 		{
@@ -532,6 +569,7 @@ namespace
 		d.portInstalled = MfgKernels::Install(XeFG::Module());
 
 		InstallTensorRoute(d, record);
+		InstallCoopMatrixRoute(d, record);
 
 		if (!CreatePipelines(d))
 		{
@@ -542,9 +580,9 @@ namespace
 		d.ready = true;
 		d.reason.clear();
 
-		Log::Info("Vulkan XeMFG ready on queue family {}, vendor {:#06x}: {} programs, ported model {}, tensor cores {}, up to {}x",
+		Log::Info("Vulkan XeMFG ready on queue family {}, vendor {:#06x}: {} programs, ported model {}, tensor cores {}, coopmat {}, up to {}x",
 			d.family, d.vendor, VulkanPrograms::Installed().programs.size(), d.portInstalled ? "installed" : "not available",
-			d.tensorInstalled ? "ready" : "not available", MaxGenerated + 1);
+			d.tensorInstalled ? "ready" : "not available", d.coopInstalled ? "ready" : "not available", MaxGenerated + 1);
 
 		return true;
 	}
@@ -607,13 +645,25 @@ namespace
 	void ApplyTensorGate(const Device& d, int32_t model)
 	{
 		const auto path = Plugin::options.path.load();
-		const bool on = d.tensorInstalled && VulkanPolicy::UseTensorCores(model == MfgKernels::MfgModel,
+		const bool portModel = model == MfgKernels::MfgModel;
+		const bool on = d.tensorInstalled && VulkanPolicy::UseTensorCores(portModel,
 			path == Plugin::Path::Cuda, path == Plugin::Path::XmxNative);
 
 		xvk::SetTensorCoresEnabled(d.d3d.Get(), on);
 
 		if (gTensorGate.exchange(on) != on)
 			Log::Info("Vulkan tensor cores: {}", on ? "on, the CUDA path runs the int8 layers on the tensor cores" : "off");
+
+		// When the CUDA cubin route is not active, the VK_KHR_cooperative_matrix route runs the int8 layers on
+		// AMD RDNA3/RDNA4 (WMMA) or Intel Arc (XMX) hardware for the XMX Port, XMX (native), and CUDA paths
+		const bool coopOn = !on && d.coopInstalled && VulkanPolicy::UseCoopMatrix(portModel,
+			path == Plugin::Path::XmxPort, path == Plugin::Path::XmxNative, path == Plugin::Path::Cuda);
+
+		xvk::SetCoopMatrixEnabled(d.d3d.Get(), coopOn);
+
+		if (gCoopGate.exchange(coopOn) != coopOn)
+			Log::Info("Vulkan cooperative matrix: {}",
+				coopOn ? "on, VK_KHR_cooperative_matrix runs the int8 layers on hardware matrix units" : "off");
 	}
 
 	// The network the menu and OptiScaler show for the model that runs
@@ -623,7 +673,10 @@ namespace
 			return Plugin::Network::Fallback;
 
 		// The route turns itself off after a driver fault, then the layers are the SPIR-V ones
-		return gTensorGate.load() && xefg_cuda::VulkanActive() ? Plugin::Network::Cuda : Plugin::Network::XmxPort;
+		if (gTensorGate.load() && xefg_cuda::VulkanActive())
+			return Plugin::Network::Cuda;
+
+		return Plugin::Network::XmxPort;
 	}
 
 	// The images of one feature: back buffer size and format, depth size (the motion vectors are resampled to it). XeFG's
@@ -1423,6 +1476,43 @@ VulkanRuntime::TensorStatus VulkanRuntime::GetTensorStatus()
 	{
 		std::scoped_lock lock(gStatusMutex);
 		status.reason = gTensorReason;
+	}
+
+	return status;
+}
+
+VulkanRuntime::CoopMatrixStatus VulkanRuntime::GetCoopMatrixStatus()
+{
+	CoopMatrixStatus status;
+	const auto route = xefg_cuda::CoopMatrixSnapshot();
+
+	switch (route.state)
+	{
+	case xefg_cuda::State::Active:
+		status.state = TensorState::Active;
+		break;
+	case xefg_cuda::State::Unavailable:
+		status.state = TensorState::Unavailable;
+		break;
+	case xefg_cuda::State::Disabled:
+		status.state = TensorState::Disabled;
+		break;
+	default:
+		break;
+	}
+
+	status.reason = route.reason;
+	status.tileM = route.major;
+	status.tileN = route.minor & 0xFFFF;
+	status.tileK = (route.minor >> 16) & 0xFFFF;
+	status.launches = route.launches;
+	status.fallbacks = route.fallbacks;
+	status.replacing = status.state == TensorState::Active && gCoopGate.load();
+
+	if (status.state == TensorState::NotAttempted)
+	{
+		std::scoped_lock lock(gStatusMutex);
+		status.reason = gCoopReason;
 	}
 
 	return status;

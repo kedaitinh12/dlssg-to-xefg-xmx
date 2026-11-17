@@ -133,6 +133,14 @@ void STDMETHODCALLTYPE CommandList::Dispatch(UINT x, UINT y, UINT z)
     if (!pso_) { Fail("Dispatch without a pipeline state"); return; }
     if (device_->tensor().TryLaunch(*device_, buffer_, pso_->tensorLayer(), tables_[0], tables_[1], constants_[2].data(), constantMasks_[2], x, y, z))
     { boundPipeline_ = VK_NULL_HANDLE; return; }
+    if (device_->coopmat().TryLaunch(*device_, buffer_, pso_->tensorLayer(), *pso_, tables_, constants_, constantMasks_, x, y, z))
+    {
+        boundPipeline_ = VK_NULL_HANDLE;
+        for (const auto& range : pso_->ranges())
+            if (const auto* table = tables_[range.parameter]; table && table[range.offset].kind == DescriptorKind::UavBuffer && table[range.offset].resource)
+                table[range.offset].resource->NoteWrite();
+        return;
+    }
     const auto& vk = device_->vk();
     if (boundPipeline_ != pso_->pipeline()) {
         vk.vkCmdBindPipeline(buffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pso_->pipeline());

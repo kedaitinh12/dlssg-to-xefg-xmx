@@ -2,6 +2,7 @@
 #include "xvk_internal.h"
 #include "../MfgPort/Sha256.h"
 #include "../VulkanPrograms.h"
+#include <map>
 #include <set>
 
 namespace xvk {
@@ -31,6 +32,69 @@ bool FindPart(const uint8_t* data, size_t size, uint32_t fourcc, const uint8_t*&
         return true;
     }
     return false;
+}
+
+uint32_t ClassBase(D3D12_DESCRIPTOR_RANGE_TYPE type)
+{
+    switch (type) {
+    case D3D12_DESCRIPTOR_RANGE_TYPE_SRV: return kSrvBase;
+    case D3D12_DESCRIPTOR_RANGE_TYPE_UAV: return kUavBase;
+    case D3D12_DESCRIPTOR_RANGE_TYPE_CBV: return kCbvBase;
+    default: return kSamplerBase;
+    }
+}
+
+bool Compatible(D3D12_DESCRIPTOR_RANGE_TYPE range, VkDescriptorType type)
+{
+    switch (range) {
+    case D3D12_DESCRIPTOR_RANGE_TYPE_SRV: return type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    case D3D12_DESCRIPTOR_RANGE_TYPE_UAV: return type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    case D3D12_DESCRIPTOR_RANGE_TYPE_CBV: return type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    default: return type == VK_DESCRIPTOR_TYPE_SAMPLER;
+    }
+}
+
+bool MatchesRootLayout(const Program& program, const RootLayout& root)
+{
+    std::map<uint32_t, VkDescriptorType> declared;
+    for (const auto& b : program.bindings) declared[b.binding] = b.type;
+    std::map<uint32_t, bool> covered;
+    uint32_t pushBytes = 0;
+    int constantsParam = -1;
+
+    for (uint32_t p = 0; p < root.parameters.size(); ++p) {
+        const auto& parameter = root.parameters[p];
+        if (parameter.type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+            if (constantsParam >= 0 || parameter.num32 > 64) return false;
+            constantsParam = int(p);
+            pushBytes = parameter.num32 * 4;
+            continue;
+        }
+        if (parameter.type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) return false;
+        for (const auto& range : parameter.ranges) {
+            if (range.space) return false;
+            for (uint32_t i = 0; i < range.count; ++i) {
+                const uint32_t binding = ClassBase(range.type) + range.baseRegister + i;
+                auto it = declared.find(binding);
+                if (it == declared.end()) continue;
+                if (!Compatible(range.type, it->second)) return false;
+                covered[binding] = true;
+            }
+        }
+    }
+    if (program.pushConstantBytes > pushBytes || constantsParam >= 16) return false;
+    for (const auto& [binding, type] : declared) {
+        if (type == VK_DESCRIPTOR_TYPE_SAMPLER && !covered[binding]) {
+            for (const auto& s : root.samplers) {
+                if (kSamplerBase + s.desc.ShaderRegister == binding && !s.desc.RegisterSpace) {
+                    covered[binding] = true;
+                    break;
+                }
+            }
+        }
+        if (!covered[binding]) return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -122,25 +186,19 @@ constexpr std::pair<const char*, const char*> kReplacements[] = {
     {"efa8da5ef5f90c62b789b0fed8e77e2ce043e558d164cc552ca7fb9127cedb00", "40e159414d5b839ba7e0e07cbf8ff4ef425ee026c216b2928ef3bb6dd0e20d40"}};
 }
 
-const Program* ProgramSet::Find(const std::string& requested)
+const Program* ProgramSet::LoadRow(size_t rowIdx, const std::string& key)
 {
-    std::string sha256 = requested;
-    if (index_.find(sha256) == index_.end())
-        for (const auto& [ours, intel] : kReplacements)
-            if (sha256 == ours) { sha256 = intel; break; }
-    std::lock_guard lock(mutex_);
-    if (auto it = loaded_.find(sha256); it != loaded_.end()) return it->second.get();
-    auto row = index_.find(sha256);
-    if (row == index_.end()) return nullptr;
-    // dlssg-to-xefg: the SPIR-V is read from its file again and checked against the hash the manifest lists
-    const auto& asset = VulkanPrograms::Installed().programs[row->second];
+    if (auto it = loaded_.find(key); it != loaded_.end()) return it->second.get();
+    const auto& programs = VulkanPrograms::Installed().programs;
+    if (rowIdx >= programs.size()) return nullptr;
+    const auto& asset = programs[rowIdx];
     std::unique_ptr<Program> program;
     const auto bytes = VulkanPrograms::ReadModule(asset, &sha256_util::Compute);
     if (bytes.empty() || bytes.size() % 4) {
-        Log("program set: program %u (%.16s) failed verification (%zu bytes)", asset.id, asset.dxilSha256.c_str(), bytes.size());
+        Log("program set: program %u (%.16s) failed verification (%zu bytes)", asset.id, key.c_str(), bytes.size());
     } else {
         program = std::make_unique<Program>();
-        program->sha256 = asset.dxilSha256;
+        program->sha256 = key;
         program->spirv.resize(bytes.size() / 4);
         memcpy(program->spirv.data(), bytes.data(), bytes.size());
         program->pushConstantBytes = asset.pushBytes;
@@ -149,27 +207,63 @@ const Program* ProgramSet::Find(const std::string& requested)
         for (const auto& b : asset.bindingRows)
             program->bindings.push_back({b.binding, types[static_cast<size_t>(b.type)]});
     }
-    return (loaded_[sha256] = std::move(program)).get();
+    const Program* result = program.get();
+    loaded_.emplace(key, std::move(program));
+    return result;
+}
+
+const Program* ProgramSet::Find(const std::string& requested)
+{
+    std::string sha256 = requested;
+    if (index_.find(sha256) == index_.end())
+        for (const auto& [ours, intel] : kReplacements)
+            if (sha256 == ours) { sha256 = intel; break; }
+    std::lock_guard lock(mutex_);
+    auto row = index_.find(sha256);
+    if (row == index_.end()) return nullptr;
+    return LoadRow(row->second, sha256);
+}
+
+const Program* ProgramSet::FindForRoot(const std::string& requested, const RootLayout& root)
+{
+    std::string sha256 = requested;
+    if (index_.find(sha256) == index_.end())
+        for (const auto& [ours, intel] : kReplacements)
+            if (sha256 == ours) { sha256 = intel; break; }
+    std::lock_guard lock(mutex_);
+    auto row = index_.find(sha256);
+    if (row == index_.end()) return nullptr;
+    const Program* direct = LoadRow(row->second, sha256);
+    if (direct && MatchesRootLayout(*direct, root))
+        return direct;
+
+    // Self-healing fallback for manifests where ExtractXeFgVulkanPrograms.py unpacked ProgramAsset starting at
+    // offset +8 (`resource`) instead of offset 0 (`dxilSha256`), shifting `sourceDxilSha256` by 1 row (`row + 1`).
+    const size_t nextRow = row->second + 1;
+    const Program* shifted = LoadRow(nextRow, sha256 + "#shifted");
+    if (shifted && MatchesRootLayout(*shifted, root)) {
+        Log("program set: %.16s matched shifted SPIR-V row %zu (id %u) by root signature",
+            sha256.c_str(), nextRow, VulkanPrograms::Installed().programs[nextRow].id);
+        return shifted;
+    }
+    return direct;
 }
 
 namespace {
-std::atomic<uint64_t> gMissing{0};
-}
+std::mutex gMissingMutex;
+std::set<std::string> gMissing;
+std::atomic<uint64_t> gMissingCount{0};
+} // namespace
 
-void NoteMissingProgram(const std::string& sha256, const void* dxil, size_t bytes)
+void NoteMissingProgram(const std::string& sha256, const void*, size_t bytes)
 {
-    ++gMissing;
-    static std::mutex mutex;
-    static std::set<std::string> seen;
-    {
-        std::lock_guard lock(mutex);
-        if (seen.size() > 256 || !seen.insert(sha256).second) return;
-    }
-    Log("CreateComputePipelineState: no SPIR-V for program %s (%zu bytes); failing closed", sha256.c_str(), bytes);
-    (void)dxil;
+    ++gMissingCount;
+    std::lock_guard lock(gMissingMutex);
+    if (gMissing.insert(sha256).second)
+        Log("missing SPIR-V translation for DXIL %s (%zu bytes) - failing CreateComputePipelineState", sha256.c_str(), bytes);
 }
 
 size_t EmbeddedProgramCount(HMODULE) noexcept { return VulkanPrograms::Installed().programs.size(); }
-uint64_t MissingProgramCount() noexcept { return gMissing.load(); }
+uint64_t MissingProgramCount() noexcept { return gMissingCount.load(); }
 
 } // namespace xvk

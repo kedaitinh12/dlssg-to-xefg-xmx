@@ -668,16 +668,17 @@ HRESULT STDMETHODCALLTYPE Device::CreateComputePipelineState(const D3D12_COMPUTE
 {
     if (!desc || !desc->CS.pShaderBytecode || !desc->CS.BytecodeLength) return E_INVALIDARG;
     const std::string sha = Sha256(desc->CS.pShaderBytecode, desc->CS.BytecodeLength);
-    const Program* program = programs_.Find(sha);
-    if (!program) {
-        NoteMissingProgram(sha, desc->CS.pShaderBytecode, desc->CS.BytecodeLength);
-        return E_INVALIDARG;
-    }
     RootSignature* rootSignature = Own<RootSignature>(desc->pRootSignature);
     ID3D12RootSignature* embedded = nullptr;
     if (!rootSignature) {
         if (FAILED(CreateRootSignature(0, desc->CS.pShaderBytecode, desc->CS.BytecodeLength, IID_PPV_ARGS(&embedded)))) return E_INVALIDARG;
         rootSignature = Own<RootSignature>(embedded);
+    }
+    const Program* program = programs_.FindForRoot(sha, rootSignature->layout());
+    if (!program) {
+        if (embedded) embedded->Release();
+        NoteMissingProgram(sha, desc->CS.pShaderBytecode, desc->CS.BytecodeLength);
+        return E_INVALIDARG;
     }
     auto* pso = new PipelineState(this);
     pso->SetTensorLayer(xefg_cuda::LayerForSha256(sha));
@@ -1161,5 +1162,15 @@ bool InstallTensorCores(ID3D12Device* device, const void* fatbin, size_t bytes, 
 void SetTensorCoresEnabled(ID3D12Device* device, bool enabled) noexcept
 {
     if (auto* own = Own<Device>(device)) own->tensor().Enable(enabled);
+}
+
+bool InstallCoopMatrix(ID3D12Device* device, const wchar_t* moduleDir, const CoopMatrixOptions& options, std::string& reason) noexcept
+{
+    auto* own = Own<Device>(device);
+    return own && moduleDir && own->InstallCoopMat(std::filesystem::path(moduleDir), options, reason);
+}
+void SetCoopMatrixEnabled(ID3D12Device* device, bool enabled) noexcept
+{
+    if (auto* own = Own<Device>(device)) own->coopmat().Enable(enabled);
 }
 } // namespace xvk

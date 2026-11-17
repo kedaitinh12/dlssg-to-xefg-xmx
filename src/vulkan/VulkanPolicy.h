@@ -120,8 +120,8 @@ namespace VulkanPolicy
 		std::memcpy(out, matrix, sizeof(matrix));
 	}
 
-	// VkFormat and DXGI_FORMAT values, spelled out so this header needs neither header. VulkanRuntime.cpp static_asserts
-	// every one of them against the real enums
+	// VkFormat and DXGI_FORMAT values, so this header needs neither header. VulkanRuntime.cpp static_asserts that these are
+	// the real enum values
 	namespace Vk
 	{
 		constexpr uint32_t R8G8B8A8Unorm = 37;
@@ -286,6 +286,48 @@ namespace VulkanPolicy
 	inline bool UseTensorCores(bool portModel, bool cudaPath, bool nativePath) noexcept
 	{
 		return portModel && (cudaPath || nativePath);
+	}
+
+	// The VK_KHR_cooperative_matrix route (AMD RDNA3/RDNA4 WMMA and Intel Arc/Battlemage XMX) replaces the int8 layers of
+	// the ported MFG model when the XMX Port, XMX (native), or CUDA path is selected on a GPU where the NVIDIA CUDA cubin
+	// route isn't active. Fallback (DP4a) keeps XeFG's stock model.
+	inline bool UseCoopMatrix(bool portModel, bool xmxPortPath, bool xmxNativePath, bool cudaPath) noexcept
+	{
+		return portModel && (xmxPortPath || xmxNativePath || cudaPath);
+	}
+
+	// What a reason code of the cooperative-matrix route means, for the log and the menu
+	inline std::string DescribeCoopMatrix(std::string_view reason)
+	{
+		struct Row
+		{
+			std::string_view code;
+			std::string_view text;
+		};
+
+		static constexpr Row CoopMatrixRows[] = {
+			{ "environment_off", "XEFG_COOP_MATRIX is off in the environment" },
+			{ "no_port", "the ported MFG model couldn't be installed in libxess_fg.dll" },
+			{ "already_attempted", "the cooperative-matrix route was already installed on this device" },
+			{ "no_extensions", "the game's device has no VK_KHR_cooperative_matrix enabled" },
+			{ "device_inputs", "the layer's device lacks what the cooperative-matrix route needs" },
+			{ "instance_functions", "the Vulkan loader lacks vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR" },
+			{ "device_functions", "the device lacks compute pipeline functions for cooperative matrices" },
+			{ "no_int8_tile", "the GPU offers no subgroup SINT8 x SINT8 -> SINT32 cooperative matrix tile" },
+			{ "no_s8_matrix_shape", "the GPU offers no subgroup SINT8 x SINT8 -> SINT32 cooperative matrix shape" },
+			{ "layout_create", "the cooperative-matrix descriptor or pipeline layout couldn't be created" },
+			{ "shader_dir_missing", "the SPV_KHR_cooperative_matrix shaders aren't installed in xefg_mfg_programs\\vulkan\\coopmat" },
+			{ "exception", "the cooperative-matrix route failed while installing" },
+			{ "driver_fault", "the driver faulted while launching a cooperative-matrix shader, the route turned itself off" },
+		};
+
+		for (const auto& row : CoopMatrixRows)
+		{
+			if (row.code == reason)
+				return std::string(row.text);
+		}
+
+		return std::string(reason);
 	}
 
 	// What a reason code of the tensor-core route means, for the log and the menu: why it isn't installed. The codes are

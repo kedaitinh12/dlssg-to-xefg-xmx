@@ -1,6 +1,7 @@
 #include "VulkanHost.h"
 
 #include "../Log.h"
+#include "VulkanCoopMat.h"
 #include "VulkanPolicy.h"
 #include "VulkanFeatureChain.h"
 #include "VulkanTensor.h"
@@ -199,21 +200,27 @@ namespace
 		VkPhysicalDeviceShaderIntegerDotProductFeatures dot{
 			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES
 		};
+		VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop{
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR
+		};
 
 		VulkanHost::FeatureChain chain;
 		VulkanHost::DeviceRecord record;
 
-		// How many of the last entries of `extensions` are the tensor-core route's NVX extensions this edit added (none
-		// the game asked for itself): the one part of the edit XeFG can do without
+		// How many of the last entries of `extensions` are the tensor-core route's NVX or cooperative-matrix extensions
+		// this edit added (none the game asked for itself): the part of the edit XeFG can do without
 		size_t tensorAdded = 0;
 
-		// The device the driver takes without the NVX extensions: XeFG's features and push descriptors stay, the tensor-core
-		// route doesn't exist and the SPIR-V programs run every layer
+		// The device the driver takes without the NVX / cooperative-matrix extensions: XeFG's features and push descriptors
+		// stay, the hardware matrix route doesn't exist and the SPIR-V programs run every layer
 		void DropTensorExtensions()
 		{
 			extensions.resize(extensions.size() - std::min(tensorAdded, extensions.size()));
 			tensorAdded = 0;
 			record.tensorExtensions = false;
+			record.coopMatrixExtensions = false;
+			if (info.pNext == &coop)
+				info.pNext = coop.pNext;
 			info.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
 			info.ppEnabledExtensionNames = extensions.data();
 		}
@@ -323,12 +330,11 @@ namespace
 				(v11Properties.subgroupSupportedOperations & SubgroupOps) != SubgroupOps)
 				return Refuse(physical, "subgroup_operations");
 
-			// XeFG's own XMX network is what Intel GPUs run, and it needs Intel's D3D12 driver path
-			if (edit->record.vendor == 0x8086)
-				return Refuse(physical, "intel_adapter");
-
 			// What the layer and the program set use
-			VkPhysicalDeviceVulkan13Features v13{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
+			VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopSupported{
+				VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR
+			};
+			VkPhysicalDeviceVulkan13Features v13{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &coopSupported };
 			VkPhysicalDeviceVulkan12Features v12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &v13 };
 			VkPhysicalDeviceFeatures2 supported{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &v12 };
 			features2(physical, &supported);
@@ -341,6 +347,17 @@ namespace
 			extensionsFn(physical, nullptr, &count, nullptr);
 			std::vector<VkExtensionProperties> available(count);
 			extensionsFn(physical, nullptr, &count, available.data());
+
+			for (const auto& extension : available)
+			{
+				if (!strcmp(extension.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME))
+					edit->record.coopMatrixSpec = extension.specVersion;
+			}
+
+			// Intel GPUs are refused on Vulkan unless cooperative-matrix acceleration is available and allowed
+			if (edit->record.vendor == 0x8086 &&
+				(!edit->record.coopMatrixSpec || !coopSupported.cooperativeMatrix || !VulkanCoopMat::AllowIntelAdapter()))
+				return Refuse(physical, "intel_adapter");
 
 			auto offered = [&](const char* name)
 				{
@@ -384,7 +401,7 @@ namespace
 			if (!family)
 				return Refuse(physical, "no_graphics_family");
 
-			// Only push descriptors are added to the extensions, nothing is taken away
+			// Only push descriptors (plus optional tensor/coopmat extensions) are added to the extensions, nothing is taken away
 			if (info->enabledExtensionCount)
 				edit->extensions.assign(info->ppEnabledExtensionNames, info->ppEnabledExtensionNames + info->enabledExtensionCount);
 
@@ -392,10 +409,7 @@ namespace
 				edit->extensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
 
 			// The tensor-core route launches CUDA kernels in the game's command buffers (VK_NVX_binary_import) and gets the
-			// handles of the images they read and write (VK_NVX_image_view_handle). NVIDIA's driver also returns the entry
-			// points of extensions that aren't enabled, so the route is only used when they were enabled at creation: here,
-			// when the GPU offers both and the route isn't switched off. Both have to be at the device's creation, the route
-			// can't be turned on later
+			// handles of the images they read and write (VK_NVX_image_view_handle).
 			if (edit->record.vendor == 0x10DE)
 			{
 				for (const auto& extension : available)
@@ -420,6 +434,21 @@ namespace
 
 					edit->record.tensorExtensions = true;
 				}
+			}
+
+			// VK_KHR_cooperative_matrix for AMD RDNA3/RDNA4 (WMMA) and Intel Arc (XMX), or NVIDIA fallback when NVX is off
+			const bool wantCoopMat = edit->record.coopMatrixSpec && coopSupported.cooperativeMatrix &&
+				VulkanCoopMat::Wanted() && !edit->record.tensorExtensions;
+
+			if (wantCoopMat)
+			{
+				if (!enabled(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME))
+				{
+					edit->extensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+					edit->tensorAdded++;
+				}
+
+				edit->record.coopMatrixExtensions = true;
 			}
 
 			edit->info = *info;
@@ -494,6 +523,13 @@ namespace
 				}
 			}
 
+			if (edit->record.coopMatrixExtensions &&
+				!FindStruct<VkPhysicalDeviceCooperativeMatrixFeaturesKHR>(chain, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR))
+			{
+				edit->coop.cooperativeMatrix = VK_TRUE;
+				prepend(edit->coop);
+			}
+
 			edit->info.pNext = head;
 			edit->record.physical = physical;
 			edit->record.gipa = gipa;
@@ -522,13 +558,14 @@ namespace
 			}
 
 			s.prepared++;
-			Log::Info("Vulkan device {} prepared for XeFG: graphics family {}, vendor {:#06x}{}",
+			Log::Info("Vulkan device {} prepared for XeFG: graphics family {}, vendor {:#06x}{}{}",
 				static_cast<const void*>(device), edit.record.family, edit.record.vendor,
 				edit.record.tensorExtensions ? ", tensor-core extensions enabled"
 				: edit.record.vendor == 0x10DE ? (edit.record.binaryImportSpec && edit.record.imageViewHandleSpec
 					? ", tensor-core extensions not enabled (XEFG_TENSOR_CORES is off or the driver refused them)"
 					: ", the driver doesn't offer the tensor-core extensions")
-				: "");
+				: "",
+				edit.record.coopMatrixExtensions ? ", VK_KHR_cooperative_matrix enabled" : "");
 		}
 		catch (...)
 		{
@@ -550,9 +587,9 @@ namespace
 
 		if (result != VK_SUCCESS && edit && edit->tensorAdded)
 		{
-			// The NVX extensions are the part of the edit XeFG can do without: keep the rest and let the SPIR-V programs run
-			// every layer
-			Log::Warn("The driver refused the device with the tensor-core extensions ({}), trying again without them",
+			// The NVX / cooperative-matrix extensions are the part of the edit XeFG can do without: keep the rest and let
+			// the SPIR-V programs run every layer
+			Log::Warn("The driver refused the device with the tensor/cooperative-matrix extensions ({}), trying again without them",
 				static_cast<int>(result));
 			edit->DropTensorExtensions();
 			result = s.createDevice(physical, &edit->info, allocator, device);

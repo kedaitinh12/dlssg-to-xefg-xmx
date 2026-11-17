@@ -8,6 +8,7 @@
 #include <windows.h>
 #include "xvk.h"
 #include "xvk_tensor.h"
+#include "xvk_coopmat.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -230,8 +231,10 @@ class ProgramSet
 public:
     void Load(HMODULE module);
     const Program* Find(const std::string& sha256);
+    const Program* FindForRoot(const std::string& sha256, const RootLayout& root);
     size_t Size() const { return index_.size(); }
 private:
+    const Program* LoadRow(size_t rowIdx, const std::string& key);
     HMODULE module_ = nullptr;
     std::mutex mutex_;
     std::unordered_map<std::string, size_t> index_;              // DXIL SHA-256 -> embedded row
@@ -401,6 +404,7 @@ private:
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
     std::vector<VkSampler> samplers_;       // owned by the device sampler cache
+    std::vector<uint32_t>& staticSamplersMutable() { return staticBindings_; }
     std::vector<uint32_t> staticBindings_;
     std::vector<BoundRange> ranges_;
     int constantsParameter_ = -1;
@@ -630,8 +634,11 @@ class Device final : public D3D12Object<ID3D12Device1>
 public:
     Device() = default;
     TensorRoute& tensor() noexcept { return tensor_; }
+    CoopMatrixRoute& coopmat() noexcept { return coopmat_; }
     bool InstallTensor(std::span<const unsigned char> fatbin, const TensorOptions& options, std::string& reason) noexcept
     { return tensor_.Install(tensorDesc_, fatbin, options, reason); }
+    bool InstallCoopMat(const std::filesystem::path& moduleDir, const CoopMatrixOptions& options, std::string& reason) noexcept
+    { return coopmat_.Install(*this, tensorDesc_, moduleDir, options, reason); }
     ~Device() override;
     HRESULT Init(const DeviceDesc& desc);
 
@@ -778,6 +785,7 @@ public:
 private:
     void WaiterThread();
     TensorRoute tensor_;
+    CoopMatrixRoute coopmat_;
     DeviceDesc tensorDesc_;
     VkFns vk_;
     VkInstance instance_ = VK_NULL_HANDLE;

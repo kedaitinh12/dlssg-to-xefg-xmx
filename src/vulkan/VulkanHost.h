@@ -6,8 +6,9 @@
 //
 // It follows MFG-Unlocker's vk_host.cpp (MIT, Copyright (c) 2026 Michael Robles, see NOTICE.md) for what a device must
 // have and what refuses it, without its swap chain and latency parts: only the features of a device that the game keeps
-// rendering to are changed, never its queues, extensions it didn't ask for apart from push descriptors and, on an NVIDIA
-// GPU, the two NVX extensions of the tensor-core route (VulkanTensor.h), or its swap chains.
+// rendering to are changed, never its queues, extensions it didn't ask for apart from push descriptors, on an NVIDIA
+// GPU the two NVX extensions of the tensor-core route (VulkanTensor.h), and on GPUs supporting SINT8 cooperative
+// matrices VK_KHR_cooperative_matrix (VulkanCoopMat.h), or its swap chains.
 #pragma once
 
 #include "../VulkanRuntime.h"
@@ -32,6 +33,9 @@ namespace VulkanHost
 		bool tensorExtensions = false;
 		uint32_t binaryImportSpec = 0;
 		uint32_t imageViewHandleSpec = 0;
+		// VK_KHR_cooperative_matrix (AMD RDNA3/RDNA4 WMMA and Intel Arc/Battlemage XMX)
+		bool coopMatrixExtensions = false;
+		uint32_t coopMatrixSpec = 0;
 	};
 
 	// Installs the hooks, or arranges for them to be installed when vulkan-1.dll is loaded. Later calls do nothing. Not

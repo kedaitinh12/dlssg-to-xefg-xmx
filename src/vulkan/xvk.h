@@ -51,6 +51,9 @@ struct DeviceDesc
     bool tensorExtensions = false;
     uint32_t binaryImportSpec = 0;
     uint32_t imageViewHandleSpec = 0;
+    // VK_KHR_cooperative_matrix enablement (AMD WMMA / Intel XMX)
+    bool coopMatrixExtensions = false;
+    uint32_t coopMatrixSpec = 0;
 };
 
 struct TensorOptions
@@ -62,8 +65,16 @@ struct TensorOptions
     bool argumentParams = false;
 };
 
+struct CoopMatrixOptions
+{
+    bool fullBarriers = false;
+};
+
 bool InstallTensorCores(ID3D12Device*, const void* fatbin, size_t bytes, const TensorOptions&, std::string& reason) noexcept;
 void SetTensorCoresEnabled(ID3D12Device*, bool enabled) noexcept;
+
+bool InstallCoopMatrix(ID3D12Device*, const wchar_t* moduleDir, const CoopMatrixOptions&, std::string& reason) noexcept;
+void SetCoopMatrixEnabled(ID3D12Device*, bool enabled) noexcept;
 
 // What the device needs. The SPIR-V is version 1.6, so the device must run at Vulkan 1.3 or later.
 constexpr uint32_t kRequiredApiVersion = VK_API_VERSION_1_3;
