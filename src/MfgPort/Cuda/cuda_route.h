@@ -82,6 +82,25 @@ bool SupportedArchitecture(int major, int minor, const std::string& name) noexce
 // Lock-free: the route is active and a layer has run on tensor cores (OptiScaler's "XeFG model" line).
 bool Launched() noexcept;
 
+// The Vulkan route (src/vulkan/xvk_tensor.cpp, MFG-Unlocker 1.7.1). It runs the same layer table (cuda_layers.h) and the
+// same kernels, launched through VK_NVX_binary_import in the layer's own command buffer instead of
+// NvAPI_D3D12_LaunchCubinShader. MFG-Unlocker's cuda_route.cpp shares these between its two routes; here the D3D12
+// route's Snapshot() and Launched() above stay as they were and the Vulkan route has a status of its own.
+// The log line of the route, the same sink SetLog gave the D3D12 route
+void Report(const char* stage, const std::string& fields) noexcept;
+// Compute capability and CUDA device name of the adapter with this LUID, through nvcuda.dll without a context
+bool AdapterCapability(const LUID& luid, int& major, int& minor, std::string& name) noexcept;
+// Diagnosis: bit n - 1 lets layer n launch, the default is every layer. Read by the Vulkan route only
+void SetLayerMask(uint32_t mask) noexcept;
+bool LayerEnabled(uint8_t layerId) noexcept;
+// The Vulkan route's own status: what it installed, and how many layers it launched or left to the SPIR-V program
+void ReportVulkan(State state, int major, int minor, uint32_t layers, const char* reason) noexcept;
+void CountVulkan(uint64_t launches, uint64_t fallbacks) noexcept;
+Status VulkanSnapshot() noexcept;
+// Lock-free: the Vulkan route is installed and hasn't turned itself off, and the same once a layer has run on tensor cores
+bool VulkanActive() noexcept;
+bool VulkanLaunched() noexcept;
+
 // Layer table and kernel names (tests). ownSha256 (unet.1): RTXMFG's own DXIL for the same layer, which ShaderPort
 // swaps in for Intel's program; the provider then creates the pipeline from those bytes (nullptr when there is none).
 struct LayerInfo { const char* program; const char* sha256; const char* kernel; const char* ownSha256 = nullptr; };

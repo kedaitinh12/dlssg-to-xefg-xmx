@@ -30,8 +30,9 @@ using Microsoft::WRL::ComPtr;
 // One entry per Intel program the kernels reproduce byte for byte (tests/xess_cuda; research
 // build\cubin-bench-20261014 and build\vk-layer-port-20261008). The SHA-256 is of the DXIL container
 // the provider passes to CreateComputePipelineState: the 11 U-Net programs and 2 flow programs from
-// libxess_fg 3.0.2 (the same bytes in OptiScaler's provider), and 4 of RTXMFG's embedded ported flow
-// programs (xess-programs/programs). Every program binds root parameter 0 = table (t0, [t4,] u0),
+// libxess_fg 3.0.2 (the same bytes in OptiScaler's provider, and byte for byte the 13 Intel programs of
+// libxess_fg 1.3.4.95 too, tools/CheckXeFgBuild.py decodes a build's programs and compares them), and 4 of
+// RTXMFG's embedded ported flow programs (xess-programs/programs). Every program binds root parameter 0 = table (t0, [t4,] u0),
 // 1 = table (t1, t2, t3), 2 = root constants b0. unet.1: five layers also match RTXMFG's own program
 // (xess/port/unet_conv.hlsl, the pins in xess/generate_xess_shaders.py), which ShaderPort puts in place of
 // Intel's: same root signature, same Dispatch, byte-identical output.
@@ -243,7 +244,8 @@ UINT VendorOf(const LUID& luid)
 
 // ---- state -------------------------------------------------------------------------------------------
 std::mutex gMutex;
-LogFunction gLog{};
+// The D3D12 route's frame generator and the Vulkan route (cuda_vulkan.cpp, VulkanTensor.cpp) both set it
+std::atomic<LogFunction> gLog{};
 std::atomic<State> gState{State::NotAttempted};
 std::string gReason;
 int gMajor{}, gMinor{};
@@ -263,7 +265,7 @@ std::array<std::atomic<bool>, std::size(kLayers)> gLayerSeen{};
 
 void Log(const char* stage, const std::string& fields) noexcept
 {
-    if (const auto log = gLog) log(stage, fields);
+    if (const auto log = gLog.load(std::memory_order_relaxed)) log(stage, fields);
 }
 
 // Recognized pipeline states: open addressing on the pointer (inserted under gMutex, read lock-free).
@@ -1269,7 +1271,7 @@ void MarkUnavailable(const std::string& reason)
 }
 }
 
-void SetLog(LogFunction log) noexcept { gLog = log; }
+void SetLog(LogFunction log) noexcept { gLog.store(log, std::memory_order_relaxed); }
 
 void SetStackRecognition(bool enabled) noexcept { gStackRecognition.store(enabled, std::memory_order_relaxed); }
 
@@ -1478,4 +1480,13 @@ bool SupportedArchitecture(int major, int minor, const std::string& name) noexce
 }
 
 std::span<const LayerInfo> Layers() noexcept { return kLayerInfos; }
+
+// For the Vulkan route (see cuda_route.h): the log sink and the CUDA driver query that Install makes on D3D12
+void Report(const char* stage, const std::string& fields) noexcept { Log(stage, fields); }
+
+bool AdapterCapability(const LUID& luid, int& major, int& minor, std::string& name) noexcept
+{
+    try { return Capability(luid, major, minor, name); }
+    catch (...) { return false; }
+}
 }
