@@ -37,6 +37,8 @@
 #define VK_NVX_BINARY_IMPORT_EXTENSION_NAME "VK_NVX_binary_import"
 #define VK_NVX_IMAGE_VIEW_HANDLE_SPEC_VERSION 3
 #define VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME "VK_NVX_image_view_handle"
+#define VK_KHR_COOPERATIVE_MATRIX_SPEC_VERSION 2
+#define VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME "VK_KHR_cooperative_matrix"
 
 typedef uint32_t VkFlags;
 typedef uint64_t VkFlags64;
@@ -132,9 +134,36 @@ typedef enum VkStructureType
 	VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 = 1000059001,
 	VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES = 1000280000,
 	VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES = 1000207000,
+	VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES = 1000211000,
 	VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES = 1000314007,
 	VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES = 1000413000,
+	VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR = 1000506000,
+	VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR = 1000506001,
+	VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR = 1000506002,
 } VkStructureType;
+
+typedef enum VkComponentTypeKHR
+{
+	VK_COMPONENT_TYPE_FLOAT16_KHR = 0,
+	VK_COMPONENT_TYPE_FLOAT32_KHR = 1,
+	VK_COMPONENT_TYPE_FLOAT64_KHR = 2,
+	VK_COMPONENT_TYPE_SINT8_KHR = 3,
+	VK_COMPONENT_TYPE_SINT16_KHR = 4,
+	VK_COMPONENT_TYPE_SINT32_KHR = 5,
+	VK_COMPONENT_TYPE_SINT64_KHR = 6,
+	VK_COMPONENT_TYPE_UINT8_KHR = 7,
+	VK_COMPONENT_TYPE_UINT16_KHR = 8,
+	VK_COMPONENT_TYPE_UINT32_KHR = 9,
+	VK_COMPONENT_TYPE_UINT64_KHR = 10,
+} VkComponentTypeKHR;
+
+typedef enum VkScopeKHR
+{
+	VK_SCOPE_DEVICE_KHR = 1,
+	VK_SCOPE_WORKGROUP_KHR = 2,
+	VK_SCOPE_SUBGROUP_KHR = 3,
+	VK_SCOPE_QUEUE_FAMILY_KHR = 5,
+} VkScopeKHR;
 
 typedef enum VkFormat
 {
@@ -191,6 +220,7 @@ typedef enum VkDescriptorType
 	VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER = 1,
 	VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE = 2,
 	VK_DESCRIPTOR_TYPE_STORAGE_IMAGE = 3,
+	VK_DESCRIPTOR_TYPE_STORAGE_BUFFER = 7,
 } VkDescriptorType;
 
 typedef enum VkDescriptorSetLayoutCreateFlagBits
@@ -599,6 +629,45 @@ typedef struct VkPhysicalDeviceShaderIntegerDotProductFeatures
 	VkBool32 shaderIntegerDotProduct;
 } VkPhysicalDeviceShaderIntegerDotProductFeatures;
 
+typedef struct VkPhysicalDeviceVulkanMemoryModelFeatures
+{
+	VkStructureType sType;
+	void* pNext;
+	VkBool32 vulkanMemoryModel;
+	VkBool32 vulkanMemoryModelDeviceScope;
+	VkBool32 vulkanMemoryModelAvailabilityVisibilityChains;
+} VkPhysicalDeviceVulkanMemoryModelFeatures;
+
+typedef struct VkPhysicalDeviceCooperativeMatrixFeaturesKHR
+{
+	VkStructureType sType;
+	void* pNext;
+	VkBool32 cooperativeMatrix;
+	VkBool32 cooperativeMatrixRobustBufferAccess;
+} VkPhysicalDeviceCooperativeMatrixFeaturesKHR;
+
+typedef struct VkPhysicalDeviceCooperativeMatrixPropertiesKHR
+{
+	VkStructureType sType;
+	void* pNext;
+	VkShaderStageFlags cooperativeMatrixSupportedStages;
+} VkPhysicalDeviceCooperativeMatrixPropertiesKHR;
+
+typedef struct VkCooperativeMatrixPropertiesKHR
+{
+	VkStructureType sType;
+	void* pNext;
+	uint32_t MSize;
+	uint32_t NSize;
+	uint32_t KSize;
+	VkComponentTypeKHR AType;
+	VkComponentTypeKHR BType;
+	VkComponentTypeKHR CType;
+	VkComponentTypeKHR ResultType;
+	VkBool32 saturatingAccumulation;
+	VkScopeKHR scope;
+} VkCooperativeMatrixPropertiesKHR;
+
 typedef struct VkExtensionProperties
 {
 	char extensionName[VK_MAX_EXTENSION_NAME_SIZE];
@@ -733,7 +802,12 @@ typedef struct VkDescriptorImageInfo
 	VkImageLayout imageLayout;
 } VkDescriptorImageInfo;
 
-typedef struct VkDescriptorBufferInfo VkDescriptorBufferInfo;
+typedef struct VkDescriptorBufferInfo
+{
+	VkBuffer buffer;
+	VkDeviceSize offset;
+	VkDeviceSize range;
+} VkDescriptorBufferInfo;
 typedef struct VkBufferView_T* VkBufferView;
 
 typedef struct VkWriteDescriptorSet
@@ -817,7 +891,20 @@ typedef struct VkShaderModuleCreateInfo
 	const uint32_t* pCode;
 } VkShaderModuleCreateInfo;
 
-typedef struct VkSpecializationInfo VkSpecializationInfo;
+typedef struct VkSpecializationMapEntry
+{
+	uint32_t constantID;
+	uint32_t offset;
+	size_t size;
+} VkSpecializationMapEntry;
+
+typedef struct VkSpecializationInfo
+{
+	uint32_t mapEntryCount;
+	const VkSpecializationMapEntry* pMapEntries;
+	size_t dataSize;
+	const void* pData;
+} VkSpecializationInfo;
 
 typedef struct VkPipelineShaderStageCreateInfo
 {
@@ -910,4 +997,6 @@ typedef void(VKAPI_PTR* PFN_vkDestroyCuFunctionNVX)(
 typedef void(VKAPI_PTR* PFN_vkCmdCuLaunchKernelNVX)(VkCommandBuffer commandBuffer, const VkCuLaunchInfoNVX* pLaunchInfo);
 typedef uint32_t(VKAPI_PTR* PFN_vkGetImageViewHandleNVX)(VkDevice device, const VkImageViewHandleInfoNVX* pInfo);
 typedef uint64_t(VKAPI_PTR* PFN_vkGetImageViewHandle64NVX)(VkDevice device, const VkImageViewHandleInfoNVX* pInfo);
+typedef VkResult(VKAPI_PTR* PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)(VkPhysicalDevice physicalDevice,
+	uint32_t* pPropertyCount, VkCooperativeMatrixPropertiesKHR* pProperties);
 typedef void(VKAPI_PTR* PFN_vkCmdPipelineBarrier2)(VkCommandBuffer commandBuffer, const VkDependencyInfo* pDependencyInfo);
