@@ -1,0 +1,2 @@
+# Runtime payload hashes cover exact bytes, including CRLF in the manifest.
+third_party/xefg_mfg_programs/vulkan/** -text
