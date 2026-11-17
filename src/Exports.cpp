@@ -1,4 +1,5 @@
-// The nvngx_dlssg exports. Only DX12, XeFG has no Vulkan API
+// The nvngx_dlssg exports for DX12. XeFG has no Vulkan API, the Vulkan exports are in ExportsVulkan.cpp and hand
+// the calls to MFG-Unlocker's provider
 #include "FrameGenerator.h"
 #include "Log.h"
 #include "Util.h"
@@ -94,8 +95,9 @@ NGX_EXPORT NGXResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList* cm
 
 	static std::atomic_uint32_t nextId = 1;
 
-	// The XeFG context is created on the first evaluation, once the resources are known
-	*handle = new FeatureHandle{ { nextId++ }, std::make_shared<FrameGenerator>(device.Get()) };
+	// The XeFG context is created on the first evaluation, once the resources are known. The Vulkan bit stays clear,
+	// that is how the Vulkan exports tell their handles apart
+	*handle = new FeatureHandle{ { nextId++ & ~NGX_HANDLE_VULKAN }, std::make_shared<FrameGenerator>(device.Get()) };
 
 	return NGX_SUCCESS;
 }
@@ -104,6 +106,10 @@ NGX_EXPORT NGXResult NVSDK_NGX_D3D12_ReleaseFeature(NGXHandle* handle)
 {
 	if (!handle)
 		return NGX_FAIL_INVALID_PARAMETER;
+
+	// A Vulkan feature isn't ours to read as a D3D12 one
+	if (IsVulkanHandle(handle))
+		return NGX_FAIL_FEATURE_NOT_FOUND;
 
 	auto feature = static_cast<FeatureHandle*>(handle);
 	DeferredDestroy::Add(std::move(feature->generator));
@@ -117,6 +123,9 @@ NGX_EXPORT NGXResult NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList* 
 {
 	if (!cmdList || !handle || !params)
 		return NGX_FAIL_INVALID_PARAMETER;
+
+	if (IsVulkanHandle(handle))
+		return NGX_FAIL_FEATURE_NOT_FOUND;
 
 	DeferredDestroy::Collect();
 

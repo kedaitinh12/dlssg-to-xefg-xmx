@@ -15,6 +15,7 @@ constexpr NGXResult NGX_FAIL_FEATURE_NOT_SUPPORTED = NGX_FAIL | 1;
 constexpr NGXResult NGX_FAIL_PLATFORM_ERROR = NGX_FAIL | 2;
 constexpr NGXResult NGX_FAIL_FEATURE_NOT_FOUND = NGX_FAIL | 4;
 constexpr NGXResult NGX_FAIL_INVALID_PARAMETER = NGX_FAIL | 5;
+constexpr NGXResult NGX_FAIL_NOT_INITIALIZED = NGX_FAIL | 7;
 
 constexpr uint32_t NGX_FEATURE_FRAME_GENERATION = 11;
 
@@ -22,6 +23,15 @@ struct NGXHandle
 {
 	uint32_t Id;
 };
+
+// The handles of the Vulkan exports have this bit set in Id. A handle given to the other API's exports is recognised
+// by it instead of being read as the wrong struct
+constexpr uint32_t NGX_HANDLE_VULKAN = 0x80000000;
+
+inline bool IsVulkanHandle(const NGXHandle* handle)
+{
+	return (handle->Id & NGX_HANDLE_VULKAN) != 0;
+}
 
 struct NGXFeatureRequirement
 {

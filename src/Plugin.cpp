@@ -1,12 +1,18 @@
 #include "Plugin.h"
 #include "Log.h"
 #include "Util.h"
+#include "VulkanPrograms.h"
+#include "VulkanProvider.h"
+#include "VulkanRuntime.h"
 #include "XeFG.h"
 #include "optiscaler_plugin.h"
+#include "vulkan/VulkanPolicy.h"
 
+#include <filesystem>
 #include <format>
 #include <mutex>
 #include <string>
+#include <system_error>
 
 namespace
 {
@@ -95,6 +101,272 @@ namespace
 			library.knownBuild ? "Known build" : "Functions found by scanning").c_str());
 	}
 
+	const char* HooksText(const VulkanRuntime::Status& host)
+	{
+		if (!host.enabled)
+			return "off";
+
+		switch (host.hooks)
+		{
+		case VulkanRuntime::Hooks::Waiting:
+			return "waiting for vulkan-1.dll";
+		case VulkanRuntime::Hooks::Installed:
+			return "installed";
+		case VulkanRuntime::Hooks::Failed:
+			return "failed";
+		default:
+			return "not started";
+		}
+	}
+
+	// What the tensor-core route (src/vulkan/VulkanTensor.h) is doing for the ported model's int8 layers: on an NVIDIA RTX GPU
+	// they run as CUDA kernels in the game's command buffers. Nothing is drawn until a Vulkan game gave the runtime a
+	// device, most games are DX12 ones and those have a tensor-core route of their own
+	void DrawVulkanTensor()
+	{
+		using State = VulkanRuntime::TensorState;
+
+		const auto tensor = VulkanRuntime::GetTensorStatus();
+
+		if (tensor.state == State::NotAttempted && (tensor.reason.empty() || tensor.reason == "not_attempted"))
+			return;
+
+		const auto why = VulkanPolicy::DescribeTensor(tensor.reason);
+
+		if (tensor.state == State::Active)
+		{
+			const auto architecture = std::format("sm_{}{}", tensor.major, tensor.minor);
+
+			if (tensor.replacing)
+			{
+				// Green once a layer has run there. Selected and installed is all that can be said before that: no frame
+				// was generated yet, or no program of this XeFG build is one of the route's layers (its table is of
+				// libxess_fg.dll 1.3.1, XeSS SDK 3.0.2, whose 13 Intel programs 1.3.4.95 has byte for byte too,
+				// tools/CheckXeFgBuild.py) and the SPIR-V programs run everything
+				if (tensor.launches)
+					Green(std::format("Tensor cores: on \xC2\xB7 {}", architecture).c_str());
+				else
+					api->Text(std::format("Tensor cores: idle \xC2\xB7 {}", architecture).c_str());
+
+				api->ItemTooltip(std::format("The ported model's int8 layers run as CUDA kernels on this GPU's tensor cores, in the\n"
+					"game's own command buffers.\n"
+					"Layers launched on the tensor cores: {}\n"
+					"Layers left to their SPIR-V program: {}\n"
+					"A layer the route doesn't take (a shape or an image view it doesn't know) keeps its SPIR-V program in the same\n"
+					"frame, the log says which. While both counts are 0 no layer has gone through the route yet: no frame was\n"
+					"generated, or none of this XeFG build's programs is in the route's layer table (the same in libxess_fg.dll\n"
+					"1.3.1 and 1.3.4.95; another build may not have them).\n"
+					"XEFG_TENSOR_CORES=off in the environment turns the route off.",
+					tensor.launches, tensor.fallbacks).c_str());
+			}
+			else
+			{
+				api->Text(std::format("Tensor cores: ready \xC2\xB7 {}", architecture).c_str());
+				api->ItemTooltip("Installed on this GPU, but the layers run as SPIR-V programs now: the XMX Port or Fallback (DP4a)\n"
+								 "network path is selected. The CUDA path (and XMX (native), which runs as CUDA on Vulkan) puts them on the\n"
+								 "tensor cores.");
+			}
+
+			return;
+		}
+
+		if (tensor.state == State::NotAttempted)
+		{
+			// The route reports nothing for a GPU it was never an option for
+			api->TextDisabled("Tensor cores: NVIDIA RTX GPUs only");
+			api->ItemTooltip(why.c_str());
+			return;
+		}
+
+		// The driver crashing under the route is no matter of this GPU not having it, the log has the details
+		const bool faulted = tensor.reason.ends_with("_fault");
+
+		if (faulted)
+			Red("Tensor cores: the driver faulted");
+		else
+			api->TextDisabled(tensor.state == State::Disabled ? "Tensor cores: off" : "Tensor cores: unavailable");
+
+		api->ItemTooltip(std::format("{}\nThe layers run as SPIR-V programs instead.", why).c_str());
+	}
+
+	// Vulkan games run on the runtime built into this dll: MFG-Unlocker's D3D12-on-Vulkan layer and the models of
+	// xefg_mfg_programs\vulkan (src/VulkanRuntime.h)
+	void DrawVulkanRuntime()
+	{
+		const auto info = VulkanProvider::Query();
+		const auto host = VulkanRuntime::GetStatus();
+		const bool ready = info.state == VulkanProvider::State::Ready;
+		const bool initialized = VulkanProvider::initialized.load();
+		const bool running = VulkanProvider::liveFeatures.load() != 0;
+
+		if (!ready && initialized)
+		{
+			// A Vulkan game asked for frame generation and it can't have it
+			Red("Unavailable");
+			api->Text(info.reason.c_str());
+		}
+		else if (!ready)
+		{
+			// Most games aren't Vulkan games, what keeps this from running there isn't news
+			api->TextDisabled("Idle");
+			api->ItemTooltip(info.reason.c_str());
+		}
+		else if (running)
+		{
+			Green("Active");
+		}
+		else if (initialized)
+		{
+			Green("Ready");
+		}
+		else
+		{
+			api->TextDisabled("Idle");
+			api->ItemTooltip("Waiting for a Vulkan game to start frame generation. DX12 games don't use this.");
+		}
+
+		if (ready)
+		{
+			auto line = std::format("Up to {}x", info.maxFrames + 1);
+
+			if (const auto model = VulkanProvider::ModelName(); !model.empty())
+				line += std::format(" \xC2\xB7 {} model", model);
+
+			api->Text(line.c_str());
+			api->ItemTooltip("port: the ported MFG model, the XMX Port, XMX (native) and CUDA network paths\n"
+							 "DP4a: XeFG's own model, the Fallback (DP4a) network path\n"
+							 "XeFG's own XMX network isn't used on Vulkan, XMX (native) runs the port. The CUDA path (and XMX (native)) puts the\n"
+							 "port's int8 layers on the tensor cores of an NVIDIA RTX GPU when it can, the XMX Port runs them as SPIR-V programs.");
+		}
+
+		DrawVulkanTensor();
+
+		auto hooks = std::format("Hooks: {}", HooksText(host));
+
+		if (host.devices)
+			hooks += std::format(" \xC2\xB7 {} of {} devices prepared", host.prepared, host.devices);
+
+		api->Text(hooks.c_str());
+
+		std::string tip = "The hooks add what XeFG's programs need (Vulkan 1.3 features, VK_KHR_push_descriptor) to the game's\n"
+			"VkDevice when it creates it. They have to be in before that: with this dll as an .asi in OptiScaler's\n"
+			"plugins folder (see the README), or a game that creates its device after OptiScaler loaded this dll.";
+
+		if (!host.detail.empty())
+			tip += "\n" + host.detail;
+
+		if (!host.refusal.empty())
+			tip += "\nLast device turned down: " + VulkanPolicy::Describe(host.refusal);
+
+		api->ItemTooltip(tip.c_str());
+
+		bool hooksOn = host.enabled;
+
+		if (api->Checkbox("Vulkan hooks", &hooksOn))
+		{
+			VulkanRuntime::SetHooksEnabled(hooksOn);
+			api->SetBool(self, "VulkanHooks", hooksOn);
+		}
+
+		api->ItemTooltip("Off: the game's Vulkan device is left alone and Vulkan games get no frame generation. Hooks that\n"
+						 "aren't installed yet come with the next start of the game. XEFG_VULKAN_HOOKS=0 in the environment\n"
+						 "does the same. Saved as VulkanHooks in OptiScaler.ini.");
+	}
+
+	// A build without the Vulkan headers has no runtime of its own: Vulkan games run through MFG-Unlocker's XeMFG provider
+	// (MFGUnlocker.asi), the Vulkan models are its own. The choice between them is the asi's, not the network path
+	void DrawVulkanProvider()
+	{
+		const auto info = VulkanProvider::Query();
+
+		if (info.state == VulkanProvider::State::NotLoaded)
+		{
+			api->TextDisabled("MFGUnlocker.asi isn't loaded");
+			api->ItemTooltip("This build of the dll has no Vulkan runtime, Vulkan games need MFG-Unlocker's MFGUnlocker.asi, it\n"
+							 "runs XeFG on Vulkan. DX12 games don't need it.");
+			return;
+		}
+
+		if (info.state == VulkanProvider::State::Blocked)
+		{
+			Red("Unavailable");
+			api->ItemTooltip(info.module.c_str());
+			api->Text(info.reason.c_str());
+			return;
+		}
+
+		const bool running = VulkanProvider::liveFeatures.load() != 0;
+
+		if (running)
+			Green("Active");
+		else if (VulkanProvider::initialized.load())
+			Green("Ready");
+		else
+			api->TextDisabled("Idle");
+
+		auto line = std::format("Up to {}x", info.maxFrames + 1);
+
+		if (const auto model = VulkanProvider::ModelName(); !model.empty())
+			line += std::format(" \xC2\xB7 {} model", model);
+
+		api->Text(line.c_str());
+		api->ItemTooltip(std::format("{}\n"
+			"port: the ported MFG model, used unless XeFGModel says otherwise\n"
+			"2X: XeFG's own 2x model, XeFGModel = default\n"
+			"CUDA-port: the port with its int8 layers on tensor cores, XeFGTensorCores = off turns it off\n"
+			"XeFGModel is in [XeFG] of OptiScaler.ini, restart the game after changing it.",
+			info.module).c_str());
+	}
+
+	void DrawVulkan()
+	{
+		api->Section("Vulkan");
+
+		if (VulkanRuntime::Built())
+			DrawVulkanRuntime();
+		else
+			DrawVulkanProvider();
+	}
+
+	// The Vulkan models in xefg_mfg_programs\vulkan, read and checked when the plugin starts
+	void DrawVulkanModels()
+	{
+		const auto* set = VulkanPrograms::Loaded();
+
+		if (!set)
+			return;
+
+		if (!set->present)
+		{
+			api->TextDisabled("Vulkan models: not installed");
+			api->ItemTooltip(std::format("{}\n"
+				"The models XeFG runs on Vulkan. tools/ExtractXeFgVulkanPrograms.py makes this folder from MFGUnlocker.asi.\n"
+				"DX12 games don't need it.",
+				VulkanPrograms::PathText(set->directory)).c_str());
+			return;
+		}
+
+		if (!set->Usable())
+		{
+			std::string problems;
+
+			for (const auto& problem : set->problems)
+				problems += "\n" + problem;
+
+			Red("Vulkan models: can't be used");
+			api->ItemTooltip(std::format("{}{}", VulkanPrograms::PathText(set->directory), problems).c_str());
+			return;
+		}
+
+		api->Text(std::format("Vulkan models: {} programs", set->programs.size()).c_str());
+		api->ItemTooltip(std::format("{}\n{}\n"
+			"Every program was checked against its SHA-256 at start-up.{}",
+			VulkanPrograms::Summary(*set), VulkanPrograms::PathText(set->directory),
+			VulkanRuntime::Built() ? " Vulkan games run them on this dll's own D3D12-on-Vulkan layer."
+			                       : " Running them takes the D3D12 layer of MFGUnlocker.asi (this build has none of its own).")
+				.c_str());
+	}
+
 	void DrawSettings()
 	{
 		api->Section("Settings");
@@ -123,7 +395,9 @@ namespace
 		api->ItemTooltip("XMX (native): XeFG's own XMX network, the default on Intel GPUs with XMX\n"
 						 "XMX Port: ported XMX model on DXIL\n"
 						 "CUDA: ported XMX model on NVIDIA tensor cores, RTX GPUs only\n"
-						 "Fallback (DP4a): XeFG's default model");
+						 "Fallback (DP4a): XeFG's default model\n"
+						 "Vulkan games run the ported model, on the tensor cores of an RTX GPU for CUDA and XMX (native) when the route is\n"
+						 "available, as SPIR-V programs for XMX Port. Fallback (DP4a) runs XeFG's own model (see Vulkan)");
 
 		bool hudlessUi = Plugin::options.hudlessUi;
 
@@ -148,7 +422,85 @@ namespace
 	void DrawTab(void*)
 	{
 		DrawStatus();
+		DrawVulkan();
+		DrawVulkanModels();
 		DrawSettings();
+	}
+
+	// A copy of this dll renamed to .asi, in OptiScaler's plugins folder. See InitializeASI
+	bool IsEarlyCopy()
+	{
+		return _wcsicmp(ThisModulePath().extension().c_str(), L".asi") == 0;
+	}
+
+	// The dll OptiScaler uses, <OptiScaler folder>\custom\<name>\dlssg\<this file's name>.dll, for the copy that is
+	// <OptiScaler folder>\plugins\<this file's name>.asi. Empty when there is none
+	std::filesystem::path FindMainDll()
+	{
+		try
+		{
+			const auto self = ThisModulePath();
+			const auto name = self.stem().wstring() + L".dll";
+			const auto custom = self.parent_path().parent_path() / L"custom";
+
+			std::error_code error;
+
+			for (const auto& entry : std::filesystem::directory_iterator(custom, error))
+			{
+				const auto candidate = entry.path() / L"dlssg" / name;
+
+				if (std::filesystem::is_regular_file(candidate, error))
+					return candidate;
+			}
+		}
+		catch (...)
+		{
+		}
+
+		return {};
+	}
+
+	void StartFromAsi()
+	{
+		const auto self = ThisModulePath();
+		Log::Info("InitializeASI, {}", self.string());
+
+		// The dll itself, started by OptiScaler as a plugin or by its early copy
+		if (!IsEarlyCopy())
+		{
+			VulkanRuntime::Start("InitializeASI");
+			return;
+		}
+
+		// The copy has no settings, no models and no menu of its own, those are the main dll's. It only gets that one
+		// loaded now, so that its Vulkan hooks are in before the game creates its instance and device
+		const auto main = FindMainDll();
+
+		if (main.empty())
+		{
+			Log::Warn("This copy of the dll is a plugin, but there is no {}.dll in custom\\<name>\\dlssg next to the plugins "
+				"folder to start", self.stem().string());
+			return;
+		}
+
+		HMODULE module = LoadLibraryW(main.c_str());
+
+		if (!module)
+		{
+			Log::Error("Can't load {} ({})", main.string(), GetLastError());
+			return;
+		}
+
+		const auto start = reinterpret_cast<void (*)()>(GetProcAddress(module, "InitializeASI"));
+
+		if (!start)
+		{
+			Log::Error("{} has no InitializeASI, it isn't a build this copy can start", main.string());
+			return;
+		}
+
+		Log::Info("Starting {}", main.string());
+		start();
 	}
 } // namespace
 
@@ -176,8 +528,33 @@ void Plugin::Report(const Status& reported)
 	reportedAt = GetTickCount64();
 }
 
+// OptiScaler's ASI plugin entry point: with LoadAsiPlugins=true it loads every .asi in its plugins folder at start-up and
+// calls this right away, long before a game creates its Vulkan instance and device. The dll OptiScaler uses is loaded
+// later, when the game asks for DLSS Frame Generation, which for a Vulkan game is after the device exists and too late
+// for the Vulkan hooks. So for Vulkan games this dll is also copied to OptiScaler's plugins folder renamed to .asi: that
+// copy loads the real one from custom\<name>\dlssg here, and the real one installs the hooks.
+extern "C" __declspec(dllexport) void InitializeASI()
+{
+	try
+	{
+		StartFromAsi();
+	}
+	catch (const std::exception& error)
+	{
+		Log::Error("InitializeASI: {}", error.what());
+	}
+	catch (...)
+	{
+		Log::Error("InitializeASI failed");
+	}
+}
+
 extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* optiApi, OptiPlugin* plugin)
 {
+	// The early copy has done its job in InitializeASI, the menu and the settings are the real dll's
+	if (IsEarlyCopy())
+		return false;
+
 	api = optiApi;
 	self = plugin;
 
@@ -188,6 +565,35 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* optiAp
 		Plugin::options.path = (Plugin::Path)path;
 
 	Plugin::options.hudlessUi = api->GetBool(self, "HudlessUi", Plugin::options.hudlessUi);
+
+	// Off in OptiScaler.ini, the Vulkan hooks aren't installed. Said before they are, and a copy started by
+	// InitializeASI that has installed them already only passes the game's calls on from here
+	if (!api->GetBool(self, "VulkanHooks", true))
+	{
+		Log::Info("VulkanHooks is off in OptiScaler.ini, the game's Vulkan device is left alone");
+		VulkanRuntime::SetHooksEnabled(false);
+	}
+
+	// Reads and checks the Vulkan models next to the dll now, so neither the menu nor a frame pays for it
+	try
+	{
+		VulkanPrograms::Installed();
+	}
+	catch (const std::exception& error)
+	{
+		Log::Warn("Vulkan models: {}", error.what());
+	}
+
+	// Late for a game that already created its Vulkan device, which the log says when it asks for frame generation. Not
+	// from DllMain: that is why this is here and not there
+	try
+	{
+		VulkanRuntime::Start("OptiPluginInit");
+	}
+	catch (const std::exception& error)
+	{
+		Log::Warn("Vulkan hooks: {}", error.what());
+	}
 
 	return api->RegisterTab(self, "XeMFG XMX", "XeFG replacing DLSS Frame Generation", DrawTab, nullptr);
 }

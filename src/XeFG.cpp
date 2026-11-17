@@ -64,7 +64,8 @@ namespace
 	const KnownBuild knownBuilds[] = {
 		// libxess_fg.dll 1.3.1 from XeSS SDK 3.0.2
 		{ 0x69CB0F4D, 0x015ED000, 0x1853B0, 0x1871C0, 0x185800, 0x1874C0, 0x188060, 0x1A4610, &Layout_1_3_1 },
-		// libxess_fg.dll 1.3.4
+		// libxess_fg.dll 1.3.4.95 (22,866,056 bytes, SHA-256 752b1491350a2983...); tools/CheckXeFgBuild.py checks a file
+		// against this row, and against everything else this dll relies on
 		{ 0x6A95ED0F, 0x015D7000, 0x1856A0, 0x1874B0, 0x185AF0, 0x1877B0, 0x188350, 0x1A4EA0, &Layout_1_3_4 },
 	};
 
