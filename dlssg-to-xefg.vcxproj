@@ -32,6 +32,17 @@
     <IntDir>$(SolutionDir)obj\$(Configuration)\</IntDir>
     <XeFgProgramsDir>$(OutDir)xefg_mfg_programs</XeFgProgramsDir>
     <XeFgCudaSha256 Condition="'$(XeFgCudaSha256)' == ''"></XeFgCudaSha256>
+    <!-- Set MfgUnlockerAsi to a MFGUnlocker.asi to have the build put its Vulkan models in xefg_mfg_programs\vulkan -->
+    <MfgUnlockerAsi Condition="'$(MfgUnlockerAsi)' == ''"></MfgUnlockerAsi>
+    <PythonExe Condition="'$(PythonExe)' == ''">python</PythonExe>
+    <!-- The Vulkan runtime (src\VulkanRuntime.h: MFG-Unlocker's D3D12-on-Vulkan layer and the hooks that prepare a game's VkDevice
+         for it) is built when the Vulkan headers are found: -p:VulkanIncludeDir=<the folder that has vulkan\vulkan.h>, which is
+         the include folder of a Vulkan-Headers checkout or the Include folder of the Vulkan SDK (found through VULKAN_SDK).
+         MFG-Unlocker builds the layer against the 1.4.363 headers. Without them the dll is built the same but has no runtime,
+         and Vulkan games then need MFGUnlocker.asi as before (src\VulkanRuntimeOff.cpp). -->
+    <VulkanIncludeDir Condition="'$(VulkanIncludeDir)' == '' and '$(VULKAN_SDK)' != ''">$(VULKAN_SDK)\Include</VulkanIncludeDir>
+    <VulkanRuntime Condition="'$(VulkanIncludeDir)' != '' and Exists('$(VulkanIncludeDir)\vulkan\vulkan.h')">true</VulkanRuntime>
+    <VulkanRuntime Condition="'$(VulkanRuntime)' != 'true'">false</VulkanRuntime>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
@@ -56,14 +67,48 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\Exports.cpp" />
+    <ClCompile Include="src\ExportsVulkan.cpp" />
     <ClCompile Include="src\FrameGenerator.cpp" />
     <ClCompile Include="src\Log.cpp" />
     <ClCompile Include="src\MfgKernels.cpp" />
     <ClCompile Include="src\MfgPort\RuntimePayload.cpp" />
     <ClCompile Include="src\MfgPort\Cuda\cuda_route.cpp" />
+    <ClCompile Include="src\MfgPort\Cuda\cuda_vulkan.cpp" />
     <ClCompile Include="src\Plugin.cpp" />
+    <ClCompile Include="src\VulkanPrograms.cpp" />
+    <ClCompile Include="src\VulkanProvider.cpp" />
     <ClCompile Include="src\XeFG.cpp" />
     <ClCompile Include="src\XeFGLoader.cpp" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(VulkanRuntime)' != 'true'">
+    <ClCompile Include="src\VulkanRuntimeOff.cpp" />
+  </ItemGroup>
+  <ItemDefinitionGroup Condition="'$(VulkanRuntime)' == 'true'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(MSBuildProjectDirectory)\third_party\minhook\include;$(VulkanIncludeDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <!-- The Vulkan runtime: the layer and the hooks are src\vulkan\, most of it MFG-Unlocker's own (src\vulkan\VENDORED.txt), and
+       MinHook for the hooks -->
+  <ItemGroup Condition="'$(VulkanRuntime)' == 'true'">
+    <ClCompile Include="src\vulkan\VulkanHost.cpp" />
+    <ClCompile Include="src\vulkan\VulkanRuntime.cpp" />
+    <ClCompile Include="src\vulkan\VulkanTensor.cpp" />
+    <ClCompile Include="src\vulkan\xvk_commandlist.cpp" />
+    <ClCompile Include="src\vulkan\xvk_device.cpp" />
+    <ClCompile Include="src\vulkan\xvk_dxgi.cpp" />
+    <ClCompile Include="src\vulkan\xvk_extra.cpp" />
+    <ClCompile Include="src\vulkan\xvk_pipeline.cpp" />
+    <ClCompile Include="src\vulkan\xvk_programs.cpp" />
+    <ClCompile Include="src\vulkan\xvk_queue.cpp" />
+    <ClCompile Include="src\vulkan\xvk_resource.cpp" />
+    <ClCompile Include="src\vulkan\xvk_tensor.cpp" />
+    <ClCompile Include="src\vulkan\xvk_util.cpp" />
+    <ClCompile Include="third_party\minhook\src\buffer.c" />
+    <ClCompile Include="third_party\minhook\src\hook.c" />
+    <ClCompile Include="third_party\minhook\src\trampoline.c" />
+    <ClCompile Include="third_party\minhook\src\hde\hde64.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\FrameGenerator.h" />
@@ -77,6 +122,7 @@
     <ClInclude Include="src\MfgPort\Sha256.h" />
     <ClInclude Include="src\MfgPort\ShaderPort.h" />
     <ClInclude Include="src\MfgPort\Cuda\AdapterDiscovery.h" />
+    <ClInclude Include="src\MfgPort\Cuda\cuda_layers.h" />
     <ClInclude Include="src\MfgPort\Cuda\cuda_route.h" />
     <ClInclude Include="src\MfgPort\Cuda\OverlayNative.h" />
     <ClInclude Include="src\MfgPort\Cuda\xefg_cuda_params.h" />
@@ -84,7 +130,19 @@
     <ClInclude Include="src\optiscaler_plugin.h" />
     <ClInclude Include="src\Plugin.h" />
     <ClInclude Include="src\Util.h" />
+    <ClInclude Include="src\VulkanPrograms.h" />
+    <ClInclude Include="src\VulkanProvider.h" />
+    <ClInclude Include="src\VulkanRuntime.h" />
     <ClInclude Include="src\XeFG.h" />
+    <ClInclude Include="src\vulkan\VulkanHost.h" />
+    <ClInclude Include="src\vulkan\VulkanInputCopy.h" />
+    <ClInclude Include="src\vulkan\VulkanPolicy.h" />
+    <ClInclude Include="src\vulkan\VulkanTensor.h" />
+    <ClInclude Include="src\vulkan\xvk.h" />
+    <ClInclude Include="src\vulkan\xvk_extra.h" />
+    <ClInclude Include="src\vulkan\xvk_internal.h" />
+    <ClInclude Include="src\vulkan\xvk_output_frame.h" />
+    <ClInclude Include="src\vulkan\xvk_tensor.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <!-- The ported XeSS MFG programs and the tensor-core fatbin are Intel/MFG-Unlocker build data, so they stay out of
@@ -101,5 +159,19 @@
   </Target>
   <Target Name="ReportXeFgCudaSkipped" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true' and '$(CudaRoot)' == ''">
     <Message Importance="normal" Text="CUDA source rebuild not configured; using the extracted XeFG tensor-core fatbin." />
+  </Target>
+  <!-- Says whether the Vulkan runtime is in this build, so that a build without the Vulkan headers doesn't pass for one with it -->
+  <Target Name="ReportVulkanRuntime" BeforeTargets="ClCompile" Condition="'$(DesignTimeBuild)' != 'true'">
+    <Message Condition="'$(VulkanRuntime)' == 'true'" Importance="high" Text="Vulkan runtime: built in (Vulkan headers from $(VulkanIncludeDir))." />
+    <Warning Condition="'$(VulkanRuntime)' != 'true'" Text="Vulkan runtime: NOT built, no Vulkan headers were found (VulkanIncludeDir is '$(VulkanIncludeDir)'). Vulkan games then need MFGUnlocker.asi. Pass -p:VulkanIncludeDir=&lt;folder that has vulkan\vulkan.h&gt;, see README.md." />
+  </Target>
+  <!-- The Vulkan models, the SPIR-V programs XeFG runs on a VkDevice, are MFG-Unlocker (and Intel derived) data too, so they
+       stay out of the repo as well. They come out of a MFGUnlocker.asi: msbuild -p:MfgUnlockerAsi=C:\path\MFGUnlocker.asi
+       writes them to xefg_mfg_programs\vulkan, which the dll reads and checks at start-up. Without it the dll is built the
+       same and reports "Vulkan models: not installed". -->
+  <Target Name="GenerateXeFgVulkanPrograms" AfterTargets="Build" DependsOnTargets="GenerateXeFgPrograms" Condition="'$(DesignTimeBuild)' != 'true' and '$(MfgUnlockerAsi)' != ''">
+    <Error Condition="!Exists('$(MfgUnlockerAsi)')" Text="MfgUnlockerAsi is $(MfgUnlockerAsi), there is no such file." />
+    <Message Importance="high" Text="Extracting the Vulkan models from $(MfgUnlockerAsi)..." />
+    <Exec Command="&quot;$(PythonExe)&quot; &quot;$(MSBuildProjectDirectory)\tools\ExtractXeFgVulkanPrograms.py&quot; &quot;$(MfgUnlockerAsi)&quot; --output &quot;$(XeFgProgramsDir)\vulkan&quot;" />
   </Target>
 </Project>

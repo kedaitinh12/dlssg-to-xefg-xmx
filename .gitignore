@@ -2,6 +2,12 @@ bin/
 obj/
 .vs/
 *.user
+msbuild.log
 
 MFG-Unlocker/
 *.dll
+tests/vulkan_provider/vk_test
+tests/vulkan_provider/vk_builtin_test
+tests/vulkan_programs/programs_test
+tests/vulkan_runtime/policy_test
+__pycache__/
