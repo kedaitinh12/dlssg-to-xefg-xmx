@@ -1,1 +1,64 @@
+# Clones the Khronos Vulkan headers that the Vulkan runtime (src/vulkan, MFG-Unlocker's D3D12-on-Vulkan layer) is built
+# against and gives the folder that has vulkan/vulkan.h. They aren't part of this repository. MFG-Unlocker builds against
+# 1.4.363, so that tag is tried first. If the repository doesn't have it, the newest v1.4.x tag does the same job (the headers
+# only ever grow), and the default branch is the last resort. The version that was used goes to the step summary.
+name: Vulkan headers
+description: Clones the Khronos Vulkan-Headers and gives the folder that has vulkan/vulkan.h
 
+inputs:
+  tag:
+    description: The Vulkan-Headers tag to build against
+    default: v1.4.363
+
+outputs:
+  include:
+    description: The folder that has vulkan/vulkan.h
+    value: ${{ steps.clone.outputs.include }}
+  version:
+    description: VK_HEADER_VERSION of the headers that were cloned (363 for 1.4.363)
+    value: ${{ steps.clone.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - id: clone
+      shell: pwsh
+      env:
+        PINNED_TAG: ${{ inputs.tag }}
+      run: |
+        $url = "https://github.com/KhronosGroup/Vulkan-Headers.git"
+        $dir = Join-Path $env:RUNNER_TEMP "Vulkan-Headers"
+
+        function Clone([string]$ref) {
+          if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
+          # Out-Null: nothing but the result may leave this function
+          if ($ref) { git clone --quiet --depth 1 --branch $ref $url $dir | Out-Null } else { git clone --quiet --depth 1 $url $dir | Out-Null }
+          return ($LASTEXITCODE -eq 0)
+        }
+
+        $used = $env:PINNED_TAG
+        if (-not (Clone $used)) {
+          $latest = git ls-remote --tags --refs --sort=-v:refname $url "v1.4.*" | Select-Object -First 1
+          $used = if ($latest -match "refs/tags/(v1\.4\.\d+)$") { $Matches[1] } else { "" }
+          Write-Host "Vulkan-Headers has no tag $env:PINNED_TAG, trying '$used'"
+
+          if (-not $used -or -not (Clone $used)) {
+            $used = "the default branch"
+            if (-not (Clone "")) { throw "Can't clone $url" }
+          }
+        }
+
+        $include = Join-Path $dir "include"
+        foreach ($name in "vulkan\vulkan.h", "vulkan\vulkan_core.h", "vulkan\vulkan_win32.h") {
+          if (-not (Test-Path (Join-Path $include $name))) { throw "The Vulkan headers have no $name" }
+        }
+
+        $core = Get-Content (Join-Path $include "vulkan\vulkan_core.h") -Raw
+        if ($core -notmatch "#define\s+VK_HEADER_VERSION\s+(\d+)") { throw "vulkan_core.h has no VK_HEADER_VERSION" }
+        $version = $Matches[1]
+
+        "include=$include" >> $env:GITHUB_OUTPUT
+        "version=$version" >> $env:GITHUB_OUTPUT
+        "Vulkan headers: VK_HEADER_VERSION $version ($used)" >> $env:GITHUB_STEP_SUMMARY
+        Write-Host "Vulkan headers: VK_HEADER_VERSION $version ($used) in $include"
+        exit 0
