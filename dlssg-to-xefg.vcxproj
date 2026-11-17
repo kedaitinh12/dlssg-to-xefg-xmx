@@ -92,10 +92,12 @@
   <!-- The Vulkan runtime: the layer and the hooks are src\vulkan\, most of it MFG-Unlocker's own (src\vulkan\VENDORED.txt), and
        MinHook for the hooks -->
   <ItemGroup Condition="'$(VulkanRuntime)' == 'true'">
+    <ClCompile Include="src\vulkan\VulkanCoopMat.cpp" />
     <ClCompile Include="src\vulkan\VulkanHost.cpp" />
     <ClCompile Include="src\vulkan\VulkanRuntime.cpp" />
     <ClCompile Include="src\vulkan\VulkanTensor.cpp" />
     <ClCompile Include="src\vulkan\xvk_commandlist.cpp" />
+    <ClCompile Include="src\vulkan\xvk_coopmat.cpp" />
     <ClCompile Include="src\vulkan\xvk_device.cpp" />
     <ClCompile Include="src\vulkan\xvk_dxgi.cpp" />
     <ClCompile Include="src\vulkan\xvk_extra.cpp" />
@@ -134,12 +136,14 @@
     <ClInclude Include="src\VulkanProvider.h" />
     <ClInclude Include="src\VulkanRuntime.h" />
     <ClInclude Include="src\XeFG.h" />
+    <ClInclude Include="src\vulkan\VulkanCoopMat.h" />
     <ClInclude Include="src\vulkan\VulkanHost.h" />
     <ClInclude Include="src\vulkan\VulkanFeatureChain.h" />
     <ClInclude Include="src\vulkan\VulkanInputCopy.h" />
     <ClInclude Include="src\vulkan\VulkanPolicy.h" />
     <ClInclude Include="src\vulkan\VulkanTensor.h" />
     <ClInclude Include="src\vulkan\xvk.h" />
+    <ClInclude Include="src\vulkan\xvk_coopmat.h" />
     <ClInclude Include="src\vulkan\xvk_extra.h" />
     <ClInclude Include="src\vulkan\xvk_internal.h" />
     <ClInclude Include="src\vulkan\xvk_output_frame.h" />
