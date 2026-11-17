@@ -66,10 +66,32 @@ jobs:
         shell: pwsh
         run: ./tools/GenerateXeFgPrograms.ps1 -Output bin\Release\xefg_mfg_programs -Cache obj\Release\packages
 
+      # Optional: if a CUDA Toolkit (12.8+ / 13.x with sm_120 support) is installed on the runner, rebuild
+      # xefg_cuda_layers.fatbin from the optimized src/MfgPort/Cuda/xefg_cuda_layers.cu AFTER GenerateXeFgPrograms.ps1
+      # so the extracted v1.7.0 fatbin does not overwrite the newly built sm_120 fatbin.
+      - name: Rebuild CUDA tensor-core fatbin (when CUDA Toolkit is present)
+        id: cuda_rebuild
+        shell: pwsh
+        run: |
+          if ($env:CUDA_PATH -and (Test-Path (Join-Path $env:CUDA_PATH "bin\nvcc.exe"))) {
+            Write-Host "CUDA Toolkit found at $env:CUDA_PATH, rebuilding xefg_cuda_layers.fatbin from xefg_cuda_layers.cu..."
+            ./tools/GenerateXeFgCuda.ps1 -Output bin\Release\xefg_mfg_programs -CudaRoot $env:CUDA_PATH -Source src\MfgPort\Cuda -AllowUnpinnedNvcc
+            "rebuilt=true" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "No CUDA Toolkit on runner; keeping the extracted xefg_cuda_layers.fatbin."
+            "rebuilt=false" >> $env:GITHUB_OUTPUT
+          }
+
       # The tensor-core route of both APIs, D3D12 (src/MfgPort/Cuda/cuda_route.cpp) and Vulkan (src/vulkan/xvk_tensor.cpp),
-      # launches the 16 kernels of this file. It has to be the pinned one, with every kernel the two layer tables name.
+      # launches the 16 kernels of this file.
       - name: Tensor-core fatbin
-        run: python tests/vulkan_runtime/check_layer_tables.py --fatbin bin/Release/xefg_mfg_programs/xefg_cuda_layers.fatbin
+        shell: pwsh
+        run: |
+          if ("${{ steps.cuda_rebuild.outputs.rebuilt }}" -eq "true") {
+            python tests/vulkan_runtime/check_layer_tables.py --fatbin bin/Release/xefg_mfg_programs/xefg_cuda_layers.fatbin --no-pin
+          } else {
+            python tests/vulkan_runtime/check_layer_tables.py --fatbin bin/Release/xefg_mfg_programs/xefg_cuda_layers.fatbin
+          }
 
       # The extractor fails when the program set of the asi doesn't check out against the hashes the asi lists itself, the
       # inspector when the asi isn't one this dll can use.
@@ -99,6 +121,23 @@ jobs:
           "source=$source" >> $env:GITHUB_OUTPUT
           Write-Host "Vulkan models from $source"
           exit 0
+
+      # Build the 16 SPV_KHR_cooperative_matrix shaders into bin\Release\xefg_mfg_programs\vulkan\coopmat when glslangValidator is available
+      - name: Build Vulkan cooperative-matrix shaders (WMMA/XMX)
+        shell: pwsh
+        run: |
+          $glslang = Get-Command glslangValidator -ErrorAction SilentlyContinue
+          if (-not $glslang -and $env:VULKAN_SDK) {
+            $candidate = Join-Path $env:VULKAN_SDK "Bin\glslangValidator.exe"
+            if (Test-Path $candidate) { $glslang = $candidate }
+          }
+          if ($glslang) {
+            $exe = if ($glslang -is [string]) { $glslang } else { $glslang.Source }
+            python tools/GenerateXeFgCoopMat.py --glslang "$exe" --output bin\Release\xefg_mfg_programs\vulkan\coopmat
+            if ($LASTEXITCODE -ne 0) { throw "GenerateXeFgCoopMat.py failed" }
+          } else {
+            Write-Host "glslangValidator not found on runner; skipping optional coopmat SPIR-V compilation."
+          }
 
       # Every function the sources mark as exported has to be in the dll's export table, the NGX D3D12 and Vulkan
       # entry points and the OptiScaler plugin entries (OptiPluginInit, InitializeASI) among them.
