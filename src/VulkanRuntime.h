@@ -82,4 +82,21 @@ namespace VulkanRuntime
 	};
 
 	TensorStatus GetTensorStatus();
+
+	// What became of the VK_KHR_cooperative_matrix route (src/vulkan/VulkanCoopMat.h): on AMD RDNA3/RDNA4 (WMMA) and
+	// Intel Arc/Battlemage (XMX) GPUs, the XMX Port and XMX (native) paths run the ported model's int8 layers as
+	// SPV_KHR_cooperative_matrix shaders in the game's command buffers, instead of DP4a SPIR-V programs
+	struct CoopMatrixStatus
+	{
+		TensorState state = TensorState::NotAttempted;
+		std::string reason;       // a VulkanPolicy::DescribeCoopMatrix code, empty when it's active
+		int tileM = 0;            // the GPU's selected SINT8xSINT8->SINT32 cooperative matrix tile M dimension
+		int tileN = 0;            // the GPU's selected SINT8xSINT8->SINT32 cooperative matrix tile N dimension
+		int tileK = 0;            // the GPU's selected SINT8xSINT8->SINT32 cooperative matrix tile K dimension
+		bool replacing = false;   // it takes layers now: active, the XMX Port / XMX (native) path selected and ported model running
+		uint64_t launches = 0;    // layers it ran on the cooperative matrix units
+		uint64_t fallbacks = 0;   // layers it left to their DP4a SPIR-V programs
+	};
+
+	CoopMatrixStatus GetCoopMatrixStatus();
 } // namespace VulkanRuntime

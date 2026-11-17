@@ -34,3 +34,8 @@ VulkanRuntime::TensorStatus VulkanRuntime::GetTensorStatus()
 {
 	return {};
 }
+
+VulkanRuntime::CoopMatrixStatus VulkanRuntime::GetCoopMatrixStatus()
+{
+	return {};
+}

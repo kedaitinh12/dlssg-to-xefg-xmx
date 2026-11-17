@@ -189,6 +189,49 @@ namespace
 		api->ItemTooltip(std::format("{}\nThe layers run as SPIR-V programs instead.", why).c_str());
 	}
 
+	// What the VK_KHR_cooperative_matrix route (src/vulkan/VulkanCoopMat.h) is doing on AMD RDNA3/RDNA4 (WMMA) and Intel Arc (XMX)
+	void DrawVulkanCoopMat()
+	{
+		using State = VulkanRuntime::TensorState;
+
+		const auto coop = VulkanRuntime::GetCoopMatrixStatus();
+
+		if (coop.state == State::NotAttempted && (coop.reason.empty() || coop.reason == "not_attempted" || coop.reason == "no_extensions"))
+			return;
+
+		const auto why = VulkanPolicy::DescribeCoopMatrix(coop.reason);
+
+		if (coop.state == State::Active)
+		{
+			const auto shape = std::format("{}x{}x{}", coop.tileM, coop.tileN, coop.tileK);
+
+			if (coop.replacing)
+			{
+				if (coop.launches)
+					Green(std::format("Coop matrix (WMMA/XMX): on \xC2\xB7 {}", shape).c_str());
+				else
+					api->Text(std::format("Coop matrix (WMMA/XMX): idle \xC2\xB7 {}", shape).c_str());
+
+				api->ItemTooltip(std::format("The ported model's int8 layers run on VK_KHR_cooperative_matrix hardware units\n"
+					"(AMD RDNA3/RDNA4 WMMA or Intel Arc/Battlemage XMX) in the game's command buffers.\n"
+					"Layers launched on cooperative matrix: {}\n"
+					"Layers left to their DP4a SPIR-V program: {}\n"
+					"XEFG_COOP_MATRIX=off in the environment turns the route off.",
+					coop.launches, coop.fallbacks).c_str());
+			}
+			else
+			{
+				api->Text(std::format("Coop matrix (WMMA/XMX): ready \xC2\xB7 {}", shape).c_str());
+				api->ItemTooltip("Installed on this GPU, ready for the XMX Port and XMX (native) paths.");
+			}
+
+			return;
+		}
+
+		api->TextDisabled(coop.state == State::Disabled ? "Coop matrix: off" : "Coop matrix: unavailable");
+		api->ItemTooltip(std::format("{}\nThe layers run as DP4a SPIR-V programs instead.", why).c_str());
+	}
+
 	// Vulkan games run on the runtime built into this dll: MFG-Unlocker's D3D12-on-Vulkan layer and the models of
 	// xefg_mfg_programs\vulkan (src/VulkanRuntime.h)
 	void DrawVulkanRuntime()
@@ -240,6 +283,7 @@ namespace
 		}
 
 		DrawVulkanTensor();
+		DrawVulkanCoopMat();
 
 		auto hooks = std::format("Hooks: {}", HooksText(host));
 
@@ -397,7 +441,8 @@ namespace
 						 "CUDA: ported XMX model on NVIDIA tensor cores, RTX GPUs only\n"
 						 "Fallback (DP4a): XeFG's default model\n"
 						 "Vulkan games run the ported model, on the tensor cores of an RTX GPU for CUDA and XMX (native) when the route is\n"
-						 "available, as SPIR-V programs for XMX Port. Fallback (DP4a) runs XeFG's own model (see Vulkan)");
+						 "available, on VK_KHR_cooperative_matrix (AMD WMMA / Intel XMX) when available, or as SPIR-V programs for XMX Port.\n"
+						 "Fallback (DP4a) runs XeFG's own model (see Vulkan)");
 
 		bool hudlessUi = Plugin::options.hudlessUi;
 

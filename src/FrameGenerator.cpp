@@ -218,13 +218,36 @@ static bool Capture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, ID
 	return true;
 }
 
-static xefgd_resource_t Subrect(const NGXParameter& params, const char* name, ID3D12Resource* resource)
+struct SubrectKeys
 {
-	auto key = [name](const char* field) { return std::format("DLSSG.{}Subrect{}", name, field); };
+	const char* baseX;
+	const char* baseY;
+	const char* width;
+	const char* height;
+};
 
+constexpr SubrectKeys kBackbufferSubrect{
+	"DLSSG.BackbufferSubrectBaseX", "DLSSG.BackbufferSubrectBaseY",
+	"DLSSG.BackbufferSubrectWidth", "DLSSG.BackbufferSubrectHeight"
+};
+constexpr SubrectKeys kDepthSubrect{
+	"DLSSG.DepthSubrectBaseX", "DLSSG.DepthSubrectBaseY",
+	"DLSSG.DepthSubrectWidth", "DLSSG.DepthSubrectHeight"
+};
+constexpr SubrectKeys kMVecsSubrect{
+	"DLSSG.MVecsSubrectBaseX", "DLSSG.MVecsSubrectBaseY",
+	"DLSSG.MVecsSubrectWidth", "DLSSG.MVecsSubrectHeight"
+};
+constexpr SubrectKeys kHudlessSubrect{
+	"DLSSG.HUDLessSubrectBaseX", "DLSSG.HUDLessSubrectBaseY",
+	"DLSSG.HUDLessSubrectWidth", "DLSSG.HUDLessSubrectHeight"
+};
+
+static xefgd_resource_t Subrect(const NGXParameter& params, const SubrectKeys& keys, ID3D12Resource* resource)
+{
 	xefgd_resource_t subrect{};
-	subrect.base = { params.GetOr<uint32_t>(key("BaseX").c_str(), 0), params.GetOr<uint32_t>(key("BaseY").c_str(), 0) };
-	subrect.size = { params.GetOr<uint32_t>(key("Width").c_str(), 0), params.GetOr<uint32_t>(key("Height").c_str(), 0) };
+	subrect.base = { params.GetOr<uint32_t>(keys.baseX, 0), params.GetOr<uint32_t>(keys.baseY, 0) };
+	subrect.size = { params.GetOr<uint32_t>(keys.width, 0), params.GetOr<uint32_t>(keys.height, 0) };
 
 	if (subrect.size.x == 0 || subrect.size.y == 0)
 	{
@@ -236,20 +259,18 @@ static xefgd_resource_t Subrect(const NGXParameter& params, const char* name, ID
 	return subrect;
 }
 
-static XMFLOAT3 GetVector(const NGXParameter& params, const char* name)
+static XMFLOAT3 GetVector(const NGXParameter& params, const char* keyX, const char* keyY, const char* keyZ)
 {
-	auto key = [name](const char* axis) { return std::format("DLSSG.{}{}", name, axis); };
-	return { params.GetOr(key("X").c_str(), 0.0f), params.GetOr(key("Y").c_str(), 0.0f),
-			 params.GetOr(key("Z").c_str(), 0.0f) };
+	return { params.GetOr(keyX, 0.0f), params.GetOr(keyY, 0.0f), params.GetOr(keyZ, 0.0f) };
 }
 
 // XeFG's scene change detection uses the forward axis
 static void GetViewMatrix(const NGXParameter& params, float* out)
 {
-	const XMFLOAT3 pos = GetVector(params, "CameraPos");
-	const XMFLOAT3 right = GetVector(params, "CameraRight");
-	const XMFLOAT3 up = GetVector(params, "CameraUp");
-	const XMFLOAT3 forward = GetVector(params, "CameraFwd");
+	const XMFLOAT3 pos = GetVector(params, "DLSSG.CameraPosX", "DLSSG.CameraPosY", "DLSSG.CameraPosZ");
+	const XMFLOAT3 right = GetVector(params, "DLSSG.CameraRightX", "DLSSG.CameraRightY", "DLSSG.CameraRightZ");
+	const XMFLOAT3 up = GetVector(params, "DLSSG.CameraUpX", "DLSSG.CameraUpY", "DLSSG.CameraUpZ");
+	const XMFLOAT3 forward = GetVector(params, "DLSSG.CameraFwdX", "DLSSG.CameraFwdY", "DLSSG.CameraFwdZ");
 
 	// All zero disables XeFG's scene change detection
 	if (forward.x == 0.0f && forward.y == 0.0f && forward.z == 0.0f)
@@ -643,7 +664,10 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 		return;
 
 	xefg_cuda::SetEnabled(UseCuda(settings.model));
-	XeFG::SetDebugLines(Plugin::options.debugLines);
+	const bool debugLines = Plugin::options.debugLines.load(std::memory_order_relaxed);
+	static std::atomic<int> sLastDebugLines{ -1 };
+	if (sLastDebugLines.exchange(debugLines ? 1 : 0, std::memory_order_relaxed) != (debugLines ? 1 : 0))
+		XeFG::SetDebugLines(debugLines);
 
 	// After CreateContext: before it, the route has not been installed yet
 	if (pathChanged && path == Plugin::Path::Cuda)
@@ -676,12 +700,12 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 
 	if (captured)
 	{
-		data.backBuffer = Subrect(params, "Backbuffer", backbuffer);
-		data.depth = Subrect(params, "Depth", depth);
-		data.motionVectors = Subrect(params, "MVecs", mvecs);
+		data.backBuffer = Subrect(params, kBackbufferSubrect, backbuffer);
+		data.depth = Subrect(params, kDepthSubrect, depth);
+		data.motionVectors = Subrect(params, kMVecsSubrect, mvecs);
 
 		if (hudless)
-			data.hudlessColor = Subrect(params, "HUDLess", hudless);
+			data.hudlessColor = Subrect(params, kHudlessSubrect, hudless);
 	}
 
 	// The outputs are full size, XeFG writes its region at the back buffer's offset to keep letterboxing aligned
