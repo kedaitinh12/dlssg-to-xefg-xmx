@@ -1,0 +1,7 @@
+MFG Unlocker build: 1.7.1 (file version 1.7.1.177)
+MFGUnlocker.asi sha256: 5a389e6cad23b2b607e1dc224e9e86ee32d6ef46f0557b6c6f8137feadf0aa74
+programs: 83 (intel 56, port 25, port-extra 1, unhashed 1)
+programs.tsv sha256: 18ce39ef3e69c064ba46ee70738b2e9cbf13e5fb000780e7061efc0543724079
+input-copy shaders: 3, the SHA-256 their generator pins
+binding types: match the image's own table
+extracted by tools/ExtractXeFgVulkanPrograms.py

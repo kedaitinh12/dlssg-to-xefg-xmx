@@ -135,6 +135,7 @@
     <ClInclude Include="src\VulkanRuntime.h" />
     <ClInclude Include="src\XeFG.h" />
     <ClInclude Include="src\vulkan\VulkanHost.h" />
+    <ClInclude Include="src\vulkan\VulkanFeatureChain.h" />
     <ClInclude Include="src\vulkan\VulkanInputCopy.h" />
     <ClInclude Include="src\vulkan\VulkanPolicy.h" />
     <ClInclude Include="src\vulkan\VulkanTensor.h" />

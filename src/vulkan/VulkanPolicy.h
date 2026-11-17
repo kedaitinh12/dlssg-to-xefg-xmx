@@ -180,6 +180,18 @@ namespace VulkanPolicy
 		}
 	}
 
+	// The copy path only supports the color formats understood by XeFG. sRGB and
+	// UNORM twins have the same texel layout; RGBA/BGRA and packed HDR do not.
+	inline bool CopyCompatible(uint32_t source, uint32_t target) noexcept
+	{
+		const auto a = ColorFormat(source).dxgi;
+		return a != Dxgi::Unknown && a == ColorFormat(target).dxgi;
+	}
+
+	// Combined depth/stencil image views cannot be sampled by our float sampler.
+	// Callers must supply a single depth or color aspect (Vulkan bits 2 and 1).
+	inline bool SampledAspect(uint32_t aspect) noexcept { return aspect == 1 || aspect == 2; }
+
 	// The format of the motion vector copy: two 32-bit floats when the game's are, else two 16-bit ones
 	inline uint32_t MotionFormat(uint32_t vkFormat) noexcept
 	{
@@ -355,6 +367,7 @@ namespace VulkanPolicy
 			{ "no_graphics_family", "the game's device has no graphics queue family" },
 			{ "intel_adapter", "Intel GPUs aren't supported on Vulkan: XeFG's own network needs Intel's D3D12 driver path" },
 			{ "device_functions", "the device lacks functions the runtime needs" },
+			{ "feature_chain_unsupported", "a feature request needs editing behind an unknown pNext structure; the game keeps its original device request" },
 			{ "prepare_exception", "the hooks failed while preparing the device" },
 			{ "no_xefg", "no compatible libxess_fg.dll was found" },
 			{ "no_vulkan_models", "the Vulkan models aren't installed or don't check out (xefg_mfg_programs\\vulkan)" },

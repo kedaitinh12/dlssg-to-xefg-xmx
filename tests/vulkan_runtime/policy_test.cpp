@@ -34,6 +34,19 @@ using VulkanPolicy::OutputRange;
 
 int main()
 {
+	// Color copies must not reinterpret BGRA as RGBA or packed HDR as FP16.
+	CHECK(VulkanPolicy::CopyCompatible(37, 43));
+	CHECK(VulkanPolicy::CopyCompatible(50, 44));
+	CHECK(VulkanPolicy::CopyCompatible(97, 97));
+	CHECK(!VulkanPolicy::CopyCompatible(37, 44));
+	CHECK(!VulkanPolicy::CopyCompatible(64, 97));
+	CHECK(!VulkanPolicy::CopyCompatible(0, 0));
+	CHECK(!VulkanPolicy::CopyCompatible(126, 126));
+	CHECK(VulkanPolicy::SampledAspect(1));
+	CHECK(VulkanPolicy::SampledAspect(2));
+	CHECK(!VulkanPolicy::SampledAspect(0));
+	CHECK(!VulkanPolicy::SampledAspect(4));
+	CHECK(!VulkanPolicy::SampledAspect(6));
 	// ---- batches
 	CHECK(VulkanPolicy::MaxGenerated == 5);
 

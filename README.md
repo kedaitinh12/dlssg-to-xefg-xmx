@@ -22,6 +22,8 @@ runs go next to the dll, in `xefg_mfg_programs\vulkan`, see [Vulkan](#vulkan).
 
 ## Installation
 
+For the updated GitHub build artifact (already includes `custom` and the Vulkan early loader), follow [build/install and OptiScaler compatibility notes](docs/OPTISCALER_BUILD_VI.md).
+
 1. Download dlssg-to-xefg-#.zip from the [latest release](https://github.com/realdody/dlssg-to-xefg/releases/latest).
 2. Make sure you're using OptiScaler v10 https://github.com/optiscaler/OptiScaler-nightly/releases/latest.
 3. Extract the XeMFG XMX folder from the zip into OptiScaler\custom. The folder structure should be: gamefolderwithoptiscaler'sdll\OptiScaler\custom\XeMFG XMX
@@ -76,6 +78,8 @@ tensor-core layer table and all 56 Intel programs of the Vulkan models, byte for
 That is a static result: running it in a game on a Windows machine is not what this checks.
 
 ## Vulkan
+
+Source hardening changes and validation limits: [Vietnamese comparison and test report](docs/VULKAN_HARDENING_VI.md).
 
 XeFG only has a D3D12 API. This dll runs it on a Vulkan game's `VkDevice` by itself: the D3D12-on-Vulkan layer of
 [MFG-Unlocker](https://github.com/dashdogy/MFG-Unlocker) (MIT, its V1.7.1 source) is built into it (`src/vulkan/`), together

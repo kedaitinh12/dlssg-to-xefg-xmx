@@ -2,6 +2,7 @@
 
 #include "../Log.h"
 #include "VulkanPolicy.h"
+#include "VulkanFeatureChain.h"
 #include "VulkanTensor.h"
 
 #include <MinHook.h>
@@ -199,9 +200,7 @@ namespace
 			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES
 		};
 
-		// The game's own feature bits that were switched on, and what they were, to give back when the driver turns
-		// the edited device down
-		std::vector<std::pair<VkBool32*, VkBool32>> raised;
+		VulkanHost::FeatureChain chain;
 		VulkanHost::DeviceRecord record;
 
 		// How many of the last entries of `extensions` are the tensor-core route's NVX extensions this edit added (none
@@ -221,20 +220,10 @@ namespace
 
 		void Raise(VkBool32& field)
 		{
-			if (field == VK_TRUE)
-				return;
-
-			raised.emplace_back(&field, field);
-			field = VK_TRUE;
+			// An already enabled field may belong to the borrowed tail: do not write it.
+			if (field != VK_TRUE) field = VK_TRUE;
 		}
 
-		void Restore()
-		{
-			for (auto& [field, value] : raised)
-				*field = value;
-
-			raised.clear();
-		}
 	};
 
 	std::unique_ptr<DeviceEdit> Refuse(VkPhysicalDevice physical, const char* code) noexcept
@@ -396,7 +385,8 @@ namespace
 				return Refuse(physical, "no_graphics_family");
 
 			// Only push descriptors are added to the extensions, nothing is taken away
-			edit->extensions.assign(info->ppEnabledExtensionNames, info->ppEnabledExtensionNames + info->enabledExtensionCount);
+			if (info->enabledExtensionCount)
+				edit->extensions.assign(info->ppEnabledExtensionNames, info->ppEnabledExtensionNames + info->enabledExtensionCount);
 
 			if (!enabled(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME))
 				edit->extensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
@@ -436,10 +426,11 @@ namespace
 			edit->info.enabledExtensionCount = static_cast<uint32_t>(edit->extensions.size());
 			edit->info.ppEnabledExtensionNames = edit->extensions.data();
 
-			// Features: the bits in the game's own structures are raised where it passes them (its values are only ever
-			// switched on), the individual structures it doesn't pass are added in front of the chain. A request that
+			// Features: raise bits in an owned copy of the game's chain (never in its const storage); the individual structures it doesn't pass are added in front of the chain. A request that
 			// holds a Vulkan 1.2 or 1.3 features structure must not also hold the single feature structures it covers
-			const void* chain = info->pNext;
+			if (!edit->chain.Copy(info->pNext))
+				return Refuse(physical, "feature_chain_unsupported");
+			const void* chain = edit->chain.Head();
 
 			if (auto* f2 = FindStruct<VkPhysicalDeviceFeatures2>(chain, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2))
 				edit->Raise(f2->features.shaderStorageImageExtendedFormats);
@@ -452,7 +443,7 @@ namespace
 				edit->info.pEnabledFeatures = &edit->features10;
 			}
 
-			void* head = const_cast<void*>(info->pNext);
+			void* head = const_cast<void*>(chain);
 
 			auto prepend = [&head](auto& structure)
 				{
@@ -573,7 +564,6 @@ namespace
 			// the bits that were raised in its own structures
 			Log::Warn("The driver refused the device with XeFG's features ({}), created as the game asked",
 				static_cast<int>(result));
-			edit->Restore();
 			edit.reset();
 			Refuse(physical, "device_features");
 			result = s.createDevice(physical, info, allocator, device);

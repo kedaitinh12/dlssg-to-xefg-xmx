@@ -1,5 +1,5 @@
 # Builds the dll on every push and pull request, checks that it exports what the sources declare, runs the tests that need no
-# Windows and keeps the result as a workflow artifact laid out like a release (XeMFG XMX\dlssg\...). Releases are still
+# Windows and keeps the result as a workflow artifact laid out like a release (custom\XeMFG XMX\dlssg\... plus plugins\...). Releases are still
 # published by hand with release.yml.
 #
 # The dll has the Vulkan runtime built in (src/vulkan: MFG-Unlocker's D3D12-on-Vulkan layer and the hooks that prepare a
@@ -10,17 +10,16 @@
 # repository's history unless its owner puts them there. The build takes them from the first of
 #   third_party/xefg_mfg_programs/vulkan/    a folder made by tools/ExtractXeFgVulkanPrograms.py (programs.tsv, <id>.spv, ...)
 #   third_party/MFGUnlocker.asi              an MFGUnlocker.asi, 1.7.1 or newer, that the models are extracted from
-# that exists, and the artifact has them next to the dll. Without either the dll is built the same and its menu says the
-# Vulkan models aren't installed: copy the folder next to the dll by hand.
+# that exists, and the artifact has them next to the dll. Missing Vulkan data fails this workflow.
 #
 # A libxess_fg.dll (XeFG, Intel's as well, so not in the history either) at third_party/libxess_fg.dll is checked from the file
 # alone: tools/CheckXeFgBuild.py says whether the build has what this dll relies on, see the step "libxess_fg.dll" of the
 # models test.
-name: Build
+name: Build OptiScaler XeMFG Vulkan
 
 on:
   push:
-    branches: [master, main]
+    branches: ["**"]
   pull_request:
   workflow_dispatch:
 
@@ -38,10 +37,11 @@ jobs:
   windows:
     name: Windows x64 Release
     runs-on: windows-latest
+    needs: [vulkan-provider, vulkan-runtime, vulkan-programs]
     timeout-minutes: 40
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - uses: microsoft/setup-msbuild@v2
 
@@ -93,9 +93,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "The Vulkan models couldn't be extracted from $asi" }
             $source = $asi
           } else {
-            "source=none" >> $env:GITHUB_OUTPUT
-            Write-Host "No Vulkan models in this repository, the artifact has none."
-            exit 0
+            throw "Vulkan payload missing: commit third_party/xefg_mfg_programs/vulkan from the supplied ZIP, or provide third_party/MFGUnlocker.asi."
           }
 
           "source=$source" >> $env:GITHUB_OUTPUT
@@ -107,14 +105,24 @@ jobs:
       - name: Check the exports
         run: python tools/CheckExports.py bin/Release/dlssg_to_xefg_intel_is_better.dll src/Exports.cpp src/ExportsVulkan.cpp src/Plugin.cpp
 
+      - name: Load DLL and resolve exports (no GPU)
+        run: python tests/windows/load_plugin.py bin/Release/dlssg_to_xefg_intel_is_better.dll
+
       - name: Stage
         shell: pwsh
         run: |
-          $dlssg = Join-Path $PWD "staging\XeMFG XMX\dlssg"
+          $dlssg = Join-Path $PWD "staging\custom\XeMFG XMX\dlssg"
           $programs = Join-Path $dlssg "xefg_mfg_programs"
           New-Item -ItemType Directory -Path $programs -Force | Out-Null
 
           Copy-Item bin\Release\dlssg_to_xefg_intel_is_better.dll $dlssg
+          # Same basename as the main DLL: Plugin.cpp::FindMainDll depends on it.
+          New-Item -ItemType Directory -Path staging\plugins -Force | Out-Null
+          Copy-Item bin\Release\dlssg_to_xefg_intel_is_better.dll staging\plugins\dlssg_to_xefg_intel_is_better.asi
+          Copy-Item docs\OPTISCALER_BUILD_VI.md staging\README-VI.md
+          if (Test-Path third_party\libxess_fg.dll) {
+            Copy-Item third_party\libxess_fg.dll staging\libxess_fg.dll
+          }
           Copy-Item bin\Release\xefg_mfg_programs\* $programs -Recurse
 
           # The licenses a binary distribution has to carry: this project's, MFG-Unlocker's (its code is in the dll), MinHook's
@@ -140,10 +148,10 @@ jobs:
             "",
             "- Vulkan runtime: built in, Vulkan headers VK_HEADER_VERSION ${{ steps.vulkan.outputs.version }}",
             "- Vulkan models: $models",
-            "- Artifact: ``XeMFG XMX\dlssg\dlssg_to_xefg_intel_is_better.dll`` with ``xefg_mfg_programs`` beside it"
+            "- Artifact: ``custom\XeMFG XMX\dlssg\dlssg_to_xefg_intel_is_better.dll`` with ``xefg_mfg_programs`` beside it"
           ) -join "`n" >> $env:GITHUB_STEP_SUMMARY
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v4
         with:
           name: dlssg-to-xefg-${{ github.run_number }}
           path: staging
@@ -151,7 +159,7 @@ jobs:
           retention-days: 30
 
       # The build log has the compiler's own messages when something above failed
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v4
         if: failure()
         with:
           name: msbuild-log-${{ github.run_number }}
@@ -167,7 +175,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       # Newer kernels map memory where the sanitizers expect their shadow memory; lowering this is the usual workaround.
       - name: Allow the sanitizers
@@ -199,7 +207,7 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Allow the sanitizers
         run: sudo sysctl vm.mmap_rnd_bits=28 || true
@@ -216,6 +224,12 @@ jobs:
           g++ -std=c++20 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -g \
             -I ../../src policy_test.cpp -o policy_test
           ./policy_test
+
+      - name: Vulkan regression tests
+        run: bash tests/vulkan_runtime/check_regressions.sh
+
+      - name: OptiScaler plugin ABI prefix
+        run: python tools/CheckOptiScalerAbi.py
 
       - name: Reason codes
         run: python3 tests/vulkan_runtime/check_reasons.py
@@ -245,7 +259,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Allow the sanitizers
         run: sudo sysctl vm.mmap_rnd_bits=28 || true

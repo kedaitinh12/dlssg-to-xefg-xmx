@@ -183,7 +183,6 @@ namespace
 		uint32_t batchCount = 0;
 		bool batchReady = false;
 		bool cameraLogged = false;
-		bool realFormatLogged = false;
 		uint64_t batches = 0, failures = 0, evaluations = 0, realCopies = 0, paused = 0;
 		std::string fault;
 
@@ -290,10 +289,17 @@ namespace
 
 		const auto* resource = static_cast<const NgxResource*>(value);
 
-		if (resource->type != NgxResourceImageView || !resource->image || !resource->width || !resource->height)
+		if (resource->type != NgxResourceImageView || !resource->image || !resource->width || !resource->height ||
+			!resource->range.levelCount || resource->range.layerCount != 1)
 			return nullptr;
 
 		return resource;
+	}
+
+	bool SameSubresource(const NgxResource& a, const NgxResource& b)
+	{
+		return a.image == b.image && a.range.baseMipLevel == b.range.baseMipLevel &&
+			a.range.baseArrayLayer == b.range.baseArrayLayer;
 	}
 
 	// Why a device the game created has no record: the reason the hooks gave, else what state they are in
@@ -325,11 +331,22 @@ namespace
 	}
 
 	void CopyImage(const Device& d, VkCommandBuffer command, VkImage source, VkImageLayout sourceLayout, VkImage target,
-		VkImageLayout targetLayout, uint32_t width, uint32_t height)
+		VkImageLayout targetLayout, uint32_t width, uint32_t height, const NgxResource* sourceResource = nullptr,
+		const NgxResource* targetResource = nullptr)
 	{
 		VkImageCopy region{};
 		region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
 		region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		if (sourceResource)
+		{
+			region.srcSubresource.mipLevel = sourceResource->range.baseMipLevel;
+			region.srcSubresource.baseArrayLayer = sourceResource->range.baseArrayLayer;
+		}
+		if (targetResource)
+		{
+			region.dstSubresource.mipLevel = targetResource->range.baseMipLevel;
+			region.dstSubresource.baseArrayLayer = targetResource->range.baseArrayLayer;
+		}
 		region.extent = { width, height, 1 };
 
 		d.vkCmdCopyImage(command, source, sourceLayout, target, targetLayout, 1, &region);
@@ -849,6 +866,24 @@ namespace
 			return false;
 		}
 
+		if (!in.depth->imageView || !in.motion->imageView ||
+			!VulkanPolicy::SampledAspect(in.depth->range.aspectMask) ||
+			in.motion->range.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+			in.backbuffer->range.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT)
+		{
+			f.fault = "input_view_or_aspect";
+			return false;
+		}
+
+		// XeFG's UI inputs cover the output extent. A differently sized optional
+		// image cannot be described as the full backbuffer: ignore it this batch.
+		auto usableUi = [&](const NgxResource* image) {
+			return image && image->width == in.backbuffer->width && image->height == in.backbuffer->height &&
+				image->range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT;
+		};
+		if (!usableUi(in.hudless)) in.hudless = nullptr;
+		if (!usableUi(in.ui)) in.ui = nullptr;
+
 		const bool inverted = parameters.GetOr<uint32_t>("DLSSG.DepthInverted", 0) != 0;
 		const bool jittered = parameters.GetOr<uint32_t>("DLSSG.MvecJittered", 0) != 0;
 
@@ -864,19 +899,19 @@ namespace
 		// The frame's inputs
 		FullBarrier(d, command);
 		CopyImage(d, command, in.backbuffer->image, GameLayout, xvk::ImageOf(slot.backbuffer.Get()),
-			VK_IMAGE_LAYOUT_GENERAL, f.width, f.height);
+			VK_IMAGE_LAYOUT_GENERAL, f.width, f.height, in.backbuffer);
 
 		slot.hasHudless = in.hudless && slot.hudless;
 
 		if (slot.hasHudless)
 			CopyImage(d, command, in.hudless->image, GameLayout, xvk::ImageOf(slot.hudless.Get()),
-				VK_IMAGE_LAYOUT_GENERAL, std::min(in.hudless->width, f.width), std::min(in.hudless->height, f.height));
+				VK_IMAGE_LAYOUT_GENERAL, f.width, f.height, in.hudless);
 
 		slot.hasUi = in.ui && slot.ui;
 
 		if (slot.hasUi)
 			CopyImage(d, command, in.ui->image, GameLayout, xvk::ImageOf(slot.ui.Get()), VK_IMAGE_LAYOUT_GENERAL,
-				std::min(in.ui->width, f.width), std::min(in.ui->height, f.height));
+				f.width, f.height, in.ui);
 
 		const auto& depth = *in.depth;
 		const auto& motion = *in.motion;
@@ -927,7 +962,7 @@ namespace
 		DescribeFrame(f, previous, f.exec.prev);
 		DescribeFrame(f, slot, f.exec.next);
 		f.exec.prev.resetHistory = 0;
-		f.exec.next.resetHistory = reset ? 1 : 0;
+		f.exec.next.resetHistory = (reset || !f.havePrevious) ? 1 : 0;
 
 		f.execOutputs = {};
 		f.execBases = {};
@@ -940,10 +975,14 @@ namespace
 		f.exec.numInterpolatedFrames = static_cast<uint8_t>(count);
 		f.exec.uiCompositionEnabled = (slot.hasHudless || slot.hasUi) ? 1u : 0u;
 
+		if (!RecordOutputs(d, f, command, range))
+		{
+			f.havePrevious = false;
+			return false;
+		}
 		f.current ^= 1;
 		f.havePrevious = true;
-
-		return RecordOutputs(d, f, command, range);
+		return true;
 	}
 
 	// ------------------------------------------------------------------------------------- the provider table
@@ -1059,11 +1098,24 @@ namespace
 
 			const NgxResource* output = ImageParameter(*parameters, "DLSSG.OutputInterpolated");
 
-			if (!output)
+			if (!output || output->range.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT)
 				return NGX_FAIL_INVALID_PARAMETER;
+
+			// Vulkan dispatchable objects from another device must never reach xvk.
+			if (*reinterpret_cast<const void* const*>(command) !=
+				*reinterpret_cast<const void* const*>(d.device))
+				return NGX_FAIL_PLATFORM_ERROR;
 
 			const NgxResource* real = ImageParameter(*parameters, "DLSSG.OutputReal");
 			const NgxResource* backbuffer = ImageParameter(*parameters, "DLSSG.Backbuffer");
+
+			if (!backbuffer || backbuffer->range.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+				!VulkanPolicy::CopyCompatible(backbuffer->format, output->format) ||
+				output->width != backbuffer->width || output->height != backbuffer->height ||
+				(real && (real->range.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+					!VulkanPolicy::CopyCompatible(backbuffer->format, real->format) ||
+					SameSubresource(*real, *output))))
+				return NGX_FAIL_INVALID_PARAMETER;
 
 			if (!xvk::BeginRecording(d.d3d.Get(), command))
 				return NGX_FAIL_PLATFORM_ERROR;
@@ -1096,6 +1148,7 @@ namespace
 
 				if (!f.batchReady)
 				{
+					f.havePrevious = false;
 					if (++f.failures <= 16)
 						Log::Error("Vulkan: batch failed ({}), index {}, count {}", f.fault, index, count);
 				}
@@ -1109,8 +1162,14 @@ namespace
 			{
 				const auto range = VulkanPolicy::ExecuteRange(false, index, f.batchCount, false);
 
-				if (range.record && f.context && !RecordOutputs(d, f, command, range) && ++f.failures <= 16)
-					Log::Error("Vulkan: output {} of {} failed ({})", index, f.batchCount, f.fault);
+				if (range.record && f.context && !RecordOutputs(d, f, command, range))
+				{
+					f.batchReady = false;
+					f.havePrevious = false;
+					f.generatedThrough = 0;
+					if (++f.failures <= 16)
+						Log::Error("Vulkan: output {} of {} failed ({})", index, f.batchCount, f.fault);
+				}
 			}
 
 			f.lastIndex = index;
@@ -1118,43 +1177,37 @@ namespace
 			const bool copied = f.batchReady && index <= f.generatedThrough && index <= f.batchCount &&
 				f.outputs[index - 1];
 
+			// Preserve the real frame before writing an interpolated output that may
+			// alias the backbuffer. Later evaluations use this batch's saved input,
+			// because that game backbuffer may already hold an interpolated frame.
+			if (real && !SameSubresource(*real, *backbuffer))
+			{
+				FullBarrier(d, command);
+				if (copied)
+					CopyImage(d, command, xvk::ImageOf(f.slots[f.current ^ 1].backbuffer.Get()),
+						VK_IMAGE_LAYOUT_GENERAL, real->image, GameLayout,
+						std::min(f.width, real->width), std::min(f.height, real->height), nullptr, real);
+				else
+					CopyImage(d, command, backbuffer->image, GameLayout, real->image, GameLayout,
+						std::min(backbuffer->width, real->width), std::min(backbuffer->height, real->height), backbuffer, real);
+				FullBarrier(d, command);
+				f.realCopies++;
+			}
+
 			if (copied)
 			{
 				FullBarrier(d, command);
 				CopyImage(d, command, xvk::ImageOf(f.outputs[index - 1].Get()), VK_IMAGE_LAYOUT_GENERAL, output->image,
-					GameLayout, std::min(output->width, f.width), std::min(output->height, f.height));
+					GameLayout, std::min(output->width, f.width), std::min(output->height, f.height), nullptr, output);
 				FullBarrier(d, command);
 			}
-			else if (backbuffer && output->image != backbuffer->image && output->format == backbuffer->format)
+			else if (backbuffer && !SameSubresource(*output, *backbuffer) && VulkanPolicy::CopyCompatible(output->format, backbuffer->format))
 			{
 				// Paused, or the batch failed: the real frame takes the output's place, never its stale content
 				FullBarrier(d, command);
 				CopyImage(d, command, backbuffer->image, GameLayout, output->image, GameLayout,
-					std::min(backbuffer->width, output->width), std::min(backbuffer->height, output->height));
+					std::min(backbuffer->width, output->width), std::min(backbuffer->height, output->height), backbuffer, output);
 				FullBarrier(d, command);
-			}
-
-			// Streamline presents DLSSG.OutputReal as the real frame after the generated ones, left unwritten the real
-			// frame on screen is a stale one
-			if (real && backbuffer && real->image != backbuffer->image)
-			{
-				if (real->format != backbuffer->format)
-				{
-					if (!f.realFormatLogged)
-					{
-						f.realFormatLogged = true;
-						Log::Warn("Vulkan: DLSSG.OutputReal is format {} and the back buffer {}, the real frame isn't copied",
-							static_cast<int>(real->format), static_cast<int>(backbuffer->format));
-					}
-				}
-				else
-				{
-					FullBarrier(d, command);
-					CopyImage(d, command, backbuffer->image, GameLayout, real->image, GameLayout,
-						std::min(backbuffer->width, real->width), std::min(backbuffer->height, real->height));
-					FullBarrier(d, command);
-					f.realCopies++;
-				}
 			}
 
 			xvk::EndRecording(d.d3d.Get());
@@ -1164,6 +1217,10 @@ namespace
 		}
 		catch (...)
 		{
+			std::scoped_lock lock(gDevice.mutex);
+			f.batchReady = false;
+			f.havePrevious = false;
+			f.generatedThrough = 0;
 			if (recording)
 				xvk::EndRecording(gDevice.d3d.Get());
 
