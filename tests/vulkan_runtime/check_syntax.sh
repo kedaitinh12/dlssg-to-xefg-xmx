@@ -26,8 +26,10 @@ sources=(
 	src/vulkan/VulkanHost.cpp
 	src/vulkan/VulkanRuntime.cpp
 	src/vulkan/VulkanTensor.cpp
+	src/vulkan/VulkanCoopMat.cpp
 	src/vulkan/xvk_extra.h
 	src/vulkan/xvk_tensor.h
+	src/vulkan/xvk_coopmat.h
 	src/MfgPort/Cuda/cuda_route.h
 	src/MfgPort/Cuda/cuda_layers.h
 	src/MfgPort/Cuda/cuda_vulkan.cpp
@@ -49,6 +51,10 @@ for cxx in "${compilers[@]}"; do
 		-Wno-ignored-attributes -Wno-cast-function-type
 		-DNOMINMAX -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN -DVK_USE_PLATFORM_WIN32_KHR -DVK_NO_PROTOTYPES
 		-I "$lower" -I "$here/stubs" -I "$root/third_party/minhook/include" -I "$root/src" -I "$root/src/vulkan")
+	if [ -n "${EXTRA_CXXFLAGS:-}" ]; then
+		# shellcheck disable=SC2206
+		flags+=(${EXTRA_CXXFLAGS})
+	fi
 	case "$cxx" in
 		*clang*) flags+=(-fms-extensions -fdeclspec -Wno-microsoft -Wno-pragma-pack -Wno-pragma-once-outside-header) ;;
 		*) flags+=("-D__declspec(attribute)=") ;; # GCC has no __declspec

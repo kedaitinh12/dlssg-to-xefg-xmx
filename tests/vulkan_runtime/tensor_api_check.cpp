@@ -1,7 +1,7 @@
-// The calls src/vulkan/xvk_tensor.cpp makes into src/MfgPort/Cuda (cuda_route.h and cuda_layers.h), written out so that
-// check_syntax.sh proves the declarations match them. xvk_tensor.cpp is MFG-Unlocker's file and needs the whole of its
-// layer's headers, which the stubs don't have: the Windows build is the check of the file itself, this one is of what this
-// repository adds underneath it. Nothing is linked or run.
+// The calls src/vulkan/xvk_tensor.cpp and src/vulkan/xvk_coopmat.cpp make into src/MfgPort/Cuda (cuda_route.h and
+// cuda_layers.h), written out so that check_syntax.sh proves the declarations match them. xvk_tensor.cpp is MFG-Unlocker's
+// file and needs the whole of its layer's headers, which the stubs don't have: the Windows build is the check of the file
+// itself, this one is of what this repository adds underneath it. Nothing is linked or run.
 #include "MfgPort/Cuda/cuda_layers.h"
 
 #include <iterator>
@@ -25,10 +25,14 @@ void TensorApiCheck(const LUID& luid, UINT x, UINT y, UINT z, XefgCudaParams& pa
 	// TensorRoute::Fault
 	xefg_cuda::ReportVulkan(xefg_cuda::State::Unavailable, major, minor, 0, "driver_fault");
 
+	// CoopMatrixRoute::Install & TryLaunch
+	xefg_cuda::ReportCoopMatrix(xefg_cuda::State::Active, 16, 8, 32, uint32_t(std::size(xefg_cuda::kLayers)), "");
+	xefg_cuda::CountCoopMatrix(1, 0);
+
 	// TensorRoute::TryLaunch
 	const uint8_t id = xefg_cuda::LayerForSha256("");
 
-	if (id && xefg_cuda::LayerEnabled(id))
+	if (id && xefg_cuda::LayerEnabled(id) && xefg_cuda::CoopMatrixLayerEnabled(id))
 	{
 		const auto& layer = xefg_cuda::kLayers[id - 1];
 		const bool decoder = layer.family == xefg_cuda::Family::Decoder;
@@ -57,7 +61,7 @@ void TensorApiCheck(const LUID& luid, UINT x, UINT y, UINT z, XefgCudaParams& pa
 	(void)allowed;
 }
 
-// What VulkanRuntime.cpp and Plugin.cpp read of the Vulkan route
+// What VulkanRuntime.cpp and Plugin.cpp read of the Vulkan routes
 void TensorStatusCheck()
 {
 	const xefg_cuda::Status status = xefg_cuda::VulkanSnapshot();
@@ -68,4 +72,13 @@ void TensorStatusCheck()
 	(void)xefg_cuda::VulkanActive();
 	(void)xefg_cuda::VulkanLaunched();
 	xefg_cuda::SetLayerMask(0x1FFFFu);
+
+	const xefg_cuda::Status coopStatus = xefg_cuda::CoopMatrixSnapshot();
+	(void)coopStatus.state;
+	(void)coopStatus.reason;
+	(void)coopStatus.launches;
+	(void)coopStatus.fallbacks;
+	(void)xefg_cuda::CoopMatrixActive();
+	(void)xefg_cuda::CoopMatrixLaunched();
+	xefg_cuda::SetCoopMatrixLayerMask(0x1FFFFu);
 }

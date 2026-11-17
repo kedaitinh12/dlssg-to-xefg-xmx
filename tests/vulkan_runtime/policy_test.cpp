@@ -10,6 +10,7 @@
 #include <limits>
 #include <set>
 #include <string>
+#include <tuple>
 
 static int failures = 0;
 static int checks = 0;
@@ -208,8 +209,10 @@ int main()
 		bool ok = true;
 
 		for (uint32_t format = 0; format < 300; ++format)
+		{
 			if (!taken.count(format))
 				ok &= VulkanPolicy::ColorFormat(format).dxgi == Dxgi::Unknown && !VulkanPolicy::ColorFormat(format).srgb;
+		}
 
 		CHECK(ok);
 	}
@@ -338,6 +341,30 @@ int main()
 		CHECK(VulkanPolicy::DescribeTensor("something_else") == "something_else");
 		CHECK(VulkanPolicy::DescribeTensor("") == "");
 		CHECK(VulkanPolicy::DescribeTensor("dispatch_shape") == "dispatch_shape"); // a layer's, not the route's
+	}
+
+	// ---- the VK_KHR_cooperative_matrix route: when it replaces the layers and what its reasons mean
+	{
+		using VulkanPolicy::UseCoopMatrix;
+		CHECK(UseCoopMatrix(true, true, false, false));   // XMX Port
+		CHECK(UseCoopMatrix(true, false, true, false));   // XMX (native)
+		CHECK(UseCoopMatrix(true, false, false, true));   // CUDA fallback on AMD/Intel
+		CHECK(!UseCoopMatrix(true, false, false, false));
+		CHECK(!UseCoopMatrix(false, true, false, false)); // DP4a model
+
+		const char* coopCodes[] = { "environment_off", "no_port", "already_attempted", "no_extensions", "device_inputs",
+			"instance_functions", "device_functions", "no_int8_tile", "layout_create", "shader_dir_missing", "exception",
+			"driver_fault" };
+		std::set<std::string> coopTexts;
+
+		for (const char* code : coopCodes)
+		{
+			const auto text = VulkanPolicy::DescribeCoopMatrix(code);
+			CHECK(!text.empty() && text != code);
+			CHECK(text.find(' ') != std::string::npos);
+			CHECK(text.front() != ' ' && text.back() != ' ' && text.back() != '.');
+			CHECK(coopTexts.insert(text).second);
+		}
 	}
 
 	std::printf("%d checks, %d failed\n", checks, failures);
