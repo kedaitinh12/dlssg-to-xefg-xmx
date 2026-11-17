@@ -1,0 +1,39 @@
+The files of src/vulkan/, src/MfgPort/Cuda/cuda_layers.h and third_party/minhook/ that came from MFG-Unlocker
+(https://github.com/dashdogy/MFG-Unlocker), copied by tools/VendorXvk.py: xvk, its D3D12 API on Vulkan, with its
+tensor-core route and the layer table that route shares with the D3D12 one, MIT licensed (LICENSE-MFG-Unlocker.txt),
+and MinHook, BSD-2-Clause (third_party/minhook/LICENSE.txt).
+
+Source: [V1.7.1](https://github.com/dashdogy/MFG-Unlocker/releases/tag/v1.7.1) - 13 Nov 2026
+
+file  SHA-256 of MFG-Unlocker's file  what this repository did
+
+xvk.h  d0a83adb18eaea8141c2a5f53023ef103c504f3092deb12e9104e73496798e04  as is
+xvk_commandlist.cpp  b37672e1334007e411fae0318704b98bfab1a49cd20440791695b11200e927ed  as is
+xvk_device.cpp  0ab8c070d43e1febc448f83a8a422c634522895a8e46ae402fe90cad6d3f5c20  patched, now 66e31574af2325a9
+xvk_dxgi.cpp  7cb41f40a9ef53281d52cf45a6805c8ed6b0acb7e27b7378775983900dad70cb  as is
+xvk_internal.h  cfa936cc787ea1cacdb0ef66db4d7560487ac458b6bd1726893af248d5a3bf06  as is
+xvk_output_frame.h  572b0d8eb3f05a760ea1affa4d7f802f146db853134ecb26432b1c1313598543  as is
+xvk_pipeline.cpp  2c03a60b580e44a5866d18cf24f1cc90b599f7149b14368e8e0a1227d67d3de6  as is
+xvk_programs.cpp  32efab37c3d7e0888f79964893c444764ac9d4e8da25216ab81c75b87967863a  patched, now 0f8e8fccb0742282
+xvk_queue.cpp  8c5e148e4ba7ea1d7523487d07a15d0a62e151c285740fd8778430fd75e3ceca  as is
+xvk_resource.cpp  e38800fd05df528d5c2bd30460cc0b5c459bed34b52a72ce50588d7c8997f021  as is
+xvk_tensor.cpp  bb3cbaa3ff3f0bdc62a03932f97655e240cb15b02ae7bb4de075a6cbd51892eb  patched, now a46ecc4b23d024ed
+xvk_tensor.h  d58e705ee6f63304a948b807bf1affcb03f24d33c0be7885c32722afb9fcb771  patched, now 0bca1e62a20048aa
+xvk_util.cpp  5e955bfad4acbd9cbcadf08629b6fceef584c97a7ce12a3d4d4be2e13d0db60e  patched, now 01d615ab41576ecc
+MfgPort/Cuda/cuda_layers.h  126ff6e4f2590c8e0ea6c64241cd4d2774f0ea1db6b437bb86462f4a13d8e97e  as is
+LICENSE-MFG-Unlocker.txt  433da96087fd9b91afd44c6350ca92da53167c9636a0a71e428f71036d8c372f  as is
+minhook/LICENSE.txt  d5c2224982b0b95a16b098a561335fa93f3eaf4d0aa964b7843edb986df78dc8  as is
+minhook/include/MinHook.h  37f00f5780573b75826a9ba4f3eafd18a771e30bfa156a350a846adec4bdbc3a  as is
+minhook/src/buffer.c  264518ef018e0b8b1b37e75be7773a9dc39d98a0d57eb705e4769d2bc5aa5f83  as is
+minhook/src/buffer.h  9769702bd625249e59a19ede05c84365fcc7707e1fa0e5df08df42227cee13e3  as is
+minhook/src/hook.c  68f8a4784cc783754ba436dcbcfd367480ab042248a89338aec8fb0954c4d6ca  as is
+minhook/src/trampoline.c  146215967881eec554918a34ede20db9a20b7165431a08c82ad5a7ed84c1ab93  as is
+minhook/src/trampoline.h  53ed9934492320617a27bfd952ffe7f5b7a4a1d09963d4512447082fe7b727b4  as is
+minhook/src/hde/hde64.c  338f3124469ee1278dd51d3efb4a58dad42ff215cfd9f1aa8bfd160da830f7f5  as is
+minhook/src/hde/hde64.h  e99aa4997bda14b534c614c3d8cb78a72c4aca91a1212c8b03ec605d1d75e36e  as is
+minhook/src/hde/pstdint.h  604d1cdf45c5a95bc9cf1bbf39ca05ef83013541101d34971c5cd7577e3d5247  as is
+minhook/src/hde/table64.h  b774446d2f110ce954fb0a710f4693c5562ddbd8d56fe84106f2ee80db8b50a2  as is
+
+VulkanRuntime.cpp, VulkanHost.cpp, VulkanTensor.cpp, VulkanPolicy.h and VulkanInputCopy.h are this repository's own
+(the last holds MFG-Unlocker's xess/vulkan/vk_input_copy.comp, compiled, see tools/MakeVulkanInputCopyHeader.py), and
+so are the helpers the tensor-core route shares with the D3D12 one (src/MfgPort/Cuda/cuda_route.cpp, cuda_vulkan.cpp).
