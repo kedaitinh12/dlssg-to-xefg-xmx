@@ -101,6 +101,16 @@ Status VulkanSnapshot() noexcept;
 bool VulkanActive() noexcept;
 bool VulkanLaunched() noexcept;
 
+// VK_KHR_cooperative_matrix route on Vulkan (src/vulkan/xvk_coopmat.cpp): hardware WMMA (AMD RDNA3/RDNA4) and XMX
+// (Intel Arc) acceleration for the same 17 int8 layers of cuda_layers.h.
+void SetCoopMatrixLayerMask(uint32_t mask) noexcept;
+bool CoopMatrixLayerEnabled(uint8_t layerId) noexcept;
+void ReportCoopMatrix(State state, uint32_t tileM, uint32_t tileN, uint32_t tileK, uint32_t layers, const char* reason) noexcept;
+void CountCoopMatrix(uint64_t launches, uint64_t fallbacks) noexcept;
+Status CoopMatrixSnapshot() noexcept;
+bool CoopMatrixActive() noexcept;
+bool CoopMatrixLaunched() noexcept;
+
 // Layer table and kernel names (tests). ownSha256 (unet.1): RTXMFG's own DXIL for the same layer, which ShaderPort
 // swaps in for Intel's program; the provider then creates the pipeline from those bytes (nullptr when there is none).
 struct LayerInfo { const char* program; const char* sha256; const char* kernel; const char* ownSha256 = nullptr; };

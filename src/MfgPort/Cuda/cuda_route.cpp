@@ -448,38 +448,77 @@ ListTable* FindTable(void** table) noexcept
     return nullptr;
 }
 
-template <class F> F ListOriginal(void* self, int slot) noexcept
+const std::array<void*, kVtableSlots>& ListHooks() noexcept;
+
+// A table the route wrote: every slot it patches carries its hook. A per-list copy of a hooked shared table does
+// too, though it is not one of gTables (the runtime may copy the table after adoption).
+bool HookedTable(void** table) noexcept
 {
-    if (const ListTable* table = FindTable(*static_cast<void***>(self))) return reinterpret_cast<F>(table->original[slot]);
-    const size_t type = TypeIndex(static_cast<ID3D12GraphicsCommandList*>(self)->GetType());
-    void* original = gSharedOriginal[type][slot].load(std::memory_order_acquire);
-    if (!original) original = gSharedOriginal[1 - type][slot].load(std::memory_order_acquire);
-    return reinterpret_cast<F>(original);
+    if (!table) return false;
+    const auto& hooks = ListHooks();
+    for (int slot : kListSlots)
+        if (table[slot] != hooks[slot]) return false;
+    return true;
 }
 
 // ---- the recording state of the current list, per thread ---------------------------------------------
 // The replaced Dispatch needs the pipeline state, the CBV/SRV/UAV heap, root tables 0 and 1 and the
 // root constants. Kept for one list (and its table) per thread: another list on the same thread starts
 // over, and an incomplete state keeps the Dispatch.
+// Also caches the resolved ListTable*, heap start handles, and per-recording NVAPI independent descriptor
+// handles (modeled on f5low-fg-main's xefg_pack_d3d.h handle caching) to avoid repeated hash-table, COM,
+// and NVAPI driver calls on the render thread hot path.
+struct DescCacheEntry
+{
+    uint64_t key{};   // ((index + 1) << 1) | (type & 1), 0 = empty
+    uint64_t handle{};
+};
+constexpr size_t kDescCacheSlots = 64;
+
 struct Recording
 {
     void* list{};
     void** table{};
+    const ListTable* tableRecord{};
+    bool tableHooked{};
+    ID3D12PipelineState* lastState{};
     uint8_t layer{};
     ID3D12DescriptorHeap* heap{};
+    D3D12_GPU_DESCRIPTOR_HANDLE heapGpuStart{};
+    D3D12_CPU_DESCRIPTOR_HANDLE heapCpuStart{};
+    UINT heapNumDescriptors{};
     D3D12_GPU_DESCRIPTOR_HANDLE tables[2]{};
     uint32_t tableMask{};
     uint32_t constants[12]{};
     uint32_t constantMask{};
+    std::array<DescCacheEntry, kDescCacheSlots> descCache{};
 };
 thread_local Recording tRecording;
+
+void InitRecording(Recording& r, void* list) noexcept
+{
+    void** table = *static_cast<void***>(list);
+    const ListTable* rec = FindTable(table);
+    r = Recording{list, table, rec, rec ? false : HookedTable(table)};
+}
 
 Recording& Track(void* list) noexcept
 {
     auto& r = tRecording;
     void** table = *static_cast<void***>(list);
-    if (r.list != list || r.table != table) r = Recording{list, table};
+    if (r.list != list || r.table != table) InitRecording(r, list);
     return r;
+}
+
+template <class F> F ListOriginal(void* self, int slot) noexcept
+{
+    const auto& r = tRecording;
+    if (r.list == self && r.tableRecord) return reinterpret_cast<F>(r.tableRecord->original[slot]);
+    if (const ListTable* table = FindTable(*static_cast<void***>(self))) return reinterpret_cast<F>(table->original[slot]);
+    const size_t type = TypeIndex(static_cast<ID3D12GraphicsCommandList*>(self)->GetType());
+    void* original = gSharedOriginal[type][slot].load(std::memory_order_acquire);
+    if (!original) original = gSharedOriginal[1 - type][slot].load(std::memory_order_acquire);
+    return reinterpret_cast<F>(original);
 }
 
 using ResetFn = HRESULT (STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*, ID3D12PipelineState*);
@@ -499,9 +538,10 @@ HRESULT STDMETHODCALLTYPE HookReset(ID3D12GraphicsCommandList* self, ID3D12Comma
 {
     const HRESULT result = ListOriginal<ResetFn>(self, kReset)(self, allocator, initial);
     auto& r = tRecording;
-    r = Recording{self, *reinterpret_cast<void***>(self)};
+    InitRecording(r, self);
     if (SUCCEEDED(result))
     {
+        r.lastState = initial;
         r.layer = Lookup(initial);
         if (r.layer) gLayerBinds.fetch_add(1, std::memory_order_relaxed);
     }
@@ -510,17 +550,39 @@ HRESULT STDMETHODCALLTYPE HookReset(ID3D12GraphicsCommandList* self, ID3D12Comma
 void STDMETHODCALLTYPE HookSetPipelineState(ID3D12GraphicsCommandList* self, ID3D12PipelineState* state)
 {
     auto& r = Track(self);
-    r.layer = Lookup(state);
+    if (r.lastState != state || !state)
+    {
+        r.lastState = state;
+        r.layer = Lookup(state);
+    }
     if (r.layer) gLayerBinds.fetch_add(1, std::memory_order_relaxed);
     ListOriginal<SetPipelineStateFn>(self, kSetPipelineState)(self, state);
 }
 void STDMETHODCALLTYPE HookSetDescriptorHeaps(ID3D12GraphicsCommandList* self, UINT count, ID3D12DescriptorHeap* const* heaps)
 {
     auto& r = Track(self);
+    ID3D12DescriptorHeap* prevHeap = r.heap;
     r.heap = nullptr;
+    r.heapNumDescriptors = 0;
     if (heaps)
+    {
         for (UINT i = 0; i < count && i < 2; ++i)
-            if (heaps[i] && heaps[i]->GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) r.heap = heaps[i];
+        {
+            if (!heaps[i]) continue;
+            const D3D12_DESCRIPTOR_HEAP_DESC desc = heaps[i]->GetDesc();
+            if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+            {
+                r.heap = heaps[i];
+                if (desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
+                {
+                    r.heapGpuStart = heaps[i]->GetGPUDescriptorHandleForHeapStart();
+                    r.heapCpuStart = heaps[i]->GetCPUDescriptorHandleForHeapStart();
+                    r.heapNumDescriptors = desc.NumDescriptors;
+                }
+            }
+        }
+    }
+    if (r.heap != prevHeap) r.descCache = {};
     ListOriginal<SetDescriptorHeapsFn>(self, kSetDescriptorHeaps)(self, count, heaps);
 }
 void STDMETHODCALLTYPE HookSetComputeRootSignature(ID3D12GraphicsCommandList* self, ID3D12RootSignature* signature)
@@ -581,25 +643,31 @@ void RuntimeFault(const char* where) noexcept
 }
 
 // The layer's Dispatch as a CUDA launch on the same descriptors. False keeps the Dispatch.
-bool Launch(ID3D12GraphicsCommandList* list, const Recording& r, UINT x, UINT y, UINT z) noexcept
+bool Launch(ID3D12GraphicsCommandList* list, Recording& r, UINT x, UINT y, UINT z) noexcept
 {
     const Layer& layer = kLayers[r.layer - 1];
     if (z != layer.groupsZ || !x || !y || x > 65535 || y > 65535) { Fallback(kShape, "dispatch_shape", layer); return false; }
     if ((r.tableMask & 3u) != 3u || !r.heap) { Fallback(kBindings, "bindings_incomplete", layer); return false; }
     if ((r.constantMask & layer.constants) != layer.constants) { Fallback(kConstants, "constants_incomplete", layer); return false; }
-    const D3D12_DESCRIPTOR_HEAP_DESC heap = r.heap->GetDesc();
-    if (heap.Type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !(heap.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE))
-    { Fallback(kHeap, "heap_type", layer); return false; }
-    const auto gpuStart = r.heap->GetGPUDescriptorHandleForHeapStart();
-    const auto cpuStart = r.heap->GetCPUDescriptorHandleForHeapStart();
+    if (!r.heapNumDescriptors) { Fallback(kHeap, "heap_type", layer); return false; }
+    const auto gpuStart = r.heapGpuStart;
+    const auto cpuStart = r.heapCpuStart;
     auto object = [&](D3D12_GPU_DESCRIPTOR_HANDLE table, uint32_t offset, int type, uint64_t& handle) {
         if (table.ptr < gpuStart.ptr || (table.ptr - gpuStart.ptr) % gIncrement) return false;
         const uint64_t index = (table.ptr - gpuStart.ptr)/gIncrement + offset;
-        if (index >= heap.NumDescriptors) return false;
+        if (index >= r.heapNumDescriptors) return false;
+        const uint64_t cacheKey = ((index + 1ull) << 1) | uint64_t(type & 1);
+        auto& slot = r.descCache[size_t((cacheKey * 0x9E3779B97F4A7C15ull) >> 58) & (kDescCacheSlots - 1)];
+        if (slot.key == cacheKey && slot.handle)
+        {
+            handle = slot.handle;
+            return true;
+        }
         DescriptorObject request{sizeof(DescriptorObject), 0, gDevice, type, {SIZE_T(cpuStart.ptr + index*gIncrement)}, 0};
         const int result = GuardedObject(gNvapi.object, &request);
         if (result == kNvFault) RuntimeFault("descriptor_object");
         if (result != 0 || !request.handle) return false;
+        slot = {cacheKey, request.handle};
         handle = request.handle;
         return true;
     };
@@ -623,28 +691,14 @@ bool Launch(ID3D12GraphicsCommandList* list, const Recording& r, UINT x, UINT y,
     return true;
 }
 
-const std::array<void*, kVtableSlots>& ListHooks() noexcept;
-
-// A table the route wrote: every slot it patches carries its hook. A per-list copy of a hooked shared table does
-// too, though it is not one of gTables (the runtime may copy the table after adoption).
-bool HookedTable(void** table) noexcept
-{
-    if (!table) return false;
-    const auto& hooks = ListHooks();
-    for (int slot : kListSlots)
-        if (table[slot] != hooks[slot]) return false;
-    return true;
-}
-
 // Only through a table that carries every hook: a recognized pipeline state seen by our SetPipelineState
 // is then the one the Dispatch runs. A retired own table (complete false) never launches.
 void STDMETHODCALLTYPE HookDispatch(ID3D12GraphicsCommandList* self, UINT x, UINT y, UINT z)
 {
-    const auto& r = tRecording;
+    auto& r = tRecording;
     if (r.list == self && r.layer && r.table == *reinterpret_cast<void***>(self) && gActive.load(std::memory_order_acquire))
     {
-        const ListTable* table = FindTable(r.table);
-        if ((table && table->complete.load(std::memory_order_acquire)) || (!table && HookedTable(r.table)))
+        if ((r.tableRecord && r.tableRecord->complete.load(std::memory_order_acquire)) || (!r.tableRecord && r.tableHooked))
             if (Launch(self, r, x, y, z))
                 return;
     }
@@ -1024,7 +1078,8 @@ HRESULT STDMETHODCALLTYPE HookCreateCommandList(ID3D12Device* self, UINT mask, D
                 {
                     AdoptCreated(list.Get(), type, nullptr, "list", caller);
                     auto& r = tRecording;
-                    r = Recording{list.Get(), *reinterpret_cast<void***>(list.Get())};
+                    InitRecording(r, list.Get());
+                    r.lastState = initial;
                     r.layer = Lookup(initial);
                     if (r.layer) gLayerBinds.fetch_add(1, std::memory_order_relaxed);
                     *out = requested;
@@ -1395,6 +1450,8 @@ void Disable(const char* reason) noexcept
 
 void SetEnabled(bool enabled) noexcept
 {
+    if (gState.load(std::memory_order_acquire) == State::Active && gActive.load(std::memory_order_relaxed) == enabled)
+        return;
     std::lock_guard lock(gMutex);
     if (gState.load(std::memory_order_acquire) == State::Active)
         gActive.store(enabled, std::memory_order_release);
@@ -1406,6 +1463,8 @@ void SetEnabled(bool enabled) noexcept
 void Adopt(ID3D12GraphicsCommandList* list) noexcept
 {
     if (!list || gState.load(std::memory_order_acquire) != State::Active) return;
+    void** fastTable = *reinterpret_cast<void***>(list);
+    if (const ListTable* record = FindTable(fastTable); record && record->complete.load(std::memory_order_acquire)) return;
     try
     {
         std::lock_guard lock(gMutex);
