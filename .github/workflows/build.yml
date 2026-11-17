@@ -1,0 +1,286 @@
+# Builds the dll on every push and pull request, checks that it exports what the sources declare, runs the tests that need no
+# Windows and keeps the result as a workflow artifact laid out like a release (XeMFG XMX\dlssg\...). Releases are still
+# published by hand with release.yml.
+#
+# The dll has the Vulkan runtime built in (src/vulkan: MFG-Unlocker's D3D12-on-Vulkan layer and the hooks that prepare a
+# game's VkDevice for it), so the build clones the Khronos Vulkan headers (.github/actions/vulkan-headers) and fails when
+# the runtime didn't get built. MFGUnlocker.asi isn't needed to run it.
+#
+# What the runtime runs are the Vulkan models, xefg_mfg_programs\vulkan. They are Intel derived data and aren't in the
+# repository's history unless its owner puts them there. The build takes them from the first of
+#   third_party/xefg_mfg_programs/vulkan/    a folder made by tools/ExtractXeFgVulkanPrograms.py (programs.tsv, <id>.spv, ...)
+#   third_party/MFGUnlocker.asi              an MFGUnlocker.asi, 1.7.1 or newer, that the models are extracted from
+# that exists, and the artifact has them next to the dll. Without either the dll is built the same and its menu says the
+# Vulkan models aren't installed: copy the folder next to the dll by hand.
+#
+# A libxess_fg.dll (XeFG, Intel's as well, so not in the history either) at third_party/libxess_fg.dll is checked from the file
+# alone: tools/CheckXeFgBuild.py says whether the build has what this dll relies on, see the step "libxess_fg.dll" of the
+# models test.
+name: Build
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  windows:
+    name: Windows x64 Release
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Vulkan headers
+        id: vulkan
+        uses: ./.github/actions/vulkan-headers
+
+      - name: Build
+        shell: pwsh
+        run: |
+          msbuild dlssg-to-xefg.sln -p:Configuration=Release -p:Platform=x64 -m "-p:VulkanIncludeDir=${{ steps.vulkan.outputs.include }}" '-flp:logfile=msbuild.log;verbosity=minimal'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # Without the headers the project builds a dll that has no Vulkan runtime and only warns, which this job must not pass for a good build
+          if (-not (Select-String -Path msbuild.log -Pattern "Vulkan runtime: built in" -Quiet)) {
+            throw "The dll was built without the Vulkan runtime, see the 'Vulkan runtime' line of the build log"
+          }
+
+      # msbuild already runs the project's GenerateXeFgPrograms target. Run the generator again so a build that
+      # skipped it still leaves the pinned programs and tensor-core fatbin; it is a no-op when current.
+      - name: Generate XeFG MFG programs
+        shell: pwsh
+        run: ./tools/GenerateXeFgPrograms.ps1 -Output bin\Release\xefg_mfg_programs -Cache obj\Release\packages
+
+      # The tensor-core route of both APIs, D3D12 (src/MfgPort/Cuda/cuda_route.cpp) and Vulkan (src/vulkan/xvk_tensor.cpp),
+      # launches the 16 kernels of this file. It has to be the pinned one, with every kernel the two layer tables name.
+      - name: Tensor-core fatbin
+        run: python tests/vulkan_runtime/check_layer_tables.py --fatbin bin/Release/xefg_mfg_programs/xefg_cuda_layers.fatbin
+
+      # The extractor fails when the program set of the asi doesn't check out against the hashes the asi lists itself, the
+      # inspector when the asi isn't one this dll can use.
+      - name: Vulkan models
+        id: models
+        shell: pwsh
+        run: |
+          $target = "bin\Release\xefg_mfg_programs\vulkan"
+          $folder = "third_party\xefg_mfg_programs\vulkan"
+          $asi = "third_party\MFGUnlocker.asi"
+
+          if (Test-Path (Join-Path $folder "programs.tsv")) {
+            New-Item -ItemType Directory -Path $target -Force | Out-Null
+            Copy-Item (Join-Path $folder "*") $target -Recurse -Force
+            $source = $folder
+          } elseif (Test-Path $asi) {
+            python tools/InspectMfgUnlockerAsi.py $asi
+            if ($LASTEXITCODE -ne 0) { throw "$asi isn't an MFGUnlocker.asi this dll can use" }
+
+            python tools/ExtractXeFgVulkanPrograms.py $asi --output $target
+            if ($LASTEXITCODE -ne 0) { throw "The Vulkan models couldn't be extracted from $asi" }
+            $source = $asi
+          } else {
+            "source=none" >> $env:GITHUB_OUTPUT
+            Write-Host "No Vulkan models in this repository, the artifact has none."
+            exit 0
+          }
+
+          "source=$source" >> $env:GITHUB_OUTPUT
+          Write-Host "Vulkan models from $source"
+          exit 0
+
+      # Every function the sources mark as exported has to be in the dll's export table, the NGX D3D12 and Vulkan
+      # entry points and the OptiScaler plugin entries (OptiPluginInit, InitializeASI) among them.
+      - name: Check the exports
+        run: python tools/CheckExports.py bin/Release/dlssg_to_xefg_intel_is_better.dll src/Exports.cpp src/ExportsVulkan.cpp src/Plugin.cpp
+
+      - name: Stage
+        shell: pwsh
+        run: |
+          $dlssg = Join-Path $PWD "staging\XeMFG XMX\dlssg"
+          $programs = Join-Path $dlssg "xefg_mfg_programs"
+          New-Item -ItemType Directory -Path $programs -Force | Out-Null
+
+          Copy-Item bin\Release\dlssg_to_xefg_intel_is_better.dll $dlssg
+          Copy-Item bin\Release\xefg_mfg_programs\* $programs -Recurse
+
+          # The licenses a binary distribution has to carry: this project's, MFG-Unlocker's (its code is in the dll), MinHook's
+          Copy-Item LICENSE (Join-Path $dlssg "LICENSE")
+          Copy-Item NOTICE.md $dlssg
+          Copy-Item src\vulkan\LICENSE-MFG-Unlocker.txt $dlssg
+          Copy-Item third_party\minhook\LICENSE.txt (Join-Path $dlssg "LICENSE-MinHook.txt")
+
+          foreach ($name in "programs.tsv", "LICENSE", "xefg_cuda_layers.fatbin") {
+            if (-not (Test-Path (Join-Path $programs $name))) { throw "$name is missing from the XeFG MFG program set" }
+          }
+
+          $models = "none"
+          if ("${{ steps.models.outputs.source }}" -ne "none") {
+            foreach ($name in "programs.tsv", "SOURCE.txt", "LICENSE", "7400.spv", "7482.spv") {
+              if (-not (Test-Path (Join-Path $programs "vulkan\$name"))) { throw "$name is missing from the Vulkan models" }
+            }
+            $models = (Get-Content (Join-Path $programs "vulkan\SOURCE.txt") -TotalCount 1)
+          }
+
+          @(
+            "### dlssg-to-xefg build ${{ github.run_number }}",
+            "",
+            "- Vulkan runtime: built in, Vulkan headers VK_HEADER_VERSION ${{ steps.vulkan.outputs.version }}",
+            "- Vulkan models: $models",
+            "- Artifact: ``XeMFG XMX\dlssg\dlssg_to_xefg_intel_is_better.dll`` with ``xefg_mfg_programs`` beside it"
+          ) -join "`n" >> $env:GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dlssg-to-xefg-${{ github.run_number }}
+          path: staging
+          if-no-files-found: error
+          retention-days: 30
+
+      # The build log has the compiler's own messages when something above failed
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: msbuild-log-${{ github.run_number }}
+          path: msbuild.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The two ways the Vulkan exports find their provider, on Linux against fakes: the runtime built into the dll (what this
+  # build has), and a build without the Vulkan headers that goes through a MFGUnlocker.asi in the process.
+  vulkan-provider:
+    name: Vulkan provider test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6
+
+      # Newer kernels map memory where the sanitizers expect their shadow memory; lowering this is the usual workaround.
+      - name: Allow the sanitizers
+        run: sudo sysctl vm.mmap_rnd_bits=28 || true
+
+      - name: Build and run, built-in runtime
+        working-directory: tests/vulkan_provider
+        run: |
+          g++ --version
+          g++ -std=c++20 -Wall -Wextra -Wno-unknown-pragmas -Wno-unused-parameter -Wno-cast-function-type \
+            -fsanitize=address,undefined -g -D'__declspec(x)=' -I stubs -I ../../src \
+            vk_builtin_test.cpp ../../src/ExportsVulkan.cpp ../../src/VulkanProvider.cpp -o vk_builtin_test
+          ./vk_builtin_test
+
+      - name: Build and run, MFGUnlocker.asi as the provider
+        working-directory: tests/vulkan_provider
+        run: |
+          g++ -std=c++20 -Wall -Wextra -Wno-unknown-pragmas -Wno-unused-parameter -Wno-cast-function-type \
+            -fsanitize=address,undefined -g -D'__declspec(x)=' -I stubs -I ../../src \
+            vk_test.cpp ../../src/ExportsVulkan.cpp ../../src/VulkanProvider.cpp ../../src/VulkanRuntimeOff.cpp -o vk_test
+          ./vk_test
+
+  # What the Vulkan runtime decides without Vulkan or Windows (VulkanPolicy.h), that every reason it can give has a text, that
+  # the D3D12 and Vulkan tensor-core routes have the same layer table, and a syntax check of its Windows-only sources against
+  # stand-ins for the Win32, D3D12 and Vulkan APIs with clang++ and g++. The real compile is the Windows job's.
+  vulkan-runtime:
+    name: Vulkan runtime checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Allow the sanitizers
+        run: sudo sysctl vm.mmap_rnd_bits=28 || true
+
+      # A checkout or an archive unpacked on Windows has one file for two names that differ only in case
+      - name: No file names that differ only in case
+        run: |
+          duplicates=$(git ls-files | tr '[:upper:]' '[:lower:]' | sort | uniq -d)
+          if [ -n "$duplicates" ]; then echo "$duplicates"; exit 1; fi
+
+      - name: Policy test
+        working-directory: tests/vulkan_runtime
+        run: |
+          g++ -std=c++20 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -g \
+            -I ../../src policy_test.cpp -o policy_test
+          ./policy_test
+
+      - name: Reason codes
+        run: python3 tests/vulkan_runtime/check_reasons.py
+
+      - name: Tensor-core layer tables
+        run: python3 tests/vulkan_runtime/check_layer_tables.py
+
+      # The checker of a libxess_fg.dll (tools/CheckXeFgBuild.py): its zstd decoder, its reading of this repository's tables and
+      # its answer to files that aren't what it expects. None of that needs the dll, which is Intel's.
+      - name: XeFG build checker
+        run: python3 tests/xefg_build/check_tool.py
+
+      - name: Syntax check of the Windows-only sources
+        run: |
+          g++ --version
+          clang++ --version || true
+          bash tests/vulkan_runtime/check_syntax.sh
+
+      - name: Tools
+        run: python3 -m py_compile tools/*.py tests/vulkan_runtime/check_reasons.py tests/vulkan_runtime/check_layer_tables.py tests/xefg_build/check_tool.py
+
+  # The reader of xefg_mfg_programs\vulkan (src/VulkanPrograms.cpp) is plain C++, it runs here against synthetic sets and,
+  # when the repository has the models, against the real ones.
+  vulkan-programs:
+    name: Vulkan models test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Allow the sanitizers
+        run: sudo sysctl vm.mmap_rnd_bits=28 || true
+
+      - name: Build and run
+        working-directory: tests/vulkan_programs
+        run: |
+          g++ --version
+          g++ -std=c++20 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -g \
+            -DVULKANPROGRAMS_HOSTED -I stubs -I ../../src \
+            programs_test.cpp ../../src/VulkanPrograms.cpp -o programs_test
+          ./programs_test
+          ./programs_test --missing
+
+      - name: Real models, from the folder
+        if: hashFiles('third_party/xefg_mfg_programs/vulkan/programs.tsv') != ''
+        run: tests/vulkan_programs/programs_test --real third_party/xefg_mfg_programs/vulkan
+
+      - name: Real models, from MFGUnlocker.asi
+        if: hashFiles('third_party/xefg_mfg_programs/vulkan/programs.tsv') == '' && hashFiles('third_party/MFGUnlocker.asi') != ''
+        run: |
+          python3 tools/InspectMfgUnlockerAsi.py third_party/MFGUnlocker.asi
+          python3 tools/ExtractXeFgVulkanPrograms.py third_party/MFGUnlocker.asi --output "$RUNNER_TEMP/vulkan"
+          tests/vulkan_programs/programs_test --real "$RUNNER_TEMP/vulkan"
+
+      # What depends on the XeFG build, read from the file itself (tools/CheckXeFgBuild.py, no GPU, nothing is run): the API
+      # addresses, the program decoder and model catalog the MFG port patches, and the Intel programs that the tensor-core
+      # routes' layer table and the Vulkan models recognize. libzstd is on the runner; the models are those of the steps above.
+      - name: libxess_fg.dll
+        if: hashFiles('third_party/libxess_fg.dll') != ''
+        run: |
+          models=""
+          if [ -f third_party/xefg_mfg_programs/vulkan/programs.tsv ]; then
+            models=third_party/xefg_mfg_programs/vulkan
+          elif [ -f "$RUNNER_TEMP/vulkan/programs.tsv" ]; then
+            models="$RUNNER_TEMP/vulkan"
+          fi
+          python3 tools/CheckXeFgBuild.py third_party/libxess_fg.dll ${models:+--vulkan-programs "$models"}

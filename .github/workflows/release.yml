@@ -1,4 +1,6 @@
-# Builds the dll when triggered manually and publishes it, together with the MFG program data, as a release
+# Builds the dll when triggered manually and publishes it, together with the MFG program data, as a release. The dll has the
+# Vulkan runtime built in, so this clones the Khronos Vulkan headers like build.yml does. The Vulkan models (xefg_mfg_programs\vulkan)
+# are Intel derived data from MFGUnlocker.asi and are not part of the release, the README says where they go.
 name: Release
 
 on:
@@ -16,8 +18,20 @@ jobs:
 
       - uses: microsoft/setup-msbuild@v2
 
+      - name: Vulkan headers
+        id: vulkan
+        uses: ./.github/actions/vulkan-headers
+
       - name: Build
-        run: msbuild dlssg-to-xefg.sln -p:Configuration=Release -p:Platform=x64 -m
+        shell: pwsh
+        run: |
+          msbuild dlssg-to-xefg.sln -p:Configuration=Release -p:Platform=x64 -m "-p:VulkanIncludeDir=${{ steps.vulkan.outputs.include }}" '-flp:logfile=msbuild.log;verbosity=minimal'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # A release without the Vulkan runtime would build the same and only warn
+          if (-not (Select-String -Path msbuild.log -Pattern "Vulkan runtime: built in" -Quiet)) {
+            throw "The dll was built without the Vulkan runtime, see the 'Vulkan runtime' line of the build log"
+          }
 
       # msbuild already runs the project's GenerateXeFgPrograms target. Run the generator again so a build
       # that skipped it still publishes the pinned programs and tensor-core fatbin; it is a no-op when current.
@@ -36,6 +50,12 @@ jobs:
 
           Copy-Item bin\Release\dlssg_to_xefg_intel_is_better.dll $dlssg
           Copy-Item bin\Release\xefg_mfg_programs\* $programs -Recurse
+
+          # The licenses a binary distribution has to carry: this project's, MFG-Unlocker's (its code is in the dll), MinHook's
+          Copy-Item LICENSE (Join-Path $dlssg "LICENSE")
+          Copy-Item NOTICE.md $dlssg
+          Copy-Item src\vulkan\LICENSE-MFG-Unlocker.txt $dlssg
+          Copy-Item third_party\minhook\LICENSE.txt (Join-Path $dlssg "LICENSE-MinHook.txt")
 
           if (-not (Test-Path (Join-Path $programs "programs.tsv"))) { throw "The XeFG MFG program set was not generated" }
           if (-not (Test-Path (Join-Path $programs "LICENSE"))) { throw "The XeFG MFG program LICENSE is missing" }
@@ -64,4 +84,4 @@ jobs:
           gh release create "build-${{ github.run_number }}" $env:ZIP `
             --target "${{ github.sha }}" `
             --title "Build ${{ github.run_number }} ($sha)" `
-            --notes "Built from $sha."
+            --notes "Built from $sha. Vulkan runtime built in (Khronos Vulkan headers ${{ steps.vulkan.outputs.version }}). The Vulkan models (xefg_mfg_programs\vulkan) are not part of this release, see the README."
