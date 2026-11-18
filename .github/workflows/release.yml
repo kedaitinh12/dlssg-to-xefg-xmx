@@ -1,6 +1,5 @@
 # Builds the dll when triggered manually and publishes it, together with the MFG program data, as a release. The dll has the
-# Vulkan runtime built in, so this clones the Khronos Vulkan headers like build.yml does. The Vulkan models (xefg_mfg_programs\vulkan)
-# are Intel derived data from MFGUnlocker.asi and are not part of the release, the README says where they go.
+# Vulkan runtime built in, so this clones the Khronos Vulkan headers like build.yml does.
 name: Release
 
 on:
@@ -38,6 +37,58 @@ jobs:
       - name: Generate XeFG MFG programs
         shell: pwsh
         run: ./tools/GenerateXeFgPrograms.ps1 -Output bin\Release\xefg_mfg_programs -Cache obj\Release\packages
+
+      - name: Rebuild CUDA tensor-core fatbin (when CUDA Toolkit is present)
+        shell: pwsh
+        run: |
+          if ($env:CUDA_PATH -and (Test-Path (Join-Path $env:CUDA_PATH "bin\nvcc.exe"))) {
+            Write-Host "CUDA Toolkit found at $env:CUDA_PATH, rebuilding xefg_cuda_layers.fatbin from xefg_cuda_layers.cu..."
+            ./tools/GenerateXeFgCuda.ps1 -Output bin\Release\xefg_mfg_programs -CudaRoot $env:CUDA_PATH -Source src\MfgPort\Cuda -AllowUnpinnedNvcc
+          } else {
+            Write-Host "No CUDA Toolkit on runner; keeping the extracted xefg_cuda_layers.fatbin."
+          }
+
+      - name: Vulkan models (optional when present in repository)
+        shell: pwsh
+        run: |
+          $target = "bin\Release\xefg_mfg_programs\vulkan"
+          $folder = "third_party\xefg_mfg_programs\vulkan"
+          $asi = "third_party\MFGUnlocker.asi"
+
+          if (Test-Path (Join-Path $folder "programs.tsv")) {
+            New-Item -ItemType Directory -Path $target -Force | Out-Null
+            Copy-Item (Join-Path $folder "*") $target -Recurse -Force
+          } elseif (Test-Path $asi) {
+            python tools/ExtractXeFgVulkanPrograms.py $asi --output $target
+          }
+
+          $exe = $null
+          $cmd = Get-Command glslangValidator -ErrorAction SilentlyContinue
+          if ($cmd) { $exe = $cmd.Source }
+          if (-not $exe -and $env:VULKAN_SDK) {
+            $candidate = Join-Path $env:VULKAN_SDK "Bin\glslangValidator.exe"
+            if (Test-Path $candidate) { $exe = $candidate }
+          }
+          if (-not $exe) {
+            $dlDir = Join-Path $env:RUNNER_TEMP "glslang-bin"
+            $zipPath = Join-Path $env:RUNNER_TEMP "glslang.zip"
+            New-Item -ItemType Directory -Path $dlDir -Force | Out-Null
+            foreach ($u in @(
+              "https://github.com/KhronosGroup/glslang/releases/latest/download/glslang-main-windows-x64-Release.zip",
+              "https://github.com/KhronosGroup/glslang/releases/download/main-tot/glslang-master-windows-Release.zip"
+            )) {
+              try {
+                Invoke-WebRequest -Uri $u -OutFile $zipPath -UseBasicParsing
+                Expand-Archive -Path $zipPath -DestinationPath $dlDir -Force
+                $found = Get-ChildItem -Path $dlDir -Recurse -Filter "glslangValidator.exe" | Select-Object -First 1
+                if ($found) { $exe = $found.FullName; break }
+              } catch {}
+            }
+          }
+          if ($exe -and (Test-Path $target)) {
+            python tools/GenerateXeFgCoopMat.py --glslang "$exe" --output (Join-Path $target "coopmat")
+            if ($LASTEXITCODE -ne 0) { throw "GenerateXeFgCoopMat.py failed" }
+          }
 
       - name: Package
         shell: pwsh
@@ -84,4 +135,4 @@ jobs:
           gh release create "build-${{ github.run_number }}" $env:ZIP `
             --target "${{ github.sha }}" `
             --title "Build ${{ github.run_number }} ($sha)" `
-            --notes "Built from $sha. Vulkan runtime built in (Khronos Vulkan headers ${{ steps.vulkan.outputs.version }}). The Vulkan models (xefg_mfg_programs\vulkan) are not part of this release, see the README."
+            --notes "Built from $sha. Vulkan runtime, CUDA sm_120 Tensor Cores, and AMD WMMA INT8 (RDNA 4 / RDNA 3 & VK_KHR_cooperative_matrix) built in (Khronos Vulkan headers ${{ steps.vulkan.outputs.version }})."
