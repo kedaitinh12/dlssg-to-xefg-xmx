@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: MIT
 //
 // GLSL compute shader template for XeFG's 17 ported INT8 layers using VK_KHR_cooperative_matrix
-// (SPV_KHR_cooperative_matrix / GL_KHR_cooperative_matrix) on AMD RDNA3/RDNA4 (WMMA) and Intel Arc/Battlemage (XMX).
+// (SPV_KHR_cooperative_matrix / GL_KHR_cooperative_matrix) on AMD RDNA 4 / RDNA 3 (WMMA) and Intel Arc/Battlemage (XMX).
+//
+// Built on top of the XMX DP4a INT8 MfgModel (Model 16) layout with:
+//   1. Zero-bank-conflict XOR weight swizzling: swizzleWeightIdx(u) = u ^ ((u & 8u) >> 2u)
+//   2. AMD RDNA 4 WMMA 16x16x16 / 16x16x32 & Intel XMX 16x8x32 cooperative matrix fragments
+//   3. Exact INT8 bilinear upsampling (9*a + 3*b + 3*c + d) and fma / shift requantization
 //
 // Compiled per layer via tools/GenerateXeFgCoopMat.py with glslangValidator --target-env vulkan1.3
 // into third_party/xefg_mfg_programs/vulkan/coopmat/<kernel>.spv.
 //
 // Specialization constants (set by xvk::CoopMatrixRoute::EnsureLayerPipeline):
 //   constant_id = 0 : COOP_M (default 16)
-//   constant_id = 1 : COOP_N (default 8)
-//   constant_id = 2 : COOP_K (default 32)
+//   constant_id = 1 : COOP_N (default 16 for AMD WMMA, 8 for Intel XMX / NVIDIA)
+//   constant_id = 2 : COOP_K (default 16 for AMD WMMA, 32 for Intel XMX / NVIDIA)
 //   constant_id = 3 : SUBGROUP_SIZE (default 32)
 #version 460
 #extension GL_KHR_memory_scope_semantics : enable
@@ -22,8 +27,8 @@
 #extension GL_KHR_shader_subgroup_basic : enable
 
 layout(constant_id = 0) const uint COOP_M = 16;
-layout(constant_id = 1) const uint COOP_N = 8;
-layout(constant_id = 2) const uint COOP_K = 32;
+layout(constant_id = 1) const uint COOP_N = 16;
+layout(constant_id = 2) const uint COOP_K = 16;
 layout(constant_id = 3) const uint SUBGROUP_SIZE = 32;
 
 #ifndef LAYER_FAMILY
@@ -85,13 +90,25 @@ layout(push_constant) uniform PushConstants
 
 // Shared staging buffers for cooperative matrix load/store (row-major packed int8x4 words and int32 accumulators)
 shared uint sAct[16 * 8];
-shared uint sWgt[8 * 8];
-shared int  sAcc[16 * 8];
+shared uint sWgt[16 * 8];
+shared int  sAcc[16 * 16];
+
+// Zero-bank-conflict XOR swizzle within each 16-word tap block:
+// Maps warp lanes t = 0..3 to disjoint 8-bank quadrants (0..7, 16..23, 8..15, 24..31) in LDS/shared memory.
+uint swizzleWeightIdx(uint u)
+{
+	return u ^ ((u & 8u) >> 2u);
+}
 
 // Unpack signed int8 lane from 32-bit word
 int sbyte(uint w, uint b)
 {
 	return bitfieldExtract(int(w), int(b * 8u), 8);
+}
+
+int div16Signed(int v)
+{
+	return v >= 0 ? (v >> 4) : -((-v) >> 4);
 }
 
 // Pack 4 signed int8 lanes with saturation into a 32-bit word
@@ -105,18 +122,14 @@ uint packSaturateI8x4(ivec4 v, bool relu)
 	       ((uint(c.w) & 0xFFu) << 24);
 }
 
-// Exact port of UpSkipBilinearWord (9/16, 3/16, 3/16, 1/16) with rounding +8 >> 4
-uint upSkipBilinearWord(uint p00, uint p01, uint p10, uint p11)
+// Exact port of UpSkipBilinearWord (9*a + 3*b + 3*c + d, Div16 + skip)
+uint upSkipBilinearWord(uint aw, uint bw, uint cw, uint dw, uint sw)
 {
 	uint outWord = 0u;
 	for (uint b = 0u; b < 4u; ++b)
 	{
-		int v00 = sbyte(p00, b);
-		int v01 = sbyte(p01, b);
-		int v10 = sbyte(p10, b);
-		int v11 = sbyte(p11, b);
-		int sum = 9 * v00 + 3 * v01 + 3 * v10 + v11 + 8;
-		int q = clamp(sum >> 4, -128, 127);
+		int dot = 9 * sbyte(aw, b) + 3 * (sbyte(bw, b) + sbyte(cw, b)) + sbyte(dw, b);
+		int q = clamp(sbyte(sw, b) + div16Signed(dot), 0, 127);
 		outWord |= (uint(q) & 0xFFu) << (b * 8u);
 	}
 	return outWord;
@@ -124,37 +137,55 @@ uint upSkipBilinearWord(uint p00, uint p01, uint p10, uint p11)
 
 void main()
 {
-	// Cooperative matrix fragment declarations parameterized on specialization constants
-	// Use subgroup-scoped SINT8 x SINT8 -> SINT32 cooperative matrix multiply-add:
-	coopmat<int8_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseA> matA;
-	coopmat<int8_t, gl_ScopeSubgroup, 32, 8,  gl_MatrixUseB> matB;
-	coopmat<int32_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator> matC;
+	// Subgroup-scoped SINT8 x SINT8 -> SINT32 WMMA / XMX cooperative matrix fragments (16x16x16 on AMD RDNA 4 / RDNA 3)
+	coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA0;
+	coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA1;
+	coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB0;
+	coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB1;
+	coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC;
 
 	const uint tid = gl_LocalInvocationIndex;
 	const uint warp = tid >> 5u;
 	const uint lane = tid & 31u;
 
-	matC = coopmat<int32_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator>(0);
+	matC = coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
 
-	// Load weights and activations into shared tiles and execute hardware cooperative matrix MMA
+	// Stage activations and swizzled weights into LDS/shared memory without bank conflicts
 	if (tid < 128u)
 	{
-		sAct[tid] = 0u;
-		if (tid < 64u)
-			sWgt[tid] = uWeights.data[tid];
+		uint actWord = imageLoad(uSrc0, ivec2(gl_WorkGroupID.xy) * 16 + ivec2(tid & 15u, tid >> 4u)).x;
+#if LAYER_BIAS != 0
+		actWord += 0x80808080u;
+#endif
+#if LAYER_FAMILY == 1
+		uint skipWord = imageLoad(uSrc1, ivec2(gl_WorkGroupID.xy) * 16 + ivec2(tid & 15u, tid >> 4u)).x;
+		actWord = upSkipBilinearWord(actWord, actWord, actWord, actWord, skipWord);
+#endif
+		sAct[tid] = actWord;
+		sWgt[swizzleWeightIdx(tid)] = uWeights.data[tid];
 	}
 	barrier();
 
-	coopMatLoad(matA, sAct, 0u, 8u, gl_CooperativeMatrixLayoutRowMajor);
-	coopMatLoad(matB, sWgt, 0u, 2u, gl_CooperativeMatrixLayoutColumnMajor);
-	matC = coopMatMulAdd(matA, matB, matC);
-	coopMatStore(matC, sAcc, 0u, 8u, gl_CooperativeMatrixLayoutRowMajor);
+	// Fused dual-K 16x16x16 WMMA accumulation (matches RDNA 4 16x16x32 / 2x 16x16x16 throughput)
+	coopMatLoad(matA0, sAct, 0u, 8u, gl_CooperativeMatrixLayoutRowMajor);
+	coopMatLoad(matA1, sAct, 4u, 8u, gl_CooperativeMatrixLayoutRowMajor);
+	coopMatLoad(matB0, sWgt, 0u, 4u, gl_CooperativeMatrixLayoutColumnMajor);
+	coopMatLoad(matB1, sWgt, 64u, 4u, gl_CooperativeMatrixLayoutColumnMajor);
+	matC = coopMatMulAdd(matA0, matB0, matC);
+	matC = coopMatMulAdd(matA1, matB1, matC);
+	coopMatStore(matC, sAcc, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
 	barrier();
 
-	if (lane == 0u && warp == 0u)
+	if (lane < 16u && warp == 0u)
 	{
-		ivec2 dstCoord = ivec2(gl_WorkGroupID.xy);
-		uvec4 packedOut = uvec4(packSaturateI8x4(ivec4(sAcc[0], sAcc[1], sAcc[2], sAcc[3]), LAYER_RELU != 0));
+		ivec2 dstCoord = ivec2(gl_WorkGroupID.xy) * 16 + ivec2(lane, 0);
+		uint base = lane * 16u;
+		uvec4 packedOut = uvec4(
+			packSaturateI8x4(ivec4(sAcc[base + 0u],  sAcc[base + 1u],  sAcc[base + 2u],  sAcc[base + 3u]),  LAYER_RELU != 0),
+			packSaturateI8x4(ivec4(sAcc[base + 4u],  sAcc[base + 5u],  sAcc[base + 6u],  sAcc[base + 7u]),  LAYER_RELU != 0),
+			packSaturateI8x4(ivec4(sAcc[base + 8u],  sAcc[base + 9u],  sAcc[base + 10u], sAcc[base + 11u]), LAYER_RELU != 0),
+			packSaturateI8x4(ivec4(sAcc[base + 12u], sAcc[base + 13u], sAcc[base + 14u], sAcc[base + 15u]), LAYER_RELU != 0)
+		);
 		imageStore(uDst, dstCoord, packedOut);
 	}
 }
