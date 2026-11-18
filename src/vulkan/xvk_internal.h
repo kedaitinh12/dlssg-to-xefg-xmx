@@ -626,6 +626,7 @@ private:
     std::array<const Descriptor*, 64> tables_{};
     std::array<std::array<uint32_t, 64>, 16> constants_{};
     std::array<uint32_t, 16> constantMasks_{};
+    uint16_t constantsDirty_ = 0xFFFFu;
 };
 
 // ------------------------------------------------------------------ device

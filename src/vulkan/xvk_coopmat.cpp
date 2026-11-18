@@ -84,53 +84,22 @@ bool CoopMatrixRoute::SelectTile(const VkCooperativeMatrixPropertiesKHR* propert
     if (!properties || !count)
         return false;
 
-    // Preferred subgroup-scope SINT8 x SINT8 -> SINT32 shapes in priority order:
-    // 1. 16x8x32 (matches NVIDIA m16n8k32 & Intel Xe2 DPAS)
-    // 2. 16x16x32 (AMD RDNA 4 3rd-gen Matrix Core v_wmma_i32_16x16x32_iu8)
-    // 3. 16x16x16 (standard AMD RDNA 4 / RDNA 3 WMMA v_wmma_i32_16x16x16_iu8 & Intel Arc XMX)
-    // 4. 16x8x16
-    // 5. 8x8x16 (Intel Arc Alchemist DPAS 8x8x16 / Turing m8n8k16)
-    struct Shape { uint32_t m, n, k; };
-    static constexpr Shape kPreferred[] = {
-        {16, 8, 32},
-        {16, 16, 32},
-        {16, 16, 16},
-        {16, 8, 16},
-        {8, 8, 16},
-    };
-
-    auto matchesType = [](const VkCooperativeMatrixPropertiesKHR& p) noexcept {
-        return p.scope == VK_SCOPE_SUBGROUP_KHR &&
-               p.AType == VK_COMPONENT_TYPE_SINT8_KHR &&
-               p.BType == VK_COMPONENT_TYPE_SINT8_KHR &&
-               p.CType == VK_COMPONENT_TYPE_SINT32_KHR &&
-               p.ResultType == VK_COMPONENT_TYPE_SINT32_KHR &&
-               p.MSize > 0 && p.NSize > 0 && p.KSize > 0;
-    };
-
-    for (const auto& target : kPreferred)
-    {
-        for (uint32_t i = 0; i < count; ++i)
-        {
-            const auto& p = properties[i];
-            if (matchesType(p) && p.MSize == target.m && p.NSize == target.n && p.KSize == target.k)
-            {
-                m = p.MSize;
-                n = p.NSize;
-                k = p.KSize;
-                return true;
-            }
-        }
-    }
-
+    // xefg_coopmat_layers.comp uses fixed 16x16x16 subgroup-scope SINT8 x SINT8 -> SINT32 fragments
+    // (AMD RDNA 4 / RDNA 3 WMMA v_wmma_i32_16x16x16_iu8 and any GPU advertising 16x16x16 SINT8->SINT32).
+    // Only admit devices that actually support 16x16x16 so unsupported GPUs cleanly stay on DP4a.
     for (uint32_t i = 0; i < count; ++i)
     {
         const auto& p = properties[i];
-        if (matchesType(p))
+        if (p.scope == VK_SCOPE_SUBGROUP_KHR &&
+            p.AType == VK_COMPONENT_TYPE_SINT8_KHR &&
+            p.BType == VK_COMPONENT_TYPE_SINT8_KHR &&
+            p.CType == VK_COMPONENT_TYPE_SINT32_KHR &&
+            p.ResultType == VK_COMPONENT_TYPE_SINT32_KHR &&
+            p.MSize == 16u && p.NSize == 16u && p.KSize == 16u)
         {
-            m = p.MSize;
-            n = p.NSize;
-            k = p.KSize;
+            m = 16u;
+            n = 16u;
+            k = 16u;
             return true;
         }
     }
@@ -209,10 +178,23 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
             return false;
         }
 
-        VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        VkPhysicalDeviceSubgroupSizeControlProperties subgroupCtrl{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+        VkPhysicalDeviceSubgroupProperties subgroup{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, &subgroupCtrl};
         VkPhysicalDeviceProperties2 devProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &subgroup};
         props2(desc.physicalDevice, &devProps);
-        subgroupSize_ = subgroup.subgroupSize ? subgroup.subgroupSize : 32u;
+
+        const bool supportsWave32 =
+            (subgroupCtrl.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
+            subgroupCtrl.minSubgroupSize <= 32u && subgroupCtrl.maxSubgroupSize >= 32u;
+        if (!supportsWave32 && subgroup.subgroupSize != 32u)
+        {
+            reason = "no_s8_matrix_shape";
+            return false;
+        }
+        subgroupSize_ = 32u;
+        requireSubgroupSize32_ = supportsWave32;
 
         device_ = desc.device;
         options_ = options;
@@ -320,11 +302,18 @@ bool CoopMatrixRoute::EnsureLayerPipeline(Device& device, uint8_t layerIdx, Pipe
     specInfo.dataSize = sizeof(specData);
     specInfo.pData = specData;
 
+    // Enforce Wave32 (subgroup size 32) on AMD RDNA 3 / RDNA 4 so the 128-thread workgroup always maps to
+    // 4 uniform 32-lane warps (warp = tid >> 5) for coopMatLoad / coopMatMulAdd.
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo reqSubgroup{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+        nullptr,
+        32u
+    };
     VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     pipelineInfo.stage = {
         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        nullptr,
-        0,
+        requireSubgroupSize32_ ? &reqSubgroup : nullptr,
+        requireSubgroupSize32_ ? VkPipelineShaderStageCreateFlags(VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT) : 0u,
         VK_SHADER_STAGE_COMPUTE_BIT,
         shaderModule,
         "main",
@@ -390,9 +379,10 @@ bool CoopMatrixRoute::TryLaunch(Device& device, VkCommandBuffer buffer, uint8_t 
             return fallback("no_coopmat_module");
 
         const auto& ranges = basePso.ranges();
-        std::array<VkWriteDescriptorSet, 64> writes{};
-        std::array<VkDescriptorImageInfo, 64> images{};
-        std::array<VkDescriptorBufferInfo, 64> buffers{};
+        // Avoid zero-initializing 6 KB of stack memory on every WMMA Dispatch; only [0..count) are written and passed.
+        std::array<VkWriteDescriptorSet, 64> writes;
+        std::array<VkDescriptorImageInfo, 64> images;
+        std::array<VkDescriptorBufferInfo, 64> buffers;
         if (ranges.size() > writes.size())
             return fallback("bindings_overflow");
 
@@ -466,9 +456,8 @@ bool CoopMatrixRoute::TryLaunch(Device& device, VkCommandBuffer buffer, uint8_t 
                            constants[basePso.constantsParameter()].data());
         }
 
-        XefgCudaParams params{};
-        uint32_t gx = x, gy = y;
-        xefg_cuda::FillLaunch(layer, x, y, constants[2].data(), params, gx, gy);
+        const uint32_t gx = (x * layer.intelW + layer.tileW - 1) / layer.tileW;
+        const uint32_t gy = (y * layer.intelH + layer.tileH - 1) / layer.tileH;
         dispatch_(buffer, gx, gy, layer.gridZ);
 
         if (options_.fullBarriers)

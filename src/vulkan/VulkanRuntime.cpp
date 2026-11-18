@@ -992,8 +992,11 @@ namespace
 		if (!EnsureFeature(d, f, in, inverted, jittered))
 			return false;
 
-		// Takes effect from XeFG's next Execute on
-		XeFG::SetDebugLines(Plugin::options.debugLines);
+		// Takes effect from XeFG's next Execute on; only call into libxess_fg.dll when the toggle changes
+		const bool debugLines = Plugin::options.debugLines.load(std::memory_order_relaxed);
+		static std::atomic<int> sLastDebugLines{ -1 };
+		if (sLastDebugLines.exchange(debugLines ? 1 : 0, std::memory_order_relaxed) != (debugLines ? 1 : 0))
+			XeFG::SetDebugLines(debugLines);
 
 		const bool reset = parameters.GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
 		Slot& slot = f.slots[f.current];

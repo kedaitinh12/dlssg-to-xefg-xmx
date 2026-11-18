@@ -68,6 +68,7 @@ private:
     CoopMatrixOptions options_{};
     uint32_t tileM_{}, tileN_{}, tileK_{};
     uint32_t subgroupSize_{};
+    bool requireSubgroupSize32_{};
     uint32_t installedLayers_{};
     std::array<std::vector<uint32_t>, 17> spirvModules_{};
     std::array<VkPipeline, 17> pipelines_{};

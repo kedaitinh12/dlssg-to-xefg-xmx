@@ -88,6 +88,7 @@ void STDMETHODCALLTYPE CommandList::ClearState(ID3D12PipelineState* pso)
     boundPipeline_ = VK_NULL_HANDLE;
     tables_.fill(nullptr);
     constantMasks_.fill(0);
+    constantsDirty_ = 0xFFFFu;
     if (pso) SetPipelineState(pso);
 }
 
@@ -103,6 +104,7 @@ void STDMETHODCALLTYPE CommandList::SetComputeRootSignature(ID3D12RootSignature*
         // D3D12: changing the root signature invalidates all root arguments.
         tables_.fill(nullptr);
         constantMasks_.fill(0);
+        constantsDirty_ = 0xFFFFu;
         rootSignature_ = next;
     }
 }
@@ -118,6 +120,7 @@ void STDMETHODCALLTYPE CommandList::SetComputeRoot32BitConstant(UINT parameter, 
     if (parameter >= constants_.size() || offset >= constants_[0].size()) { Fail("root constant index"); return; }
     constants_[parameter][offset] = value;
     if (offset < 32) constantMasks_[parameter] |= 1u << offset;
+    constantsDirty_ |= uint16_t(1u << parameter);
 }
 
 void STDMETHODCALLTYPE CommandList::SetComputeRoot32BitConstants(UINT parameter, UINT count, const void* data, UINT offset)
@@ -125,6 +128,7 @@ void STDMETHODCALLTYPE CommandList::SetComputeRoot32BitConstants(UINT parameter,
     if (parameter >= constants_.size() || offset + count > constants_[0].size()) { Fail("root constants range"); return; }
     memcpy(constants_[parameter].data() + offset, data, size_t(count) * 4);
     for (UINT i = offset; i < std::min<UINT>(offset + count, 32); ++i) constantMasks_[parameter] |= 1u << i;
+    constantsDirty_ |= uint16_t(1u << parameter);
 }
 
 void STDMETHODCALLTYPE CommandList::Dispatch(UINT x, UINT y, UINT z)
@@ -145,11 +149,13 @@ void STDMETHODCALLTYPE CommandList::Dispatch(UINT x, UINT y, UINT z)
     if (boundPipeline_ != pso_->pipeline()) {
         vk.vkCmdBindPipeline(buffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pso_->pipeline());
         boundPipeline_ = pso_->pipeline();
+        constantsDirty_ = 0xFFFFu;
     }
     const auto& ranges = pso_->ranges();
-    std::array<VkWriteDescriptorSet, 64> writes{};
-    std::array<VkDescriptorImageInfo, 64> images{};
-    std::array<VkDescriptorBufferInfo, 64> buffers{};
+    // Avoid zero-initializing 6 KB of stack memory on every Dispatch; only indices [0..count) are written and passed.
+    std::array<VkWriteDescriptorSet, 64> writes;
+    std::array<VkDescriptorImageInfo, 64> images;
+    std::array<VkDescriptorBufferInfo, 64> buffers;
     if (ranges.size() > writes.size()) { Fail("too many bindings"); return; }
     for (size_t i = 0; i < ranges.size(); ++i) {
         const BoundRange& r = ranges[i];
@@ -197,9 +203,14 @@ void STDMETHODCALLTYPE CommandList::Dispatch(UINT x, UINT y, UINT z)
     }
     if (count)
         vk.vkCmdPushDescriptorSetKHR(buffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pso_->layout(), 0, uint32_t(count), writes.data());
-    if (pso_->pushConstantBytes())
-        vk.vkCmdPushConstants(buffer_, pso_->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, pso_->pushConstantBytes(),
-                              constants_[pso_->constantsParameter()].data());
+    if (pso_->pushConstantBytes()) {
+        const uint16_t paramBit = uint16_t(1u << pso_->constantsParameter());
+        if (constantsDirty_ & paramBit) {
+            vk.vkCmdPushConstants(buffer_, pso_->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, pso_->pushConstantBytes(),
+                                  constants_[pso_->constantsParameter()].data());
+            constantsDirty_ &= ~paramBit;
+        }
+    }
     vk.vkCmdDispatch(buffer_, x, y, z);
     for (const auto& range : ranges)
         if (const auto* table = tables_[range.parameter]; table && table[range.offset].kind == DescriptorKind::UavBuffer && table[range.offset].resource)
@@ -243,7 +254,9 @@ Scope FromState(D3D12_RESOURCE_STATES state)
     constexpr VkPipelineStageFlags2 kShaders = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT;
     take(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
          VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT, true);
-    take(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, kShaders, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT, false);
+    // xvk executes pure compute + transfer workloads; scoping NON_PIXEL_SHADER_RESOURCE to COMPUTE_SHADER_BIT avoids
+    // stalling the host game's graphics pipeline on every inter-layer barrier in Fallback (DP4a) and XMX Port (DP4a).
+    take(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT, false);
     take(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, kShaders, VK_ACCESS_2_SHADER_READ_BIT, false);
     take(D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, kShaders, VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT, false);
     take(D3D12_RESOURCE_STATE_INDEX_BUFFER, VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT, VK_ACCESS_2_INDEX_READ_BIT, false);
