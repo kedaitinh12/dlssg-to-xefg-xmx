@@ -144,6 +144,35 @@ def check_fatbin(path, pin):
     return digest, len(data)
 
 
+
+
+def check_vulkan_manifest_layers(header):
+    manifest = ROOT / "third_party" / "xefg_mfg_programs" / "vulkan" / "programs.tsv"
+    if not manifest.is_file() or not header:
+        return
+    rows = [line.strip().split("\t") for line in manifest.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if len(rows) != 83:
+        problem(f"vulkan/programs.tsv has {len(rows)} rows, 83 expected")
+        return
+    if rows[0][6] != "00b1098a80a5e662de426284e6bf7bdf82ed236eb7c8aef1e74f9ebed204019a":
+        problem(f"vulkan/programs.tsv row 0 has unexpected DXIL {rows[0][6]}")
+    if any(r[6] == "-" for r in rows):
+        problem("vulkan/programs.tsv contains unhashed ('-') DXIL rows from shifted extractor")
+    index = {r[6]: idx for idx, r in enumerate(rows) if r[6] != "-"}
+
+    for number, (strings, fields) in enumerate(header["rows"], 1):
+        program, sha256, kernel = strings[:3]
+        family = fields[1].replace("Family::", "")
+        if sha256 not in index:
+            problem(f"layer {number} ({kernel}): DXIL {sha256[:12]}... not in Vulkan programs.tsv")
+            continue
+        spv_row = rows[index[sha256]]
+        exp_push = "48" if family == "Flow" else "16"
+        exp_types = "0:2,1:0,2:0,3:0,4:2,64:3" if family == "Decoder" else "0:2,1:0,2:0,3:0,64:3"
+        if spv_row[3] != exp_push or spv_row[9] != exp_types:
+            problem(f"layer {number} ({kernel}): row {spv_row[0]} has push={spv_row[3]} types={spv_row[9]}, expected push={exp_push} types={exp_types}")
+
+
 def main(argv):
     fatbin = None
     pin = True
@@ -168,6 +197,7 @@ def main(argv):
 
     if header:
         check_one(HEADER.name, header)
+        check_vulkan_manifest_layers(header)
 
     if route and header:
         for key, what in (("kernels", "kernel lists"), ("flow", "kFlowConstants")):

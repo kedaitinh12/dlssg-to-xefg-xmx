@@ -33,6 +33,7 @@ sources=(
 	src/MfgPort/Cuda/cuda_route.h
 	src/MfgPort/Cuda/cuda_layers.h
 	src/MfgPort/Cuda/cuda_vulkan.cpp
+	src/MfgPort/Wmma/wmma_route.h
 	tests/vulkan_runtime/tensor_api_check.cpp
 	src/VulkanProvider.cpp
 	src/ExportsVulkan.cpp

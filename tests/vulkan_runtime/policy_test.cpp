@@ -346,11 +346,17 @@ int main()
 	// ---- the VK_KHR_cooperative_matrix route: when it replaces the layers and what its reasons mean
 	{
 		using VulkanPolicy::UseCoopMatrix;
-		CHECK(UseCoopMatrix(true, true, false, false));   // XMX Port
-		CHECK(UseCoopMatrix(true, false, true, false));   // XMX (native)
-		CHECK(UseCoopMatrix(true, false, false, true));   // CUDA fallback on AMD/Intel
-		CHECK(!UseCoopMatrix(true, false, false, false));
-		CHECK(!UseCoopMatrix(false, true, false, false)); // DP4a model
+		using VulkanPolicy::IsAmdRdna4Device;
+		CHECK(UseCoopMatrix(true, true, false, false));         // XMX Port
+		CHECK(UseCoopMatrix(true, false, true, false));         // XMX (native)
+		CHECK(UseCoopMatrix(true, false, false, true));         // CUDA fallback on AMD/Intel
+		CHECK(UseCoopMatrix(true, false, false, false, true));  // WMMA model path
+		CHECK(!UseCoopMatrix(true, false, false, false, false));
+		CHECK(!UseCoopMatrix(false, false, false, false, true));// DP4a model ignores WMMA
+		CHECK(!UseCoopMatrix(false, true, false, false));       // DP4a model
+		CHECK(IsAmdRdna4Device(0x1002, 0x7550, "AMD Radeon RX 9070 XT"));
+		CHECK(!IsAmdRdna4Device(0x1002, 0x744C, "AMD Radeon RX 7900 XTX"));
+		CHECK(!IsAmdRdna4Device(0x10DE, 0x7550, "NVIDIA GeForce RTX 5060"));
 
 		const char* coopCodes[] = { "environment_off", "no_port", "already_attempted", "no_extensions", "device_inputs",
 			"instance_functions", "device_functions", "no_int8_tile", "layout_create", "shader_dir_missing", "exception",
