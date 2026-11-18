@@ -511,7 +511,9 @@ namespace
 		return {};
 	}
 
-	void StartFromAsi()
+	std::once_flag asiStartOnce;
+
+	void StartFromAsiImpl()
 	{
 		const auto self = ThisModulePath();
 		Log::Info("InitializeASI, {}", self.string());
@@ -552,6 +554,11 @@ namespace
 
 		Log::Info("Starting {}", main.string());
 		start();
+	}
+
+	void StartFromAsi()
+	{
+		std::call_once(asiStartOnce, StartFromAsiImpl);
 	}
 } // namespace
 
@@ -604,9 +611,26 @@ extern "C" __declspec(dllexport) void InitializeASI()
 
 extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* optiApi, OptiPlugin* plugin)
 {
-	// The early copy has done its job in InitializeASI, the menu and the settings are the real dll's
+	// The early copy has no menu or settings of its own; those belong to the main dll.
+	// OptiScaler v10+ may invoke OptiPluginInit without calling InitializeASI when OptiPluginInit is exported,
+	// so trigger StartFromAsi() here as well (idempotent via std::call_once).
 	if (IsEarlyCopy())
+	{
+		try
+		{
+			StartFromAsi();
+		}
+		catch (const std::exception& error)
+		{
+			Log::Error("OptiPluginInit (early copy): {}", error.what());
+		}
+		catch (...)
+		{
+			Log::Error("OptiPluginInit (early copy) failed");
+		}
+
 		return false;
+	}
 
 	api = optiApi;
 	self = plugin;
