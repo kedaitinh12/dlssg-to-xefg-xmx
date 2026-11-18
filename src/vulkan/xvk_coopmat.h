@@ -71,6 +71,7 @@ private:
     uint32_t installedLayers_{};
     std::array<std::vector<uint32_t>, 17> spirvModules_{};
     std::array<VkPipeline, 17> pipelines_{};
+    std::array<std::atomic<bool>, 17> pipelineReady_{};
     std::array<std::atomic<bool>, 17> pipelineFailed_{};
     std::array<std::atomic<bool>, 17> seen_{};
     std::atomic<bool> active_{};

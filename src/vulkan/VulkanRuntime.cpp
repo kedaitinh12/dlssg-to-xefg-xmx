@@ -4,8 +4,8 @@
 // this repository: XeFG is driven through XeFG.h, the ported model comes from MfgKernels, the model follows the menu's
 // network path, and the programs are the ones in xefg_mfg_programs\vulkan (VulkanPrograms.h). The tensor-core route of an
 // NVIDIA GPU is in (VulkanTensor.h), selected by the CUDA network path. The cooperative-matrix route of an AMD RDNA3/RDNA4
-// or Intel Arc GPU is in (VulkanCoopMat.h), selected by the XMX Port and XMX (native) network paths. Left out: its GPU timing
-// and its registration as an OptiScaler provider.
+// or Intel Arc GPU is in (VulkanCoopMat.h), selected by the WMMA, XMX Port and XMX (native) network paths. Left out: its GPU
+// timing and its registration as an OptiScaler provider.
 //
 // Every evaluation records into the VkCommandBuffer the game gives NVSDK_NGX_VULKAN_EvaluateFeature. The game's images
 // are copied into images of the layer's own device, XeFG records its dispatches on a D3D12 command list of that device,
@@ -181,6 +181,8 @@ namespace
 		bool inverted = false;
 		bool jittered = false;
 		int32_t model = 0;
+		int32_t loggedPath = -1;
+		bool createFailed = false; // retried when settings or network path (including WMMA) change
 
 		std::array<Slot, 2> slots;
 		uint32_t current = 0;
@@ -271,7 +273,8 @@ namespace
 
 	const char* ModelText(int32_t model)
 	{
-		return model == MfgKernels::MfgModel ? "port" : "DP4a";
+		return model != MfgKernels::MfgModel ? "DP4a"
+		     : (Plugin::options.path.load() == Plugin::Path::Wmma && gCoopGate.load() ? "WMMA" : "port");
 	}
 
 	// With gDevice.mutex held
@@ -490,6 +493,10 @@ namespace
 		}
 
 		d.coopReason = d.coopInstalled ? std::string() : coopStatusReason;
+
+		auto unknown = Plugin::WmmaSupport::Unknown;
+		Plugin::wmmaSupport.compare_exchange_strong(unknown,
+			d.coopInstalled ? Plugin::WmmaSupport::Supported : Plugin::WmmaSupport::Unsupported);
 	}
 
 	// The layer's device on the game's, XeFG with its model, and the copy pipelines. With gDevice.mutex held
@@ -641,8 +648,8 @@ namespace
 	}
 
 	// The tensor-core route replaces layers while the ported model runs on the CUDA path (VulkanPolicy::UseTensorCores).
-	// The path can change without a new context, CUDA and XMX Port run the same model and only what executes the layers
-	// differs, so this is set on every batch. A layer the route can't take stays a SPIR-V program in the same frame
+	// The path can change without a new context, CUDA, WMMA, and XMX Port run the same model and only what executes the
+	// layers differs, so this is set on every batch. A layer the route can't take stays a SPIR-V program in the same frame
 	void ApplyTensorGate(const Device& d, int32_t model)
 	{
 		const auto path = Plugin::options.path.load();
@@ -656,15 +663,19 @@ namespace
 			Log::Info("Vulkan tensor cores: {}", on ? "on, the CUDA path runs the int8 layers on the tensor cores" : "off");
 
 		// When the CUDA cubin route is not active, the VK_KHR_cooperative_matrix route runs the int8 layers on
-		// AMD RDNA3/RDNA4 (WMMA) or Intel Arc (XMX) hardware for the XMX Port, XMX (native), and CUDA paths
+		// AMD RDNA3/RDNA4 (WMMA) or Intel Arc (XMX) hardware for the WMMA, XMX Port, XMX (native), and CUDA paths
 		const bool coopOn = !on && d.coopInstalled && VulkanPolicy::UseCoopMatrix(portModel,
-			path == Plugin::Path::XmxPort, path == Plugin::Path::XmxNative, path == Plugin::Path::Cuda);
+			path == Plugin::Path::XmxPort, path == Plugin::Path::XmxNative, path == Plugin::Path::Cuda,
+			path == Plugin::Path::Wmma);
 
 		xvk::SetCoopMatrixEnabled(d.d3d.Get(), coopOn);
 
 		if (gCoopGate.exchange(coopOn) != coopOn)
-			Log::Info("Vulkan cooperative matrix: {}",
+		{
+			SetModelName(model);
+			Log::Info("Vulkan cooperative matrix (WMMA/XMX): {}",
 				coopOn ? "on, VK_KHR_cooperative_matrix runs the int8 layers on hardware matrix units" : "off");
+		}
 	}
 
 	// The network the menu and OptiScaler show for the model that runs
@@ -676,6 +687,10 @@ namespace
 		// The route turns itself off after a driver fault, then the layers are the SPIR-V ones
 		if (gTensorGate.load() && xefg_cuda::VulkanActive())
 			return Plugin::Network::Cuda;
+
+		if (gCoopGate.load() && xefg_cuda::CoopMatrixActive() &&
+			(Plugin::options.path.load() == Plugin::Path::Wmma || gDevice.vendor == 0x1002))
+			return Plugin::Network::Wmma;
 
 		return Plugin::Network::XmxPort;
 	}
@@ -705,17 +720,29 @@ namespace
 
 		ApplyTensorGate(d, model);
 
-		const bool same = f.width == bb.width && f.height == bb.height && f.format == format &&
+		const auto path = static_cast<int32_t>(Plugin::options.path.load());
+		if (path != f.loggedPath)
+		{
+			f.loggedPath = path;
+			f.createFailed = false;
+		}
+
+		const bool sameSettings = f.width == bb.width && f.height == bb.height && f.format == format &&
 			f.depthWidth == depth.width && f.depthHeight == depth.height && f.motionFormat == motionFormat &&
 			f.hudlessFormat == hudlessFormat && f.uiFormat == uiFormat && f.inverted == inverted &&
 			f.jittered == jittered && f.model == model;
 
-		if (same && f.context)
-			return true;
-		if (same && !f.initFault.empty())
+		if (sameSettings)
 		{
-			f.fault = f.initFault;
-			return false;
+			if (f.context)
+				return true;
+			if (!f.initFault.empty())
+			{
+				f.fault = f.initFault;
+				return false;
+			}
+			if (f.createFailed)
+				return false;
 		}
 		f.initFault.clear();
 
@@ -726,6 +753,7 @@ namespace
 		}
 
 		f.havePrevious = false;
+		f.createFailed = false;
 		f.width = bb.width;
 		f.height = bb.height;
 		f.format = format;
@@ -755,6 +783,7 @@ namespace
 					FAILED(CreateTexture(d3d, in.ui->width, in.ui->height, uiFormat, slot.ui))))
 			{
 				f.fault = "input_images";
+				f.createFailed = true;
 				return false;
 			}
 
@@ -764,6 +793,7 @@ namespace
 			if (!slot.depthView || !slot.motionView)
 			{
 				f.fault = "input_views";
+				f.createFailed = true;
 				return false;
 			}
 		}
@@ -773,6 +803,7 @@ namespace
 			if (FAILED(CreateTexture(d3d, f.width, f.height, format, output)))
 			{
 				f.fault = "output_images";
+				f.createFailed = true;
 				return false;
 			}
 		}
@@ -780,6 +811,7 @@ namespace
 		if (!f.allocator && FAILED(d3d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&f.allocator))))
 		{
 			f.fault = "allocator";
+			f.createFailed = true;
 			return false;
 		}
 
@@ -794,6 +826,7 @@ namespace
 		if (result != XEFGD_RESULT_SUCCESS || !context)
 		{
 			f.fault = "create_context_" + std::to_string(result);
+			f.createFailed = true;
 			return false;
 		}
 
@@ -814,6 +847,7 @@ namespace
 		{
 			CallXeFG("Destroy", [&] { return XeFG::Destroy(context); });
 			f.fault = "init_" + std::to_string(result);
+			f.createFailed = true;
 			if (xvk::MissingProgramCount() != missingBefore)
 			{
 				f.initFault = f.fault + "_missing_spirv";

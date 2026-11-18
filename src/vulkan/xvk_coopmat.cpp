@@ -85,13 +85,15 @@ bool CoopMatrixRoute::SelectTile(const VkCooperativeMatrixPropertiesKHR* propert
         return false;
 
     // Preferred subgroup-scope SINT8 x SINT8 -> SINT32 shapes in priority order:
-    // 1. 16x8x32 (matches NVIDIA m16n8k32 & Intel Xe2 DPAS / AMD RDNA4)
-    // 2. 16x16x16 (standard AMD RDNA3/RDNA4 WMMA v_wmma_i32_16x16x16_iu8 & Intel Arc XMX)
-    // 3. 16x8x16
-    // 4. 8x8x16 (Intel Arc Alchemist DPAS 8x8x16 / Turing m8n8k16)
+    // 1. 16x8x32 (matches NVIDIA m16n8k32 & Intel Xe2 DPAS)
+    // 2. 16x16x32 (AMD RDNA 4 3rd-gen Matrix Core v_wmma_i32_16x16x32_iu8)
+    // 3. 16x16x16 (standard AMD RDNA 4 / RDNA 3 WMMA v_wmma_i32_16x16x16_iu8 & Intel Arc XMX)
+    // 4. 16x8x16
+    // 5. 8x8x16 (Intel Arc Alchemist DPAS 8x8x16 / Turing m8n8k16)
     struct Shape { uint32_t m, n, k; };
     static constexpr Shape kPreferred[] = {
         {16, 8, 32},
+        {16, 16, 32},
         {16, 16, 16},
         {16, 8, 16},
         {8, 8, 16},
@@ -278,6 +280,8 @@ bool CoopMatrixRoute::EnsureLayerPipeline(Device& device, uint8_t layerIdx, Pipe
         return false;
 
     const size_t idx = layerIdx - 1;
+    if (pipelineReady_[idx].load(std::memory_order_acquire))
+        return true;
     if (pipelineFailed_[idx].load(std::memory_order_relaxed))
         return false;
 
@@ -340,6 +344,7 @@ bool CoopMatrixRoute::EnsureLayerPipeline(Device& device, uint8_t layerIdx, Pipe
 
     (void)device;
     pipelines_[idx] = created;
+    pipelineReady_[idx].store(true, std::memory_order_release);
     return true;
 }
 

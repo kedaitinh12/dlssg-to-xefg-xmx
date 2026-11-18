@@ -289,11 +289,26 @@ namespace VulkanPolicy
 	}
 
 	// The VK_KHR_cooperative_matrix route (AMD RDNA3/RDNA4 WMMA and Intel Arc/Battlemage XMX) replaces the int8 layers of
-	// the ported MFG model when the XMX Port, XMX (native), or CUDA path is selected on a GPU where the NVIDIA CUDA cubin
-	// route isn't active. Fallback (DP4a) keeps XeFG's stock model.
-	inline bool UseCoopMatrix(bool portModel, bool xmxPortPath, bool xmxNativePath, bool cudaPath) noexcept
+	// the ported MFG model when the WMMA, XMX Port, XMX (native), or CUDA path is selected on a GPU where the NVIDIA CUDA
+	// cubin route isn't active. Fallback (DP4a) keeps XeFG's stock model.
+	inline bool UseCoopMatrix(bool portModel, bool xmxPortPath, bool xmxNativePath, bool cudaPath, bool wmmaPath = false) noexcept
 	{
-		return portModel && (xmxPortPath || xmxNativePath || cudaPath);
+		return portModel && (xmxPortPath || xmxNativePath || cudaPath || wmmaPath);
+	}
+
+	// Identifies AMD RDNA 4 (gfx1200/gfx1201: RX 9070 XT / 9070 / 9060 XT, PCI DeviceID 0x7550..0x75FF), where 3rd-gen
+	// Matrix Cores deliver 2048 INT8 ops/clock/CU (4x DP4a's 512 ops/clock/CU).
+	inline bool IsAmdRdna4Device(uint32_t vendorId, uint32_t deviceId, std::string_view deviceName = {}) noexcept
+	{
+		if (vendorId != 0x1002)
+			return false;
+
+		if (deviceId >= 0x7550 && deviceId <= 0x75FF)
+			return true;
+
+		return deviceName.find("RX 90") != std::string_view::npos ||
+		       deviceName.find("RDNA 4") != std::string_view::npos ||
+		       deviceName.find("gfx12") != std::string_view::npos;
 	}
 
 	// What a reason code of the cooperative-matrix route means, for the log and the menu
