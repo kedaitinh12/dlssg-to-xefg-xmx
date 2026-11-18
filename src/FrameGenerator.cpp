@@ -502,7 +502,7 @@ void FrameGenerator::ProbeSupport(ID3D12Device* device)
 				Plugin::wmmaSupport = Plugin::WmmaSupport::Supported;
 				xefg_wmma::SetEnabled(false);
 			}
-			else if (wmmaReason != "not_amd")
+			else
 			{
 				Log::Info("WMMA route inactive: {}", wmmaReason);
 			}

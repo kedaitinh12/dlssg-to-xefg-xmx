@@ -138,6 +138,13 @@ bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem
             return false;
         }
 
+        // Log the identity actually seen by this route. Hosts can hook GetDesc1,
+        // so these values are not proof of the physical adapter's identity.
+        Log("wmma_adapter_probe",
+            std::string("\"vendor_id\":") + std::to_string(desc.VendorId) +
+            ",\"device_id\":" + std::to_string(desc.DeviceId) +
+            ",\"source\":\"dxgi_getdesc1\"");
+
         if (desc.VendorId != 0x1002)
         {
             gReason = "not_amd";
