@@ -74,6 +74,7 @@
     <ClCompile Include="src\MfgPort\RuntimePayload.cpp" />
     <ClCompile Include="src\MfgPort\Cuda\cuda_route.cpp" />
     <ClCompile Include="src\MfgPort\Cuda\cuda_vulkan.cpp" />
+    <ClCompile Include="src\MfgPort\Wmma\wmma_route.cpp" />
     <ClCompile Include="src\Plugin.cpp" />
     <ClCompile Include="src\VulkanPrograms.cpp" />
     <ClCompile Include="src\VulkanProvider.cpp" />
@@ -128,6 +129,7 @@
     <ClInclude Include="src\MfgPort\Cuda\cuda_route.h" />
     <ClInclude Include="src\MfgPort\Cuda\OverlayNative.h" />
     <ClInclude Include="src\MfgPort\Cuda\xefg_cuda_params.h" />
+    <ClInclude Include="src\MfgPort\Wmma\wmma_route.h" />
     <ClInclude Include="src\NGX.h" />
     <ClInclude Include="src\optiscaler_plugin.h" />
     <ClInclude Include="src\Plugin.h" />
