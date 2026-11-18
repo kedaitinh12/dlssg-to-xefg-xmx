@@ -1,0 +1,252 @@
+From 64514e163ca0c12fdc0d43be12f1487de6bd209e Mon Sep 17 00:00:00 2001
+From: OptiScaler-Modder <modder@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 21:38:27 +0000
+Subject: [PATCH 3/3] build(ci): wire D3D12 WMMA (DXC) & Vulkan coopmat shaders
+ into MSBuild and GitHub Actions
+
+---
+ .github/workflows/build.yml   | 60 ++++++++++++++++++++++++++++++----
+ .github/workflows/release.yml | 61 +++++++++++++++++++++++++++++++++--
+ dlssg-to-xefg.vcxproj         | 12 +++++++
+ 3 files changed, 123 insertions(+), 10 deletions(-)
+
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index 9341500..3073aa1 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -93,6 +93,14 @@ jobs:
+             python tests/vulkan_runtime/check_layer_tables.py --fatbin bin/Release/xefg_mfg_programs/xefg_cuda_layers.fatbin
+           }
+ 
++      # Build the 16 D3D12 WMMA / dot4add_i8packed compute shaders (17 <program>.dxbc overrides) into bin\Release\xefg_mfg_programs\wmma
++      - name: Build D3D12 WMMA compute shaders (DXC cs_6_6)
++        id: wmma_d3d12
++        shell: pwsh
++        run: |
++          ./tools/GenerateXeFgWmma.ps1 -Output bin\Release\xefg_mfg_programs\wmma
++          "built=true" >> $env:GITHUB_OUTPUT
++
+       # The extractor fails when the program set of the asi doesn't check out against the hashes the asi lists itself, the
+       # inspector when the asi isn't one this dll can use.
+       - name: Vulkan models
+@@ -122,21 +130,44 @@ jobs:
+           Write-Host "Vulkan models from $source"
+           exit 0
+ 
+-      # Build the 16 SPV_KHR_cooperative_matrix shaders into bin\Release\xefg_mfg_programs\vulkan\coopmat when glslangValidator is available
++      # Build the 16 SPV_KHR_cooperative_matrix shaders into bin\Release\xefg_mfg_programs\vulkan\coopmat for WMMA/XMX
+       - name: Build Vulkan cooperative-matrix shaders (WMMA/XMX)
++        id: coopmat
+         shell: pwsh
+         run: |
+-          $glslang = Get-Command glslangValidator -ErrorAction SilentlyContinue
+-          if (-not $glslang -and $env:VULKAN_SDK) {
++          $exe = $null
++          $cmd = Get-Command glslangValidator -ErrorAction SilentlyContinue
++          if ($cmd) { $exe = $cmd.Source }
++          if (-not $exe -and $env:VULKAN_SDK) {
+             $candidate = Join-Path $env:VULKAN_SDK "Bin\glslangValidator.exe"
+-            if (Test-Path $candidate) { $glslang = $candidate }
++            if (Test-Path $candidate) { $exe = $candidate }
++          }
++          if (-not $exe) {
++            $dlDir = Join-Path $env:RUNNER_TEMP "glslang-bin"
++            $zipPath = Join-Path $env:RUNNER_TEMP "glslang.zip"
++            New-Item -ItemType Directory -Path $dlDir -Force | Out-Null
++            $urls = @(
++              "https://github.com/KhronosGroup/glslang/releases/latest/download/glslang-main-windows-x64-Release.zip",
++              "https://github.com/KhronosGroup/glslang/releases/download/main-tot/glslang-master-windows-Release.zip"
++            )
++            foreach ($u in $urls) {
++              try {
++                Invoke-WebRequest -Uri $u -OutFile $zipPath -UseBasicParsing
++                Expand-Archive -Path $zipPath -DestinationPath $dlDir -Force
++                $found = Get-ChildItem -Path $dlDir -Recurse -Filter "glslangValidator.exe" | Select-Object -First 1
++                if ($found) { $exe = $found.FullName; break }
++              } catch {
++                Write-Warning "Could not fetch glslang from $u : $_"
++              }
++            }
+           }
+-          if ($glslang) {
+-            $exe = if ($glslang -is [string]) { $glslang } else { $glslang.Source }
++          if ($exe) {
+             python tools/GenerateXeFgCoopMat.py --glslang "$exe" --output bin\Release\xefg_mfg_programs\vulkan\coopmat
+             if ($LASTEXITCODE -ne 0) { throw "GenerateXeFgCoopMat.py failed" }
++            "built=true" >> $env:GITHUB_OUTPUT
+           } else {
+-            Write-Host "glslangValidator not found on runner; skipping optional coopmat SPIR-V compilation."
++            Write-Warning "glslangValidator not available; skipping optional coopmat SPIR-V compilation."
++            "built=false" >> $env:GITHUB_OUTPUT
+           }
+ 
+       # Every function the sources mark as exported has to be in the dll's export table, the NGX D3D12 and Vulkan
+@@ -174,11 +205,22 @@ jobs:
+             if (-not (Test-Path (Join-Path $programs $name))) { throw "$name is missing from the XeFG MFG program set" }
+           }
+ 
++          if ("${{ steps.wmma_d3d12.outputs.built }}" -eq "true") {
++            foreach ($name in "wmma_layers.tsv", "aa016078.dxbc", "3453044.dxbc") {
++              if (-not (Test-Path (Join-Path $programs "wmma\$name"))) { throw "$name is missing from the D3D12 WMMA shaders" }
++            }
++          }
++
+           $models = "none"
+           if ("${{ steps.models.outputs.source }}" -ne "none") {
+             foreach ($name in "programs.tsv", "SOURCE.txt", "LICENSE", "7400.spv", "7482.spv") {
+               if (-not (Test-Path (Join-Path $programs "vulkan\$name"))) { throw "$name is missing from the Vulkan models" }
+             }
++            if ("${{ steps.coopmat.outputs.built }}" -eq "true") {
++              foreach ($name in "coopmat_layers.tsv", "L_aa016078.spv", "L_3453044.spv") {
++                if (-not (Test-Path (Join-Path $programs "vulkan\coopmat\$name"))) { throw "$name is missing from the Vulkan WMMA/XMX coopmat shaders" }
++              }
++            }
+             $models = (Get-Content (Join-Path $programs "vulkan\SOURCE.txt") -TotalCount 1)
+           }
+ 
+@@ -187,6 +229,7 @@ jobs:
+             "",
+             "- Vulkan runtime: built in, Vulkan headers VK_HEADER_VERSION ${{ steps.vulkan.outputs.version }}",
+             "- Vulkan models: $models",
++            "- Routes built in: XMX (native), XMX Port (DP4a INT8), CUDA Tensor Cores (sm_75/86/89/120), AMD WMMA INT8 (D3D12 cs_6_6 & Vulkan VK_KHR_cooperative_matrix)",
+             "- Artifact: ``custom\XeMFG XMX\dlssg\dlssg_to_xefg_intel_is_better.dll`` with ``xefg_mfg_programs`` beside it"
+           ) -join "`n" >> $env:GITHUB_STEP_SUMMARY
+ 
+@@ -276,6 +319,9 @@ jobs:
+       - name: Tensor-core layer tables
+         run: python3 tests/vulkan_runtime/check_layer_tables.py
+ 
++      - name: WMMA RDNA 4 performance model check
++        run: python3 tools/BenchmarkXeFgWmmaRdna4.py
++
+       # The checker of a libxess_fg.dll (tools/CheckXeFgBuild.py): its zstd decoder, its reading of this repository's tables and
+       # its answer to files that aren't what it expects. None of that needs the dll, which is Intel's.
+       - name: XeFG build checker
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+index 3fdee4a..bfbe603 100644
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -1,6 +1,5 @@
+ # Builds the dll when triggered manually and publishes it, together with the MFG program data, as a release. The dll has the
+-# Vulkan runtime built in, so this clones the Khronos Vulkan headers like build.yml does. The Vulkan models (xefg_mfg_programs\vulkan)
+-# are Intel derived data from MFGUnlocker.asi and are not part of the release, the README says where they go.
++# Vulkan runtime built in, so this clones the Khronos Vulkan headers like build.yml does.
+ name: Release
+ 
+ on:
+@@ -39,6 +38,62 @@ jobs:
+         shell: pwsh
+         run: ./tools/GenerateXeFgPrograms.ps1 -Output bin\Release\xefg_mfg_programs -Cache obj\Release\packages
+ 
++      - name: Rebuild CUDA tensor-core fatbin (when CUDA Toolkit is present)
++        shell: pwsh
++        run: |
++          if ($env:CUDA_PATH -and (Test-Path (Join-Path $env:CUDA_PATH "bin\nvcc.exe"))) {
++            Write-Host "CUDA Toolkit found at $env:CUDA_PATH, rebuilding xefg_cuda_layers.fatbin from xefg_cuda_layers.cu..."
++            ./tools/GenerateXeFgCuda.ps1 -Output bin\Release\xefg_mfg_programs -CudaRoot $env:CUDA_PATH -Source src\MfgPort\Cuda -AllowUnpinnedNvcc
++          } else {
++            Write-Host "No CUDA Toolkit on runner; keeping the extracted xefg_cuda_layers.fatbin."
++          }
++
++      - name: Build D3D12 WMMA compute shaders (DXC cs_6_6)
++        shell: pwsh
++        run: ./tools/GenerateXeFgWmma.ps1 -Output bin\Release\xefg_mfg_programs\wmma
++
++      - name: Vulkan models (optional when present in repository)
++        shell: pwsh
++        run: |
++          $target = "bin\Release\xefg_mfg_programs\vulkan"
++          $folder = "third_party\xefg_mfg_programs\vulkan"
++          $asi = "third_party\MFGUnlocker.asi"
++
++          if (Test-Path (Join-Path $folder "programs.tsv")) {
++            New-Item -ItemType Directory -Path $target -Force | Out-Null
++            Copy-Item (Join-Path $folder "*") $target -Recurse -Force
++          } elseif (Test-Path $asi) {
++            python tools/ExtractXeFgVulkanPrograms.py $asi --output $target
++          }
++
++          $exe = $null
++          $cmd = Get-Command glslangValidator -ErrorAction SilentlyContinue
++          if ($cmd) { $exe = $cmd.Source }
++          if (-not $exe -and $env:VULKAN_SDK) {
++            $candidate = Join-Path $env:VULKAN_SDK "Bin\glslangValidator.exe"
++            if (Test-Path $candidate) { $exe = $candidate }
++          }
++          if (-not $exe) {
++            $dlDir = Join-Path $env:RUNNER_TEMP "glslang-bin"
++            $zipPath = Join-Path $env:RUNNER_TEMP "glslang.zip"
++            New-Item -ItemType Directory -Path $dlDir -Force | Out-Null
++            foreach ($u in @(
++              "https://github.com/KhronosGroup/glslang/releases/latest/download/glslang-main-windows-x64-Release.zip",
++              "https://github.com/KhronosGroup/glslang/releases/download/main-tot/glslang-master-windows-Release.zip"
++            )) {
++              try {
++                Invoke-WebRequest -Uri $u -OutFile $zipPath -UseBasicParsing
++                Expand-Archive -Path $zipPath -DestinationPath $dlDir -Force
++                $found = Get-ChildItem -Path $dlDir -Recurse -Filter "glslangValidator.exe" | Select-Object -First 1
++                if ($found) { $exe = $found.FullName; break }
++              } catch {}
++            }
++          }
++          if ($exe -and (Test-Path $target)) {
++            python tools/GenerateXeFgCoopMat.py --glslang "$exe" --output (Join-Path $target "coopmat")
++            if ($LASTEXITCODE -ne 0) { throw "GenerateXeFgCoopMat.py failed" }
++          }
++
+       - name: Package
+         shell: pwsh
+         run: |
+@@ -84,4 +139,4 @@ jobs:
+           gh release create "build-${{ github.run_number }}" $env:ZIP `
+             --target "${{ github.sha }}" `
+             --title "Build ${{ github.run_number }} ($sha)" `
+-            --notes "Built from $sha. Vulkan runtime built in (Khronos Vulkan headers ${{ steps.vulkan.outputs.version }}). The Vulkan models (xefg_mfg_programs\vulkan) are not part of this release, see the README."
++            --notes "Built from $sha. Vulkan runtime, CUDA sm_120 Tensor Cores, and AMD WMMA INT8 (D3D12 cs_6_6 & Vulkan VK_KHR_cooperative_matrix) built in (Khronos Vulkan headers ${{ steps.vulkan.outputs.version }})."
+diff --git a/dlssg-to-xefg.vcxproj b/dlssg-to-xefg.vcxproj
+index 6b6d258..c9c630a 100644
+--- a/dlssg-to-xefg.vcxproj
++++ b/dlssg-to-xefg.vcxproj
+@@ -74,6 +74,7 @@
+     <ClCompile Include="src\MfgPort\RuntimePayload.cpp" />
+     <ClCompile Include="src\MfgPort\Cuda\cuda_route.cpp" />
+     <ClCompile Include="src\MfgPort\Cuda\cuda_vulkan.cpp" />
++    <ClCompile Include="src\MfgPort\Wmma\wmma_route.cpp" />
+     <ClCompile Include="src\Plugin.cpp" />
+     <ClCompile Include="src\VulkanPrograms.cpp" />
+     <ClCompile Include="src\VulkanProvider.cpp" />
+@@ -128,6 +129,7 @@
+     <ClInclude Include="src\MfgPort\Cuda\cuda_route.h" />
+     <ClInclude Include="src\MfgPort\Cuda\OverlayNative.h" />
+     <ClInclude Include="src\MfgPort\Cuda\xefg_cuda_params.h" />
++    <ClInclude Include="src\MfgPort\Wmma\wmma_route.h" />
+     <ClInclude Include="src\NGX.h" />
+     <ClInclude Include="src\optiscaler_plugin.h" />
+     <ClInclude Include="src\Plugin.h" />
+@@ -149,6 +151,11 @@
+     <ClInclude Include="src\vulkan\xvk_output_frame.h" />
+     <ClInclude Include="src\vulkan\xvk_tensor.h" />
+   </ItemGroup>
++  <ItemGroup>
++    <None Include="src\MfgPort\Cuda\xefg_cuda_layers.cu" />
++    <None Include="src\MfgPort\Wmma\xefg_wmma_layers.hlsl" />
++    <None Include="src\vulkan\shaders\xefg_coopmat_layers.comp" />
++  </ItemGroup>
+   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+   <!-- The ported XeSS MFG programs and the tensor-core fatbin are Intel/MFG-Unlocker build data, so they stay out of
+        the repo. This extracts the pinned set and fatbin from MFG-Unlocker's release dll into the runtime folder. -->
+@@ -156,6 +163,11 @@
+     <Message Importance="high" Text="Generating the XeFG MFG program set..." />
+     <Exec Command="powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\tools\GenerateXeFgPrograms.ps1&quot; -Output &quot;$(XeFgProgramsDir)&quot; -Cache &quot;$(IntDir)packages&quot; -Dll &quot;$(MfgUnlockerDll)&quot;" />
+   </Target>
++  <!-- Compile the 16 D3D12 WMMA / dot4add_i8packed compute shaders (17 <program>.dxbc overrides) via dxc.exe -->
++  <Target Name="GenerateXeFgWmma" AfterTargets="Build" DependsOnTargets="GenerateXeFgPrograms" Condition="'$(DesignTimeBuild)' != 'true'">
++    <Message Importance="high" Text="Generating the D3D12 WMMA compute shaders (DXC cs_6_6)..." />
++    <Exec Command="powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\tools\GenerateXeFgWmma.ps1&quot; -Output &quot;$(XeFgProgramsDir)\wmma&quot;" ContinueOnError="WarnAndContinue" />
++  </Target>
+   <!-- Optional: rebuild the tensor-core fatbin from source. By default GenerateXeFgPrograms extracts the pinned,
+        validated fatbin from MFG-Unlocker's release dll; without CudaRoot this target is skipped. -->
+   <Target Name="GenerateXeFgCuda" AfterTargets="Build" DependsOnTargets="GenerateXeFgPrograms" Condition="'$(DesignTimeBuild)' != 'true' and '$(CudaRoot)' != ''">
+-- 
+2.39.5
+

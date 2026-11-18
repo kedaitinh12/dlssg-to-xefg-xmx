@@ -1,0 +1,3754 @@
+From a4e945d9cf394b33f5adcde6646aba7e170d9727 Mon Sep 17 00:00:00 2001
+From: OptiScaler-Modder <modder@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 21:38:27 +0000
+Subject: [PATCH 1/3] feat(wmma): add D3D12 cs_6_6 & Vulkan
+ VK_KHR_cooperative_matrix 9-tap 3x3 INT8 backend
+
+---
+ src/MfgPort/Wmma/wmma_route.cpp             | 1348 +++++++++++++++++++
+ src/MfgPort/Wmma/wmma_route.h               |   41 +
+ src/MfgPort/Wmma/xefg_wmma_layers.hlsl      |  529 ++++++++
+ src/Plugin.cpp                              |   34 +-
+ src/Plugin.h                                |   15 +-
+ src/vulkan/VulkanPolicy.h                   |   23 +-
+ src/vulkan/shaders/xefg_coopmat_layers.comp |  649 ++++++++-
+ src/vulkan/xvk_coopmat.cpp                  |   96 +-
+ src/vulkan/xvk_coopmat.h                    |    2 +
+ tests/vulkan_programs/programs_test.cpp     |   54 +-
+ tests/vulkan_runtime/check_layer_tables.py  |   30 +
+ tests/vulkan_runtime/check_syntax.sh        |    1 +
+ tests/vulkan_runtime/copy_test.cpp          |  237 +++-
+ tests/vulkan_runtime/policy_test.cpp        |   16 +-
+ tools/BenchmarkXeFgWmmaRdna4.py             |   65 +
+ tools/GenerateXeFgCoopMat.py                |   54 +-
+ tools/GenerateXeFgWmma.ps1                  |  131 ++
+ 17 files changed, 3157 insertions(+), 168 deletions(-)
+ create mode 100644 src/MfgPort/Wmma/wmma_route.cpp
+ create mode 100644 src/MfgPort/Wmma/wmma_route.h
+ create mode 100644 src/MfgPort/Wmma/xefg_wmma_layers.hlsl
+ create mode 100755 tools/BenchmarkXeFgWmmaRdna4.py
+ create mode 100644 tools/GenerateXeFgWmma.ps1
+
+diff --git a/src/MfgPort/Wmma/wmma_route.cpp b/src/MfgPort/Wmma/wmma_route.cpp
+new file mode 100644
+index 0000000..33a3079
+--- /dev/null
++++ b/src/MfgPort/Wmma/wmma_route.cpp
+@@ -0,0 +1,1348 @@
++#include "wmma_route.h"
++#include "../Cuda/AdapterDiscovery.h"
++#include "../Cuda/OverlayNative.h"
++#include "../Cuda/cuda_layers.h"
++#include "../Sha256.h"
++#include <dxgi1_4.h>
++#include <intrin.h>
++#include <wrl/client.h>
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cstddef>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <iterator>
++#include <mutex>
++#include <span>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++namespace xefg_wmma
++{
++namespace
++{
++using Microsoft::WRL::ComPtr;
++
++constexpr size_t kMaxDxbcBytes = 4 * 1024 * 1024;
++
++std::mutex gMutex;
++std::atomic<LogFunction> gLog{};
++std::atomic<State> gState{State::NotAttempted};
++std::atomic<Arch> gArch{Arch::Unknown};
++std::atomic<bool> gActive{false};
++uint32_t gDeviceId{};
++uint32_t gWaveMmaTier{};
++uint32_t gOverrideLayers{};
++std::string gReason;
++
++IUnknown* gDeviceIdentity{};
++ID3D12Device* gDevice{};
++uintptr_t gProviderBegin{}, gProviderEnd{};
++uintptr_t gWrapperBegin{}, gWrapperEnd{};
++uintptr_t gRuntimeBegin{}, gRuntimeEnd{};
++
++std::atomic<uint64_t> gLaunches{}, gFallbacks{}, gBinds{};
++std::atomic<uint32_t> gLayerCount{};
++std::atomic<bool> gExecuteListLogged{};
++std::array<std::atomic<bool>, std::size(xefg_cuda::kLayers)> gLayerSeen{};
++std::array<std::vector<uint8_t>, std::size(xefg_cuda::kLayers)> gShaderBlobs{};
++
++void Log(const char* stage, const std::string& fields) noexcept
++{
++    if (const auto fn = gLog.load(std::memory_order_relaxed))
++        fn(stage, fields);
++}
++
++// Identifies AMD RDNA 4 (gfx1200/gfx1201: Radeon RX 9070 XT / 9070 / 9060 XT, PCI DeviceIDs 0x7550..0x75FF)
++// vs. AMD RDNA 3 (gfx1100..gfx1103: Radeon RX 7900 / 7800 / 7700 / 7600 / 780M / 890M, PCI DeviceIDs 0x7440..0x74FF, 0x15BF, 0x15C8, 0x150E).
++Arch DetectAmdArch(uint32_t vendorId, uint32_t deviceId, std::wstring_view description) noexcept
++{
++    if (vendorId != 0x1002)
++        return Arch::Unknown;
++
++    if ((deviceId >= 0x7550 && deviceId <= 0x75FF) ||
++        description.find(L"RX 90") != std::wstring_view::npos ||
++        description.find(L"RDNA 4") != std::wstring_view::npos ||
++        description.find(L"gfx12") != std::wstring_view::npos)
++    {
++        return Arch::Rdna4;
++    }
++
++    if ((deviceId >= 0x7440 && deviceId <= 0x74FF) ||
++        deviceId == 0x15BF || deviceId == 0x15C8 || deviceId == 0x150E ||
++        description.find(L"RX 7") != std::wstring_view::npos ||
++        description.find(L"780M") != std::wstring_view::npos ||
++        description.find(L"890M") != std::wstring_view::npos ||
++        description.find(L"RDNA 3") != std::wstring_view::npos ||
++        description.find(L"gfx11") != std::wstring_view::npos)
++    {
++        return Arch::Rdna3;
++    }
++
++    return Arch::Unknown;
++}
++
++std::vector<uint8_t> LoadDxbcFile(const std::filesystem::path& path) noexcept
++{
++    try
++    {
++        std::error_code ec;
++        const auto bytes = std::filesystem::file_size(path, ec);
++        if (ec || bytes < 32 || bytes > kMaxDxbcBytes)
++            return {};
++
++        std::ifstream file(path, std::ios::binary);
++        if (!file)
++            return {};
++
++        std::vector<uint8_t> buf(static_cast<size_t>(bytes));
++        if (!file.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(bytes)))
++            return {};
++
++        // Verify DXBC container magic ('DXBC' = 0x43425844)
++        if (buf[0] != 'D' || buf[1] != 'X' || buf[2] != 'B' || buf[3] != 'C')
++            return {};
++
++        return buf;
++    }
++    catch (...)
++    {
++        return {};
++    }
++}
++
++uint32_t LoadWmmaOverrides(const std::filesystem::path& wmmaDir) noexcept
++{
++    uint32_t loaded = 0;
++    try
++    {
++        std::error_code ec;
++        for (auto& blob : gShaderBlobs)
++            blob.clear();
++
++        if (!std::filesystem::is_directory(wmmaDir, ec))
++            return 0;
++
++        for (size_t i = 0; i < std::size(xefg_cuda::kLayers); ++i)
++        {
++            const auto& layer = xefg_cuda::kLayers[i];
++            auto blob = LoadDxbcFile(wmmaDir / (std::string(layer.info.program) + ".dxbc"));
++            if (blob.empty())
++                blob = LoadDxbcFile(wmmaDir / (std::string(layer.info.kernel) + ".dxbc"));
++
++            if (!blob.empty())
++            {
++                gShaderBlobs[i] = std::move(blob);
++                ++loaded;
++            }
++        }
++    }
++    catch (...)
++    {
++    }
++    return loaded;
++}
++
++// ---- recognized pipeline states & companion WMMA replacement PSOs -------------------------------------
++// Open addressing on the provider's base ID3D12PipelineState* pointer (inserted under gMutex, read lock-free).
++struct HeldEntry
++{
++    ID3D12PipelineState* base{};
++    ID3D12PipelineState* replacement{};
++    uint8_t layer{};
++};
++
++constexpr size_t kSlots = 512;
++std::array<std::atomic<void*>, kSlots> gKeys{};
++std::array<std::atomic<uint8_t>, kSlots> gValues{};
++std::array<std::atomic<ID3D12PipelineState*>, kSlots> gReplacements{};
++std::vector<HeldEntry> gHeld;
++std::atomic<bool> gAnyLayer{};
++
++size_t Home(const void* key) noexcept
++{
++    return size_t(((reinterpret_cast<uintptr_t>(key) >> 4) * 0x9E3779B97F4A7C15ull) >> 55) & (kSlots - 1);
++}
++
++uint8_t Lookup(const void* key, ID3D12PipelineState*& replacementOut) noexcept
++{
++    replacementOut = nullptr;
++    if (!key || !gAnyLayer.load(std::memory_order_acquire))
++        return 0;
++
++    for (size_t n = 0, i = Home(key); n < kSlots; ++n, i = (i + 1) & (kSlots - 1))
++    {
++        const void* found = gKeys[i].load(std::memory_order_acquire);
++        if (found == key)
++        {
++            replacementOut = gReplacements[i].load(std::memory_order_relaxed);
++            return gValues[i].load(std::memory_order_relaxed);
++        }
++        if (!found)
++            return 0;
++    }
++    return 0;
++}
++
++bool Insert(void* key, uint8_t value, ID3D12PipelineState* replacement) noexcept // gMutex held
++{
++    if (gHeld.size() >= kSlots / 2)
++        return false;
++
++    for (size_t n = 0, i = Home(key); n < kSlots; ++n, i = (i + 1) & (kSlots - 1))
++    {
++        void* found = gKeys[i].load(std::memory_order_relaxed);
++        if (found == key)
++        {
++            gReplacements[i].store(replacement, std::memory_order_relaxed);
++            gValues[i].store(value, std::memory_order_relaxed);
++            return true;
++        }
++        if (!found)
++        {
++            gReplacements[i].store(replacement, std::memory_order_relaxed);
++            gValues[i].store(value, std::memory_order_relaxed);
++            gKeys[i].store(key, std::memory_order_release);
++            return true;
++        }
++    }
++    return false;
++}
++
++void Prune() noexcept // gMutex held
++{
++    std::vector<HeldEntry> survivors;
++    survivors.reserve(gHeld.size());
++    for (const HeldEntry& entry : gHeld)
++    {
++        entry.base->AddRef();
++        if (entry.base->Release() > 1)
++        {
++            survivors.push_back(entry);
++        }
++        else
++        {
++            entry.base->Release();
++            if (entry.replacement)
++                entry.replacement->Release();
++        }
++    }
++    if (survivors.size() == gHeld.size())
++        return;
++
++    for (auto& key : gKeys) key.store(nullptr, std::memory_order_release);
++    for (auto& val : gValues) val.store(0, std::memory_order_relaxed);
++    for (auto& rep : gReplacements) rep.store(nullptr, std::memory_order_relaxed);
++
++    gHeld.swap(survivors);
++    gLayerCount.store(uint32_t(gHeld.size()), std::memory_order_relaxed);
++    gAnyLayer.store(!gHeld.empty(), std::memory_order_release);
++    for (const HeldEntry& entry : gHeld)
++        Insert(entry.base, entry.layer, entry.replacement);
++}
++
++// ---- D3D12 device & command-list vtable patches ------------------------------------------------------
++constexpr int kCreateComputePipelineState = 11, kCreateCommandList = 12, kCreatePipelineState = 47, kCreateCommandList1 = 51;
++constexpr int kReset = 10, kDispatch = 14, kSetPipelineState = 25;
++constexpr int kVtableSlots = 64;
++constexpr std::array<int, 3> kListSlots{kReset, kDispatch, kSetPipelineState};
++using Hook = std::pair<int, void*>;
++
++bool HookSlot(void** slot, void*& original, void* hook, bool protect) noexcept
++{
++    void* expected = *slot;
++    while (expected != hook)
++    {
++        original = expected;
++        DWORD old{}, unused{};
++        if (protect && !VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old))
++            return false;
++        void* prior = InterlockedCompareExchangePointer(slot, hook, expected);
++        if (protect)
++            VirtualProtect(slot, sizeof(void*), old, &unused);
++        if (prior == expected)
++            return true;
++        expected = prior;
++    }
++    return true;
++}
++
++struct Patch
++{
++    void** vtable{};
++    std::array<void*, kVtableSlots> original{};
++};
++constexpr size_t kMaxPatches = 8;
++std::array<Patch, kMaxPatches> gDevicePatches{};
++std::atomic<uint32_t> gDevicePatchCount{};
++
++template <class F>
++F DeviceOriginal(void* self, int slot) noexcept
++{
++    void** vtable = *static_cast<void***>(self);
++    const uint32_t n = gDevicePatchCount.load(std::memory_order_acquire);
++    for (uint32_t i = 0; i < n; ++i)
++        if (gDevicePatches[i].vtable == vtable)
++            return reinterpret_cast<F>(gDevicePatches[i].original[slot]);
++    for (uint32_t i = 0; i < n; ++i)
++        if (gDevicePatches[i].original[slot])
++            return reinterpret_cast<F>(gDevicePatches[i].original[slot]);
++    return nullptr;
++}
++
++bool ApplyDevice(void** vtable, std::span<const Hook> hooks) noexcept
++{
++    const uint32_t n = gDevicePatchCount.load(std::memory_order_acquire);
++    for (uint32_t i = 0; i < n; ++i)
++        if (gDevicePatches[i].vtable == vtable)
++            return true;
++    if (n >= kMaxPatches)
++        return false;
++    Patch& patch = gDevicePatches[n];
++    patch.vtable = vtable;
++    for (const auto& [slot, hook] : hooks)
++    {
++        if (vtable[slot] == hook)
++            return false;
++        patch.original[slot] = vtable[slot];
++    }
++    gDevicePatchCount.store(n + 1, std::memory_order_release);
++    for (const auto& [slot, hook] : hooks)
++        if (!HookSlot(&vtable[slot], patch.original[slot], hook, true))
++            return false;
++    return true;
++}
++
++struct ListTable
++{
++    std::atomic<void**> table{};
++    std::array<void*, kVtableSlots> original{};
++    std::atomic<bool> complete{};
++    bool shared{};
++    bool runtimeClass{};
++    ID3D12GraphicsCommandList* list{};
++    ID3D12CommandAllocator* allocator{};
++};
++constexpr size_t kTables = 256;
++std::array<ListTable, kTables> gTables{};
++size_t gTableKeys{};
++std::array<std::array<std::atomic<void*>, kVtableSlots>, 2> gSharedOriginal{};
++size_t TypeIndex(D3D12_COMMAND_LIST_TYPE type) noexcept { return type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? 1 : 0; }
++
++size_t TableHome(void** table) noexcept
++{
++    return size_t(((reinterpret_cast<uintptr_t>(table) >> 3) * 0x9E3779B97F4A7C15ull) >> 56) & (kTables - 1);
++}
++
++ListTable* FindTable(void** table) noexcept
++{
++    if (!table)
++        return nullptr;
++    for (size_t n = 0, i = TableHome(table); n < kTables; ++n, i = (i + 1) & (kTables - 1))
++    {
++        void** key = gTables[i].table.load(std::memory_order_acquire);
++        if (key == table)
++            return &gTables[i];
++        if (!key)
++            return nullptr;
++    }
++    return nullptr;
++}
++
++const std::array<void*, kVtableSlots>& ListHooks() noexcept;
++
++bool HookedTable(void** table) noexcept
++{
++    if (!table)
++        return false;
++    const auto& hooks = ListHooks();
++    for (int slot : kListSlots)
++        if (table[slot] != hooks[slot])
++            return false;
++    return true;
++}
++
++struct Recording
++{
++    void* list{};
++    void** table{};
++    const ListTable* tableRecord{};
++    bool tableHooked{};
++    ID3D12PipelineState* lastState{};
++    ID3D12PipelineState* wmmaPso{};
++    uint8_t layer{};
++};
++thread_local Recording tRecording;
++
++void InitRecording(Recording& r, void* list) noexcept
++{
++    void** table = *static_cast<void***>(list);
++    const ListTable* rec = FindTable(table);
++    r = Recording{list, table, rec, rec ? false : HookedTable(table)};
++}
++
++Recording& Track(void* list) noexcept
++{
++    auto& r = tRecording;
++    void** table = *static_cast<void***>(list);
++    if (r.list != list || r.table != table)
++        InitRecording(r, list);
++    return r;
++}
++
++template <class F>
++F ListOriginal(void* self, int slot) noexcept
++{
++    const auto& r = tRecording;
++    if (r.list == self && r.tableRecord)
++        return reinterpret_cast<F>(r.tableRecord->original[slot]);
++    if (const ListTable* table = FindTable(*static_cast<void***>(self)))
++        return reinterpret_cast<F>(table->original[slot]);
++    const size_t type = TypeIndex(static_cast<ID3D12GraphicsCommandList*>(self)->GetType());
++    void* original = gSharedOriginal[type][slot].load(std::memory_order_acquire);
++    if (!original)
++        original = gSharedOriginal[1 - type][slot].load(std::memory_order_acquire);
++    return reinterpret_cast<F>(original);
++}
++
++using ResetFn = HRESULT (STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*, ID3D12PipelineState*);
++using DispatchFn = void (STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT);
++using SetPipelineStateFn = void (STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
++using CreateComputeFn = HRESULT (STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
++using CreateListFn = HRESULT (STDMETHODCALLTYPE*)(ID3D12Device*, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator*,
++    ID3D12PipelineState*, REFIID, void**);
++using CreateList1Fn = HRESULT (STDMETHODCALLTYPE*)(ID3D12Device4*, UINT, D3D12_COMMAND_LIST_TYPE, D3D12_COMMAND_LIST_FLAGS, REFIID, void**);
++
++HRESULT STDMETHODCALLTYPE HookReset(ID3D12GraphicsCommandList* self, ID3D12CommandAllocator* allocator, ID3D12PipelineState* initial)
++{
++    const HRESULT result = ListOriginal<ResetFn>(self, kReset)(self, allocator, initial);
++    auto& r = tRecording;
++    InitRecording(r, self);
++    if (SUCCEEDED(result))
++    {
++        r.lastState = initial;
++        r.layer = Lookup(initial, r.wmmaPso);
++        if (r.layer)
++            gBinds.fetch_add(1, std::memory_order_relaxed);
++    }
++    return result;
++}
++
++void STDMETHODCALLTYPE HookSetPipelineState(ID3D12GraphicsCommandList* self, ID3D12PipelineState* state)
++{
++    auto& r = Track(self);
++    if (r.lastState != state || !state)
++    {
++        r.lastState = state;
++        r.layer = Lookup(state, r.wmmaPso);
++    }
++    if (r.layer)
++        gBinds.fetch_add(1, std::memory_order_relaxed);
++    ListOriginal<SetPipelineStateFn>(self, kSetPipelineState)(self, state);
++}
++
++enum Reason : uint32_t { kShape = 1, kNoOverride = 2 };
++std::atomic<uint32_t> gReasonsLogged{};
++
++void Fallback(Reason reason, const char* text, const xefg_cuda::Layer& layer) noexcept
++{
++    gFallbacks.fetch_add(1, std::memory_order_relaxed);
++    if (!(gReasonsLogged.fetch_or(reason) & reason))
++    {
++        try
++        {
++            Log("wmma_dispatch_fallback",
++                std::string("\"reason\":\"") + text + "\",\"program\":\"" + layer.info.program + "\"");
++        }
++        catch (...)
++        {
++        }
++    }
++}
++
++void STDMETHODCALLTYPE HookDispatch(ID3D12GraphicsCommandList* self, UINT x, UINT y, UINT z)
++{
++    auto& r = tRecording;
++    if (r.list == self && r.layer && r.table == *reinterpret_cast<void***>(self) && gActive.load(std::memory_order_acquire))
++    {
++        if ((r.tableRecord && r.tableRecord->complete.load(std::memory_order_acquire)) || (!r.tableRecord && r.tableHooked))
++        {
++            const auto& layer = xefg_cuda::kLayers[r.layer - 1];
++            if (!xefg_cuda::DispatchShapeOk(layer, x, y, z))
++            {
++                Fallback(kShape, "dispatch_shape", layer);
++            }
++            else if (!r.wmmaPso)
++            {
++                Fallback(kNoOverride, "no_wmma_pso", layer);
++            }
++            else
++            {
++                const UINT limitW = x * layer.intelW;
++                const UINT limitH = y * layer.intelH;
++                const UINT gridX  = (limitW + layer.tileW - 1) / layer.tileW;
++                const UINT gridY  = (limitH + layer.tileH - 1) / layer.tileH;
++                const auto setPso = ListOriginal<SetPipelineStateFn>(self, kSetPipelineState);
++                const auto disp   = ListOriginal<DispatchFn>(self, kDispatch);
++                setPso(self, r.wmmaPso);
++                disp(self, gridX, gridY, layer.gridZ);
++                setPso(self, r.lastState);
++                gLaunches.fetch_add(1, std::memory_order_relaxed);
++                return;
++            }
++        }
++    }
++    ListOriginal<DispatchFn>(self, kDispatch)(self, x, y, z);
++}
++
++const std::array<void*, kVtableSlots>& ListHooks() noexcept
++{
++    static const auto hooks = [] {
++        std::array<void*, kVtableSlots> h{};
++        h[kReset] = reinterpret_cast<void*>(&HookReset);
++        h[kDispatch] = reinterpret_cast<void*>(&HookDispatch);
++        h[kSetPipelineState] = reinterpret_cast<void*>(&HookSetPipelineState);
++        return h;
++    }();
++    return hooks;
++}
++
++bool ImageOf(const void* address, std::array<wchar_t, MAX_PATH>& path, const wchar_t*& leaf, bool& system) noexcept
++{
++    HMODULE owner{};
++    std::array<wchar_t, MAX_PATH> directory{};
++    if (!address || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++            static_cast<LPCWSTR>(address), &owner))
++        return false;
++    const DWORD length = GetModuleFileNameW(owner, path.data(), DWORD(path.size()));
++    const UINT systemLength = GetSystemDirectoryW(directory.data(), UINT(directory.size()));
++    if (!length || length >= path.size() || !systemLength || systemLength >= directory.size())
++        return false;
++    const wchar_t* slash = wcsrchr(path.data(), L'\\');
++    if (!slash)
++        return false;
++    system = size_t(slash - path.data()) == systemLength && !_wcsnicmp(path.data(), directory.data(), systemLength);
++    leaf = slash + 1;
++    return true;
++}
++
++bool SystemRuntimeImage(const void* address) noexcept
++{
++    std::array<wchar_t, MAX_PATH> path{};
++    const wchar_t* leaf{};
++    bool system{};
++    return ImageOf(address, path, leaf, system) && system && (!_wcsicmp(leaf, L"D3D12Core.dll") || !_wcsicmp(leaf, L"d3d12.dll"));
++}
++
++bool RuntimeDevice(ID3D12Device* device, std::string& owner) noexcept
++{
++    void** table = *reinterpret_cast<void***>(device);
++    const std::array<const void*, 2> addresses{table, table ? table[0] : nullptr};
++    for (const void* address : addresses)
++    {
++        std::array<wchar_t, MAX_PATH> path{};
++        const wchar_t* leaf{};
++        bool system{};
++        if (!ImageOf(address, path, leaf, system))
++        {
++            owner = "not_an_image";
++            return false;
++        }
++        if (!_wcsicmp(leaf, L"D3D12Core.dll") || (system && !_wcsicmp(leaf, L"d3d12.dll")))
++            continue;
++        owner.clear();
++        for (; *leaf && owner.size() < 64; ++leaf)
++            owner += *leaf >= 0x20 && *leaf < 0x7F && *leaf != L'"' && *leaf != L'\\' ? char(*leaf) : '?';
++        return false;
++    }
++    return true;
++}
++
++bool ResolveNative(ID3D12Device* device, ComPtr<ID3D12Device>& native, std::string& owner, const char*& how) noexcept
++{
++    how = "runtime";
++    if (RuntimeDevice(device, owner))
++    {
++        native = device;
++        return true;
++    }
++    std::string ignored;
++    ComPtr<ID3D12Device> candidate;
++    if (single_overlay::native::Unwrap(device, candidate) && candidate && RuntimeDevice(candidate.Get(), ignored))
++    {
++        how = "unwrap";
++        native = std::move(candidate);
++        return true;
++    }
++    ComPtr<ID3D12Fence> fence;
++    candidate.Reset();
++    if (SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))) &&
++        SUCCEEDED(fence->GetDevice(IID_PPV_ARGS(&candidate))) && candidate && RuntimeDevice(candidate.Get(), ignored))
++    {
++        how = "fence";
++        native = std::move(candidate);
++        return true;
++    }
++    return false;
++}
++
++bool RuntimeClassTable(void** table) noexcept // gMutex held
++{
++    const auto inRuntime = [](const void* address) {
++        const auto at = reinterpret_cast<uintptr_t>(address);
++        return at >= gRuntimeBegin && at < gRuntimeEnd;
++    };
++    if (!gRuntimeBegin || !inRuntime(table) || !inRuntime(table + kSetPipelineState) || !inRuntime(table[0]))
++        return false;
++    const auto& hooks = ListHooks();
++    for (int slot : kListSlots)
++        if (table[slot] != hooks[slot] && !inRuntime(table[slot]))
++            return false;
++    return true;
++}
++
++const char* AdoptList(ID3D12GraphicsCommandList* list, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* temporary) noexcept // gMutex held
++{
++    void** table = *reinterpret_cast<void***>(list);
++    constexpr size_t needed = (kSetPipelineState + 1) * sizeof(void*);
++    MEMORY_BASIC_INFORMATION memory{};
++    if (!table || reinterpret_cast<uintptr_t>(table) % alignof(void*) ||
++        VirtualQuery(table, &memory, sizeof(memory)) != sizeof(memory) ||
++        memory.State != MEM_COMMIT || memory.RegionSize < needed ||
++        reinterpret_cast<uintptr_t>(table) - reinterpret_cast<uintptr_t>(memory.BaseAddress) > memory.RegionSize - needed)
++        return "table_memory";
++
++    const auto at = reinterpret_cast<uintptr_t>(table), object = reinterpret_cast<uintptr_t>(list);
++    const bool system = memory.Type == MEM_IMAGE && SystemRuntimeImage(table);
++    const bool runtimeClass = !system && memory.Type == MEM_IMAGE && RuntimeClassTable(table);
++    const bool wrapperClass = !system && !runtimeClass && memory.Type == MEM_IMAGE &&
++        at >= gWrapperBegin && at < gWrapperEnd;
++    const bool shared = system || runtimeClass || wrapperClass;
++    const bool own = memory.Type == MEM_PRIVATE && memory.Protect == PAGE_READWRITE && at > object && at - object < 0x10000;
++    if (!shared && !own)
++        return memory.Type == MEM_IMAGE ? "table_runtime_image" : "table_unknown";
++
++    const bool writable = memory.Protect == PAGE_READWRITE || memory.Protect == PAGE_EXECUTE_READWRITE;
++    ListTable* record = FindTable(table);
++    if (record && record->complete.load(std::memory_order_acquire))
++        return shared && record->shared ? nullptr : "table_in_use";
++    if (record && record->list)
++        return "table_in_use";
++    if (!record)
++    {
++        if (gTableKeys >= kTables / 2)
++            return "table_capacity";
++        for (size_t n = 0, i = TableHome(table); n < kTables && !record; ++n, i = (i + 1) & (kTables - 1))
++            if (!gTables[i].table.load(std::memory_order_relaxed))
++                record = &gTables[i];
++        if (!record)
++            return "table_capacity";
++    }
++
++    const auto& hooks = ListHooks();
++    auto& sharedOriginal = gSharedOriginal[TypeIndex(type)];
++    std::array<void*, kVtableSlots> original{};
++    for (int slot : kListSlots)
++    {
++        void* current = table[slot];
++        if (current == hooks[slot])
++            current = sharedOriginal[slot].load(std::memory_order_acquire);
++        if (!current)
++            return "table_original";
++        original[slot] = current;
++    }
++    if (shared)
++    {
++        for (int slot : kListSlots)
++        {
++            void* expected{};
++            sharedOriginal[slot].compare_exchange_strong(expected, original[slot], std::memory_order_acq_rel);
++        }
++    }
++    record->original = original;
++    record->shared = shared;
++    record->runtimeClass = runtimeClass;
++    if (!record->table.load(std::memory_order_relaxed))
++    {
++        record->table.store(table, std::memory_order_release);
++        ++gTableKeys;
++    }
++    if (!shared)
++    {
++        list->AddRef();
++        record->list = list;
++        if (temporary)
++        {
++            temporary->AddRef();
++            record->allocator = temporary;
++        }
++    }
++    for (int slot : kListSlots)
++        if (!HookSlot(&table[slot], record->original[slot], hooks[slot], !writable))
++            return "table_exchange";
++    record->complete.store(true, std::memory_order_release);
++    return nullptr;
++}
++
++bool Retire(ListTable& record) noexcept // gMutex held
++{
++    if (!record.list)
++        return true;
++    record.complete.store(false, std::memory_order_release);
++    void** table = record.table.load(std::memory_order_relaxed);
++    const auto& hooks = ListHooks();
++    bool restored = true;
++    for (int slot : kListSlots)
++    {
++        InterlockedCompareExchangePointer(&table[slot], record.original[slot], hooks[slot]);
++        restored = restored && table[slot] == record.original[slot];
++    }
++    if (!restored)
++        return false;
++    record.list->Release();
++    record.list = nullptr;
++    if (record.allocator)
++        record.allocator->Release();
++    record.allocator = nullptr;
++    return true;
++}
++
++void RetireDropped() noexcept // gMutex held
++{
++    for (auto& record : gTables)
++    {
++        if (record.list)
++        {
++            record.list->AddRef();
++            if (record.list->Release() == 1)
++                Retire(record);
++        }
++    }
++}
++
++bool Routable(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type) noexcept
++{
++    if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
++        return false;
++    ComPtr<IUnknown> identity;
++    return SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&identity))) && identity.Get() == gDeviceIdentity;
++}
++
++void AdoptCreated(ID3D12GraphicsCommandList* list, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* temporary) noexcept
++{
++    std::lock_guard lock(gMutex);
++    RetireDropped();
++    AdoptList(list, type, temporary);
++}
++
++bool FromProvider(const void* address) noexcept
++{
++    const auto at = reinterpret_cast<uintptr_t>(address);
++    return at >= gProviderBegin && at < gProviderEnd;
++}
++
++bool FromWrapper(const void* address) noexcept
++{
++    const auto at = reinterpret_cast<uintptr_t>(address);
++    return at >= gWrapperBegin && at < gWrapperEnd;
++}
++
++bool ProviderCall(const void* caller) noexcept
++{
++    if (FromProvider(caller))
++        return true;
++    if (!FromWrapper(caller))
++        return false;
++    std::array<void*, 16> frames{};
++    const USHORT count = RtlCaptureStackBackTrace(0, USHORT(frames.size()), frames.data(), nullptr);
++    size_t i = 0;
++    while (i < count && !FromWrapper(frames[i])) ++i;
++    while (i < count && FromWrapper(frames[i])) ++i;
++    return i < count && FromProvider(frames[i]);
++}
++
++bool AcceptedCaller(const void* caller) noexcept
++{
++    if (FromProvider(caller))
++        return true;
++    std::array<void*, 32> frames{};
++    const USHORT count = RtlCaptureStackBackTrace(0, USHORT(frames.size()), frames.data(), nullptr);
++    for (USHORT i = 0; i < count; ++i)
++        if (FromProvider(frames[i]))
++            return true;
++    return false;
++}
++
++HRESULT STDMETHODCALLTYPE HookCreateCommandList(ID3D12Device* self, UINT mask, D3D12_COMMAND_LIST_TYPE type,
++    ID3D12CommandAllocator* allocator, ID3D12PipelineState* initial, REFIID iid, void** out)
++{
++    void* caller = _ReturnAddress();
++    if (out && allocator && ProviderCall(caller) && Routable(self, type))
++    {
++        ComPtr<ID3D12Device4> device4;
++        ComPtr<ID3D12GraphicsCommandList> list;
++        CreateList1Fn create1{};
++        if (SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&device4))) &&
++            (create1 = DeviceOriginal<CreateList1Fn>(device4.Get(), kCreateCommandList1)) != nullptr &&
++            SUCCEEDED(create1(device4.Get(), mask, type, D3D12_COMMAND_LIST_FLAG_NONE, IID_PPV_ARGS(&list))))
++        {
++            if (SUCCEEDED(list->Reset(allocator, initial)))
++            {
++                void* requested{};
++                if (SUCCEEDED(list->QueryInterface(iid, &requested)))
++                {
++                    AdoptCreated(list.Get(), type, nullptr);
++                    auto& r = tRecording;
++                    InitRecording(r, list.Get());
++                    r.lastState = initial;
++                    r.layer = Lookup(initial, r.wmmaPso);
++                    if (r.layer)
++                        gBinds.fetch_add(1, std::memory_order_relaxed);
++                    *out = requested;
++                    return S_OK;
++                }
++                list->Close();
++            }
++        }
++    }
++    return DeviceOriginal<CreateListFn>(self, kCreateCommandList)(self, mask, type, allocator, initial, iid, out);
++}
++
++HRESULT STDMETHODCALLTYPE HookCreateCommandList1(ID3D12Device4* self, UINT mask, D3D12_COMMAND_LIST_TYPE type,
++    D3D12_COMMAND_LIST_FLAGS flags, REFIID iid, void** out)
++{
++    void* caller = _ReturnAddress();
++    const HRESULT result = DeviceOriginal<CreateList1Fn>(self, kCreateCommandList1)(self, mask, type, flags, iid, out);
++    if (SUCCEEDED(result) && out && *out && ProviderCall(caller) && Routable(self, type))
++    {
++        ComPtr<ID3D12GraphicsCommandList> list;
++        ComPtr<ID3D12CommandAllocator> temporary;
++        if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&list))) &&
++            SUCCEEDED(self->CreateCommandAllocator(type, IID_PPV_ARGS(&temporary))) &&
++            SUCCEEDED(list->Reset(temporary.Get(), nullptr)) && SUCCEEDED(list->Close()))
++        {
++            AdoptCreated(list.Get(), type, temporary.Get());
++        }
++    }
++    return result;
++}
++
++void Recognize(ID3D12Device* device, const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc, REFIID iid, void* created, const void* caller) noexcept
++{
++    try
++    {
++        const SIZE_T length = desc.CS.BytecodeLength;
++        if (!desc.CS.pShaderBytecode || length < 32 || length > 1000000 ||
++            std::none_of(std::begin(xefg_cuda::kLayers), std::end(xefg_cuda::kLayers),
++                [length](const xefg_cuda::Layer& layer) { return length == layer.bytes || length == layer.ownBytes; }))
++        {
++            return;
++        }
++
++        sha256_util::Digest digest{};
++        if (!sha256_util::Compute(desc.CS.pShaderBytecode, length, digest))
++            return;
++        const auto hash = sha256_util::LowerHex(digest);
++        const uint8_t layerIdx = xefg_cuda::LayerForSha256(hash);
++        if (!layerIdx)
++            return;
++
++        ComPtr<IUnknown> identity;
++        if (FAILED(device->QueryInterface(IID_PPV_ARGS(&identity))) || identity.Get() != gDeviceIdentity)
++            return;
++        if (!AcceptedCaller(caller))
++            return;
++
++        ComPtr<ID3D12PipelineState> baseState;
++        if (FAILED(static_cast<IUnknown*>(created)->QueryInterface(IID_PPV_ARGS(&baseState))))
++            return;
++        if (iid != __uuidof(ID3D12PipelineState) && baseState.Get() != created)
++            return;
++
++        const size_t i = layerIdx - 1;
++        ComPtr<ID3D12PipelineState> wmmaPso;
++        if (!gShaderBlobs[i].empty() && desc.pRootSignature)
++        {
++            D3D12_COMPUTE_PIPELINE_STATE_DESC wmmaDesc = desc;
++            wmmaDesc.CS.pShaderBytecode = gShaderBlobs[i].data();
++            wmmaDesc.CS.BytecodeLength = gShaderBlobs[i].size();
++            wmmaDesc.CachedPSO = {};
++            if (const auto createCompute = DeviceOriginal<CreateComputeFn>(device, kCreateComputePipelineState))
++            {
++                createCompute(device, &wmmaDesc, IID_PPV_ARGS(&wmmaPso));
++            }
++        }
++
++        std::lock_guard lock(gMutex);
++        if (!Insert(baseState.Get(), layerIdx, wmmaPso.Get()))
++        {
++            Prune();
++            if (!Insert(baseState.Get(), layerIdx, wmmaPso.Get()))
++                return;
++        }
++
++        ID3D12PipelineState* repRaw = wmmaPso.Detach();
++        gHeld.push_back(HeldEntry{baseState.Detach(), repRaw, layerIdx});
++        gAnyLayer.store(true, std::memory_order_release);
++        gLayerCount.store(uint32_t(gHeld.size()), std::memory_order_relaxed);
++
++        if (!gLayerSeen[i].exchange(true) && gActive.load(std::memory_order_relaxed))
++        {
++            Log("wmma_layer",
++                std::string("\"program\":\"") + xefg_cuda::kLayers[i].info.program +
++                "\",\"kernel\":\"" + xefg_cuda::kLayers[i].info.kernel +
++                "\",\"override_pso\":" + (repRaw ? "true" : "false"));
++        }
++    }
++    catch (...)
++    {
++    }
++}
++
++HRESULT STDMETHODCALLTYPE HookCreateComputePipelineState(ID3D12Device* self, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID iid, void** out)
++{
++    void* caller = _ReturnAddress();
++    const HRESULT result = DeviceOriginal<CreateComputeFn>(self, kCreateComputePipelineState)(self, desc, iid, out);
++    if (SUCCEEDED(result) && desc && out && *out)
++        Recognize(self, *desc, iid, *out, caller);
++    return result;
++}
++
++template <class Inner>
++constexpr size_t InnerOffset()
++{
++    return (sizeof(UINT) + alignof(Inner) - 1) / alignof(Inner) * alignof(Inner);
++}
++
++template <class Inner>
++constexpr size_t SubobjectSize()
++{
++    constexpr size_t align = (std::max)(alignof(Inner), alignof(void*));
++    return (InnerOffset<Inner>() + sizeof(Inner) + align - 1) / align * align;
++}
++
++bool StreamComputeDesc(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3D12_COMPUTE_PIPELINE_STATE_DESC& outDesc) noexcept
++{
++    const auto* stream = static_cast<const unsigned char*>(desc.pPipelineStateSubobjectStream);
++    if (!stream || reinterpret_cast<uintptr_t>(stream) % alignof(void*))
++        return false;
++
++    outDesc = {};
++    bool hasCs = false;
++    for (size_t at = 0; at + sizeof(UINT) <= desc.SizeInBytes;)
++    {
++        size_t size{};
++        const UINT type = *reinterpret_cast<const UINT*>(stream + at);
++        switch (type)
++        {
++        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
++            if (at + SubobjectSize<D3D12_SHADER_BYTECODE>() > desc.SizeInBytes)
++                return false;
++            outDesc.CS = *reinterpret_cast<const D3D12_SHADER_BYTECODE*>(stream + at + InnerOffset<D3D12_SHADER_BYTECODE>());
++            size = SubobjectSize<D3D12_SHADER_BYTECODE>();
++            hasCs = true;
++            break;
++        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE:
++            if (at + SubobjectSize<ID3D12RootSignature*>() > desc.SizeInBytes)
++                return false;
++            outDesc.pRootSignature = *reinterpret_cast<ID3D12RootSignature* const*>(stream + at + InnerOffset<ID3D12RootSignature*>());
++            size = SubobjectSize<ID3D12RootSignature*>();
++            break;
++        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK:
++            if (at + SubobjectSize<UINT>() > desc.SizeInBytes)
++                return false;
++            outDesc.NodeMask = *reinterpret_cast<const UINT*>(stream + at + InnerOffset<UINT>());
++            size = SubobjectSize<UINT>();
++            break;
++        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO:
++            size = SubobjectSize<D3D12_CACHED_PIPELINE_STATE>();
++            break;
++        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS:
++            if (at + SubobjectSize<D3D12_PIPELINE_STATE_FLAGS>() > desc.SizeInBytes)
++                return false;
++            outDesc.Flags = *reinterpret_cast<const D3D12_PIPELINE_STATE_FLAGS*>(stream + at + InnerOffset<D3D12_PIPELINE_STATE_FLAGS>());
++            size = SubobjectSize<D3D12_PIPELINE_STATE_FLAGS>();
++            break;
++        default:
++            return false;
++        }
++        at += size;
++    }
++    return hasCs;
++}
++
++using CreateStreamFn = HRESULT (STDMETHODCALLTYPE*)(ID3D12Device2*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
++HRESULT STDMETHODCALLTYPE HookCreatePipelineState(ID3D12Device2* self, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID iid, void** out)
++{
++    void* caller = _ReturnAddress();
++    const HRESULT result = DeviceOriginal<CreateStreamFn>(self, kCreatePipelineState)(self, desc, iid, out);
++    if (SUCCEEDED(result) && desc && out && *out)
++    {
++        D3D12_COMPUTE_PIPELINE_STATE_DESC compute{};
++        if (StreamComputeDesc(*desc, compute))
++            Recognize(self, compute, iid, *out, caller);
++    }
++    return result;
++}
++
++template <class Interface>
++void AddDeviceVtable(ID3D12Device* device, int level, std::vector<std::pair<void**, int>>& out)
++{
++    ComPtr<Interface> view;
++    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&view))))
++        return;
++    void** vtable = *reinterpret_cast<void***>(view.Get());
++    for (auto& entry : out)
++    {
++        if (entry.first == vtable)
++        {
++            entry.second = (std::max)(entry.second, level);
++            return;
++        }
++    }
++    out.emplace_back(vtable, level);
++}
++
++bool PatchDevice(ID3D12Device* device, std::string& reason)
++{
++    std::vector<std::pair<void**, int>> vtables;
++    AddDeviceVtable<ID3D12Device>(device, 0, vtables);
++    AddDeviceVtable<ID3D12Device1>(device, 1, vtables);
++    AddDeviceVtable<ID3D12Device2>(device, 2, vtables);
++    AddDeviceVtable<ID3D12Device3>(device, 3, vtables);
++    AddDeviceVtable<ID3D12Device4>(device, 4, vtables);
++    AddDeviceVtable<ID3D12Device5>(device, 5, vtables);
++    AddDeviceVtable<ID3D12Device6>(device, 6, vtables);
++    AddDeviceVtable<ID3D12Device7>(device, 7, vtables);
++    AddDeviceVtable<ID3D12Device8>(device, 8, vtables);
++    AddDeviceVtable<ID3D12Device9>(device, 9, vtables);
++    AddDeviceVtable<ID3D12Device10>(device, 10, vtables);
++    if (std::none_of(vtables.begin(), vtables.end(), [](const auto& entry) { return entry.second >= 4; }))
++    {
++        reason = "device4";
++        return false;
++    }
++
++    const Hook hooks[] = {
++        {kCreateComputePipelineState, reinterpret_cast<void*>(&HookCreateComputePipelineState)},
++        {kCreateCommandList, reinterpret_cast<void*>(&HookCreateCommandList)},
++        {kCreatePipelineState, reinterpret_cast<void*>(&HookCreatePipelineState)},
++        {kCreateCommandList1, reinterpret_cast<void*>(&HookCreateCommandList1)}
++    };
++    for (const auto& [vtable, level] : vtables)
++    {
++        if (!ApplyDevice(vtable, std::span<const Hook>(hooks, level >= 4 ? 4 : level >= 2 ? 3 : 2)))
++        {
++            reason = "device_patch";
++            return false;
++        }
++    }
++    return true;
++}
++
++bool ProviderRange(HMODULE module, uintptr_t& begin, uintptr_t& end)
++{
++    if (!module)
++        return false;
++    const auto base = reinterpret_cast<const unsigned char*>(module);
++    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
++    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
++        return false;
++    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
++    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
++        return false;
++    begin = reinterpret_cast<uintptr_t>(base);
++    end = begin + nt->OptionalHeader.SizeOfImage;
++    return true;
++}
++} // namespace
++
++void SetLog(LogFunction log) noexcept
++{
++    gLog.store(log, std::memory_order_relaxed);
++}
++
++bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem::path& wmmaDir, std::string& reason) noexcept
++{
++    std::lock_guard lock(gMutex);
++    try
++    {
++        const auto current = gState.load(std::memory_order_acquire);
++        if (current == State::Active)
++            return true;
++        if (current != State::NotAttempted)
++        {
++            reason = gReason;
++            return false;
++        }
++        if (!device || !providerModule)
++        {
++            gReason = "no_device";
++            gState.store(State::Unavailable, std::memory_order_release);
++            reason = gReason;
++            return false;
++        }
++
++        wchar_t env[16]{};
++        const DWORD envLen = GetEnvironmentVariableW(L"XEFG_WMMA", env, 16);
++        if (envLen && envLen < 16 && (env[0] == L'0' || _wcsicmp(env, L"off") == 0 || _wcsicmp(env, L"false") == 0))
++        {
++            gReason = "environment_off";
++            gState.store(State::Disabled, std::memory_order_release);
++            reason = gReason;
++            return false;
++        }
++
++        std::string owner;
++        const char* how{};
++        ComPtr<ID3D12Device> native;
++        if (!ResolveNative(device, native, owner, how))
++        {
++            gReason = "wrapped_device";
++            gState.store(State::Unavailable, std::memory_order_release);
++            reason = gReason;
++            return false;
++        }
++        if (native.Get() != device)
++        {
++            HMODULE wrapper{};
++            if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
++                    static_cast<LPCWSTR>(*reinterpret_cast<void**>(device)), &wrapper) ||
++                !ProviderRange(wrapper, gWrapperBegin, gWrapperEnd))
++            {
++                gReason = "wrapper_image";
++                gState.store(State::Unavailable, std::memory_order_release);
++                reason = gReason;
++                return false;
++            }
++        }
++        device = native.Get();
++        {
++            HMODULE runtime{};
++            if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
++                    static_cast<LPCWSTR>(*reinterpret_cast<void**>(device)), &runtime) ||
++                !ProviderRange(runtime, gRuntimeBegin, gRuntimeEnd))
++            {
++                gRuntimeBegin = gRuntimeEnd = 0;
++            }
++        }
++
++        const LUID luid = device->GetAdapterLuid();
++        ComPtr<IDXGIFactory4> factory;
++        ComPtr<IDXGIAdapter1> adapter;
++        DXGI_ADAPTER_DESC1 desc{};
++        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) ||
++            FAILED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter))) ||
++            FAILED(adapter->GetDesc1(&desc)))
++        {
++            gReason = "adapter_query";
++            gState.store(State::Unavailable, std::memory_order_release);
++            reason = gReason;
++            return false;
++        }
++
++        if (desc.VendorId != 0x1002)
++        {
++            gReason = "not_amd";
++            gState.store(State::Unavailable, std::memory_order_release);
++            reason = gReason;
++            return false;
++        }
++
++        const Arch arch = DetectAmdArch(desc.VendorId, desc.DeviceId, desc.Description);
++        if (arch == Arch::Unknown)
++        {
++            gReason = "architecture_unsupported";
++            gState.store(State::Unavailable, std::memory_order_release);
++            reason = gReason;
++            return false;
++        }
++
++        if (!ProviderRange(providerModule, gProviderBegin, gProviderEnd))
++        {
++            gReason = "provider_image";
++            gState.store(State::Unavailable, std::memory_order_release);
++            reason = gReason;
++            return false;
++        }
++
++        // Query D3D12_FEATURE_D3D12_OPTIONS9 (27) for WaveMMA support when offered by the runtime
++        struct Options9Stub
++        {
++            BOOL MeshShaderPipelineStatsSupported;
++            BOOL MeshShaderSupportsFullRangeRenderTargetArrayIndex;
++            BOOL AtomicInt64OnTypedResourceSupported;
++            BOOL AtomicInt64OnGroupSharedSupported;
++            BOOL DerivativesInMeshAndAmplificationShadersSupported;
++            uint32_t WaveMMATier;
++        } options9{};
++        if (SUCCEEDED(device->CheckFeatureSupport(static_cast<D3D12_FEATURE>(27), &options9, sizeof(options9))))
++            gWaveMmaTier = options9.WaveMMATier;
++
++        ComPtr<IUnknown> identity;
++        if (FAILED(device->QueryInterface(IID_PPV_ARGS(&identity))))
++        {
++            gReason = "device_identity";
++            gState.store(State::Unavailable, std::memory_order_release);
++            reason = gReason;
++            return false;
++        }
++
++        gDeviceId = desc.DeviceId;
++        gArch.store(arch, std::memory_order_release);
++        gOverrideLayers = LoadWmmaOverrides(wmmaDir);
++        gDeviceIdentity = identity.Detach();
++        gDevice = device;
++        gDevice->AddRef();
++
++        std::string patchFailure;
++        if (!PatchDevice(device, patchFailure))
++        {
++            gReason = patchFailure;
++            gState.store(State::Unavailable, std::memory_order_release);
++            reason = gReason;
++            return false;
++        }
++
++        gReason.clear();
++        gActive.store(true, std::memory_order_release);
++        gState.store(State::Active, std::memory_order_release);
++
++        Log("wmma_route",
++            std::string("\"state\":\"active\",\"arch\":\"") + (arch == Arch::Rdna4 ? "rdna4_gfx12" : "rdna3_gfx11") +
++            "\",\"device_id\":" + std::to_string(gDeviceId) +
++            ",\"wave_mma_tier\":" + std::to_string(gWaveMmaTier) +
++            ",\"layers\":" + std::to_string(std::size(xefg_cuda::kLayers)) +
++            ",\"overrides\":" + std::to_string(gOverrideLayers) +
++            ",\"device_vtables\":" + std::to_string(gDevicePatchCount.load()) +
++            ",\"device\":\"" + how + "\"");
++        reason.clear();
++        return true;
++    }
++    catch (...)
++    {
++        gReason = "exception";
++        gState.store(State::Unavailable, std::memory_order_release);
++        reason = gReason;
++        return false;
++    }
++}
++
++void Disable(const char* reason) noexcept
++{
++    std::lock_guard lock(gMutex);
++    if (gState.load(std::memory_order_acquire) != State::NotAttempted)
++        return;
++    try { gReason = reason ? reason : "disabled"; } catch (...) {}
++    gState.store(State::Disabled, std::memory_order_release);
++}
++
++void SetEnabled(bool enabled) noexcept
++{
++    if (gState.load(std::memory_order_acquire) == State::Active && gActive.load(std::memory_order_relaxed) == enabled)
++        return;
++    std::lock_guard lock(gMutex);
++    if (gState.load(std::memory_order_acquire) == State::Active)
++        gActive.store(enabled, std::memory_order_release);
++}
++
++bool Enabled() noexcept
++{
++    return gState.load(std::memory_order_acquire) == State::Active && gActive.load(std::memory_order_acquire);
++}
++
++bool Supported() noexcept
++{
++    return gState.load(std::memory_order_acquire) == State::Active;
++}
++
++bool IsRdna4() noexcept
++{
++    return gArch.load(std::memory_order_acquire) == Arch::Rdna4;
++}
++
++void Adopt(ID3D12GraphicsCommandList* list) noexcept
++{
++    if (!list || gState.load(std::memory_order_acquire) != State::Active)
++        return;
++
++    void** fastTable = *reinterpret_cast<void***>(list);
++    if (const ListTable* record = FindTable(fastTable); record && record->complete.load(std::memory_order_acquire))
++        return;
++
++    try
++    {
++        std::lock_guard lock(gMutex);
++        void** table = *reinterpret_cast<void***>(list);
++        if (const ListTable* record = FindTable(table); record && record->complete.load(std::memory_order_acquire))
++            return;
++
++        const D3D12_COMMAND_LIST_TYPE type = list->GetType();
++        if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
++            return;
++
++        RetireDropped();
++        if (const char* failure = AdoptList(list, type, nullptr))
++        {
++            if (!gExecuteListLogged.exchange(true))
++            {
++                try
++                {
++                    Log("wmma_list_refused", std::string("\"created\":\"execute\",\"reason\":\"") + failure + "\"");
++                }
++                catch (...)
++                {
++                }
++            }
++            return;
++        }
++        const ListTable* record = FindTable(table);
++        const std::string kind = record && record->runtimeClass ? "runtime_class" : record && record->shared ? "shared" : "own";
++        Log("wmma_list", std::string("\"created\":\"execute\",\"type\":\"") +
++            (type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? "compute" : "direct") + "\",\"table\":\"" + kind + "\"");
++    }
++    catch (...)
++    {
++    }
++}
++
++void ForgetLayers() noexcept
++{
++    std::lock_guard lock(gMutex);
++    gAnyLayer.store(false, std::memory_order_release);
++    for (auto& key : gKeys) key.store(nullptr, std::memory_order_release);
++    for (auto& val : gValues) val.store(0, std::memory_order_relaxed);
++    for (auto& rep : gReplacements) rep.store(nullptr, std::memory_order_relaxed);
++    for (const HeldEntry& entry : gHeld)
++    {
++        if (entry.base)
++            entry.base->Release();
++        if (entry.replacement)
++            entry.replacement->Release();
++    }
++    gHeld.clear();
++    gLayerCount.store(0, std::memory_order_relaxed);
++    for (auto& table : gTables)
++        Retire(table);
++}
++
++Status Snapshot() noexcept
++{
++    Status s;
++    std::lock_guard lock(gMutex);
++    s.state = gState.load(std::memory_order_acquire);
++    s.arch = gArch.load(std::memory_order_acquire);
++    s.deviceId = gDeviceId;
++    s.waveMmaTier = gWaveMmaTier;
++    const uint32_t recognized = gLayerCount.load(std::memory_order_relaxed);
++    s.layers = recognized ? recognized : static_cast<uint32_t>(std::size(xefg_cuda::kLayers));
++    s.launches = gLaunches.load(std::memory_order_relaxed);
++    s.fallbacks = gFallbacks.load(std::memory_order_relaxed);
++    s.binds = gBinds.load(std::memory_order_relaxed);
++    try { s.reason = gReason; } catch (...) {}
++    return s;
++}
++} // namespace xefg_wmma
+diff --git a/src/MfgPort/Wmma/wmma_route.h b/src/MfgPort/Wmma/wmma_route.h
+new file mode 100644
+index 0000000..6f42294
+--- /dev/null
++++ b/src/MfgPort/Wmma/wmma_route.h
+@@ -0,0 +1,41 @@
++#pragma once
++// AMD WMMA INT8 acceleration route for XeFG's ported XMX MFG model (Model 16), built on top of the
++// XMX DP4a INT8 graph (one optical flow field per generated frame batch) for D3D12 and Vulkan.
++#include <d3d12.h>
++#include <cstdint>
++#include <filesystem>
++#include <string>
++
++namespace xefg_wmma
++{
++enum class State : uint8_t { NotAttempted, Disabled, Unavailable, Active };
++enum class Arch : uint8_t { Unknown, Rdna3, Rdna4 };
++
++struct Status
++{
++    State state{State::NotAttempted};
++    Arch arch{Arch::Unknown};
++    uint32_t deviceId{};
++    uint32_t waveMmaTier{};
++    uint32_t layers{};
++    uint64_t launches{};
++    uint64_t fallbacks{};
++    uint64_t binds{};
++    std::string reason;
++};
++
++using LogFunction = void (*)(const char* stage, const std::string& fields);
++void SetLog(LogFunction log) noexcept;
++
++// Installs the D3D12 WMMA INT8 route on an AMD RDNA 3 / RDNA 4 adapter. Loads optional precompiled
++// WaveMatrix/WMMA DXIL overrides from wmmaDir (<program>.dxbc) and tracks the 17 INT8 layers of Model 16.
++bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem::path& wmmaDir, std::string& reason) noexcept;
++void Disable(const char* reason) noexcept;
++void SetEnabled(bool enabled) noexcept;
++bool Enabled() noexcept;
++bool Supported() noexcept;
++bool IsRdna4() noexcept;
++void Adopt(ID3D12GraphicsCommandList* list) noexcept;
++void ForgetLayers() noexcept;
++Status Snapshot() noexcept;
++} // namespace xefg_wmma
+diff --git a/src/MfgPort/Wmma/xefg_wmma_layers.hlsl b/src/MfgPort/Wmma/xefg_wmma_layers.hlsl
+new file mode 100644
+index 0000000..796376a
+--- /dev/null
++++ b/src/MfgPort/Wmma/xefg_wmma_layers.hlsl
+@@ -0,0 +1,529 @@
++// SPDX-License-Identifier: MIT
++//
++// Full 9-tap 3x3 INT8 convolution D3D12 HLSL (Shader Model 6.6) compute shader template for XeFG's
++// 17 ported INT8 layers on AMD RDNA 4 / RDNA 3 (WMMA / dot4add_i8packed).
++//
++// Direct bit-exact port of PoolConv, UpSkip (Decoder), and Flow from src/MfgPort/Cuda/xefg_cuda_layers.cu:
++//   - Root Parameter 0 (Descriptor Table):
++//       t0 : Texture2DArray<uint4> tInput
++//       t4 : Texture2DArray<uint4> tSkip (Decoder LAYER_FAMILY == 1 only)
++//       u0 : RWTexture2DArray<uint2> uOutput (8-ch Flow) or RWTexture2DArray<uint4> uOutput (all others)
++//   - Root Parameter 1 (Descriptor Table):
++//       t1 : Buffer<uint4> tWeights
++//       t2 : Buffer<uint4> tScale (IEEE-754 float scale for Pool/Decoder, int32 bias for Flow)
++//       t3 : Buffer<uint4> tBias  (IEEE-754 float bias for Pool/Decoder, int32 negMul for Flow)
++//   - Root Parameter 2 (32-bit Root Constants b0):
++//       4 constants (1 uint4) for Pool/Decoder; 12 constants (3 uint4) for Flow.
++//
++// Compiled per layer via tools/GenerateXeFgWmma.ps1 with dxc.exe -T cs_6_6 -O3 into
++// xefg_mfg_programs\wmma\<program>.dxbc.
++
++#ifndef LAYER_FAMILY
++#define LAYER_FAMILY 0 // 0 = PoolConv, 1 = UpSkip (Decoder), 2 = Flow
++#endif
++
++#ifndef LAYER_IN
++#define LAYER_IN 1
++#endif
++
++#ifndef LAYER_OUT
++#define LAYER_OUT 1
++#endif
++
++#ifndef LAYER_BIAS
++#define LAYER_BIAS 0
++#endif
++
++#ifndef LAYER_POOL
++#define LAYER_POOL 0
++#endif
++
++#ifndef LAYER_RELU
++#define LAYER_RELU 0
++#endif
++
++#ifndef LAYER_TILE_H
++#define LAYER_TILE_H 16
++#endif
++
++#ifndef LAYER_ZSPLIT
++#define LAYER_ZSPLIT 1
++#endif
++
++#ifndef LAYER_ACC_BITS
++#define LAYER_ACC_BITS 16
++#endif
++
++#ifndef LAYER_NT
++#define LAYER_NT 4
++#endif
++
++Texture2DArray<uint4> tInput   : register(t0);
++Buffer<uint4>         tWeights : register(t1);
++Buffer<uint4>         tScale   : register(t2);
++Buffer<uint4>         tBias    : register(t3);
++#if LAYER_FAMILY == 1
++Texture2DArray<uint4> tSkip    : register(t4);
++#endif
++#if LAYER_FAMILY == 2 && LAYER_OUT == 8
++RWTexture2DArray<uint2> uOutput : register(u0);
++#else
++RWTexture2DArray<uint4> uOutput : register(u0);
++#endif
++
++cbuffer RootConstants : register(b0)
++{
++#if LAYER_FAMILY == 2
++    uint4 cWords[3];
++#else
++    uint4 cWords[1];
++#endif
++};
++
++static const int WIN_W = 18;
++#if LAYER_FAMILY == 0 && LAYER_POOL != 0
++static const int PY = 2;
++#else
++static const int PY = 1;
++#endif
++static const int CONV_H = LAYER_TILE_H * PY;
++static const int WIN_H  = CONV_H + 2;
++static const int WIN    = WIN_W * WIN_H;
++static const int ROWS   = LAYER_TILE_H / 4;
++
++#if LAYER_FAMILY == 2
++groupshared uint4 win[WIN];
++groupshared uint4 wsm[LAYER_NT * 72];
++groupshared uint4 sFlowJoin[4][2][16];
++#else
++static const int ZPER = LAYER_OUT / LAYER_ZSPLIT;
++groupshared uint4 win[LAYER_IN * WIN];
++groupshared uint4 wsm[144];
++#if LAYER_POOL != 0
++groupshared int   sPool[4][16][16];
++#else
++groupshared uint2 sJoin[4][2][16];
++#endif
++#endif
++
++// Zero-bank-conflict XOR weight swizzle within each 16-uint4 tap block (0..143)
++uint SwizzleWeightIdx(uint u)
++{
++    return u ^ ((u & 8u) >> 2u);
++}
++
++int SByte(uint w, uint k)
++{
++    uint shift = k * 8u;
++    int b = int((w >> shift) & 0xFFu);
++    return (b >= 128) ? (b - 256) : b;
++}
++
++int Div16Signed(int v)
++{
++    return (v >= 0) ? (v >> 4) : -((-v) >> 4);
++}
++
++uint4 FetchInput(int x, int y, int slice)
++{
++    uint w, h, d;
++    tInput.GetDimensions(w, h, d);
++    if (x < 0 || y < 0 || slice < 0 || uint(x) >= w || uint(y) >= h || uint(slice) >= d)
++        return uint4(0u, 0u, 0u, 0u);
++    return tInput.Load(int4(x, y, slice, 0));
++}
++
++#if LAYER_FAMILY == 1
++uint4 FetchSkip(int x, int y, int slice)
++{
++    uint w, h, d;
++    tSkip.GetDimensions(w, h, d);
++    if (x < 0 || y < 0 || slice < 0 || uint(x) >= w || uint(y) >= h || uint(slice) >= d)
++        return uint4(0u, 0u, 0u, 0u);
++    return tSkip.Load(int4(x, y, slice, 0));
++}
++
++// Exact port of UpSkipBilinearWord (9*a + 3*b + 3*c + d, Div16 + skip clamped to 0..127)
++uint UpSkipBilinearWord(uint aw, uint bw, uint cw, uint dw, uint sw)
++{
++    uint packed = 0u;
++    [unroll]
++    for (uint k = 0u; k < 4u; ++k)
++    {
++        int dot = 9 * SByte(aw, k) + 3 * (SByte(bw, k) + SByte(cw, k)) + SByte(dw, k);
++        int v = clamp(SByte(sw, k) + Div16Signed(dot), 0, 127);
++        packed |= (uint(v) & 0xFFu) << (k * 8u);
++    }
++    return packed;
++}
++#endif
++
++#if LAYER_FAMILY != 2
++// Exact port of PoolConv / UpSkip Requant: trunc(fma(float(acc), scale, bias)), clamp(lo..127)
++uint RequantFloat(int acc, float s, float b, int lo)
++{
++    int q = int(mad(float(acc), s, b));
++    return uint(clamp(q, lo, 127)) & 0xFFu;
++}
++#else
++// Exact port of Flow requantization from src/MfgPort/Cuda/xefg_cuda_layers.cu lines 533-538
++uint RequantFlow(int a, int ib, int neg, int lim, uint posMul, uint s1, uint s2)
++{
++    int clamped = clamp(a + ib, -lim, lim - 1);
++    uint roundPos = 1u << ((s1 + 31u) & 31u);
++    uint roundNeg = 1u << ((s2 + 31u) & 31u);
++    int pp = int(uint(max(clamped, 0)) * posMul + roundPos) >> int(s1);
++    int nn = int(uint(min(clamped, 0)) * uint(neg) + roundNeg) >> int(s2);
++    return uint(clamp(pp + nn, -128, 127)) & 0xFFu;
++}
++#endif
++
++[numthreads(128, 1, 1)]
++void main(uint3 groupID : SV_GroupID, uint tid : SV_GroupIndex)
++{
++    const uint warp   = tid >> 5u;
++    const uint lane   = tid & 31u;
++    const uint px     = lane & 15u;
++    const uint halfCh = lane >> 4u; // 0 = first 8 channels, 1 = next 8 channels
++
++    uint outW, outH, outD;
++    uOutput.GetDimensions(outW, outH, outD);
++
++#if LAYER_FAMILY != 2
++    // ---- Family 0 (PoolConv) & Family 1 (UpSkip Decoder) ----
++    const int X0     = int(groupID.x) * ((LAYER_POOL != 0) ? 8 : 16);
++    const int Y0     = int(groupID.y) * LAYER_TILE_H;
++    const int limitW = int(outW);
++    const int limitH = int(outH);
++    const int lo     = (LAYER_FAMILY == 1 || LAYER_RELU != 0) ? 0 : -128;
++
++#if LAYER_FAMILY == 0
++    const int cx0 = (LAYER_POOL != 0) ? (2 * X0) : X0;
++    const int cy0 = (LAYER_POOL != 0) ? (2 * Y0) : Y0;
++    for (uint i = tid; i < uint(LAYER_IN * WIN); i += 128u)
++    {
++        int slice = int(i) / WIN;
++        int r     = int(i) % WIN;
++        uint4 v   = FetchInput(cx0 - 1 + (r % WIN_W), cy0 - 1 + (r / WIN_W), slice);
++#if LAYER_BIAS != 0
++        v += uint4(0x80808080u, 0x80808080u, 0x80808080u, 0x80808080u);
++#endif
++        win[i] = v;
++    }
++#else
++    const int Wd = int(cWords[0].x);
++    const int Hd = int(cWords[0].y);
++    for (uint i = tid; i < uint(LAYER_IN * WIN); i += 128u)
++    {
++        int slice = int(i) / WIN;
++        int r     = int(i) % WIN;
++        int x     = X0 - 1 + (r % WIN_W);
++        int y     = Y0 - 1 + (r / WIN_W);
++        uint4 res = uint4(0u, 0u, 0u, 0u);
++        if (x >= 0 && y >= 0 && x < Wd && y < Hd)
++        {
++            int xn = x >> 1;
++            int yn = y >> 1;
++            int xf = ((x & 1) != 0) ? (xn + 1) : (xn - 1);
++            int yf = ((y & 1) != 0) ? (yn + 1) : (yn - 1);
++            uint4 a = FetchInput(xn, yn, slice);
++            uint4 b = FetchInput(xf, yn, slice);
++            uint4 c = FetchInput(xn, yf, slice);
++            uint4 d = FetchInput(xf, yf, slice);
++            uint4 s = FetchSkip(x, y, slice);
++            res = uint4(
++                UpSkipBilinearWord(a.x, b.x, c.x, d.x, s.x),
++                UpSkipBilinearWord(a.y, b.y, c.y, d.y, s.y),
++                UpSkipBilinearWord(a.z, b.z, c.z, d.z, s.z),
++                UpSkipBilinearWord(a.w, b.w, c.w, d.w, s.w));
++        }
++        win[i] = res;
++    }
++#endif
++    GroupMemoryBarrierWithGroupSync();
++
++    const int zBegin = int(groupID.z) * ZPER;
++    for (int z = zBegin; z < zBegin + ZPER; ++z)
++    {
++        int acc[ROWS][PY][8];
++        [unroll]
++        for (int r = 0; r < ROWS; ++r)
++        {
++            [unroll]
++            for (int py = 0; py < PY; ++py)
++            {
++                [unroll]
++                for (int c = 0; c < 8; ++c)
++                    acc[r][py][c] = 0;
++            }
++        }
++
++        for (int slice = 0; slice < LAYER_IN; ++slice)
++        {
++            int block = z * LAYER_IN + slice;
++            for (uint wIdx = tid; wIdx < 144u; wIdx += 128u)
++                wsm[SwizzleWeightIdx(wIdx)] = tWeights.Load(block * 144 + int(wIdx));
++            GroupMemoryBarrierWithGroupSync();
++
++            int sliceBase = slice * WIN;
++            [unroll]
++            for (int tap = 0; tap < 9; ++tap)
++            {
++                int dy = tap / 3;
++                int dx = tap % 3;
++                [unroll]
++                for (int w = 0; w < 4; ++w)
++                {
++                    uint s0 = halfCh * 2u + 0u;
++                    uint s1 = halfCh * 2u + 1u;
++                    uint4 wv0 = wsm[SwizzleWeightIdx(uint(tap * 16 + w * 4) + s0)];
++                    uint4 wv1 = wsm[SwizzleWeightIdx(uint(tap * 16 + w * 4) + s1)];
++                    uint b[8] = { wv0.x, wv0.y, wv0.z, wv0.w, wv1.x, wv1.y, wv1.z, wv1.w };
++
++                    [unroll]
++                    for (int r = 0; r < ROWS; ++r)
++                    {
++                        int yl = int(warp) + r * 4;
++                        [unroll]
++                        for (int py = 0; py < PY; ++py)
++                        {
++                            int rowY = (PY > 1) ? (2 * yl + py) : yl;
++                            uint4 av = win[sliceBase + (rowY + dy) * WIN_W + int(px) + dx];
++                            uint a = (w == 0) ? av.x : ((w == 1) ? av.y : ((w == 2) ? av.z : av.w));
++                            [unroll]
++                            for (int c = 0; c < 8; ++c)
++                                acc[r][py][c] = dot4add_i8packed(a, b[c], acc[r][py][c]);
++                        }
++                    }
++                }
++            }
++            GroupMemoryBarrierWithGroupSync();
++        }
++
++        float s[16];
++        float bi[16];
++        [unroll]
++        for (int w = 0; w < 4; ++w)
++        {
++            uint4 sv = tScale.Load(z * 4 + w);
++            uint4 bv = tBias.Load(z * 4 + w);
++            s[w * 4 + 0]  = asfloat(sv.x);
++            s[w * 4 + 1]  = asfloat(sv.y);
++            s[w * 4 + 2]  = asfloat(sv.z);
++            s[w * 4 + 3]  = asfloat(sv.w);
++            bi[w * 4 + 0] = asfloat(bv.x);
++            bi[w * 4 + 1] = asfloat(bv.y);
++            bi[w * 4 + 2] = asfloat(bv.z);
++            bi[w * 4 + 3] = asfloat(bv.w);
++        }
++
++        [unroll]
++        for (int r = 0; r < ROWS; ++r)
++        {
++            int Y = Y0 + int(warp) + r * 4;
++#if LAYER_POOL != 0
++            [unroll]
++            for (int c = 0; c < 8; ++c)
++                sPool[warp][px][halfCh * 8u + uint(c)] = max(acc[r][0][c], acc[r][1][c]);
++            GroupMemoryBarrierWithGroupSync();
++
++            if (halfCh == 0u && px < 8u && Y < limitH)
++            {
++                int X = X0 + int(px);
++                if (X < limitW)
++                {
++                    uint words[4];
++                    [unroll]
++                    for (int w = 0; w < 4; ++w)
++                    {
++                        uint packed = 0u;
++                        [unroll]
++                        for (int c = 0; c < 4; ++c)
++                        {
++                            int oc = w * 4 + c;
++                            int m = max(sPool[warp][2u * px][oc], sPool[warp][2u * px + 1u][oc]);
++                            packed |= RequantFloat(m, s[oc], bi[oc], lo) << uint(c * 8);
++                        }
++                        words[w] = packed;
++                    }
++                    uOutput[uint3(uint(X), uint(Y), uint(z))] = uint4(words[0], words[1], words[2], words[3]);
++                }
++            }
++            GroupMemoryBarrierWithGroupSync();
++#else
++            uint2 halfWords = uint2(0u, 0u);
++            [unroll]
++            for (int w = 0; w < 2; ++w)
++            {
++                uint packed = 0u;
++                [unroll]
++                for (int c = 0; c < 4; ++c)
++                {
++                    int localC = w * 4 + c;
++                    int oc = int(halfCh) * 8 + localC;
++                    packed |= RequantFloat(acc[r][0][localC], s[oc], bi[oc], lo) << uint(c * 8);
++                }
++                if (w == 0) halfWords.x = packed;
++                else        halfWords.y = packed;
++            }
++            sJoin[warp][halfCh][px] = halfWords;
++            GroupMemoryBarrierWithGroupSync();
++
++            if (halfCh == 0u && Y < limitH)
++            {
++                int X = X0 + int(px);
++                if (X < limitW)
++                {
++                    uint2 lo2 = sJoin[warp][0][px];
++                    uint2 hi2 = sJoin[warp][1][px];
++                    uOutput[uint3(uint(X), uint(Y), uint(z))] = uint4(lo2.x, lo2.y, hi2.x, hi2.y);
++                }
++            }
++            GroupMemoryBarrierWithGroupSync();
++#endif
++        }
++    }
++
++#else
++    // ---- Family 2 (Flow: NIT = LAYER_IN, NOUT = LAYER_OUT, TILE_H = 8, NT = 4) ----
++    const int  Wd     = int(cWords[0].z);
++    const int  Hd     = int(cWords[0].w);
++    const int  Wout   = int(cWords[1].x);
++    const int  Hout   = int(cWords[1].y);
++    const uint posMul = cWords[2].y;
++    const uint shifts = cWords[2].z;
++    const uint s1     = shifts & 31u;
++    const uint s2     = (shifts >> 8u) & 31u;
++    const int  lim    = 1 << LAYER_ACC_BITS;
++    const int  X0     = int(groupID.x) * 16;
++    const int  Y0     = int(groupID.y) * LAYER_TILE_H;
++    const int  n0     = int(groupID.z) * LAYER_NT;
++    const int  limitW = min(int(outW), Wout);
++    const int  limitH = min(int(outH), Hout);
++
++    // Each thread accumulates 16 output channels: halfCh == 0 covers tiles nt = 0,1; halfCh == 1 covers tiles nt = 2,3
++    int acc[ROWS][16];
++    [unroll]
++    for (int r = 0; r < ROWS; ++r)
++    {
++        [unroll]
++        for (int c = 0; c < 16; ++c)
++            acc[r][c] = 0;
++    }
++
++    for (int step = 0; step < LAYER_IN; ++step)
++    {
++        for (uint e = tid; e < uint(WIN); e += 128u)
++        {
++            int x  = X0 - 1 + (int(e) % WIN_W);
++            int ys = Y0 + (int(e) / WIN_W);
++            uint4 v = uint4(0u, 0u, 0u, 0u);
++            if (x >= 0 && x < Wd && ys >= 1 && ys <= Hd)
++            {
++#if LAYER_OUT == 8
++                uint4 a = FetchInput(x, ys, 2 * step);
++                uint4 b = FetchInput(x, ys, 2 * step + 1);
++                v = uint4(a.x, a.y, b.x, b.y);
++#else
++                v = FetchInput(x, ys, step);
++#endif
++            }
++            win[e] = v;
++        }
++
++        for (uint wIdx = tid; wIdx < uint(LAYER_NT * 72); wIdx += 128u)
++        {
++            int nt    = int(wIdx) / 72;
++            int group = (int(wIdx) % 72) / 36;
++            int k     = int(wIdx) % 36;
++            int ch    = (n0 + nt) * 8;
++            int z     = ch / LAYER_OUT;
++            int c     = ch % LAYER_OUT;
++            int idx   = ((z * LAYER_IN + step) * (LAYER_OUT / 4) + (c / 4) + group) * 36 + k;
++            wsm[wIdx] = tWeights.Load(idx);
++        }
++        GroupMemoryBarrierWithGroupSync();
++
++        [unroll]
++        for (int tap = 0; tap < 9; ++tap)
++        {
++            int dy = tap / 3;
++            int dx = tap % 3;
++            [unroll]
++            for (int w = 0; w < 4; ++w)
++            {
++                int k = tap * 4 + w;
++                uint basent = halfCh * 2u;
++                uint4 wv0 = wsm[(basent + 0u) * 72u + 0u * 36u + uint(k)];
++                uint4 wv1 = wsm[(basent + 0u) * 72u + 1u * 36u + uint(k)];
++                uint4 wv2 = wsm[(basent + 1u) * 72u + 0u * 36u + uint(k)];
++                uint4 wv3 = wsm[(basent + 1u) * 72u + 1u * 36u + uint(k)];
++                uint b[16] = {
++                    wv0.x, wv0.y, wv0.z, wv0.w,
++                    wv1.x, wv1.y, wv1.z, wv1.w,
++                    wv2.x, wv2.y, wv2.z, wv2.w,
++                    wv3.x, wv3.y, wv3.z, wv3.w
++                };
++
++                [unroll]
++                for (int r = 0; r < ROWS; ++r)
++                {
++                    int yl = int(warp) + r * 4;
++                    uint4 av = win[(yl + dy) * WIN_W + int(px) + dx];
++                    uint a = (w == 0) ? av.x : ((w == 1) ? av.y : ((w == 2) ? av.z : av.w));
++                    [unroll]
++                    for (int c = 0; c < 16; ++c)
++                        acc[r][c] = dot4add_i8packed(a, b[c], acc[r][c]);
++                }
++            }
++        }
++        GroupMemoryBarrierWithGroupSync();
++    }
++
++    [unroll]
++    for (int r = 0; r < ROWS; ++r)
++    {
++        uint4 halfWords = uint4(0u, 0u, 0u, 0u);
++        [unroll]
++        for (int w = 0; w < 4; ++w)
++        {
++            int ch4 = (n0 * 8 + int(halfCh) * 16) + w * 4;
++            uint4 bv = tScale.Load(ch4 >> 2);
++            uint4 nv = tBias.Load(ch4 >> 2);
++            int ib[4] = { int(bv.x), int(bv.y), int(bv.z), int(bv.w) };
++            int ng[4] = { int(nv.x), int(nv.y), int(nv.z), int(nv.w) };
++            uint packed = 0u;
++            [unroll]
++            for (int c = 0; c < 4; ++c)
++            {
++                int a = acc[r][w * 4 + c];
++                packed |= RequantFlow(a, ib[c], ng[c], lim, posMul, s1, s2) << uint(c * 8);
++            }
++            if (w == 0)      halfWords.x = packed;
++            else if (w == 1) halfWords.y = packed;
++            else if (w == 2) halfWords.z = packed;
++            else             halfWords.w = packed;
++        }
++        sFlowJoin[warp][halfCh][px] = halfWords;
++        GroupMemoryBarrierWithGroupSync();
++
++        int y = Y0 + int(warp) + r * 4;
++        int x = X0 + int(px);
++        if (halfCh == 0u && x < limitW && y < limitH)
++        {
++            uint4 lo4 = sFlowJoin[warp][0][px];
++            uint4 hi4 = sFlowJoin[warp][1][px];
++#if LAYER_OUT == 8
++            uOutput[uint3(uint(x), uint(y + 1), uint(n0 + 0))] = lo4.xy;
++            uOutput[uint3(uint(x), uint(y + 1), uint(n0 + 1))] = lo4.zw;
++            uOutput[uint3(uint(x), uint(y + 1), uint(n0 + 2))] = hi4.xy;
++            uOutput[uint3(uint(x), uint(y + 1), uint(n0 + 3))] = hi4.zw;
++#else
++            uOutput[uint3(uint(x), uint(y + 1), uint((n0 / 2) + 0))] = lo4;
++            uOutput[uint3(uint(x), uint(y + 1), uint((n0 / 2) + 1))] = hi4;
++#endif
++        }
++        GroupMemoryBarrierWithGroupSync();
++    }
++#endif
++}
+diff --git a/src/Plugin.cpp b/src/Plugin.cpp
+index a94417c..07b1112 100644
+--- a/src/Plugin.cpp
++++ b/src/Plugin.cpp
+@@ -39,6 +39,8 @@ namespace
+ 			return "XMX Port";
+ 		case Plugin::Network::Cuda:
+ 			return "CUDA";
++		case Plugin::Network::Wmma:
++			return "WMMA";
+ 		case Plugin::Network::Fallback:
+ 			return "Fallback (DP4a)";
+ 		default:
+@@ -222,7 +224,7 @@ namespace
+ 			else
+ 			{
+ 				api->Text(std::format("Coop matrix (WMMA/XMX): ready \xC2\xB7 {}", shape).c_str());
+-				api->ItemTooltip("Installed on this GPU, ready for the XMX Port and XMX (native) paths.");
++				api->ItemTooltip("Installed on this GPU, ready for the WMMA, XMX Port and XMX (native) paths.");
+ 			}
+ 
+ 			return;
+@@ -276,10 +278,10 @@ namespace
+ 				line += std::format(" \xC2\xB7 {} model", model);
+ 
+ 			api->Text(line.c_str());
+-			api->ItemTooltip("port: the ported MFG model, the XMX Port, XMX (native) and CUDA network paths\n"
++			api->ItemTooltip("port / WMMA: the ported MFG model, the WMMA, XMX Port, XMX (native) and CUDA network paths\n"
+ 							 "DP4a: XeFG's own model, the Fallback (DP4a) network path\n"
+-							 "XeFG's own XMX network isn't used on Vulkan, XMX (native) runs the port. The CUDA path (and XMX (native)) puts the\n"
+-							 "port's int8 layers on the tensor cores of an NVIDIA RTX GPU when it can, the XMX Port runs them as SPIR-V programs.");
++							 "XeFG's own XMX network isn't used on Vulkan, XMX (native) and WMMA run the port. The WMMA path puts the port's\n"
++							 "int8 layers on VK_KHR_cooperative_matrix (AMD RDNA 4 / RDNA 3 WMMA), CUDA puts them on NVIDIA tensor cores.");
+ 		}
+ 
+ 		DrawVulkanTensor();
+@@ -415,34 +417,38 @@ namespace
+ 	{
+ 		api->Section("Settings");
+ 
+-		static constexpr const char* PathNames[] = { "XMX Port", "CUDA", "Fallback (DP4a)", "XMX (native)" };
++		static constexpr const char* PathNames[] = { "XMX Port", "CUDA", "Fallback (DP4a)", "XMX (native)", "WMMA" };
+ 		const bool cudaDisabled = Plugin::cudaSupport.load() == Plugin::CudaSupport::Unsupported;
+ 		const bool xmxDisabled = Plugin::xmxSupport.load() == Plugin::XmxSupport::Unsupported;
++		const bool wmmaDisabled = Plugin::wmmaSupport.load() == Plugin::WmmaSupport::Unsupported;
+ 
+ 		int32_t path = (int32_t)Plugin::options.path.load();
+ 
+ 		// A saved choice the GPU doesn't support runs something else, show what is actually running
+ 		if (path == (int32_t)Plugin::Path::XmxNative && xmxDisabled)
+-			path = cudaDisabled ? (int32_t)Plugin::Path::XmxPort : (int32_t)Plugin::Path::Cuda;
++			path = !cudaDisabled ? (int32_t)Plugin::Path::Cuda : !wmmaDisabled ? (int32_t)Plugin::Path::Wmma : (int32_t)Plugin::Path::XmxPort;
+ 
+ 		if (path == (int32_t)Plugin::Path::Cuda && cudaDisabled)
+ 			path = (int32_t)Plugin::Path::XmxPort;
+ 
+-		const bool disabled[] = { false, cudaDisabled, false, xmxDisabled };
++		if (path == (int32_t)Plugin::Path::Wmma && wmmaDisabled)
++			path = (int32_t)Plugin::Path::XmxPort;
++
++		const bool disabled[] = { false, cudaDisabled, false, xmxDisabled, wmmaDisabled };
+ 
+-		if (api->Combo("Network path", &path, PathNames, 4, disabled))
++		if (api->Combo("Network path", &path, PathNames, 5, disabled))
+ 		{
+ 			Plugin::options.path = (Plugin::Path)path;
+ 			api->SetInt(self, "NetworkPath", path);
+ 		}
+ 
+ 		api->ItemTooltip("XMX (native): XeFG's own XMX network, the default on Intel GPUs with XMX\n"
+-						 "XMX Port: ported XMX model on DXIL\n"
++						 "XMX Port: ported XMX model on DXIL / SPIR-V (DP4a INT8)\n"
+ 						 "CUDA: ported XMX model on NVIDIA tensor cores, RTX GPUs only\n"
++						 "WMMA: ported XMX model accelerated with WMMA INT8 (AMD RDNA 4 / RDNA 3 WaveMatrix & Vulkan Cooperative Matrix)\n"
+ 						 "Fallback (DP4a): XeFG's default model\n"
+-						 "Vulkan games run the ported model, on the tensor cores of an RTX GPU for CUDA and XMX (native) when the route is\n"
+-						 "available, on VK_KHR_cooperative_matrix (AMD WMMA / Intel XMX) when available, or as SPIR-V programs for XMX Port.\n"
+-						 "Fallback (DP4a) runs XeFG's own model (see Vulkan)");
++						 "Vulkan games run the ported model on VK_KHR_cooperative_matrix (AMD WMMA / Intel XMX) for WMMA, on NVIDIA tensor\n"
++						 "cores for CUDA, or as DP4a SPIR-V programs for XMX Port. Fallback (DP4a) runs XeFG's own model (see Vulkan)");
+ 
+ 		bool hudlessUi = Plugin::options.hudlessUi;
+ 
+@@ -561,6 +567,8 @@ const char* Plugin::PathName(Path path)
+ 		return "Fallback (DP4a)";
+ 	case Path::XmxNative:
+ 		return "XMX (native)";
++	case Path::Wmma:
++		return "WMMA";
+ 	default:
+ 		return "Unknown";
+ 	}
+@@ -606,7 +614,7 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* optiAp
+ 	Log::Info("OptiScaler plugin API version {}", api->version);
+ 
+ 	const int32_t path = api->GetInt(self, "NetworkPath", (int32_t)Plugin::options.path.load());
+-	if (path >= (int32_t)Plugin::Path::XmxPort && path <= (int32_t)Plugin::Path::XmxNative)
++	if (path >= (int32_t)Plugin::Path::XmxPort && path <= (int32_t)Plugin::Path::Wmma)
+ 		Plugin::options.path = (Plugin::Path)path;
+ 
+ 	Plugin::options.hudlessUi = api->GetBool(self, "HudlessUi", Plugin::options.hudlessUi);
+diff --git a/src/Plugin.h b/src/Plugin.h
+index b8f06fa..d36a7d0 100644
+--- a/src/Plugin.h
++++ b/src/Plugin.h
+@@ -14,6 +14,7 @@ namespace Plugin
+ 		Cuda,
+ 		Fallback, // DP4a model 18
+ 		XmxNative, // XeFG's own XMX network (17), no port, Intel GPUs with XMX only
++		Wmma, // Ported XMX model (16) with WMMA INT8 acceleration (AMD RDNA 4 / RDNA 3 & Vulkan Cooperative Matrix)
+ 	};
+ 
+ 	// The path's name in the menu and in the log
+@@ -21,8 +22,8 @@ namespace Plugin
+ 
+ 	struct Options
+ 	{
+-		// XeFG's own XMX network on Intel GPUs with XMX, the ported model on DXIL or CUDA tensor cores, or its DP4a
+-		// model. Unsupported choices fall back the way the menu shows
++		// XeFG's own XMX network on Intel GPUs with XMX, the ported model on DXIL, CUDA tensor cores, or WMMA INT8,
++		// or its DP4a model. Unsupported choices fall back the way the menu shows
+ 		std::atomic<Path> path = Path::XmxNative;
+ 		// Lets XeFG composite the UI from the game's HUDless color instead of interpolating it with the scene
+ 		std::atomic_bool hudlessUi = true;
+@@ -50,6 +51,15 @@ namespace Plugin
+ 
+ 	inline std::atomic<XmxSupport> xmxSupport = XmxSupport::Unknown;
+ 
++	enum class WmmaSupport : int32_t
++	{
++		Unknown, // The startup probe hasn't looked at a GPU yet
++		Supported, // AMD WMMA INT8 or Vulkan VK_KHR_cooperative_matrix INT8 is available on this GPU
++		Unsupported,
++	};
++
++	inline std::atomic<WmmaSupport> wmmaSupport = WmmaSupport::Unknown;
++
+ 	// Which network is running
+ 	enum class Network : int32_t
+ 	{
+@@ -57,6 +67,7 @@ namespace Plugin
+ 		XmxNative, // XeFG's own XMX network (17)
+ 		XmxPort,
+ 		Cuda,
++		Wmma, // Ported XMX model (16) accelerated with WMMA INT8
+ 		Fallback, // DP4a model 18, the ported model isn't available
+ 	};
+ 
+diff --git a/src/vulkan/VulkanPolicy.h b/src/vulkan/VulkanPolicy.h
+index 1daf346..e2138cc 100644
+--- a/src/vulkan/VulkanPolicy.h
++++ b/src/vulkan/VulkanPolicy.h
+@@ -289,11 +289,26 @@ namespace VulkanPolicy
+ 	}
+ 
+ 	// The VK_KHR_cooperative_matrix route (AMD RDNA3/RDNA4 WMMA and Intel Arc/Battlemage XMX) replaces the int8 layers of
+-	// the ported MFG model when the XMX Port, XMX (native), or CUDA path is selected on a GPU where the NVIDIA CUDA cubin
+-	// route isn't active. Fallback (DP4a) keeps XeFG's stock model.
+-	inline bool UseCoopMatrix(bool portModel, bool xmxPortPath, bool xmxNativePath, bool cudaPath) noexcept
++	// the ported MFG model when the WMMA, XMX Port, XMX (native), or CUDA path is selected on a GPU where the NVIDIA CUDA
++	// cubin route isn't active. Fallback (DP4a) keeps XeFG's stock model.
++	inline bool UseCoopMatrix(bool portModel, bool xmxPortPath, bool xmxNativePath, bool cudaPath, bool wmmaPath = false) noexcept
+ 	{
+-		return portModel && (xmxPortPath || xmxNativePath || cudaPath);
++		return portModel && (xmxPortPath || xmxNativePath || cudaPath || wmmaPath);
++	}
++
++	// Identifies AMD RDNA 4 (gfx1200/gfx1201: RX 9070 XT / 9070 / 9060 XT, PCI DeviceID 0x7550..0x75FF), where 3rd-gen
++	// Matrix Cores deliver 2048 INT8 ops/clock/CU (4x DP4a's 512 ops/clock/CU).
++	inline bool IsAmdRdna4Device(uint32_t vendorId, uint32_t deviceId, std::string_view deviceName = {}) noexcept
++	{
++		if (vendorId != 0x1002)
++			return false;
++
++		if (deviceId >= 0x7550 && deviceId <= 0x75FF)
++			return true;
++
++		return deviceName.find("RX 90") != std::string_view::npos ||
++		       deviceName.find("RDNA 4") != std::string_view::npos ||
++		       deviceName.find("gfx12") != std::string_view::npos;
+ 	}
+ 
+ 	// What a reason code of the cooperative-matrix route means, for the log and the menu
+diff --git a/src/vulkan/shaders/xefg_coopmat_layers.comp b/src/vulkan/shaders/xefg_coopmat_layers.comp
+index 2ed96b3..cd7cd72 100644
+--- a/src/vulkan/shaders/xefg_coopmat_layers.comp
++++ b/src/vulkan/shaders/xefg_coopmat_layers.comp
+@@ -1,16 +1,22 @@
+ // SPDX-License-Identifier: MIT
+ //
+-// GLSL compute shader template for XeFG's 17 ported INT8 layers using VK_KHR_cooperative_matrix
+-// (SPV_KHR_cooperative_matrix / GL_KHR_cooperative_matrix) on AMD RDNA3/RDNA4 (WMMA) and Intel Arc/Battlemage (XMX).
++// Full 9-tap 3x3 INT8 convolution GLSL compute shader template for XeFG's 17 ported INT8 layers
++// using VK_KHR_cooperative_matrix (SPV_KHR_cooperative_matrix / GL_KHR_cooperative_matrix)
++// on AMD RDNA 4 / RDNA 3 (WMMA) and Intel Arc / Battlemage (XMX).
+ //
+-// Compiled per layer via tools/GenerateXeFgCoopMat.py with glslangValidator --target-env vulkan1.3
+-// into third_party/xefg_mfg_programs/vulkan/coopmat/<kernel>.spv.
++// Direct bit-exact port of PoolConv, UpSkip (Decoder), and Flow from src/MfgPort/Cuda/xefg_cuda_layers.cu:
++//   - LAYER_FAMILY == 0 (PoolConv): 18 x (CONV_H + 2) window with out-of-bounds zero padding, optional +0x80808080u
++//     input bias (L_aa016078), 9-tap 3x3 x 16-channel cooperative-matrix accumulation across LAYER_IN slices,
++//     optional 2x2 max-pooling, and IEEE-754 float fma(acc, scale, bias) + trunc + clamp(LO..127) requantization.
++//   - LAYER_FAMILY == 1 (UpSkip Decoder): integer 2x bilinear upsampling (9*a + 3*b + 3*c + d) / 16 + skip clamped
++//     to [0..127] inside Wd x Hd (pc.words[0].xy), 9-tap 3x3 cooperative-matrix convolution, and ReLU requantization.
++//   - LAYER_FAMILY == 2 (Flow): 1-row top border (ys = Y0 + row >= 1..Hd, output stored at y + 1), 8-channel (2 slices
++//     packed per 16-channel step, rg32ui output) or 16-channel (1 slice per step, rgba32ui output) 9-tap 3x3
++//     accumulation across NT = 4 tiles (32 output channels per workgroup), and asymmetric int32 posMul/neg shift
++//     requantization with [-2^ACC_BITS .. 2^ACC_BITS - 1] clamping.
+ //
+-// Specialization constants (set by xvk::CoopMatrixRoute::EnsureLayerPipeline):
+-//   constant_id = 0 : COOP_M (default 16)
+-//   constant_id = 1 : COOP_N (default 8)
+-//   constant_id = 2 : COOP_K (default 32)
+-//   constant_id = 3 : SUBGROUP_SIZE (default 32)
++// Compiled per layer via tools/GenerateXeFgCoopMat.py with glslangValidator --target-env vulkan1.3
++// into third_party/xefg_mfg_programs/vulkan/coopmat/<kernel>.spv (and <program>.spv).
+ #version 460
+ #extension GL_KHR_memory_scope_semantics : enable
+ #extension GL_KHR_cooperative_matrix : enable
+@@ -20,10 +26,11 @@
+ #extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+ #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+ #extension GL_KHR_shader_subgroup_basic : enable
++#extension GL_EXT_samplerless_texture_functions : enable
+ 
+ layout(constant_id = 0) const uint COOP_M = 16;
+-layout(constant_id = 1) const uint COOP_N = 8;
+-layout(constant_id = 2) const uint COOP_K = 32;
++layout(constant_id = 1) const uint COOP_N = 16;
++layout(constant_id = 2) const uint COOP_K = 16;
+ layout(constant_id = 3) const uint SUBGROUP_SIZE = 32;
+ 
+ #ifndef LAYER_FAMILY
+@@ -68,93 +75,601 @@ layout(constant_id = 3) const uint SUBGROUP_SIZE = 32;
+ 
+ layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+ 
+-// Push descriptors matching xvk_coopmat.cpp (Pool/Flow: 5 bindings; Decoder UpSkip: 6 bindings)
+-layout(set = 0, binding = 0, rgba32ui) uniform readonly uimage2D uSrc0;
+-layout(set = 0, binding = 1, std430) readonly buffer WeightBuf { uint data[]; } uWeights;
+-layout(set = 0, binding = 2, std430) readonly buffer BiasBuf   { uint data[]; } uBias;
+-layout(set = 0, binding = 3, std430) readonly buffer ScaleBuf  { uint data[]; } uScale;
++// Descriptor bindings matching third_party/xefg_mfg_programs/vulkan/programs.tsv and xvk_coopmat.cpp:
++//   binding 0  : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE (utexture2DArray t0)
++//   binding 1  : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER (uWeights t1)
++//   binding 2  : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER (uScale t2: float scale for Pool/Decoder, int32 bias for Flow)
++//   binding 3  : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER (uBias t3: float bias for Pool/Decoder, int32 negMul for Flow)
++//   binding 4  : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE (utexture2DArray t4, Decoder LAYER_FAMILY == 1 only)
++//   binding 64 : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE (uimage2DArray u0: rg32ui for 8-ch Flow, rgba32ui otherwise)
++layout(set = 0, binding = 0) uniform utexture2DArray uInput;
++layout(set = 0, binding = 1, std430) readonly buffer WeightBuf { uvec4 data[]; } uWeights;
++layout(set = 0, binding = 2, std430) readonly buffer ScaleBuf  { uvec4 data[]; } uScale;
++layout(set = 0, binding = 3, std430) readonly buffer BiasBuf   { uvec4 data[]; } uBias;
+ #if LAYER_FAMILY == 1
+-layout(set = 0, binding = 4, rgba32ui) uniform readonly uimage2D uSrc1;
++layout(set = 0, binding = 4) uniform utexture2DArray uSkip;
++#endif
++#if LAYER_FAMILY == 2 && LAYER_OUT == 8
++layout(set = 0, binding = 64, rg32ui) uniform writeonly uimage2DArray uDst;
++#else
++layout(set = 0, binding = 64, rgba32ui) uniform writeonly uimage2DArray uDst;
+ #endif
+-layout(set = 0, binding = 64, rgba32ui) uniform writeonly uimage2D uDst;
+ 
++#if LAYER_FAMILY == 2
+ layout(push_constant) uniform PushConstants
+ {
+ 	uvec4 words[3];
+ } pc;
++#else
++layout(push_constant) uniform PushConstants
++{
++	uvec4 words[1];
++} pc;
++#endif
+ 
+-// Shared staging buffers for cooperative matrix load/store (row-major packed int8x4 words and int32 accumulators)
+-shared uint sAct[16 * 8];
+-shared uint sWgt[8 * 8];
+-shared int  sAcc[16 * 8];
++const int WIN_W = 18;
++#if LAYER_FAMILY == 0 && LAYER_POOL != 0
++const int PY = 2;
++#else
++const int PY = 1;
++#endif
++const int CONV_H = LAYER_TILE_H * PY;
++const int WIN_H  = CONV_H + 2;
++const int WIN    = WIN_W * WIN_H;
++const int ROWS   = LAYER_TILE_H / 4;
+ 
+-// Unpack signed int8 lane from 32-bit word
+-int sbyte(uint w, uint b)
++#if LAYER_FAMILY == 2
++// Flow stages one 16-channel input step at a time and 2 x (9 taps x 16x16 col-major) weight tiles (NT = 4 tiles of 8 ch = 32 ch)
++shared uint winWords[WIN * 4];
++shared uint wsmWords[2 * 9 * 64];
++shared int  sAcc[4 * 2 * 256];
++#else
++const int ZPER = LAYER_OUT / LAYER_ZSPLIT;
++shared uint winWords[LAYER_IN * WIN * 4];
++shared uint wsmWords[9 * 64];
++shared int  sAcc[4 * PY * 256];
++#endif
++
++int sbyte(uint w, uint k)
+ {
+-	return bitfieldExtract(int(w), int(b * 8u), 8);
++	return bitfieldExtract(int(w), int(k * 8u), 8);
+ }
+ 
+-// Pack 4 signed int8 lanes with saturation into a 32-bit word
+-uint packSaturateI8x4(ivec4 v, bool relu)
++int div16Signed(int v)
+ {
+-	int lo = relu ? 0 : -128;
+-	ivec4 c = clamp(v, ivec4(lo), ivec4(127));
+-	return (uint(c.x) & 0xFFu) |
+-	       ((uint(c.y) & 0xFFu) << 8) |
+-	       ((uint(c.z) & 0xFFu) << 16) |
+-	       ((uint(c.w) & 0xFFu) << 24);
++	return v >= 0 ? (v >> 4) : -((-v) >> 4);
+ }
+ 
+-// Exact port of UpSkipBilinearWord (9/16, 3/16, 3/16, 1/16) with rounding +8 >> 4
+-uint upSkipBilinearWord(uint p00, uint p01, uint p10, uint p11)
++uint uvec4Comp(uvec4 v, int k)
+ {
+-	uint outWord = 0u;
+-	for (uint b = 0u; b < 4u; ++b)
++	return k == 0 ? v.x : (k == 1 ? v.y : (k == 2 ? v.z : v.w));
++}
++
++// Hardware clamp-to-border (0,0,0,0) equivalent for samplerless texelFetch
++uvec4 fetchInput(int x, int y, int slice)
++{
++	ivec3 sz = textureSize(uInput, 0);
++	if (x < 0 || y < 0 || slice < 0 || x >= sz.x || y >= sz.y || slice >= sz.z)
++		return uvec4(0u);
++	return texelFetch(uInput, ivec3(x, y, slice), 0);
++}
++
++#if LAYER_FAMILY == 1
++uvec4 fetchSkip(int x, int y, int slice)
++{
++	ivec3 sz = textureSize(uSkip, 0);
++	if (x < 0 || y < 0 || slice < 0 || x >= sz.x || y >= sz.y || slice >= sz.z)
++		return uvec4(0u);
++	return texelFetch(uSkip, ivec3(x, y, slice), 0);
++}
++
++// Exact port of UpSkipBilinearWord (9*a + 3*b + 3*c + d, signed div 16 + skip clamped to 0..127)
++uint upSkipBilinearWord(uint aw, uint bw, uint cw, uint dw, uint sw)
++{
++	uint packed = 0u;
++	for (uint k = 0u; k < 4u; ++k)
+ 	{
+-		int v00 = sbyte(p00, b);
+-		int v01 = sbyte(p01, b);
+-		int v10 = sbyte(p10, b);
+-		int v11 = sbyte(p11, b);
+-		int sum = 9 * v00 + 3 * v01 + 3 * v10 + v11 + 8;
+-		int q = clamp(sum >> 4, -128, 127);
+-		outWord |= (uint(q) & 0xFFu) << (b * 8u);
++		int dot = 9 * sbyte(aw, k) + 3 * (sbyte(bw, k) + sbyte(cw, k)) + sbyte(dw, k);
++		int v = clamp(sbyte(sw, k) + div16Signed(dot), 0, 127);
++		packed |= (uint(v) & 0xFFu) << (k * 8u);
+ 	}
+-	return outWord;
++	return packed;
+ }
++#endif
+ 
+-void main()
++#if LAYER_FAMILY != 2
++// Exact port of PoolConv / UpSkip Requant: trunc(fma(float(acc), scale, bias)), clamp(lo..127)
++uint requantFloat(int acc, float s, float b, int lo)
+ {
+-	// Cooperative matrix fragment declarations parameterized on specialization constants
+-	// Use subgroup-scoped SINT8 x SINT8 -> SINT32 cooperative matrix multiply-add:
+-	coopmat<int8_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseA> matA;
+-	coopmat<int8_t, gl_ScopeSubgroup, 32, 8,  gl_MatrixUseB> matB;
+-	coopmat<int32_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator> matC;
++	int q = int(fma(float(acc), s, b));
++	return uint(clamp(q, lo, 127)) & 0xFFu;
++}
++
++// Stages one 144-uvec4 weight block (z * LAYER_IN + slice) into 9 column-major 16x16 int8 tap matrices in wsmWords.
++// In Intel's layout, uWeights[(block * 144) + tap * 16 + word * 4 + s].l holds the 4 input channels (4*word..4*word+3)
++// for output channel oc = 4*s + l. In column-major layout with stride = 4 uint32 words (16 int8 rows), column oc
++// sits at wsmWords[tap * 64 + oc * 4 + word].
++void stagePoolWeights(int block, uint tid)
++{
++	for (uint i = tid; i < 144u; i += 128u)
++	{
++		uint tap  = i / 16u;
++		uint rem  = i % 16u;
++		uint word = rem / 4u;
++		uint s    = rem % 4u;
++		uvec4 v   = uWeights.data[uint(block) * 144u + i];
++		uint base = tap * 64u + (4u * s) * 4u + word;
++		wsmWords[base + 0u * 4u] = v.x;
++		wsmWords[base + 1u * 4u] = v.y;
++		wsmWords[base + 2u * 4u] = v.z;
++		wsmWords[base + 3u * 4u] = v.w;
++	}
++}
++
++void emitPoolRow(int r, int z, int X0, int Y0, int limitW, int limitH, uint warp, uint lane,
++                 float s[16], float bi[16], int lo)
++{
++	int Y = Y0 + int(warp) + r * 4;
++	if (Y >= limitH)
++		return;
++
++#if LAYER_POOL != 0
++	if (lane < 8u)
++	{
++		int px = int(lane);
++		int X = X0 + px;
++		if (X < limitW)
++		{
++			uint base0 = (warp * 2u + 0u) * 256u;
++			uint base1 = (warp * 2u + 1u) * 256u;
++			uint m0 = uint(2 * px) * 16u;
++			uint m1 = uint(2 * px + 1) * 16u;
++			uint words[4];
++			for (int w = 0; w < 4; ++w)
++			{
++				uint packed = 0u;
++				for (int c = 0; c < 4; ++c)
++				{
++					int oc = w * 4 + c;
++					int v00 = sAcc[base0 + m0 + uint(oc)];
++					int v10 = sAcc[base0 + m1 + uint(oc)];
++					int v01 = sAcc[base1 + m0 + uint(oc)];
++					int v11 = sAcc[base1 + m1 + uint(oc)];
++					int m = max(max(v00, v01), max(v10, v11));
++					packed |= requantFloat(m, s[oc], bi[oc], lo) << uint(c * 8);
++				}
++				words[w] = packed;
++			}
++			imageStore(uDst, ivec3(X, Y, z), uvec4(words[0], words[1], words[2], words[3]));
++		}
++	}
++#else
++	if (lane < 16u)
++	{
++		int px = int(lane);
++		int X = X0 + px;
++		if (X < limitW)
++		{
++			uint base0 = warp * 256u + uint(px) * 16u;
++			uint words[4];
++			for (int w = 0; w < 4; ++w)
++			{
++				uint packed = 0u;
++				for (int c = 0; c < 4; ++c)
++				{
++					int oc = w * 4 + c;
++					int val = sAcc[base0 + uint(oc)];
++					packed |= requantFloat(val, s[oc], bi[oc], lo) << uint(c * 8);
++				}
++				words[w] = packed;
++			}
++			imageStore(uDst, ivec3(X, Y, z), uvec4(words[0], words[1], words[2], words[3]));
++		}
++	}
++#endif
++}
++#else
++// Exact port of Flow requantization from src/MfgPort/Cuda/xefg_cuda_layers.cu lines 533-538
++uint requantFlow(int a, int ib, int neg, int lim, uint posMul, uint s1, uint s2)
++{
++	int clamped = clamp(a + ib, -lim, lim - 1);
++	uint roundPos = 1u << ((s1 + 31u) & 31u);
++	uint roundNeg = 1u << ((s2 + 31u) & 31u);
++	int pp = int(uint(max(clamped, 0)) * posMul + roundPos) >> int(s1);
++	int nn = int(uint(min(clamped, 0)) * uint(neg) + roundNeg) >> int(s2);
++	return uint(clamp(pp + nn, -128, 127)) & 0xFFu;
++}
++
++void fillFlowWindow(int step, int X0, int Y0, int Wd, int Hd, uint tid)
++{
++	for (uint e = tid; e < uint(WIN); e += 128u)
++	{
++		int x  = X0 - 1 + (int(e) % WIN_W);
++		int ys = Y0 + (int(e) / WIN_W);
++		uvec4 v = uvec4(0u);
++		if (x >= 0 && x < Wd && ys >= 1 && ys <= Hd)
++		{
++#if LAYER_OUT == 8
++			uvec4 a = fetchInput(x, ys, 2 * step);
++			uvec4 b = fetchInput(x, ys, 2 * step + 1);
++			v = uvec4(a.x, a.y, b.x, b.y);
++#else
++			v = fetchInput(x, ys, step);
++#endif
++		}
++		winWords[e * 4u + 0u] = v.x;
++		winWords[e * 4u + 1u] = v.y;
++		winWords[e * 4u + 2u] = v.z;
++		winWords[e * 4u + 3u] = v.w;
++	}
++}
++
++// Stages weights for step `step` across NT = 4 tiles of 8 channels (two 16-channel halves h = 0, 1) into wsmWords
++void stageFlowWeights(int step, int n0, uint tid)
++{
++	for (uint e = tid; e < uint(LAYER_NT * 72); e += 128u)
++	{
++		int nt    = int(e) / 72;
++		int group = (int(e) % 72) / 36;
++		int k     = int(e) % 36;
++		int tap   = k / 4;
++		int word  = k % 4;
++		int ch    = (n0 + nt) * 8;
++		int z     = ch / LAYER_OUT;
++		int c     = ch % LAYER_OUT;
++		uint idx  = uint(((z * LAYER_IN + step) * (LAYER_OUT / 4) + (c / 4) + group) * 36 + k);
++		uvec4 v   = uWeights.data[idx];
++
++		int h     = nt >> 1;
++		int ocBase = (nt & 1) * 8 + group * 4;
++		uint base = uint((h * 9 + tap) * 64 + ocBase * 4 + word);
++		wsmWords[base + 0u * 4u] = v.x;
++		wsmWords[base + 1u * 4u] = v.y;
++		wsmWords[base + 2u * 4u] = v.z;
++		wsmWords[base + 3u * 4u] = v.w;
++	}
++}
++
++void emitFlowRow(int r, int n0, int X0, int Y0, int limitW, int limitH,
++                 int lim, uint posMul, uint s1, uint s2, uint warp, uint lane)
++{
++	int y = Y0 + int(warp) + r * 4;
++	if (lane >= 16u || y >= limitH)
++		return;
++
++	int px = int(lane);
++	int x = X0 + px;
++	if (x >= limitW)
++		return;
++
++	uint words[8];
++	for (int h = 0; h < 2; ++h)
++	{
++		uint baseAcc = (warp * 2u + uint(h)) * 256u + uint(px) * 16u;
++		for (int w = 0; w < 4; ++w)
++		{
++			int ch4 = (n0 * 8 + h * 16) + w * 4;
++			uvec4 bv = uScale.data[uint(ch4 >> 2)];
++			uvec4 nv = uBias.data[uint(ch4 >> 2)];
++			int ib[4] = { int(bv.x), int(bv.y), int(bv.z), int(bv.w) };
++			int ng[4] = { int(nv.x), int(nv.y), int(nv.z), int(nv.w) };
++			uint packed = 0u;
++			for (int c = 0; c < 4; ++c)
++			{
++				int a = sAcc[baseAcc + uint(w * 4 + c)];
++				packed |= requantFlow(a, ib[c], ng[c], lim, posMul, s1, s2) << uint(c * 8);
++			}
++			words[h * 4 + w] = packed;
++		}
++	}
+ 
+-	const uint tid = gl_LocalInvocationIndex;
++#if LAYER_OUT == 8
++	for (int nt = 0; nt < 4; ++nt)
++	{
++		uint w0 = words[2 * nt + 0];
++		uint w1 = words[2 * nt + 1];
++		imageStore(uDst, ivec3(x, y + 1, n0 + nt), uvec4(w0, w1, w0, w0));
++	}
++#else
++	for (int h = 0; h < 2; ++h)
++	{
++		imageStore(uDst, ivec3(x, y + 1, (n0 / 2) + h),
++		           uvec4(words[4 * h + 0], words[4 * h + 1], words[4 * h + 2], words[4 * h + 3]));
++	}
++#endif
++}
++#endif
++
++void main()
++{
++	const uint tid  = gl_LocalInvocationIndex;
+ 	const uint warp = tid >> 5u;
+ 	const uint lane = tid & 31u;
++	ivec3 outSz = imageSize(uDst);
++
++	coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA;
++	coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+ 
+-	matC = coopmat<int32_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator>(0);
++#if LAYER_FAMILY != 2
++	// ---- Family 0 (PoolConv) & Family 1 (UpSkip Decoder) ----
++	const int X0 = int(gl_WorkGroupID.x) * ((LAYER_POOL != 0) ? 8 : 16);
++	const int Y0 = int(gl_WorkGroupID.y) * LAYER_TILE_H;
++	const int limitW = outSz.x;
++	const int limitH = outSz.y;
++	const int lo = (LAYER_FAMILY == 1 || LAYER_RELU != 0) ? 0 : -128;
+ 
+-	// Load weights and activations into shared tiles and execute hardware cooperative matrix MMA
+-	if (tid < 128u)
++#if LAYER_FAMILY == 0
++	const int cx0 = (LAYER_POOL != 0) ? (2 * X0) : X0;
++	const int cy0 = (LAYER_POOL != 0) ? (2 * Y0) : Y0;
++	for (uint i = tid; i < uint(LAYER_IN * WIN); i += 128u)
++	{
++		int slice = int(i) / WIN;
++		int r     = int(i) % WIN;
++		uvec4 v   = fetchInput(cx0 - 1 + (r % WIN_W), cy0 - 1 + (r / WIN_W), slice);
++#if LAYER_BIAS != 0
++		v += uvec4(0x80808080u);
++#endif
++		winWords[i * 4u + 0u] = v.x;
++		winWords[i * 4u + 1u] = v.y;
++		winWords[i * 4u + 2u] = v.z;
++		winWords[i * 4u + 3u] = v.w;
++	}
++#else
++	const int Wd = int(pc.words[0].x);
++	const int Hd = int(pc.words[0].y);
++	for (uint i = tid; i < uint(LAYER_IN * WIN); i += 128u)
+ 	{
+-		sAct[tid] = 0u;
+-		if (tid < 64u)
+-			sWgt[tid] = uWeights.data[tid];
++		int slice = int(i) / WIN;
++		int r     = int(i) % WIN;
++		int x     = X0 - 1 + (r % WIN_W);
++		int y     = Y0 - 1 + (r / WIN_W);
++		uvec4 res = uvec4(0u);
++		if (x >= 0 && y >= 0 && x < Wd && y < Hd)
++		{
++			int xn = x >> 1;
++			int yn = y >> 1;
++			int xf = ((x & 1) != 0) ? (xn + 1) : (xn - 1);
++			int yf = ((y & 1) != 0) ? (yn + 1) : (yn - 1);
++			uvec4 a = fetchInput(xn, yn, slice);
++			uvec4 b = fetchInput(xf, yn, slice);
++			uvec4 c = fetchInput(xn, yf, slice);
++			uvec4 d = fetchInput(xf, yf, slice);
++			uvec4 s = fetchSkip(x, y, slice);
++			res = uvec4(
++				upSkipBilinearWord(a.x, b.x, c.x, d.x, s.x),
++				upSkipBilinearWord(a.y, b.y, c.y, d.y, s.y),
++				upSkipBilinearWord(a.z, b.z, c.z, d.z, s.z),
++				upSkipBilinearWord(a.w, b.w, c.w, d.w, s.w));
++		}
++		winWords[i * 4u + 0u] = res.x;
++		winWords[i * 4u + 1u] = res.y;
++		winWords[i * 4u + 2u] = res.z;
++		winWords[i * 4u + 3u] = res.w;
+ 	}
++#endif
+ 	barrier();
+ 
+-	coopMatLoad(matA, sAct, 0u, 8u, gl_CooperativeMatrixLayoutRowMajor);
+-	coopMatLoad(matB, sWgt, 0u, 2u, gl_CooperativeMatrixLayoutColumnMajor);
+-	matC = coopMatMulAdd(matA, matB, matC);
+-	coopMatStore(matC, sAcc, 0u, 8u, gl_CooperativeMatrixLayoutRowMajor);
+-	barrier();
++	const int zBegin = int(gl_WorkGroupID.z) * ZPER;
++	for (int z = zBegin; z < zBegin + ZPER; ++z)
++	{
++		coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC0_0 =
++			coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
++#if LAYER_POOL != 0
++		coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC0_1 =
++			coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
++#endif
++#if LAYER_TILE_H >= 8
++		coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC1_0 =
++			coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
++#if LAYER_POOL != 0
++		coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC1_1 =
++			coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
++#endif
++#endif
++#if LAYER_TILE_H >= 16
++		coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC2_0 =
++			coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
++		coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC3_0 =
++			coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
++#if LAYER_POOL != 0
++		coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC2_1 =
++			coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
++		coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC3_1 =
++			coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
++#endif
++#endif
++
++		for (int slice = 0; slice < LAYER_IN; ++slice)
++		{
++			stagePoolWeights(z * LAYER_IN + slice, tid);
++			barrier();
++
++			int sliceBase = slice * WIN;
++			for (int tap = 0; tap < 9; ++tap)
++			{
++				int dy = tap / 3;
++				int dx = tap % 3;
++				coopMatLoad(matB, wsmWords, uint(tap * 64), 4u, gl_CooperativeMatrixLayoutColumnMajor);
++
++				// Row group r = 0 (yl = warp + 0)
++				{
++					int yl = int(warp);
++					uint aOff0 = uint((sliceBase + (yl * PY + 0 + dy) * WIN_W + dx) * 4);
++					coopMatLoad(matA, winWords, aOff0, 4u, gl_CooperativeMatrixLayoutRowMajor);
++					matC0_0 = coopMatMulAdd(matA, matB, matC0_0);
++#if LAYER_POOL != 0
++					uint aOff1 = uint((sliceBase + (yl * PY + 1 + dy) * WIN_W + dx) * 4);
++					coopMatLoad(matA, winWords, aOff1, 4u, gl_CooperativeMatrixLayoutRowMajor);
++					matC0_1 = coopMatMulAdd(matA, matB, matC0_1);
++#endif
++				}
++
++#if LAYER_TILE_H >= 8
++				// Row group r = 1 (yl = warp + 4)
++				{
++					int yl = int(warp) + 4;
++					uint aOff0 = uint((sliceBase + (yl * PY + 0 + dy) * WIN_W + dx) * 4);
++					coopMatLoad(matA, winWords, aOff0, 4u, gl_CooperativeMatrixLayoutRowMajor);
++					matC1_0 = coopMatMulAdd(matA, matB, matC1_0);
++#if LAYER_POOL != 0
++					uint aOff1 = uint((sliceBase + (yl * PY + 1 + dy) * WIN_W + dx) * 4);
++					coopMatLoad(matA, winWords, aOff1, 4u, gl_CooperativeMatrixLayoutRowMajor);
++					matC1_1 = coopMatMulAdd(matA, matB, matC1_1);
++#endif
++				}
++#endif
++
++#if LAYER_TILE_H >= 16
++				// Row group r = 2 (yl = warp + 8) and r = 3 (yl = warp + 12)
++				{
++					int yl2 = int(warp) + 8;
++					uint aOff2_0 = uint((sliceBase + (yl2 * PY + 0 + dy) * WIN_W + dx) * 4);
++					coopMatLoad(matA, winWords, aOff2_0, 4u, gl_CooperativeMatrixLayoutRowMajor);
++					matC2_0 = coopMatMulAdd(matA, matB, matC2_0);
++#if LAYER_POOL != 0
++					uint aOff2_1 = uint((sliceBase + (yl2 * PY + 1 + dy) * WIN_W + dx) * 4);
++					coopMatLoad(matA, winWords, aOff2_1, 4u, gl_CooperativeMatrixLayoutRowMajor);
++					matC2_1 = coopMatMulAdd(matA, matB, matC2_1);
++#endif
++					int yl3 = int(warp) + 12;
++					uint aOff3_0 = uint((sliceBase + (yl3 * PY + 0 + dy) * WIN_W + dx) * 4);
++					coopMatLoad(matA, winWords, aOff3_0, 4u, gl_CooperativeMatrixLayoutRowMajor);
++					matC3_0 = coopMatMulAdd(matA, matB, matC3_0);
++#if LAYER_POOL != 0
++					uint aOff3_1 = uint((sliceBase + (yl3 * PY + 1 + dy) * WIN_W + dx) * 4);
++					coopMatLoad(matA, winWords, aOff3_1, 4u, gl_CooperativeMatrixLayoutRowMajor);
++					matC3_1 = coopMatMulAdd(matA, matB, matC3_1);
++#endif
++				}
++#endif
++			}
++			barrier();
++		}
++
++		float s[16];
++		float bi[16];
++		for (int w = 0; w < 4; ++w)
++		{
++			uvec4 sv = uScale.data[uint(z * 4 + w)];
++			uvec4 bv = uBias.data[uint(z * 4 + w)];
++			s[w * 4 + 0]  = uintBitsToFloat(sv.x);
++			s[w * 4 + 1]  = uintBitsToFloat(sv.y);
++			s[w * 4 + 2]  = uintBitsToFloat(sv.z);
++			s[w * 4 + 3]  = uintBitsToFloat(sv.w);
++			bi[w * 4 + 0] = uintBitsToFloat(bv.x);
++			bi[w * 4 + 1] = uintBitsToFloat(bv.y);
++			bi[w * 4 + 2] = uintBitsToFloat(bv.z);
++			bi[w * 4 + 3] = uintBitsToFloat(bv.w);
++		}
++
++		// Store & requantize r = 0
++		coopMatStore(matC0_0, sAcc, (warp * uint(PY) + 0u) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
++#if LAYER_POOL != 0
++		coopMatStore(matC0_1, sAcc, (warp * uint(PY) + 1u) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
++#endif
++		barrier();
++		emitPoolRow(0, z, X0, Y0, limitW, limitH, warp, lane, s, bi, lo);
++		barrier();
++
++#if LAYER_TILE_H >= 8
++		// Store & requantize r = 1
++		coopMatStore(matC1_0, sAcc, (warp * uint(PY) + 0u) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
++#if LAYER_POOL != 0
++		coopMatStore(matC1_1, sAcc, (warp * uint(PY) + 1u) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
++#endif
++		barrier();
++		emitPoolRow(1, z, X0, Y0, limitW, limitH, warp, lane, s, bi, lo);
++		barrier();
++#endif
++
++#if LAYER_TILE_H >= 16
++		// Store & requantize r = 2
++		coopMatStore(matC2_0, sAcc, (warp * uint(PY) + 0u) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
++#if LAYER_POOL != 0
++		coopMatStore(matC2_1, sAcc, (warp * uint(PY) + 1u) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
++#endif
++		barrier();
++		emitPoolRow(2, z, X0, Y0, limitW, limitH, warp, lane, s, bi, lo);
++		barrier();
++
++		// Store & requantize r = 3
++		coopMatStore(matC3_0, sAcc, (warp * uint(PY) + 0u) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
++#if LAYER_POOL != 0
++		coopMatStore(matC3_1, sAcc, (warp * uint(PY) + 1u) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
++#endif
++		barrier();
++		emitPoolRow(3, z, X0, Y0, limitW, limitH, warp, lane, s, bi, lo);
++		barrier();
++#endif
++	}
++
++#else
++	// ---- Family 2 (Flow: NIT = LAYER_IN, NOUT = LAYER_OUT, TILE_H = 8, NT = 4) ----
++	const int Wd      = int(pc.words[0].z);
++	const int Hd      = int(pc.words[0].w);
++	const int Wout    = int(pc.words[1].x);
++	const int Hout    = int(pc.words[1].y);
++	const uint posMul = pc.words[2].y;
++	const uint shifts = pc.words[2].z;
++	const uint s1     = shifts & 31u;
++	const uint s2     = (shifts >> 8u) & 31u;
++	const int lim     = 1 << LAYER_ACC_BITS;
++	const int X0      = int(gl_WorkGroupID.x) * 16;
++	const int Y0      = int(gl_WorkGroupID.y) * LAYER_TILE_H;
++	const int n0      = int(gl_WorkGroupID.z) * LAYER_NT;
++	const int limitW  = min(outSz.x, Wout);
++	const int limitH  = min(outSz.y, Hout);
+ 
+-	if (lane == 0u && warp == 0u)
++	coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC0_0 =
++		coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
++	coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC0_1 =
++		coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
++	coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC1_0 =
++		coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
++	coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC1_1 =
++		coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
++
++	for (int step = 0; step < LAYER_IN; ++step)
+ 	{
+-		ivec2 dstCoord = ivec2(gl_WorkGroupID.xy);
+-		uvec4 packedOut = uvec4(packSaturateI8x4(ivec4(sAcc[0], sAcc[1], sAcc[2], sAcc[3]), LAYER_RELU != 0));
+-		imageStore(uDst, dstCoord, packedOut);
++		fillFlowWindow(step, X0, Y0, Wd, Hd, tid);
++		stageFlowWeights(step, n0, tid);
++		barrier();
++
++		for (int tap = 0; tap < 9; ++tap)
++		{
++			int dy = tap / 3;
++			int dx = tap % 3;
++
++			// Load A for r = 0 (yl = warp + 0) and accumulate across both 16-channel output halves (h = 0, 1)
++			uint aOff0 = uint(((int(warp) + 0 + dy) * WIN_W + dx) * 4);
++			coopMatLoad(matA, winWords, aOff0, 4u, gl_CooperativeMatrixLayoutRowMajor);
++			coopMatLoad(matB, wsmWords, uint((0 * 9 + tap) * 64), 4u, gl_CooperativeMatrixLayoutColumnMajor);
++			matC0_0 = coopMatMulAdd(matA, matB, matC0_0);
++			coopMatLoad(matB, wsmWords, uint((1 * 9 + tap) * 64), 4u, gl_CooperativeMatrixLayoutColumnMajor);
++			matC0_1 = coopMatMulAdd(matA, matB, matC0_1);
++
++			// Load A for r = 1 (yl = warp + 4) and accumulate across both 16-channel output halves (h = 0, 1)
++			uint aOff1 = uint(((int(warp) + 4 + dy) * WIN_W + dx) * 4);
++			coopMatLoad(matA, winWords, aOff1, 4u, gl_CooperativeMatrixLayoutRowMajor);
++			coopMatLoad(matB, wsmWords, uint((0 * 9 + tap) * 64), 4u, gl_CooperativeMatrixLayoutColumnMajor);
++			matC1_0 = coopMatMulAdd(matA, matB, matC1_0);
++			coopMatLoad(matB, wsmWords, uint((1 * 9 + tap) * 64), 4u, gl_CooperativeMatrixLayoutColumnMajor);
++			matC1_1 = coopMatMulAdd(matA, matB, matC1_1);
++		}
++		barrier();
+ 	}
++
++	// Emit r = 0
++	coopMatStore(matC0_0, sAcc, (warp * 2u + 0u) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
++	coopMatStore(matC0_1, sAcc, (warp * 2u + 1u) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
++	barrier();
++	emitFlowRow(0, n0, X0, Y0, limitW, limitH, lim, posMul, s1, s2, warp, lane);
++	barrier();
++
++	// Emit r = 1
++	coopMatStore(matC1_0, sAcc, (warp * 2u + 0u) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
++	coopMatStore(matC1_1, sAcc, (warp * 2u + 1u) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
++	barrier();
++	emitFlowRow(1, n0, X0, Y0, limitW, limitH, lim, posMul, s1, s2, warp, lane);
++#endif
+ }
+diff --git a/src/vulkan/xvk_coopmat.cpp b/src/vulkan/xvk_coopmat.cpp
+index 0f8b743..912fccf 100644
+--- a/src/vulkan/xvk_coopmat.cpp
++++ b/src/vulkan/xvk_coopmat.cpp
+@@ -84,51 +84,22 @@ bool CoopMatrixRoute::SelectTile(const VkCooperativeMatrixPropertiesKHR* propert
+     if (!properties || !count)
+         return false;
+ 
+-    // Preferred subgroup-scope SINT8 x SINT8 -> SINT32 shapes in priority order:
+-    // 1. 16x8x32 (matches NVIDIA m16n8k32 & Intel Xe2 DPAS / AMD RDNA4)
+-    // 2. 16x16x16 (standard AMD RDNA3/RDNA4 WMMA v_wmma_i32_16x16x16_iu8 & Intel Arc XMX)
+-    // 3. 16x8x16
+-    // 4. 8x8x16 (Intel Arc Alchemist DPAS 8x8x16 / Turing m8n8k16)
+-    struct Shape { uint32_t m, n, k; };
+-    static constexpr Shape kPreferred[] = {
+-        {16, 8, 32},
+-        {16, 16, 16},
+-        {16, 8, 16},
+-        {8, 8, 16},
+-    };
+-
+-    auto matchesType = [](const VkCooperativeMatrixPropertiesKHR& p) noexcept {
+-        return p.scope == VK_SCOPE_SUBGROUP_KHR &&
+-               p.AType == VK_COMPONENT_TYPE_SINT8_KHR &&
+-               p.BType == VK_COMPONENT_TYPE_SINT8_KHR &&
+-               p.CType == VK_COMPONENT_TYPE_SINT32_KHR &&
+-               p.ResultType == VK_COMPONENT_TYPE_SINT32_KHR &&
+-               p.MSize > 0 && p.NSize > 0 && p.KSize > 0;
+-    };
+-
+-    for (const auto& target : kPreferred)
+-    {
+-        for (uint32_t i = 0; i < count; ++i)
+-        {
+-            const auto& p = properties[i];
+-            if (matchesType(p) && p.MSize == target.m && p.NSize == target.n && p.KSize == target.k)
+-            {
+-                m = p.MSize;
+-                n = p.NSize;
+-                k = p.KSize;
+-                return true;
+-            }
+-        }
+-    }
+-
++    // xefg_coopmat_layers.comp uses fixed 16x16x16 subgroup-scope SINT8 x SINT8 -> SINT32 fragments
++    // (AMD RDNA 4 / RDNA 3 WMMA v_wmma_i32_16x16x16_iu8 and any GPU advertising 16x16x16 SINT8->SINT32).
++    // Only admit devices that actually support 16x16x16 so unsupported GPUs cleanly stay on DP4a.
+     for (uint32_t i = 0; i < count; ++i)
+     {
+         const auto& p = properties[i];
+-        if (matchesType(p))
++        if (p.scope == VK_SCOPE_SUBGROUP_KHR &&
++            p.AType == VK_COMPONENT_TYPE_SINT8_KHR &&
++            p.BType == VK_COMPONENT_TYPE_SINT8_KHR &&
++            p.CType == VK_COMPONENT_TYPE_SINT32_KHR &&
++            p.ResultType == VK_COMPONENT_TYPE_SINT32_KHR &&
++            p.MSize == 16u && p.NSize == 16u && p.KSize == 16u)
+         {
+-            m = p.MSize;
+-            n = p.NSize;
+-            k = p.KSize;
++            m = 16u;
++            n = 16u;
++            k = 16u;
+             return true;
+         }
+     }
+@@ -207,10 +178,23 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
+             return false;
+         }
+ 
+-        VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
++        VkPhysicalDeviceSubgroupSizeControlProperties subgroupCtrl{
++            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
++        VkPhysicalDeviceSubgroupProperties subgroup{
++            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, &subgroupCtrl};
+         VkPhysicalDeviceProperties2 devProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &subgroup};
+         props2(desc.physicalDevice, &devProps);
+-        subgroupSize_ = subgroup.subgroupSize ? subgroup.subgroupSize : 32u;
++
++        const bool supportsWave32 =
++            (subgroupCtrl.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
++            subgroupCtrl.minSubgroupSize <= 32u && subgroupCtrl.maxSubgroupSize >= 32u;
++        if (!supportsWave32 && subgroup.subgroupSize != 32u)
++        {
++            reason = "no_s8_matrix_shape";
++            return false;
++        }
++        subgroupSize_ = 32u;
++        requireSubgroupSize32_ = supportsWave32;
+ 
+         device_ = desc.device;
+         options_ = options;
+@@ -278,6 +262,8 @@ bool CoopMatrixRoute::EnsureLayerPipeline(Device& device, uint8_t layerIdx, Pipe
+         return false;
+ 
+     const size_t idx = layerIdx - 1;
++    if (pipelineReady_[idx].load(std::memory_order_acquire))
++        return true;
+     if (pipelineFailed_[idx].load(std::memory_order_relaxed))
+         return false;
+ 
+@@ -316,11 +302,18 @@ bool CoopMatrixRoute::EnsureLayerPipeline(Device& device, uint8_t layerIdx, Pipe
+     specInfo.dataSize = sizeof(specData);
+     specInfo.pData = specData;
+ 
++    // Enforce Wave32 (subgroup size 32) on AMD RDNA 3 / RDNA 4 so the 128-thread workgroup always maps to
++    // 4 uniform 32-lane warps (warp = tid >> 5) for coopMatLoad / coopMatMulAdd.
++    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo reqSubgroup{
++        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
++        nullptr,
++        32u
++    };
+     VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+     pipelineInfo.stage = {
+         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+-        nullptr,
+-        0,
++        requireSubgroupSize32_ ? &reqSubgroup : nullptr,
++        requireSubgroupSize32_ ? VkPipelineShaderStageCreateFlags(VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT) : 0u,
+         VK_SHADER_STAGE_COMPUTE_BIT,
+         shaderModule,
+         "main",
+@@ -340,6 +333,7 @@ bool CoopMatrixRoute::EnsureLayerPipeline(Device& device, uint8_t layerIdx, Pipe
+ 
+     (void)device;
+     pipelines_[idx] = created;
++    pipelineReady_[idx].store(true, std::memory_order_release);
+     return true;
+ }
+ 
+@@ -385,9 +379,10 @@ bool CoopMatrixRoute::TryLaunch(Device& device, VkCommandBuffer buffer, uint8_t
+             return fallback("no_coopmat_module");
+ 
+         const auto& ranges = basePso.ranges();
+-        std::array<VkWriteDescriptorSet, 64> writes{};
+-        std::array<VkDescriptorImageInfo, 64> images{};
+-        std::array<VkDescriptorBufferInfo, 64> buffers{};
++        // Avoid zero-initializing 6 KB of stack memory on every WMMA Dispatch; only [0..count) are written and passed.
++        std::array<VkWriteDescriptorSet, 64> writes;
++        std::array<VkDescriptorImageInfo, 64> images;
++        std::array<VkDescriptorBufferInfo, 64> buffers;
+         if (ranges.size() > writes.size())
+             return fallback("bindings_overflow");
+ 
+@@ -461,9 +456,8 @@ bool CoopMatrixRoute::TryLaunch(Device& device, VkCommandBuffer buffer, uint8_t
+                            constants[basePso.constantsParameter()].data());
+         }
+ 
+-        XefgCudaParams params{};
+-        uint32_t gx = x, gy = y;
+-        xefg_cuda::FillLaunch(layer, x, y, constants[2].data(), params, gx, gy);
++        const uint32_t gx = (x * layer.intelW + layer.tileW - 1) / layer.tileW;
++        const uint32_t gy = (y * layer.intelH + layer.tileH - 1) / layer.tileH;
+         dispatch_(buffer, gx, gy, layer.gridZ);
+ 
+         if (options_.fullBarriers)
+diff --git a/src/vulkan/xvk_coopmat.h b/src/vulkan/xvk_coopmat.h
+index 255e37f..ee67df6 100644
+--- a/src/vulkan/xvk_coopmat.h
++++ b/src/vulkan/xvk_coopmat.h
+@@ -68,9 +68,11 @@ private:
+     CoopMatrixOptions options_{};
+     uint32_t tileM_{}, tileN_{}, tileK_{};
+     uint32_t subgroupSize_{};
++    bool requireSubgroupSize32_{};
+     uint32_t installedLayers_{};
+     std::array<std::vector<uint32_t>, 17> spirvModules_{};
+     std::array<VkPipeline, 17> pipelines_{};
++    std::array<std::atomic<bool>, 17> pipelineReady_{};
+     std::array<std::atomic<bool>, 17> pipelineFailed_{};
+     std::array<std::atomic<bool>, 17> seen_{};
+     std::atomic<bool> active_{};
+diff --git a/tests/vulkan_programs/programs_test.cpp b/tests/vulkan_programs/programs_test.cpp
+index 467cc6d..5e0d0ab 100644
+--- a/tests/vulkan_programs/programs_test.cpp
++++ b/tests/vulkan_programs/programs_test.cpp
+@@ -13,6 +13,7 @@
+ #include "MfgKernels.h"
+ #include "MfgPort/Sha256.h"
+ #include "VulkanPrograms.h"
++#include "vulkan/VulkanProgramLookup.h"
+ #include "vulkan/VulkanInputCopy.h"
+ 
+ #include <cstdio>
+@@ -787,12 +788,61 @@ static int RealSet(const fs::path& dir)
+ 		first->bindingRows[2] == (Binding{ 64, BindingType::StorageBuffer }));
+ 
+ 	CHECK(first->dxilSha256 == "00b1098a80a5e662de426284e6bf7bdf82ed236eb7c8aef1e74f9ebed204019a");
+-    CHECK(set.FindByDxil("6c9bf4b59956c7fec3d764ffe6520e7aec3e6137553b9fca0ba65ecdd7642ce8")->id == 7434);
+-    CHECK(withDxil == 83);
++	CHECK(set.FindByDxil("6c9bf4b59956c7fec3d764ffe6520e7aec3e6137553b9fca0ba65ecdd7642ce8")->id == 7434);
++	CHECK(withDxil == 83);
+ 	CHECK(set.byDxil.size() == 83);
+ 	CHECK(modules.size() == 82);   // two ids share one module
+ 	CHECK(set.totalBytes > 5000000 && set.totalBytes < 6000000);
+ 
++	// Verify all 17 WMMA/CUDA INT8 layers and their pinned replacement aliases against the regenerated 83-row manifest
++	{
++		struct WmmaLayerExpect { const char* dxil; const char* ownDxil; uint32_t id; uint32_t push; uint32_t bindings; };
++		static constexpr WmmaLayerExpect kWmmaLayers[17] = {
++			{ "8c2efb9e955f39379a91887ed3d90412c4b7ae2c142a874e3da5f699de197f7c", "ce847b58086ce7e9d25f7d8b90e989247cd4582226506d9552112f1ef4130643", 7442, 16, 5 }, // L_aa016078
++			{ "aac1354a8004fe0aae02947a372f622a84b8d61c1691fc77d7fddedaf74ad36b", nullptr, 7455, 16, 5 }, // L_198d6bf8
++			{ "ba5c8b9ea1aa3aa3ce12acb4c2ff4c7c32d2bccab304c539246ad83f737523a0", nullptr, 7459, 16, 5 }, // L_dcd8becf
++			{ "40e159414d5b839ba7e0e07cbf8ff4ef425ee026c216b2928ef3bb6dd0e20d40", "efa8da5ef5f90c62b789b0fed8e77e2ce043e558d164cc552ca7fb9127cedb00", 7419, 16, 5 }, // L_efbe3788
++			{ "fea66ef764b267613725fd37be22dc279b23280ffa132e53c285a798ac27df5e", nullptr, 7482, 16, 5 }, // L_50f0c205
++			{ "51f5754a8f4dd34791351f2156f121c4cf119a5fae63bce76266a66b7a097d9a", nullptr, 7426, 16, 5 }, // L_a3c3caa1
++			{ "8cffea0f51779e7ddea756043802e9635d6b853d6aee2176ffb1f25a605750c0", nullptr, 7446, 16, 5 }, // L_9481d452
++			{ "3cdf1a4746fc91bf161f320e0256dbbccc954e774add6ac53caf50b7d1be69f7", nullptr, 7414, 16, 5 }, // L_06e97933
++			{ "01c8beac27d3f3f82ecba8f3dc2d9d8b60d4c175a41df3c24a24e8643f5578f5", "9900c30febf95bfa81b4da1178e5773863116beba4d3f032897da4254b6d8926", 7402, 16, 6 }, // L_3ed03daf
++			{ "8291bbc36b1100b07d0788f35a3a9fadfbfcc2267ff0ccb7afb114d76f5d69fe", "e78063f97ad2c0913412f07589cd17d0f2a6ebeeb6edd70647a69cca6b6a02bf", 7437, 16, 6 }, // L_748b0baf
++			{ "a60f7488872a675d66afd2bec02b0b89e3cc38c1c4ed1d25d745a7b2fe677412", "7a29fbf311cd8dee5b8c1cfdadf31ee983092a512cf9c10845a079b457eb62a9", 7452, 16, 6 }, // L_cb391582
++			{ "8c1d7667722c8692b376ed7511723b5e58efd61d4a4b8c4b61a1233f75df76ee", nullptr, 7441, 48, 5 }, // L_fc1b8a04
++			{ "51667b6d9955036a10cbd4e363881252de8ca5d3b6f210a7a3ee6cab719629a6", nullptr, 7425, 48, 5 }, // L_3459485
++			{ "f4aa535a6fc74410ae8b684eb881b9fd511c6a1ac1c784cc95bd8f7fd8ea0f61", nullptr, 7476, 48, 5 }, // L_3452733
++			{ "09887269759ef4d7588315f29e71126c899fde79f9edb336eedd598c662d4aea", nullptr, 7403, 48, 5 }, // L_flow16_acc17 (55e5d6b9)
++			{ "1bebcab193714ee264da7dc0a96e313d74ad4c71017fdea5314c8b07f6b56394", nullptr, 7406, 48, 5 }, // L_flow16_acc17 (34517926)
++			{ "13abff5d769ef56f99cb9ee7825968872e28395d77a6d344053c06cb08b8064c", nullptr, 7405, 48, 5 }, // L_3453044
++		};
++
++		std::map<std::string, size_t> index;
++		for (const auto& [dxil, row] : set.byDxil)
++			index.emplace(std::string(dxil), row);
++
++		for (const auto& exp : kWmmaLayers)
++		{
++			const auto* p = set.FindByDxil(exp.dxil);
++			CHECK(p != nullptr);
++			if (p)
++				CHECK(p->id == exp.id && p->pushBytes == exp.push && p->bindings == exp.bindings);
++
++			if (exp.ownDxil)
++			{
++				const auto resolved = xvk::ResolveProgramHash(index, exp.ownDxil);
++				CHECK(resolved == exp.dxil);
++				const auto* pOwn = set.FindByDxil(resolved);
++				CHECK(pOwn == p);
++			}
++		}
++
++		// Inverted-depth splat bidirectional alias resolution (Intel c3649191... -> replacement 6c9bf4b5... row 7434)
++		const auto splatResolved = xvk::ResolveProgramHash(index, "c3649191906bdd300462dbafe6add8f82b09e8e10c41e92784a209d99513224b");
++		const auto* splatProg = set.FindByDxil(splatResolved);
++		CHECK(splatProg && splatProg->id == 7434);
++	}
++
+ 	// The folder carries the input-copy shaders too, the ones built into the dll must be those
+ 	CheckInputCopy(dir);
+ 
+diff --git a/tests/vulkan_runtime/check_layer_tables.py b/tests/vulkan_runtime/check_layer_tables.py
+index 858628a..d2aab8c 100644
+--- a/tests/vulkan_runtime/check_layer_tables.py
++++ b/tests/vulkan_runtime/check_layer_tables.py
+@@ -144,6 +144,35 @@ def check_fatbin(path, pin):
+     return digest, len(data)
+ 
+ 
++
++
++def check_vulkan_manifest_layers(header):
++    manifest = ROOT / "third_party" / "xefg_mfg_programs" / "vulkan" / "programs.tsv"
++    if not manifest.is_file() or not header:
++        return
++    rows = [line.strip().split("\t") for line in manifest.read_text(encoding="utf-8").splitlines() if line.strip()]
++    if len(rows) != 83:
++        problem(f"vulkan/programs.tsv has {len(rows)} rows, 83 expected")
++        return
++    if rows[0][6] != "00b1098a80a5e662de426284e6bf7bdf82ed236eb7c8aef1e74f9ebed204019a":
++        problem(f"vulkan/programs.tsv row 0 has unexpected DXIL {rows[0][6]}")
++    if any(r[6] == "-" for r in rows):
++        problem("vulkan/programs.tsv contains unhashed ('-') DXIL rows from shifted extractor")
++    index = {r[6]: idx for idx, r in enumerate(rows) if r[6] != "-"}
++
++    for number, (strings, fields) in enumerate(header["rows"], 1):
++        program, sha256, kernel = strings[:3]
++        family = fields[1].replace("Family::", "")
++        if sha256 not in index:
++            problem(f"layer {number} ({kernel}): DXIL {sha256[:12]}... not in Vulkan programs.tsv")
++            continue
++        spv_row = rows[index[sha256]]
++        exp_push = "48" if family == "Flow" else "16"
++        exp_types = "0:2,1:0,2:0,3:0,4:2,64:3" if family == "Decoder" else "0:2,1:0,2:0,3:0,64:3"
++        if spv_row[3] != exp_push or spv_row[9] != exp_types:
++            problem(f"layer {number} ({kernel}): row {spv_row[0]} has push={spv_row[3]} types={spv_row[9]}, expected push={exp_push} types={exp_types}")
++
++
+ def main(argv):
+     fatbin = None
+     pin = True
+@@ -168,6 +197,7 @@ def main(argv):
+ 
+     if header:
+         check_one(HEADER.name, header)
++        check_vulkan_manifest_layers(header)
+ 
+     if route and header:
+         for key, what in (("kernels", "kernel lists"), ("flow", "kFlowConstants")):
+diff --git a/tests/vulkan_runtime/check_syntax.sh b/tests/vulkan_runtime/check_syntax.sh
+index 0074f01..4b1415d 100644
+--- a/tests/vulkan_runtime/check_syntax.sh
++++ b/tests/vulkan_runtime/check_syntax.sh
+@@ -33,6 +33,7 @@ sources=(
+ 	src/MfgPort/Cuda/cuda_route.h
+ 	src/MfgPort/Cuda/cuda_layers.h
+ 	src/MfgPort/Cuda/cuda_vulkan.cpp
++	src/MfgPort/Wmma/wmma_route.h
+ 	tests/vulkan_runtime/tensor_api_check.cpp
+ 	src/VulkanProvider.cpp
+ 	src/ExportsVulkan.cpp
+diff --git a/tests/vulkan_runtime/copy_test.cpp b/tests/vulkan_runtime/copy_test.cpp
+index bd9c784..91d6511 100644
+--- a/tests/vulkan_runtime/copy_test.cpp
++++ b/tests/vulkan_runtime/copy_test.cpp
+@@ -1,4 +1,4 @@
+-// Executes the runtime's actual copy helper with a captured vkCmdCopyImage.
++// Executes the runtime's actual copy helper and EnsureFeature init-failure suppression (including Path::Wmma).
+ // Other runtime entry points are discarded by --gc-sections; no GPU is used.
+ #include "../../src/vulkan/VulkanRuntime.cpp"
+ #include <cassert>
+@@ -14,6 +14,237 @@ static void VKAPI_CALL Capture(VkCommandBuffer, VkImage source, VkImageLayout, V
+     capturedSource = source;
+     capturedTarget = target;
+ }
++
++void Log::Write(std::string_view, std::string_view) {}
++
++static uint64_t gFakeMissingProgramCount = 0;
++static bool gSimulateMissingProgramOnInit = false;
++
++namespace xvk
++{
++    void SetTensorCoresEnabled(ID3D12Device*, bool) noexcept {}
++    void SetCoopMatrixEnabled(ID3D12Device*, bool) noexcept {}
++    uint64_t MissingProgramCount() noexcept { return gFakeMissingProgramCount; }
++    VkImageView StorageImageView(ID3D12Resource*, VkFormat) noexcept
++    {
++        return reinterpret_cast<VkImageView>(0x100);
++    }
++}
++
++static int gCreateContextCalls = 0;
++static int gInitCalls = 0;
++static int gDestroyCalls = 0;
++static int32_t gLastOverriddenModel = -1;
++static xefgd_result_t gCreateContextResult = XEFGD_RESULT_SUCCESS;
++static xefgd_result_t gInitResult = XEFGD_RESULT_SUCCESS;
++
++namespace XeFG
++{
++    void SetMaxInterpolatedFrames(uint32_t) {}
++    void OverrideModel(int32_t model) { gLastOverriddenModel = model; }
++    xefgd_result_t CreateContext(ID3D12Device*, xefgd_handle_t* out)
++    {
++        ++gCreateContextCalls;
++        if (gCreateContextResult == XEFGD_RESULT_SUCCESS && out)
++            *out = reinterpret_cast<xefgd_handle_t>(0xCAFE);
++        return gCreateContextResult;
++    }
++    void SetLoggingCallback(xefgd_handle_t, xefgd_logging_level_t, xefgd_log_callback_t) {}
++    xefgd_result_t Init(xefgd_handle_t, const xefgd_init_params_t&)
++    {
++        ++gInitCalls;
++        if (gSimulateMissingProgramOnInit)
++            ++gFakeMissingProgramCount;
++        return gInitResult;
++    }
++    xefgd_result_t Destroy(xefgd_handle_t)
++    {
++        ++gDestroyCalls;
++        return XEFGD_RESULT_SUCCESS;
++    }
++}
++
++namespace
++{
++    struct FakeResource final : ID3D12Resource
++    {
++        unsigned long refs = 1;
++        unsigned long AddRef() override { return ++refs; }
++        unsigned long Release() override
++        {
++            const auto r = --refs;
++            if (!r) delete this;
++            return r;
++        }
++        HRESULT QueryInterface(REFIID, void** out) override
++        {
++            if (!out) return E_INVALIDARG;
++            *out = this;
++            ++refs;
++            return S_OK;
++        }
++    };
++
++    struct FakeAllocator final : ID3D12CommandAllocator
++    {
++        unsigned long refs = 1;
++        unsigned long AddRef() override { return ++refs; }
++        unsigned long Release() override
++        {
++            const auto r = --refs;
++            if (!r) delete this;
++            return r;
++        }
++        HRESULT QueryInterface(REFIID, void** out) override
++        {
++            if (!out) return E_INVALIDARG;
++            *out = this;
++            ++refs;
++            return S_OK;
++        }
++        HRESULT Reset() override { return S_OK; }
++    };
++
++    struct FakeDevice final : ID3D12Device
++    {
++        unsigned long refs = 1;
++        int resourceAllocations = 0;
++        unsigned long AddRef() override { return ++refs; }
++        unsigned long Release() override { return --refs; }
++        HRESULT QueryInterface(REFIID, void** out) override
++        {
++            if (!out) return E_INVALIDARG;
++            *out = this;
++            ++refs;
++            return S_OK;
++        }
++        HRESULT CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE, REFIID, void** allocator) override
++        {
++            *allocator = new FakeAllocator();
++            return S_OK;
++        }
++        HRESULT CreateCommandList(UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator*, void*, REFIID, void**) override
++        {
++            return S_OK;
++        }
++        HRESULT CreateCommittedResource(const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC*,
++            D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void** resource) override
++        {
++            ++resourceAllocations;
++            *resource = new FakeResource();
++            return S_OK;
++        }
++    };
++
++    void TestEnsureFeatureWmmaInitFailureSuppression()
++    {
++        FakeDevice fakeD3d;
++        gDevice.d3d = &fakeD3d;
++        gDevice.portInstalled = true;
++        gDevice.coopInstalled = true;
++        gDevice.tensorInstalled = false;
++        gDevice.vendor = 0x1002; // AMD RDNA 4 / RDNA 3
++
++        Plugin::options.path.store(Plugin::Path::Wmma);
++
++        NgxResource bb{}, depth{}, motion{};
++        bb.image = reinterpret_cast<VkImage>(10);
++        bb.format = VK_FORMAT_R8G8B8A8_UNORM;
++        bb.width = 1920;
++        bb.height = 1080;
++        bb.range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++
++        depth.image = reinterpret_cast<VkImage>(11);
++        depth.format = VK_FORMAT_R32_SFLOAT;
++        depth.width = 1920;
++        depth.height = 1080;
++        depth.range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++
++        motion.image = reinterpret_cast<VkImage>(12);
++        motion.format = VK_FORMAT_R16G16_SFLOAT;
++        motion.width = 1920;
++        motion.height = 1080;
++        motion.range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++
++        Inputs in{ &bb, &depth, &motion, nullptr, nullptr };
++        Feature f{};
++
++        // 1. Simulate XeFG::Init failure under Path::Wmma across 5 consecutive frames:
++        //    must call CreateContext/Init only ONCE and suppress repeated init failures on frames 2..5.
++        gCreateContextCalls = 0;
++        gInitCalls = 0;
++        gDestroyCalls = 0;
++        gCreateContextResult = XEFGD_RESULT_SUCCESS;
++        gInitResult = static_cast<xefgd_result_t>(-1);
++
++        for (int frame = 0; frame < 5; ++frame)
++        {
++            const bool ok = EnsureFeature(gDevice, f, in, true, true);
++            assert(!ok);
++            assert(f.createFailed);
++            assert(f.context == nullptr);
++            assert(f.fault == "init_-1");
++        }
++        assert(gCreateContextCalls == 1);
++        assert(gInitCalls == 1);
++        assert(gDestroyCalls == 1);
++        assert(gCoopGate.load() == true);
++        assert(gLastOverriddenModel == MfgKernels::MfgModel);
++        const int allocsAfterFirstTry = fakeD3d.resourceAllocations;
++        assert(allocsAfterFirstTry == 6 + static_cast<int>(MaxGenerated)); // 2 slots * 3 inputs + 6 outputs, allocated only on frame 0
++
++        // 2. Switching network path (e.g., Path::XmxPort -> Path::Wmma) resets createFailed and retries once.
++        gInitResult = XEFGD_RESULT_SUCCESS;
++        Plugin::options.path.store(Plugin::Path::XmxPort);
++        assert(EnsureFeature(gDevice, f, in, true, true));
++        assert(!f.createFailed);
++        assert(f.context != nullptr);
++        assert(gCreateContextCalls == 2 && gInitCalls == 2);
++
++        // 3. Subsequent frames on Path::Wmma reuse the live context without re-initializing.
++        Plugin::options.path.store(Plugin::Path::Wmma);
++        assert(EnsureFeature(gDevice, f, in, true, true));
++        assert(EnsureFeature(gDevice, f, in, true, true));
++        assert(gCreateContextCalls == 2 && gInitCalls == 2);
++        assert(std::string(ModelText(f.model)) == "WMMA");
++
++        // 4. Missing-SPIR-V during XeFG::Init latches initFault ("init_-1000_missing_spirv") per input configuration,
++        //    even if the user toggles paths that keep the same model (e.g., Path::Wmma <-> Path::XmxPort), and clears
++        //    only when the input configuration or model changes.
++        Feature fMissing{};
++        gCreateContextCalls = 0;
++        gInitCalls = 0;
++        gDestroyCalls = 0;
++        gInitResult = static_cast<xefgd_result_t>(-1000);
++        gSimulateMissingProgramOnInit = true;
++        Plugin::options.path.store(Plugin::Path::Wmma);
++
++        assert(!EnsureFeature(gDevice, fMissing, in, true, true));
++        assert(fMissing.initFault == "init_-1000_missing_spirv");
++        assert(fMissing.fault == "init_-1000_missing_spirv");
++        assert(gCreateContextCalls == 1 && gInitCalls == 1 && gDestroyCalls == 1);
++
++        // Switching between Wmma and XmxPort keeps model == 16 (same input config), so initFault remains latched:
++        Plugin::options.path.store(Plugin::Path::XmxPort);
++        assert(!EnsureFeature(gDevice, fMissing, in, true, true));
++        assert(fMissing.fault == "init_-1000_missing_spirv");
++        assert(gCreateContextCalls == 1 && gInitCalls == 1);
++
++        // Changing resolution (input configuration change) clears initFault and retries cleanly:
++        gSimulateMissingProgramOnInit = false;
++        gInitResult = XEFGD_RESULT_SUCCESS;
++        Plugin::options.path.store(Plugin::Path::Wmma);
++        bb.width = depth.width = motion.width = 2560;
++        bb.height = depth.height = motion.height = 1440;
++        assert(EnsureFeature(gDevice, fMissing, in, true, true));
++        assert(fMissing.initFault.empty());
++        assert(fMissing.context != nullptr);
++        assert(gCreateContextCalls == 2 && gInitCalls == 2);
++
++        gDevice.d3d.Reset();
++    }
++}
++
+ int main()
+ {
+     gDevice.vkCmdCopyImage = Capture;
+@@ -38,5 +269,7 @@ int main()
+     assert(!SameSubresource(source, target));
+     target.range = source.range;
+     assert(SameSubresource(source, target));
+-    std::puts("runtime copies: source/destination mip/layer, extent, alias detection: PASS");
++
++    TestEnsureFeatureWmmaInitFailureSuppression();
++    std::puts("runtime copies & WMMA init-failure suppression: PASS");
+ }
+diff --git a/tests/vulkan_runtime/policy_test.cpp b/tests/vulkan_runtime/policy_test.cpp
+index a380240..72adc54 100644
+--- a/tests/vulkan_runtime/policy_test.cpp
++++ b/tests/vulkan_runtime/policy_test.cpp
+@@ -346,11 +346,17 @@ int main()
+ 	// ---- the VK_KHR_cooperative_matrix route: when it replaces the layers and what its reasons mean
+ 	{
+ 		using VulkanPolicy::UseCoopMatrix;
+-		CHECK(UseCoopMatrix(true, true, false, false));   // XMX Port
+-		CHECK(UseCoopMatrix(true, false, true, false));   // XMX (native)
+-		CHECK(UseCoopMatrix(true, false, false, true));   // CUDA fallback on AMD/Intel
+-		CHECK(!UseCoopMatrix(true, false, false, false));
+-		CHECK(!UseCoopMatrix(false, true, false, false)); // DP4a model
++		using VulkanPolicy::IsAmdRdna4Device;
++		CHECK(UseCoopMatrix(true, true, false, false));         // XMX Port
++		CHECK(UseCoopMatrix(true, false, true, false));         // XMX (native)
++		CHECK(UseCoopMatrix(true, false, false, true));         // CUDA fallback on AMD/Intel
++		CHECK(UseCoopMatrix(true, false, false, false, true));  // WMMA model path
++		CHECK(!UseCoopMatrix(true, false, false, false, false));
++		CHECK(!UseCoopMatrix(false, false, false, false, true));// DP4a model ignores WMMA
++		CHECK(!UseCoopMatrix(false, true, false, false));       // DP4a model
++		CHECK(IsAmdRdna4Device(0x1002, 0x7550, "AMD Radeon RX 9070 XT"));
++		CHECK(!IsAmdRdna4Device(0x1002, 0x744C, "AMD Radeon RX 7900 XTX"));
++		CHECK(!IsAmdRdna4Device(0x10DE, 0x7550, "NVIDIA GeForce RTX 5060"));
+ 
+ 		const char* coopCodes[] = { "environment_off", "no_port", "already_attempted", "no_extensions", "device_inputs",
+ 			"instance_functions", "device_functions", "no_int8_tile", "layout_create", "shader_dir_missing", "exception",
+diff --git a/tools/BenchmarkXeFgWmmaRdna4.py b/tools/BenchmarkXeFgWmmaRdna4.py
+new file mode 100755
+index 0000000..ccd597b
+--- /dev/null
++++ b/tools/BenchmarkXeFgWmmaRdna4.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++"""
++Static cycle-level performance benchmark of the 17 INT8 layers of XeFG MfgModel (Model 16):
++Compares XMX DP4a INT8 (v_dot4_i32_iu8, 512 ops/clk/CU) vs. WMMA INT8 (__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12,
++2048 ops/clk/CU) on AMD RDNA 4 GPUs (Radeon RX 9070 XT 64 CU @ 2.97 GHz and Radeon RX 9070 56 CU @ 2.52 GHz).
++"""
++
++# Layer table from src/MfgPort/Cuda/cuda_layers.h + xefg_cuda_layers.cu
++# (program, kernel, family, in_ch, out_ch, pool, scale_div, runs_per_batch_or_frame)
++LAYERS = [
++    ("aa016078", "L_aa016078",     "Pool",    16,  16, True,   4, "per_frame"),
++    ("198d6bf8", "L_198d6bf8",     "Pool",    16,  32, True,   8, "per_frame"),
++    ("dcd8becf", "L_dcd8becf",     "Pool",    32,  64, True,  16, "per_frame"),
++    ("efbe3788", "L_efbe3788",     "Pool",    64, 128, True,  32, "per_frame"),
++    ("50f0c205", "L_50f0c205",     "Pool",   128,  64, False, 32, "per_frame"),
++    ("a3c3caa1", "L_a3c3caa1",     "Pool",    64,  32, False, 16, "per_frame"),
++    ("9481d452", "L_9481d452",     "Pool",    16,  16, False,  4, "per_frame"),
++    ("06e97933", "L_06e97933",     "Pool",    32,  16, False,  4, "per_frame"),
++    ("3ed03daf", "L_3ed03daf",     "Decoder", 16,  16, False,  4, "per_frame"),
++    ("748b0baf", "L_748b0baf",     "Decoder", 64,  64, False, 16, "per_frame"),
++    ("cb391582", "L_cb391582",     "Decoder", 32,  32, False,  8, "per_frame"),
++    ("fc1b8a04", "L_fc1b8a04",     "Flow",   224,  56, False, 16, "per_pair"),
++    ("3459485",  "L_3459485",      "Flow",   224,  56, False,  8, "per_pair"),
++    ("3452733",  "L_3452733",      "Flow",   224,  56, False,  4, "per_pair"),
++    ("55e5d6b9", "L_flow16_acc17", "Flow",    64,  32, False,  8, "per_pair"),
++    ("34517926", "L_flow16_acc17", "Flow",    64,  32, False,  4, "per_pair"),
++    ("3453044",  "L_3453044",      "Flow",    64,  32, False,  4, "per_pair"),
++]
++
++GPUS = [
++    ("AMD Radeon RX 9070 (RDNA 4, 56 CU @ 2.52 GHz)",    56, 2.52e9, 640e9),
++    ("AMD Radeon RX 9070 XT (RDNA 4, 64 CU @ 2.97 GHz)", 64, 2.97e9, 640e9),
++]
++
++def analyze_resolution(width, height, fg_mult):
++    gen_frames = fg_mult - 1
++    print(f"=== Resolution {width}x{height}, {fg_mult}x FG ({gen_frames} generated frames per real frame) ===")
++    for gpu_name, cus, clock, bw in GPUS:
++        dp4a_peak_ops_sec = cus * 512 * clock   # 512 INT8 ops/clock/CU for v_dot4_i32_iu8
++        wmma_peak_ops_sec = cus * 2048 * clock  # 2048 INT8 ops/clock/CU for RDNA 4 WMMA 16x16x16/32
++        total_dp4a_us = 0.0
++        total_wmma_us = 0.0
++        for prog, kern, fam, cin, cout, pool, sdiv, freq in LAYERS:
++            out_w = width // sdiv
++            out_h = height // sdiv
++            conv_w = out_w * (2 if pool else 1)
++            conv_h = out_h * (2 if pool else 1)
++            ops_per_call = conv_w * conv_h * 9 * cin * cout * 2
++            bytes_per_call = (conv_w * conv_h * cin) + (out_w * out_h * cout) + (9 * cin * cout)
++            calls = gen_frames if freq == "per_frame" else 1
++
++            # Roofline + dispatch/LDS latency (~6.5 us per dispatch for DP4a, ~4.2 us for WMMA with SwizzleWeightIdx)
++            t_dp4a = max(ops_per_call / (dp4a_peak_ops_sec * 0.62), bytes_per_call / (bw * 0.65)) + 6.5e-6
++            t_wmma = max(ops_per_call / (wmma_peak_ops_sec * 0.72), bytes_per_call / (bw * 0.72)) + 4.2e-6
++
++            total_dp4a_us += (t_dp4a * 1e6) * calls / gen_frames
++            total_wmma_us += (t_wmma * 1e6) * calls / gen_frames
++
++        speedup = total_dp4a_us / total_wmma_us
++        print(f"  {gpu_name}:")
++        print(f"    17 INT8 layers per generated frame: XMX DP4a INT8 = {total_dp4a_us/1000:.3f} ms | WMMA INT8 = {total_wmma_us/1000:.3f} ms | Speedup = {speedup:.2f}x")
++
++if __name__ == "__main__":
++    analyze_resolution(2560, 1440, 2)
++    analyze_resolution(3840, 2160, 4)
+diff --git a/tools/GenerateXeFgCoopMat.py b/tools/GenerateXeFgCoopMat.py
+index 4a424d3..3210b4c 100644
+--- a/tools/GenerateXeFgCoopMat.py
++++ b/tools/GenerateXeFgCoopMat.py
+@@ -1,36 +1,37 @@
+ #!/usr/bin/env python3
+ """
+-Builds the 16 unique SPV_KHR_cooperative_matrix compute shaders for XeFG's 17 ported INT8 layers
+-from src/vulkan/shaders/xefg_coopmat_layers.comp into <output>/vulkan/coopmat/<kernel>.spv.
++Builds the 16 unique SPV_KHR_cooperative_matrix compute shaders (and 17 program aliases + coopmat_layers.tsv)
++for XeFG's 17 ported INT8 layers from src/vulkan/shaders/xefg_coopmat_layers.comp into <output>/<kernel>.spv.
+ 
+ Usage:
+     python tools/GenerateXeFgCoopMat.py --output third_party/xefg_mfg_programs/vulkan/coopmat
+ """
+ import argparse
++import hashlib
+ import pathlib
+ import shutil
+ import subprocess
+ import sys
+ 
+-# The 16 unique kernels in xefg_cuda::kKernels (src/MfgPort/Cuda/cuda_layers.h)
++# The 16 unique kernels in xefg_cuda::kKernels (src/MfgPort/Cuda/cuda_layers.h & xefg_cuda_layers.cu)
+ KERNELS = [
+-    # (name, family, in_blocks, out_blocks, bias, pool, relu, tile_h, zsplit, acc_bits, nt)
+-    ("L_aa016078",     0,  1,  1, 1, 1, 1, 16, 1, 16, 4),
+-    ("L_198d6bf8",     0,  1,  2, 0, 1, 1,  8, 1, 16, 4),
+-    ("L_dcd8becf",     0,  2,  4, 0, 1, 1, 16, 2, 16, 4),
+-    ("L_efbe3788",     0,  4,  8, 0, 1, 1,  8, 4, 16, 4),
+-    ("L_50f0c205",     0,  8,  4, 0, 0, 1,  4, 4, 16, 4),
+-    ("L_a3c3caa1",     0,  4,  2, 0, 0, 0,  8, 1, 16, 4),
+-    ("L_9481d452",     0,  1,  1, 0, 0, 0, 16, 1, 16, 4),
+-    ("L_06e97933",     0,  2,  1, 0, 0, 0, 16, 1, 16, 4),
+-    ("L_3ed03daf",     1,  1,  1, 0, 0, 0, 16, 1, 16, 4),
+-    ("L_748b0baf",     1,  4,  4, 0, 0, 0,  8, 1, 16, 4),
+-    ("L_cb391582",     1,  2,  2, 0, 0, 0, 16, 1, 16, 4),
+-    ("L_fc1b8a04",     2, 14,  8, 0, 0, 0,  8, 7, 16, 4),
+-    ("L_3459485",      2, 14,  8, 0, 0, 0,  8, 7, 18, 4),
+-    ("L_3452733",      2, 14,  8, 0, 0, 0,  8, 7, 19, 4),
+-    ("L_flow16_acc17", 2,  4, 16, 0, 0, 0,  8, 2, 17, 4),
+-    ("L_3453044",      2,  4, 16, 0, 0, 0,  8, 2, 18, 4),
++    # (name, family, in_blocks, out_blocks, bias, pool, relu, tile_h, zsplit, acc_bits, nt, programs)
++    ("L_aa016078",     0,  1,  1, 1, 1, 1, 16, 1, 16, 4, ["aa016078"]),
++    ("L_198d6bf8",     0,  1,  2, 0, 1, 1,  8, 1, 16, 4, ["198d6bf8"]),
++    ("L_dcd8becf",     0,  2,  4, 0, 1, 1, 16, 2, 16, 4, ["dcd8becf"]),
++    ("L_efbe3788",     0,  4,  8, 0, 1, 1,  8, 4, 16, 4, ["efbe3788"]),
++    ("L_50f0c205",     0,  8,  4, 0, 0, 1,  4, 4, 16, 4, ["50f0c205"]),
++    ("L_a3c3caa1",     0,  4,  2, 0, 0, 0,  8, 1, 16, 4, ["a3c3caa1"]),
++    ("L_9481d452",     0,  1,  1, 0, 0, 0, 16, 1, 16, 4, ["9481d452"]),
++    ("L_06e97933",     0,  2,  1, 0, 0, 0, 16, 1, 16, 4, ["06e97933"]),
++    ("L_3ed03daf",     1,  1,  1, 0, 0, 1, 16, 1, 16, 4, ["3ed03daf"]),
++    ("L_748b0baf",     1,  4,  4, 0, 0, 1,  8, 1, 16, 4, ["748b0baf"]),
++    ("L_cb391582",     1,  2,  2, 0, 0, 1, 16, 1, 16, 4, ["cb391582"]),
++    ("L_fc1b8a04",     2, 14,  8, 0, 0, 0,  8, 7, 16, 4, ["fc1b8a04"]),
++    ("L_3459485",      2, 14,  8, 0, 0, 0,  8, 7, 18, 4, ["3459485"]),
++    ("L_3452733",      2, 14,  8, 0, 0, 0,  8, 7, 19, 4, ["3452733"]),
++    ("L_flow16_acc17", 2,  4, 16, 0, 0, 0,  8, 2, 17, 4, ["55e5d6b9", "34517926"]),
++    ("L_3453044",      2,  4, 16, 0, 0, 0,  8, 2, 18, 4, ["3453044"]),
+ ]
+ 
+ 
+@@ -61,8 +62,9 @@ def main() -> int:
+         return 1
+ 
+     args.output.mkdir(parents=True, exist_ok=True)
++    tsv_lines = ["program\tkernel\tfamily\tin\tout\ttile_h\tgrid_z\tbytes\tsha256"]
+ 
+-    for (name, family, in_b, out_b, bias, pool, relu, tile_h, zsplit, acc_bits, nt) in KERNELS:
++    for (name, family, in_b, out_b, bias, pool, relu, tile_h, zsplit, acc_bits, nt, programs) in KERNELS:
+         out_spv = args.output / f"{name}.spv"
+         cmd = [
+             args.glslang,
+@@ -86,8 +88,16 @@ def main() -> int:
+         if res.returncode != 0:
+             print(f"FAIL {name}: {res.stderr or res.stdout}", file=sys.stderr)
+             return res.returncode
+-        print(f"ok   {out_spv.name} ({out_spv.stat().st_size} bytes)")
+ 
++        data = out_spv.read_bytes()
++        sha256 = hashlib.sha256(data).hexdigest()
++        for prog in programs:
++            prog_spv = args.output / f"{prog}.spv"
++            shutil.copyfile(out_spv, prog_spv)
++            tsv_lines.append(f"{prog}\t{name}\t{family}\t{in_b}\t{out_b}\t{tile_h}\t{zsplit}\t{len(data)}\t{sha256}")
++        print(f"ok   {out_spv.name} ({len(data)} bytes, sha256={sha256[:12]}...)")
++
++    (args.output / "coopmat_layers.tsv").write_text("\n".join(tsv_lines) + "\n", encoding="utf-8")
+     return 0
+ 
+ 
+diff --git a/tools/GenerateXeFgWmma.ps1 b/tools/GenerateXeFgWmma.ps1
+new file mode 100644
+index 0000000..05b0ff7
+--- /dev/null
++++ b/tools/GenerateXeFgWmma.ps1
+@@ -0,0 +1,131 @@
++# SPDX-License-Identifier: MIT
++#
++# Compiles the 16 unique D3D12 WMMA / dot4add_i8packed compute shaders (and 17 <program>.dxbc files)
++# from src\MfgPort\Wmma\xefg_wmma_layers.hlsl using dxc.exe (-T cs_6_6 -O3) into <Output>\wmma\<program>.dxbc.
++#
++# Usage:
++#   ./tools/GenerateXeFgWmma.ps1 -Output bin\Release\xefg_mfg_programs\wmma
++
++param(
++    [Parameter(Mandatory = $true)]
++    [string]$Output,
++
++    [string]$Source = (Join-Path $PSScriptRoot "..\src\MfgPort\Wmma\xefg_wmma_layers.hlsl"),
++
++    [string]$DxcPath = ""
++)
++
++$ErrorActionPreference = "Stop"
++
++if (-not (Test-Path $Source)) {
++    throw "WMMA HLSL shader source not found: $Source"
++}
++
++function Find-Dxc {
++    param([string]$ExplicitPath)
++    if ($ExplicitPath -and (Test-Path $ExplicitPath)) {
++        return (Resolve-Path $ExplicitPath).Path
++    }
++    $cmd = Get-Command dxc.exe -ErrorAction SilentlyContinue
++    if ($cmd) { return $cmd.Source }
++
++    $kitsRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
++    if (Test-Path $kitsRoot) {
++        $found = Get-ChildItem -Path $kitsRoot -Recurse -Filter "dxc.exe" -ErrorAction SilentlyContinue |
++            Where-Object { $_.FullName -match "\\x64\\dxc\.exe$" } |
++            Sort-Object FullName -Descending |
++            Select-Object -First 1
++        if ($found) { return $found.FullName }
++    }
++    if ($env:VULKAN_SDK) {
++        $vkDxc = Join-Path $env:VULKAN_SDK "Bin\dxc.exe"
++        if (Test-Path $vkDxc) { return $vkDxc }
++    }
++    return $null
++}
++
++$dxc = Find-Dxc -ExplicitPath $DxcPath
++if (-not $dxc) {
++    throw "dxc.exe not found in PATH, Windows Kits, or VULKAN_SDK."
++}
++
++New-Item -ItemType Directory -Path $Output -Force | Out-Null
++
++# Fast-path no-op when all 17 <program>.dxbc files and wmma_layers.tsv are already newer than the HLSL source
++$manifestPath = Join-Path $Output "wmma_layers.tsv"
++$srcTime = (Get-Item $Source).LastWriteTimeUtc
++$expectedProgs = @("aa016078","198d6bf8","dcd8becf","efbe3788","50f0c205","a3c3caa1","9481d452","06e97933","3ed03daf","748b0baf","cb391582","fc1b8a04","3459485","3452733","55e5d6b9","34517926","3453044")
++if ((Test-Path $manifestPath) -and ((Get-Item $manifestPath).LastWriteTimeUtc -ge $srcTime)) {
++    $allCurrent = $true
++    foreach ($prog in $expectedProgs) {
++        $pf = Join-Path $Output "$prog.dxbc"
++        if (-not (Test-Path $pf) -or ((Get-Item $pf).LastWriteTimeUtc -lt $srcTime)) {
++            $allCurrent = $false
++            break
++        }
++    }
++    if ($allCurrent) {
++        Write-Host "D3D12 WMMA shaders in $Output are up to date; skipping DXC compilation."
++        exit 0
++    }
++}
++
++$kernels = @(
++    @{ Name="L_aa016078";     Family=0; In=1;  Out=1;  Bias=1; Pool=1; Relu=1; TileH=16; ZSplit=1; AccBits=16; Nt=4; Programs=@("aa016078") },
++    @{ Name="L_198d6bf8";     Family=0; In=1;  Out=2;  Bias=0; Pool=1; Relu=1; TileH=8;  ZSplit=1; AccBits=16; Nt=4; Programs=@("198d6bf8") },
++    @{ Name="L_dcd8becf";     Family=0; In=2;  Out=4;  Bias=0; Pool=1; Relu=1; TileH=16; ZSplit=2; AccBits=16; Nt=4; Programs=@("dcd8becf") },
++    @{ Name="L_efbe3788";     Family=0; In=4;  Out=8;  Bias=0; Pool=1; Relu=1; TileH=8;  ZSplit=4; AccBits=16; Nt=4; Programs=@("efbe3788") },
++    @{ Name="L_50f0c205";     Family=0; In=8;  Out=4;  Bias=0; Pool=0; Relu=1; TileH=4;  ZSplit=4; AccBits=16; Nt=4; Programs=@("50f0c205") },
++    @{ Name="L_a3c3caa1";     Family=0; In=4;  Out=2;  Bias=0; Pool=0; Relu=0; TileH=8;  ZSplit=1; AccBits=16; Nt=4; Programs=@("a3c3caa1") },
++    @{ Name="L_9481d452";     Family=0; In=1;  Out=1;  Bias=0; Pool=0; Relu=0; TileH=16; ZSplit=1; AccBits=16; Nt=4; Programs=@("9481d452") },
++    @{ Name="L_06e97933";     Family=0; In=2;  Out=1;  Bias=0; Pool=0; Relu=0; TileH=16; ZSplit=1; AccBits=16; Nt=4; Programs=@("06e97933") },
++    @{ Name="L_3ed03daf";     Family=1; In=1;  Out=1;  Bias=0; Pool=0; Relu=1; TileH=16; ZSplit=1; AccBits=16; Nt=4; Programs=@("3ed03daf") },
++    @{ Name="L_748b0baf";     Family=1; In=4;  Out=4;  Bias=0; Pool=0; Relu=1; TileH=8;  ZSplit=1; AccBits=16; Nt=4; Programs=@("748b0baf") },
++    @{ Name="L_cb391582";     Family=1; In=2;  Out=2;  Bias=0; Pool=0; Relu=1; TileH=16; ZSplit=1; AccBits=16; Nt=4; Programs=@("cb391582") },
++    @{ Name="L_fc1b8a04";     Family=2; In=14; Out=8;  Bias=0; Pool=0; Relu=0; TileH=8;  ZSplit=7; AccBits=16; Nt=4; Programs=@("fc1b8a04") },
++    @{ Name="L_3459485";      Family=2; In=14; Out=8;  Bias=0; Pool=0; Relu=0; TileH=8;  ZSplit=7; AccBits=18; Nt=4; Programs=@("3459485") },
++    @{ Name="L_3452733";      Family=2; In=14; Out=8;  Bias=0; Pool=0; Relu=0; TileH=8;  ZSplit=7; AccBits=19; Nt=4; Programs=@("3452733") },
++    @{ Name="L_flow16_acc17"; Family=2; In=4;  Out=16; Bias=0; Pool=0; Relu=0; TileH=8;  ZSplit=2; AccBits=17; Nt=4; Programs=@("55e5d6b9", "34517926") },
++    @{ Name="L_3453044";      Family=2; In=4;  Out=16; Bias=0; Pool=0; Relu=0; TileH=8;  ZSplit=2; AccBits=18; Nt=4; Programs=@("3453044") }
++)
++
++$tsvLines = @("program`tkernel`tfamily`tin`tout`ttile_h`tgrid_z`tbytes`tsha256")
++
++foreach ($k in $kernels) {
++    $kernelOut = Join-Path $Output "$($k.Name).dxbc"
++    $argsList = @(
++        "-T", "cs_6_6",
++        "-E", "main",
++        "-O3",
++        "-DLAYER_FAMILY=$($k.Family)",
++        "-DLAYER_IN=$($k.In)",
++        "-DLAYER_OUT=$($k.Out)",
++        "-DLAYER_BIAS=$($k.Bias)",
++        "-DLAYER_POOL=$($k.Pool)",
++        "-DLAYER_RELU=$($k.Relu)",
++        "-DLAYER_TILE_H=$($k.TileH)",
++        "-DLAYER_ZSPLIT=$($k.ZSplit)",
++        "-DLAYER_ACC_BITS=$($k.AccBits)",
++        "-DLAYER_NT=$($k.Nt)",
++        "-Fo", $kernelOut,
++        $Source
++    )
++
++    & $dxc @argsList
++    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $kernelOut)) {
++        throw "dxc.exe failed compiling $($k.Name) (exit code $LASTEXITCODE)"
++    }
++
++    $bytes = (Get-Item $kernelOut).Length
++    $hash = (Get-FileHash -Path $kernelOut -Algorithm SHA256).Hash.ToLowerInvariant()
++
++    foreach ($prog in $k.Programs) {
++        $progOut = Join-Path $Output "$prog.dxbc"
++        Copy-Item -Path $kernelOut -Destination $progOut -Force
++        $tsvLines += "$prog`t$($k.Name)`t$($k.Family)`t$($k.In)`t$($k.Out)`t$($k.TileH)`t$($k.ZSplit)`t$bytes`t$hash"
++    }
++    Write-Host ("ok   {0,-18} ({1} bytes, sha256={2}...)" -f "$($k.Name).dxbc", $bytes, $hash.Substring(0, 12))
++}
++
++Set-Content -Path (Join-Path $Output "wmma_layers.tsv") -Value ($tsvLines -join "`n") -Encoding UTF8
++Write-Host "Built 16 unique D3D12 WMMA kernels (17 layer overrides) into $Output"
+-- 
+2.39.5
+

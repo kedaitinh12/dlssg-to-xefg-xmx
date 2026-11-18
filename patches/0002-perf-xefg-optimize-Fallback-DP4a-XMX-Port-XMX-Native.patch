@@ -1,0 +1,863 @@
+From d6f99d5bf30d3c13a82eb78d1eed5fc91e2cfd4d Mon Sep 17 00:00:00 2001
+From: OptiScaler-Modder <modder@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 21:38:27 +0000
+Subject: [PATCH 2/3] perf(xefg): optimize Fallback DP4a, XMX Port, XMX Native,
+ CUDA & WMMA CPU/GPU paths
+
+---
+ src/FrameGenerator.cpp         | 220 ++++++++++++++++++++++++---------
+ src/FrameGenerator.h           |   6 +-
+ src/MfgPort/ShaderPort.h       |  15 ++-
+ src/Util.h                     |  68 ++++++++--
+ src/vulkan/VulkanRuntime.cpp   |  69 ++++++++---
+ src/vulkan/xvk_commandlist.cpp |  27 ++--
+ src/vulkan/xvk_internal.h      |   1 +
+ 7 files changed, 312 insertions(+), 94 deletions(-)
+
+diff --git a/src/FrameGenerator.cpp b/src/FrameGenerator.cpp
+index 05046ff..28a6f99 100644
+--- a/src/FrameGenerator.cpp
++++ b/src/FrameGenerator.cpp
+@@ -2,6 +2,7 @@
+ #include "Log.h"
+ #include "MfgKernels.h"
+ #include "MfgPort/Cuda/cuda_route.h"
++#include "MfgPort/Wmma/wmma_route.h"
+ #include "Plugin.h"
+ #include "Util.h"
+ 
+@@ -431,8 +432,8 @@ static int32_t NativeModel(ID3D12Device* device)
+ }
+ 
+ // Probes the GPU once, as early as a device is available: XeFG's own XMX network first, then the ported model and its
+-// CUDA tensor-core route. The menu uses the flags to grey out paths that would fail, and the first context no longer
+-// runs these checks. A later different device keeps the first device's answer, same as the native model probe.
++// CUDA tensor-core and AMD WMMA INT8 routes. The menu uses the flags to grey out paths that would fail, and the first
++// context no longer runs these checks. A later different device keeps the first device's answer.
+ void FrameGenerator::ProbeSupport(ID3D12Device* device)
+ {
+ 	if (!device)
+@@ -443,48 +444,68 @@ void FrameGenerator::ProbeSupport(ID3D12Device* device)
+ 		{
+ 			const int32_t native = NativeModel(device);
+ 
+-			// XeFG's own XMX network works here; the port and its CUDA route are only needed when it doesn't.
++			// XeFG's own XMX network works here; the port and its CUDA/WMMA routes are only needed when it doesn't.
+ 			if (native == XeFGXmxModel)
+ 			{
+ 				Plugin::cudaSupport = Plugin::CudaSupport::Unsupported;
+-				Log::Info("XeFG native XMX network available, CUDA route not applicable");
++				Plugin::wmmaSupport = Plugin::WmmaSupport::Unsupported;
++				Log::Info("XeFG native XMX network available, CUDA/WMMA routes not applicable");
+ 				return;
+ 			}
+ 
+ 			// Publishing the ported model patches libxess_fg.dll process wide. It's installed even when another path
+-			// is selected, so the menu knows whether CUDA is available and switching paths needs no new context.
++			// is selected, so the menu knows whether CUDA/WMMA are available and switching paths needs no new context.
+ 			const bool mfgModel = MfgKernels::Install(XeFG::Module());
+ 			Plugin::cudaSupport = Plugin::CudaSupport::Unsupported;
++			Plugin::wmmaSupport = Plugin::WmmaSupport::Unsupported;
+ 
+ 			if (!mfgModel)
+ 			{
+-				Log::Info("Tensor-core route skipped: the ported MFG model is not available");
++				Log::Info("Hardware matrix routes skipped: the ported MFG model is not available");
+ 				return;
+ 			}
+ 
++			static std::once_flag routeLogOnce;
++			std::call_once(routeLogOnce, [] {
++				xefg_cuda::SetLog(CudaRouteLog);
++				xefg_wmma::SetLog(CudaRouteLog);
++			});
++
+ 			wchar_t tensorCores[16]{};
+ 			const DWORD tensorCoresLength = GetEnvironmentVariableW(L"XEFG_TENSOR_CORES", tensorCores, 16);
++			const bool tensorOff = tensorCoresLength && tensorCoresLength < 16 && (tensorCores[0] == L'0'
++				|| _wcsicmp(tensorCores, L"off") == 0 || _wcsicmp(tensorCores, L"false") == 0);
+ 
+-			if (tensorCoresLength && tensorCoresLength < 16 && (tensorCores[0] == L'0'
+-				|| _wcsicmp(tensorCores, L"off") == 0 || _wcsicmp(tensorCores, L"false") == 0))
++			if (tensorOff)
+ 			{
+ 				Log::Info("Tensor-core route disabled by XEFG_TENSOR_CORES");
+-				return;
++			}
++			else
++			{
++				const auto fatbin = LoadCudaFatbin(MfgKernels::ProgramsDirectory() / L"xefg_cuda_layers.fatbin");
++				std::string reason;
++				if (xefg_cuda::Install(device, XeFG::Module(), fatbin, reason))
++				{
++					Plugin::cudaSupport = Plugin::CudaSupport::Supported;
++					// The route's hooks stay installed, but only a context that selects CUDA turns Dispatch replacement on
++					xefg_cuda::SetEnabled(false);
++				}
++				else
++				{
++					Log::Info("Tensor-core route inactive: {}", reason);
++				}
+ 			}
+ 
+-			static std::once_flag cudaLogOnce;
+-			std::call_once(cudaLogOnce, [] { xefg_cuda::SetLog(CudaRouteLog); });
+-
+-			const auto fatbin = LoadCudaFatbin(MfgKernels::ProgramsDirectory() / L"xefg_cuda_layers.fatbin");
+-			std::string reason;
+-			if (xefg_cuda::Install(device, XeFG::Module(), fatbin, reason))
++			std::string wmmaReason;
++			if (xefg_wmma::Install(device, XeFG::Module(), MfgKernels::ProgramsDirectory() / L"wmma", wmmaReason))
+ 			{
+-				Plugin::cudaSupport = Plugin::CudaSupport::Supported;
+-				// The route's hooks stay installed, but only a context that selects CUDA turns Dispatch replacement on
+-				xefg_cuda::SetEnabled(false);
++				Plugin::wmmaSupport = Plugin::WmmaSupport::Supported;
++				xefg_wmma::SetEnabled(false);
++			}
++			else if (wmmaReason != "not_amd")
++			{
++				Log::Info("WMMA route inactive: {}", wmmaReason);
+ 			}
+-			else
+-				Log::Info("Tensor-core route inactive: {}", reason);
+ 		});
+ }
+ 
+@@ -500,9 +521,10 @@ static int32_t PickModel(ID3D12Device* device)
+ 		if (native == XeFGXmxModel)
+ 			return XeFGXmxModel;
+ 
+-		// Unsupported, the CUDA / ported defaults below, the same as an unsupported CUDA choice
++		// Unsupported, the CUDA / WMMA / ported defaults below
+ 		break;
+ 	case Plugin::Path::Cuda:
++	case Plugin::Path::Wmma:
+ 	case Plugin::Path::XmxPort:
+ 		break;
+ 	}
+@@ -510,7 +532,7 @@ static int32_t PickModel(ID3D12Device* device)
+ 	return PortAvailable() ? MfgKernels::MfgModel : MfgKernels::Dp4aModel;
+ }
+ 
+-// The ported model runs on the CUDA tensor-core route when that's the selected path, otherwise on DXIL. XeFG's own
++// The ported model runs on the CUDA tensor-core route when that's the selected path, otherwise on WMMA or DXIL. XeFG's own
+ // XMX network doesn't need the port at all.
+ static bool UseCuda(int32_t model)
+ {
+@@ -518,7 +540,18 @@ static bool UseCuda(int32_t model)
+ 		return false;
+ 
+ 	const auto path = Plugin::options.path.load();
+-	return path == Plugin::Path::Cuda || path == Plugin::Path::XmxNative;
++	return path == Plugin::Path::Cuda || (path == Plugin::Path::XmxNative && Plugin::cudaSupport.load() == Plugin::CudaSupport::Supported);
++}
++
++// The ported model runs on the AMD WMMA INT8 route when WMMA is explicitly selected, or automatically on AMD RDNA 4
++// when XMX (native) is selected (RDNA 3 stays on XMX DP4a INT8 unless WMMA is explicitly selected).
++static bool UseWmma(int32_t model)
++{
++	if (model != MfgKernels::MfgModel || !xefg_wmma::Supported())
++		return false;
++
++	const auto path = Plugin::options.path.load();
++	return path == Plugin::Path::Wmma || (path == Plugin::Path::XmxNative && xefg_wmma::IsRdna4());
+ }
+ 
+ static Plugin::Network CurrentNetwork(int32_t model)
+@@ -529,7 +562,13 @@ static Plugin::Network CurrentNetwork(int32_t model)
+ 	if (model != MfgKernels::MfgModel)
+ 		return Plugin::Network::Fallback;
+ 
+-	return xefg_cuda::Enabled() ? Plugin::Network::Cuda : Plugin::Network::XmxPort;
++	if (xefg_cuda::Enabled())
++		return Plugin::Network::Cuda;
++
++	if (xefg_wmma::Enabled())
++		return Plugin::Network::Wmma;
++
++	return Plugin::Network::XmxPort;
+ }
+ 
+ bool FrameGenerator::CreateContext()
+@@ -546,10 +585,11 @@ bool FrameGenerator::CreateContext()
+ 	if (!mfgModel && settings.model != XeFGXmxModel)
+ 	{
+ 		// The route runs the ported model, so without the port there's nothing for it to launch
+-		Log::Info("Tensor-core route skipped: the ported MFG model is not available");
++		Log::Info("Hardware matrix route skipped: the ported MFG model is not available");
+ 	}
+ 
+ 	xefg_cuda::SetEnabled(UseCuda(settings.model));
++	xefg_wmma::SetEnabled(UseWmma(settings.model));
+ 
+ 	// Process wide, they also affect other XeFG contexts. Must happen before the context picks its model
+ 	XeFG::SetMaxInterpolatedFrames(MaxFrames);
+@@ -581,7 +621,7 @@ bool FrameGenerator::CreateContext()
+ 
+ 	context = std::move(newContext);
+ 
+-	routeLaunches = xefg_cuda::Snapshot().launches;
++	routeLaunches = UseWmma(settings.model) ? xefg_wmma::Snapshot().launches : xefg_cuda::Snapshot().launches;
+ 	routeFrames = 0;
+ 	routeReported = false;
+ 	return true;
+@@ -614,7 +654,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const
+ 	wanted.uiMode = hudless ? XEFGD_UI_MODE_BACKBUFFER_HUDLESS : XEFGD_UI_MODE_AUTO;
+ 	wanted.model = PickModel(device.Get());
+ 
+-	// The menu path can change without a context change: XMX Port and CUDA both run the ported model (16), only the
++	// The menu path can change without a context change: XMX Port, CUDA, and WMMA all run the ported model (16), only the
+ 	// route that executes its programs differs. Log the switch, and say whether it took effect below
+ 	const auto path = Plugin::options.path.load();
+ 	const bool pathChanged = (int32_t)path != loggedPath;
+@@ -664,6 +704,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const
+ 		return;
+ 
+ 	xefg_cuda::SetEnabled(UseCuda(settings.model));
++	xefg_wmma::SetEnabled(UseWmma(settings.model));
+ 	const bool debugLines = Plugin::options.debugLines.load(std::memory_order_relaxed);
+ 	static std::atomic<int> sLastDebugLines{ -1 };
+ 	if (sLastDebugLines.exchange(debugLines ? 1 : 0, std::memory_order_relaxed) != (debugLines ? 1 : 0))
+@@ -678,10 +719,18 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const
+ 			Log::Warn("CUDA path selected, but the tensor-core route is unavailable ({}), the DXIL port runs instead",
+ 				route.reason.empty() ? std::string("not installed") : route.reason);
+ 	}
++	else if (pathChanged && path == Plugin::Path::Wmma)
++	{
++		const auto route = xefg_wmma::Snapshot();
++
++		if (route.state != xefg_wmma::State::Active)
++			Log::Warn("WMMA path selected, but the WMMA INT8 route is unavailable ({}), the XMX DP4a INT8 port runs instead",
++				route.reason.empty() ? std::string("not installed") : route.reason);
++	}
+ 
+-	if (pathChanged && UseCuda(settings.model))
++	if (pathChanged && (UseCuda(settings.model) || UseWmma(settings.model)))
+ 	{
+-		routeLaunches = xefg_cuda::Snapshot().launches;
++		routeLaunches = UseWmma(settings.model) ? xefg_wmma::Snapshot().launches : xefg_cuda::Snapshot().launches;
+ 		routeFrames = 0;
+ 		routeReported = false;
+ 	}
+@@ -732,28 +781,52 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const
+ 
+ 	// XeFG needs both frames to have hudless or neither
+ 	context->pairValid = captured && previous.valid && !reset && (frame.hudless != nullptr) == (previous.hudless != nullptr);
++	context->batchGeneratedThrough = 0;
++	context->directOutput = false;
+ 	frame.valid = captured;
+ }
+ 
+-FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsCommandList* cmdList, D3D12_RESOURCE_DESC outputDesc,
+-	uint32_t frameIndex, uint32_t frameCount)
++FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* output,
++	D3D12_RESOURCE_DESC outputDesc, uint32_t frameIndex, uint32_t frameCount)
+ {
+ 	if (!context || !context->pairValid)
+ 		return InterpolateResult::Skipped;
+ 
+-	outputDesc.Format = settings.format;
+-	outputDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+-	// The game's output can live in a layout a committed UAV texture can't use
+-	outputDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++	// Multi-frame batch reuse: when frameIndex == 1 already generated the entire batch (1..frameCount) in one pass,
++	// subsequent evaluations in the same batch simply copy their pre-generated output without re-entering XeFG::Execute.
++	if (frameIndex > 1 && context->batchGeneratedThrough >= frameIndex &&
++		outputDesc.Width == settings.width && outputDesc.Height == settings.height &&
++		TypedFormat(outputDesc.Format) == settings.format &&
++		context->outputs[frameIndex - 1] != nullptr)
++	{
++		context->directOutput = false;
++		return InterpolateResult::Interpolated;
++	}
+ 
+-	for (uint32_t i = 0; i < frameCount; i++)
++	// Zero-copy in-place UAV fast-path for 2x FG (frameCount == 1) when the game's output texture is directly UAV-compatible
++	const bool canWriteDirect = frameCount == 1 && frameIndex == 1 && output != nullptr &&
++		outputDesc.Format == settings.format &&
++		(outputDesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0 &&
++		outputDesc.SampleDesc.Count == 1 &&
++		outputDesc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN;
++	context->directOutput = canWriteDirect;
++
++	if (!canWriteDirect)
+ 	{
+-		if (!context->outputs[i])
+-			context->outputs[i] = CreateTexture(device.Get(), outputDesc, OutputState, L"dlssg-to-xefg output",
+-				"XeFG output");
++		outputDesc.Format = settings.format;
++		outputDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++		// The game's output can live in a layout a committed UAV texture can't use
++		outputDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++
++		for (uint32_t i = 0; i < frameCount; i++)
++		{
++			if (!context->outputs[i])
++				context->outputs[i] = CreateTexture(device.Get(), outputDesc, OutputState, L"dlssg-to-xefg output",
++					"XeFG output");
+ 
+-		if (!context->outputs[i])
+-			return InterpolateResult::Failed;
++			if (!context->outputs[i])
++				return InterpolateResult::Failed;
++		}
+ 	}
+ 
+ 	auto fill = [this](const Frame& frame, xefgd_frame_t& out)
+@@ -771,23 +844,39 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
+ 
+ 	// XeFG wants the same array for every frame of a pair
+ 	static_assert(sizeof(ComPtr<ID3D12Resource>) == sizeof(ID3D12Resource*));
+-	params.ppOutputs = reinterpret_cast<ID3D12Resource* const*>(context->outputs);
++	ID3D12Resource* directOutputs[1]{ output };
++	params.ppOutputs = canWriteDirect ? directOutputs : reinterpret_cast<ID3D12Resource* const*>(context->outputs);
+ 	params.pOutputBases = context->outputBases;
+ 	params.numInterpolatedFrames = (uint8_t)frameCount;
+ 	params.uiCompositionEnabled = settings.uiMode != XEFGD_UI_MODE_AUTO;
+ 
+-	// Frame 1 runs the per pair work and generates its frame, the rest only generate theirs
+-	params.firstFrameIndex = frameIndex - 1;
+-	params.frameCount = 1;
++	// When starting a batch at frameIndex == 1, generate all frameCount frames in one XeFG::Execute pass so intermediate
++	// feature pyramid and optical flow tensors stay hot in GPU L2/Infinity Cache across Fallback, XMX Port, and XMX Native.
++	if (frameIndex == 1)
++	{
++		params.firstFrameIndex = 0;
++		params.frameCount = (uint8_t)frameCount;
++	}
++	else
++	{
++		params.firstFrameIndex = frameIndex - 1;
++		params.frameCount = 1;
++	}
+ 
+ 	// Execute records the provider's dispatches into the caller's list; make sure that list's table is hooked too
+ 	if (UseCuda(settings.model))
+ 		xefg_cuda::Adopt(cmdList);
++	else if (UseWmma(settings.model))
++		xefg_wmma::Adopt(cmdList);
+ 
+ 	auto result = XeFG::Execute(context->handle, cmdList, params);
+ 
+ 	if (result == XEFGD_RESULT_SUCCESS)
++	{
++		if (frameIndex == 1)
++			context->batchGeneratedThrough = frameCount;
+ 		return InterpolateResult::Interpolated;
++	}
+ 
+ 	if (result > 0)
+ 	{
+@@ -843,27 +932,44 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
+ 			CurrentNetwork(settings.model), context == nullptr, settings.format == DXGI_FORMAT_R16G16B16A16_FLOAT });
+ 	}
+ 
+-	const auto result = Interpolate(cmdList, output->GetDesc(), frameIndex, frameCount);
++	const auto result = Interpolate(cmdList, output, output->GetDesc(), frameIndex, frameCount);
+ 
+-	// A few frames after the path or context changed, say whether the tensor-core route is actually the one running
+-	if (result == InterpolateResult::Interpolated && UseCuda(settings.model) && !routeReported && ++routeFrames >= 8)
++	// A few frames after the path or context changed, say whether the hardware matrix route is actually the one running
++	if (result == InterpolateResult::Interpolated && !routeReported && ++routeFrames >= 8)
+ 	{
+-		routeReported = true;
+-		const auto route = xefg_cuda::Snapshot();
++		if (UseCuda(settings.model))
++		{
++			routeReported = true;
++			const auto route = xefg_cuda::Snapshot();
++
++			if (route.launches > routeLaunches)
++				Log::Info("CUDA route: {} tensor-core kernels launched ({} layer binds, {} layers recognized)",
++					route.launches - routeLaunches, route.binds, route.layers);
++			else
++				Log::Warn("CUDA route: no tensor-core kernel launched ({} layer binds, {} layers recognized), the DXIL port is running",
++					route.binds, route.layers);
++		}
++		else if (UseWmma(settings.model))
++		{
++			routeReported = true;
++			const auto route = xefg_wmma::Snapshot();
+ 
+-		if (route.launches > routeLaunches)
+-			Log::Info("CUDA route: {} tensor-core kernels launched ({} layer binds, {} layers recognized)",
+-				route.launches - routeLaunches, route.binds, route.layers);
+-		else
+-			Log::Warn("CUDA route: no tensor-core kernel launched ({} layer binds, {} layers recognized), the DXIL port is running",
+-				route.binds, route.layers);
++			if (route.launches > routeLaunches)
++				Log::Info("WMMA route: {} WMMA INT8 dispatches accelerated ({} layer binds, {} layers recognized)",
++					route.launches - routeLaunches, route.binds, route.layers);
++		}
+ 	}
+ 
+ 	// Without a usable pair (first frame, reset) the real frame is shown again, that's not an error
+ 	if (result == InterpolateResult::Interpolated)
+-		Copy(cmdList, output, OutputState, context->outputs[frameIndex - 1].Get(), OutputState);
++	{
++		if (!context->directOutput)
++			Copy(cmdList, output, OutputState, context->outputs[frameIndex - 1].Get(), OutputState);
++	}
+ 	else
++	{
+ 		Copy(cmdList, output, OutputState, backbuffer, BackbufferState);
++	}
+ 
+ 	return result == InterpolateResult::Failed ? NGX_FAIL : NGX_SUCCESS;
+ }
+diff --git a/src/FrameGenerator.h b/src/FrameGenerator.h
+index bf14287..3027494 100644
+--- a/src/FrameGenerator.h
++++ b/src/FrameGenerator.h
+@@ -63,6 +63,8 @@ private:
+ 
+ 		// The previous and the current real frame can be interpolated
+ 		bool pairValid = false;
++		uint32_t batchGeneratedThrough = 0;
++		bool directOutput = false;
+ 
+ 		~Context();
+ 	};
+@@ -76,8 +78,8 @@ private:
+ 
+ 	bool CreateContext();
+ 	void CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const NGXParameter& params);
+-	InterpolateResult Interpolate(ID3D12GraphicsCommandList* cmdList, D3D12_RESOURCE_DESC outputDesc,
+-		uint32_t frameIndex, uint32_t frameCount);
++	InterpolateResult Interpolate(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* output,
++		D3D12_RESOURCE_DESC outputDesc, uint32_t frameIndex, uint32_t frameCount);
+ 
+ 	ComPtr<ID3D12Device> device;
+ 	Settings settings;
+diff --git a/src/MfgPort/ShaderPort.h b/src/MfgPort/ShaderPort.h
+index 65b87a1..bc184c7 100644
+--- a/src/MfgPort/ShaderPort.h
++++ b/src/MfgPort/ShaderPort.h
+@@ -47,10 +47,19 @@ class ShaderPort
+ 
+ 	static void read(uintptr_t p, void* out, size_t count)
+ 	{
+-		SIZE_T got{};
++		if (!p || count > 1000000)
++			throw std::runtime_error("shader_port_read");
+ 
+-		if (!p || count > 1000000 || !ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(p), out, count, &got) ||
+-			got != count)
++		// Once ShaderPort is active in-process, dispatch() reads validated in-process STL strings/vectors directly
++		// without paying kernel syscall overhead via ReadProcessMemory on every shader lookup.
++		if (instance && instance->active)
++		{
++			std::memcpy(out, reinterpret_cast<const void*>(p), count);
++			return;
++		}
++
++		SIZE_T got{};
++		if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(p), out, count, &got) || got != count)
+ 		{
+ 			throw std::runtime_error("shader_port_read");
+ 		}
+diff --git a/src/Util.h b/src/Util.h
+index a6032f9..8b26d5b 100644
+--- a/src/Util.h
++++ b/src/Util.h
+@@ -4,6 +4,7 @@
+ #include <d3d12.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <filesystem>
+ #include <memory>
+ #include <mutex>
+@@ -25,24 +26,30 @@ namespace DeferredDestroy
+ 	// Leaked on purpose: destroying XeFG contexts from our static destructors at process exit would call into a
+ 	// libxess_fg.dll that may already be torn down
+ 	inline std::vector<Entry>& entries = *new std::vector<Entry>;
+-	inline uint64_t evaluations = 0;
++	inline std::atomic<uint64_t> evaluations{ 0 };
++	inline std::atomic<size_t> pendingCount{ 0 };
+ 
+ 	inline void Add(std::shared_ptr<void> object)
+ 	{
+ 		std::scoped_lock lock(mutex);
+-		entries.push_back({ evaluations + Delay, std::move(object) });
++		entries.push_back({ evaluations.load(std::memory_order_relaxed) + Delay, std::move(object) });
++		pendingCount.store(entries.size(), std::memory_order_release);
+ 	}
+ 
+ 	inline void Collect(bool all = false)
+ 	{
++		const uint64_t now = evaluations.fetch_add(1, std::memory_order_relaxed) + 1;
++		if (!all && pendingCount.load(std::memory_order_acquire) == 0)
++			return;
++
+ 		std::vector<Entry> due;
+ 		{
+ 			std::scoped_lock lock(mutex);
+-			evaluations++;
+ 			auto split = std::partition(entries.begin(), entries.end(),
+-				[all](const Entry& e) { return !all && e.destroyAt > evaluations; });
++				[all, now](const Entry& e) { return !all && e.destroyAt > now; });
+ 			due.assign(std::make_move_iterator(split), std::make_move_iterator(entries.end()));
+ 			entries.erase(split, entries.end());
++			pendingCount.store(entries.size(), std::memory_order_release);
+ 		}
+ 		// Destroyed here, outside the lock
+ 	}
+@@ -80,15 +87,58 @@ inline void Barrier(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* resource
+ 	cmdList->ResourceBarrier(1, &barrier);
+ }
+ 
+-// Both resources are back in their states afterwards
++// Both resources are back in their states afterwards; transitions are batched into at most one ResourceBarrier call
++// before and one after CopyResource to halve CPU/GPU barrier overhead across all models.
+ inline void Copy(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* destination, D3D12_RESOURCE_STATES destinationState,
+ 	ID3D12Resource* source, D3D12_RESOURCE_STATES sourceState)
+ {
+-	Barrier(cmdList, destination, destinationState, D3D12_RESOURCE_STATE_COPY_DEST);
+-	Barrier(cmdList, source, sourceState, D3D12_RESOURCE_STATE_COPY_SOURCE);
++	D3D12_RESOURCE_BARRIER before[2]{};
++	UINT beforeCount = 0;
++	if (destinationState != D3D12_RESOURCE_STATE_COPY_DEST)
++	{
++		before[beforeCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++		before[beforeCount].Transition.pResource = destination;
++		before[beforeCount].Transition.StateBefore = destinationState;
++		before[beforeCount].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
++		before[beforeCount].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++		++beforeCount;
++	}
++	if (sourceState != D3D12_RESOURCE_STATE_COPY_SOURCE)
++	{
++		before[beforeCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++		before[beforeCount].Transition.pResource = source;
++		before[beforeCount].Transition.StateBefore = sourceState;
++		before[beforeCount].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++		before[beforeCount].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++		++beforeCount;
++	}
++	if (beforeCount)
++		cmdList->ResourceBarrier(beforeCount, before);
++
+ 	cmdList->CopyResource(destination, source);
+-	Barrier(cmdList, destination, D3D12_RESOURCE_STATE_COPY_DEST, destinationState);
+-	Barrier(cmdList, source, D3D12_RESOURCE_STATE_COPY_SOURCE, sourceState);
++
++	D3D12_RESOURCE_BARRIER after[2]{};
++	UINT afterCount = 0;
++	if (destinationState != D3D12_RESOURCE_STATE_COPY_DEST)
++	{
++		after[afterCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++		after[afterCount].Transition.pResource = destination;
++		after[afterCount].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++		after[afterCount].Transition.StateAfter = destinationState;
++		after[afterCount].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++		++afterCount;
++	}
++	if (sourceState != D3D12_RESOURCE_STATE_COPY_SOURCE)
++	{
++		after[afterCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++		after[afterCount].Transition.pResource = source;
++		after[afterCount].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
++		after[afterCount].Transition.StateAfter = sourceState;
++		after[afterCount].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++		++afterCount;
++	}
++	if (afterCount)
++		cmdList->ResourceBarrier(afterCount, after);
+ }
+ 
+ // Typed formats for views on typeless or depth resources. 8-bit sRGB maps to UNORM, typed UAVs can't be sRGB
+diff --git a/src/vulkan/VulkanRuntime.cpp b/src/vulkan/VulkanRuntime.cpp
+index d9faa50..3e7d1b9 100644
+--- a/src/vulkan/VulkanRuntime.cpp
++++ b/src/vulkan/VulkanRuntime.cpp
+@@ -4,8 +4,8 @@
+ // this repository: XeFG is driven through XeFG.h, the ported model comes from MfgKernels, the model follows the menu's
+ // network path, and the programs are the ones in xefg_mfg_programs\vulkan (VulkanPrograms.h). The tensor-core route of an
+ // NVIDIA GPU is in (VulkanTensor.h), selected by the CUDA network path. The cooperative-matrix route of an AMD RDNA3/RDNA4
+-// or Intel Arc GPU is in (VulkanCoopMat.h), selected by the XMX Port and XMX (native) network paths. Left out: its GPU timing
+-// and its registration as an OptiScaler provider.
++// or Intel Arc GPU is in (VulkanCoopMat.h), selected by the WMMA, XMX Port and XMX (native) network paths. Left out: its GPU
++// timing and its registration as an OptiScaler provider.
+ //
+ // Every evaluation records into the VkCommandBuffer the game gives NVSDK_NGX_VULKAN_EvaluateFeature. The game's images
+ // are copied into images of the layer's own device, XeFG records its dispatches on a D3D12 command list of that device,
+@@ -181,6 +181,8 @@ namespace
+ 		bool inverted = false;
+ 		bool jittered = false;
+ 		int32_t model = 0;
++		int32_t loggedPath = -1;
++		bool createFailed = false; // retried when settings or network path (including WMMA) change
+ 
+ 		std::array<Slot, 2> slots;
+ 		uint32_t current = 0;
+@@ -271,7 +273,8 @@ namespace
+ 
+ 	const char* ModelText(int32_t model)
+ 	{
+-		return model == MfgKernels::MfgModel ? "port" : "DP4a";
++		return model != MfgKernels::MfgModel ? "DP4a"
++		     : (Plugin::options.path.load() == Plugin::Path::Wmma && gCoopGate.load() ? "WMMA" : "port");
+ 	}
+ 
+ 	// With gDevice.mutex held
+@@ -490,6 +493,10 @@ namespace
+ 		}
+ 
+ 		d.coopReason = d.coopInstalled ? std::string() : coopStatusReason;
++
++		auto unknown = Plugin::WmmaSupport::Unknown;
++		Plugin::wmmaSupport.compare_exchange_strong(unknown,
++			d.coopInstalled ? Plugin::WmmaSupport::Supported : Plugin::WmmaSupport::Unsupported);
+ 	}
+ 
+ 	// The layer's device on the game's, XeFG with its model, and the copy pipelines. With gDevice.mutex held
+@@ -641,8 +648,8 @@ namespace
+ 	}
+ 
+ 	// The tensor-core route replaces layers while the ported model runs on the CUDA path (VulkanPolicy::UseTensorCores).
+-	// The path can change without a new context, CUDA and XMX Port run the same model and only what executes the layers
+-	// differs, so this is set on every batch. A layer the route can't take stays a SPIR-V program in the same frame
++	// The path can change without a new context, CUDA, WMMA, and XMX Port run the same model and only what executes the
++	// layers differs, so this is set on every batch. A layer the route can't take stays a SPIR-V program in the same frame
+ 	void ApplyTensorGate(const Device& d, int32_t model)
+ 	{
+ 		const auto path = Plugin::options.path.load();
+@@ -656,15 +663,19 @@ namespace
+ 			Log::Info("Vulkan tensor cores: {}", on ? "on, the CUDA path runs the int8 layers on the tensor cores" : "off");
+ 
+ 		// When the CUDA cubin route is not active, the VK_KHR_cooperative_matrix route runs the int8 layers on
+-		// AMD RDNA3/RDNA4 (WMMA) or Intel Arc (XMX) hardware for the XMX Port, XMX (native), and CUDA paths
++		// AMD RDNA3/RDNA4 (WMMA) or Intel Arc (XMX) hardware for the WMMA, XMX Port, XMX (native), and CUDA paths
+ 		const bool coopOn = !on && d.coopInstalled && VulkanPolicy::UseCoopMatrix(portModel,
+-			path == Plugin::Path::XmxPort, path == Plugin::Path::XmxNative, path == Plugin::Path::Cuda);
++			path == Plugin::Path::XmxPort, path == Plugin::Path::XmxNative, path == Plugin::Path::Cuda,
++			path == Plugin::Path::Wmma);
+ 
+ 		xvk::SetCoopMatrixEnabled(d.d3d.Get(), coopOn);
+ 
+ 		if (gCoopGate.exchange(coopOn) != coopOn)
+-			Log::Info("Vulkan cooperative matrix: {}",
++		{
++			SetModelName(model);
++			Log::Info("Vulkan cooperative matrix (WMMA/XMX): {}",
+ 				coopOn ? "on, VK_KHR_cooperative_matrix runs the int8 layers on hardware matrix units" : "off");
++		}
+ 	}
+ 
+ 	// The network the menu and OptiScaler show for the model that runs
+@@ -677,6 +688,10 @@ namespace
+ 		if (gTensorGate.load() && xefg_cuda::VulkanActive())
+ 			return Plugin::Network::Cuda;
+ 
++		if (gCoopGate.load() && xefg_cuda::CoopMatrixActive() &&
++			(Plugin::options.path.load() == Plugin::Path::Wmma || gDevice.vendor == 0x1002))
++			return Plugin::Network::Wmma;
++
+ 		return Plugin::Network::XmxPort;
+ 	}
+ 
+@@ -705,17 +720,29 @@ namespace
+ 
+ 		ApplyTensorGate(d, model);
+ 
+-		const bool same = f.width == bb.width && f.height == bb.height && f.format == format &&
++		const auto path = static_cast<int32_t>(Plugin::options.path.load());
++		if (path != f.loggedPath)
++		{
++			f.loggedPath = path;
++			f.createFailed = false;
++		}
++
++		const bool sameSettings = f.width == bb.width && f.height == bb.height && f.format == format &&
+ 			f.depthWidth == depth.width && f.depthHeight == depth.height && f.motionFormat == motionFormat &&
+ 			f.hudlessFormat == hudlessFormat && f.uiFormat == uiFormat && f.inverted == inverted &&
+ 			f.jittered == jittered && f.model == model;
+ 
+-		if (same && f.context)
+-			return true;
+-		if (same && !f.initFault.empty())
++		if (sameSettings)
+ 		{
+-			f.fault = f.initFault;
+-			return false;
++			if (f.context)
++				return true;
++			if (!f.initFault.empty())
++			{
++				f.fault = f.initFault;
++				return false;
++			}
++			if (f.createFailed)
++				return false;
+ 		}
+ 		f.initFault.clear();
+ 
+@@ -726,6 +753,7 @@ namespace
+ 		}
+ 
+ 		f.havePrevious = false;
++		f.createFailed = false;
+ 		f.width = bb.width;
+ 		f.height = bb.height;
+ 		f.format = format;
+@@ -755,6 +783,7 @@ namespace
+ 					FAILED(CreateTexture(d3d, in.ui->width, in.ui->height, uiFormat, slot.ui))))
+ 			{
+ 				f.fault = "input_images";
++				f.createFailed = true;
+ 				return false;
+ 			}
+ 
+@@ -764,6 +793,7 @@ namespace
+ 			if (!slot.depthView || !slot.motionView)
+ 			{
+ 				f.fault = "input_views";
++				f.createFailed = true;
+ 				return false;
+ 			}
+ 		}
+@@ -773,6 +803,7 @@ namespace
+ 			if (FAILED(CreateTexture(d3d, f.width, f.height, format, output)))
+ 			{
+ 				f.fault = "output_images";
++				f.createFailed = true;
+ 				return false;
+ 			}
+ 		}
+@@ -780,6 +811,7 @@ namespace
+ 		if (!f.allocator && FAILED(d3d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&f.allocator))))
+ 		{
+ 			f.fault = "allocator";
++			f.createFailed = true;
+ 			return false;
+ 		}
+ 
+@@ -794,6 +826,7 @@ namespace
+ 		if (result != XEFGD_RESULT_SUCCESS || !context)
+ 		{
+ 			f.fault = "create_context_" + std::to_string(result);
++			f.createFailed = true;
+ 			return false;
+ 		}
+ 
+@@ -814,6 +847,7 @@ namespace
+ 		{
+ 			CallXeFG("Destroy", [&] { return XeFG::Destroy(context); });
+ 			f.fault = "init_" + std::to_string(result);
++			f.createFailed = true;
+ 			if (xvk::MissingProgramCount() != missingBefore)
+ 			{
+ 				f.initFault = f.fault + "_missing_spirv";
+@@ -958,8 +992,11 @@ namespace
+ 		if (!EnsureFeature(d, f, in, inverted, jittered))
+ 			return false;
+ 
+-		// Takes effect from XeFG's next Execute on
+-		XeFG::SetDebugLines(Plugin::options.debugLines);
++		// Takes effect from XeFG's next Execute on; only call into libxess_fg.dll when the toggle changes
++		const bool debugLines = Plugin::options.debugLines.load(std::memory_order_relaxed);
++		static std::atomic<int> sLastDebugLines{ -1 };
++		if (sLastDebugLines.exchange(debugLines ? 1 : 0, std::memory_order_relaxed) != (debugLines ? 1 : 0))
++			XeFG::SetDebugLines(debugLines);
+ 
+ 		const bool reset = parameters.GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
+ 		Slot& slot = f.slots[f.current];
+diff --git a/src/vulkan/xvk_commandlist.cpp b/src/vulkan/xvk_commandlist.cpp
+index 5c3e2dd..d9ff212 100644
+--- a/src/vulkan/xvk_commandlist.cpp
++++ b/src/vulkan/xvk_commandlist.cpp
+@@ -88,6 +88,7 @@ void STDMETHODCALLTYPE CommandList::ClearState(ID3D12PipelineState* pso)
+     boundPipeline_ = VK_NULL_HANDLE;
+     tables_.fill(nullptr);
+     constantMasks_.fill(0);
++    constantsDirty_ = 0xFFFFu;
+     if (pso) SetPipelineState(pso);
+ }
+ 
+@@ -103,6 +104,7 @@ void STDMETHODCALLTYPE CommandList::SetComputeRootSignature(ID3D12RootSignature*
+         // D3D12: changing the root signature invalidates all root arguments.
+         tables_.fill(nullptr);
+         constantMasks_.fill(0);
++        constantsDirty_ = 0xFFFFu;
+         rootSignature_ = next;
+     }
+ }
+@@ -118,6 +120,7 @@ void STDMETHODCALLTYPE CommandList::SetComputeRoot32BitConstant(UINT parameter,
+     if (parameter >= constants_.size() || offset >= constants_[0].size()) { Fail("root constant index"); return; }
+     constants_[parameter][offset] = value;
+     if (offset < 32) constantMasks_[parameter] |= 1u << offset;
++    constantsDirty_ |= uint16_t(1u << parameter);
+ }
+ 
+ void STDMETHODCALLTYPE CommandList::SetComputeRoot32BitConstants(UINT parameter, UINT count, const void* data, UINT offset)
+@@ -125,6 +128,7 @@ void STDMETHODCALLTYPE CommandList::SetComputeRoot32BitConstants(UINT parameter,
+     if (parameter >= constants_.size() || offset + count > constants_[0].size()) { Fail("root constants range"); return; }
+     memcpy(constants_[parameter].data() + offset, data, size_t(count) * 4);
+     for (UINT i = offset; i < std::min<UINT>(offset + count, 32); ++i) constantMasks_[parameter] |= 1u << i;
++    constantsDirty_ |= uint16_t(1u << parameter);
+ }
+ 
+ void STDMETHODCALLTYPE CommandList::Dispatch(UINT x, UINT y, UINT z)
+@@ -145,11 +149,13 @@ void STDMETHODCALLTYPE CommandList::Dispatch(UINT x, UINT y, UINT z)
+     if (boundPipeline_ != pso_->pipeline()) {
+         vk.vkCmdBindPipeline(buffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pso_->pipeline());
+         boundPipeline_ = pso_->pipeline();
++        constantsDirty_ = 0xFFFFu;
+     }
+     const auto& ranges = pso_->ranges();
+-    std::array<VkWriteDescriptorSet, 64> writes{};
+-    std::array<VkDescriptorImageInfo, 64> images{};
+-    std::array<VkDescriptorBufferInfo, 64> buffers{};
++    // Avoid zero-initializing 6 KB of stack memory on every Dispatch; only indices [0..count) are written and passed.
++    std::array<VkWriteDescriptorSet, 64> writes;
++    std::array<VkDescriptorImageInfo, 64> images;
++    std::array<VkDescriptorBufferInfo, 64> buffers;
+     if (ranges.size() > writes.size()) { Fail("too many bindings"); return; }
+     for (size_t i = 0; i < ranges.size(); ++i) {
+         const BoundRange& r = ranges[i];
+@@ -197,9 +203,14 @@ void STDMETHODCALLTYPE CommandList::Dispatch(UINT x, UINT y, UINT z)
+     }
+     if (count)
+         vk.vkCmdPushDescriptorSetKHR(buffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pso_->layout(), 0, uint32_t(count), writes.data());
+-    if (pso_->pushConstantBytes())
+-        vk.vkCmdPushConstants(buffer_, pso_->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, pso_->pushConstantBytes(),
+-                              constants_[pso_->constantsParameter()].data());
++    if (pso_->pushConstantBytes()) {
++        const uint16_t paramBit = uint16_t(1u << pso_->constantsParameter());
++        if (constantsDirty_ & paramBit) {
++            vk.vkCmdPushConstants(buffer_, pso_->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, pso_->pushConstantBytes(),
++                                  constants_[pso_->constantsParameter()].data());
++            constantsDirty_ &= ~paramBit;
++        }
++    }
+     vk.vkCmdDispatch(buffer_, x, y, z);
+     for (const auto& range : ranges)
+         if (const auto* table = tables_[range.parameter]; table && table[range.offset].kind == DescriptorKind::UavBuffer && table[range.offset].resource)
+@@ -243,7 +254,9 @@ Scope FromState(D3D12_RESOURCE_STATES state)
+     constexpr VkPipelineStageFlags2 kShaders = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT;
+     take(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+          VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT, true);
+-    take(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, kShaders, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT, false);
++    // xvk executes pure compute + transfer workloads; scoping NON_PIXEL_SHADER_RESOURCE to COMPUTE_SHADER_BIT avoids
++    // stalling the host game's graphics pipeline on every inter-layer barrier in Fallback (DP4a) and XMX Port (DP4a).
++    take(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT, false);
+     take(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, kShaders, VK_ACCESS_2_SHADER_READ_BIT, false);
+     take(D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, kShaders, VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT, false);
+     take(D3D12_RESOURCE_STATE_INDEX_BUFFER, VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT, VK_ACCESS_2_INDEX_READ_BIT, false);
+diff --git a/src/vulkan/xvk_internal.h b/src/vulkan/xvk_internal.h
+index cae8a5b..59e5bdc 100644
+--- a/src/vulkan/xvk_internal.h
++++ b/src/vulkan/xvk_internal.h
+@@ -626,6 +626,7 @@ private:
+     std::array<const Descriptor*, 64> tables_{};
+     std::array<std::array<uint32_t, 64>, 16> constants_{};
+     std::array<uint32_t, 16> constantMasks_{};
++    uint16_t constantsDirty_ = 0xFFFFu;
+ };
+ 
+ // ------------------------------------------------------------------ device
+-- 
+2.39.5
+
