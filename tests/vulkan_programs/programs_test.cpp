@@ -13,6 +13,7 @@
 #include "MfgKernels.h"
 #include "MfgPort/Sha256.h"
 #include "VulkanPrograms.h"
+#include "vulkan/VulkanProgramLookup.h"
 #include "vulkan/VulkanInputCopy.h"
 
 #include <cstdio>
@@ -787,11 +788,60 @@ static int RealSet(const fs::path& dir)
 		first->bindingRows[2] == (Binding{ 64, BindingType::StorageBuffer }));
 
 	CHECK(first->dxilSha256 == "00b1098a80a5e662de426284e6bf7bdf82ed236eb7c8aef1e74f9ebed204019a");
-    CHECK(set.FindByDxil("6c9bf4b59956c7fec3d764ffe6520e7aec3e6137553b9fca0ba65ecdd7642ce8")->id == 7434);
-    CHECK(withDxil == 83);
+	CHECK(set.FindByDxil("6c9bf4b59956c7fec3d764ffe6520e7aec3e6137553b9fca0ba65ecdd7642ce8")->id == 7434);
+	CHECK(withDxil == 83);
 	CHECK(set.byDxil.size() == 83);
 	CHECK(modules.size() == 82);   // two ids share one module
 	CHECK(set.totalBytes > 5000000 && set.totalBytes < 6000000);
+
+	// Verify all 17 WMMA/CUDA INT8 layers and their pinned replacement aliases against the regenerated 83-row manifest
+	{
+		struct WmmaLayerExpect { const char* dxil; const char* ownDxil; uint32_t id; uint32_t push; uint32_t bindings; };
+		static constexpr WmmaLayerExpect kWmmaLayers[17] = {
+			{ "8c2efb9e955f39379a91887ed3d90412c4b7ae2c142a874e3da5f699de197f7c", "ce847b58086ce7e9d25f7d8b90e989247cd4582226506d9552112f1ef4130643", 7442, 16, 5 }, // L_aa016078
+			{ "aac1354a8004fe0aae02947a372f622a84b8d61c1691fc77d7fddedaf74ad36b", nullptr, 7455, 16, 5 }, // L_198d6bf8
+			{ "ba5c8b9ea1aa3aa3ce12acb4c2ff4c7c32d2bccab304c539246ad83f737523a0", nullptr, 7459, 16, 5 }, // L_dcd8becf
+			{ "40e159414d5b839ba7e0e07cbf8ff4ef425ee026c216b2928ef3bb6dd0e20d40", "efa8da5ef5f90c62b789b0fed8e77e2ce043e558d164cc552ca7fb9127cedb00", 7419, 16, 5 }, // L_efbe3788
+			{ "fea66ef764b267613725fd37be22dc279b23280ffa132e53c285a798ac27df5e", nullptr, 7482, 16, 5 }, // L_50f0c205
+			{ "51f5754a8f4dd34791351f2156f121c4cf119a5fae63bce76266a66b7a097d9a", nullptr, 7426, 16, 5 }, // L_a3c3caa1
+			{ "8cffea0f51779e7ddea756043802e9635d6b853d6aee2176ffb1f25a605750c0", nullptr, 7446, 16, 5 }, // L_9481d452
+			{ "3cdf1a4746fc91bf161f320e0256dbbccc954e774add6ac53caf50b7d1be69f7", nullptr, 7414, 16, 5 }, // L_06e97933
+			{ "01c8beac27d3f3f82ecba8f3dc2d9d8b60d4c175a41df3c24a24e8643f5578f5", "9900c30febf95bfa81b4da1178e5773863116beba4d3f032897da4254b6d8926", 7402, 16, 6 }, // L_3ed03daf
+			{ "8291bbc36b1100b07d0788f35a3a9fadfbfcc2267ff0ccb7afb114d76f5d69fe", "e78063f97ad2c0913412f07589cd17d0f2a6ebeeb6edd70647a69cca6b6a02bf", 7437, 16, 6 }, // L_748b0baf
+			{ "a60f7488872a675d66afd2bec02b0b89e3cc38c1c4ed1d25d745a7b2fe677412", "7a29fbf311cd8dee5b8c1cfdadf31ee983092a512cf9c10845a079b457eb62a9", 7452, 16, 6 }, // L_cb391582
+			{ "8c1d7667722c8692b376ed7511723b5e58efd61d4a4b8c4b61a1233f75df76ee", nullptr, 7441, 48, 5 }, // L_fc1b8a04
+			{ "51667b6d9955036a10cbd4e363881252de8ca5d3b6f210a7a3ee6cab719629a6", nullptr, 7425, 48, 5 }, // L_3459485
+			{ "f4aa535a6fc74410ae8b684eb881b9fd511c6a1ac1c784cc95bd8f7fd8ea0f61", nullptr, 7476, 48, 5 }, // L_3452733
+			{ "09887269759ef4d7588315f29e71126c899fde79f9edb336eedd598c662d4aea", nullptr, 7403, 48, 5 }, // L_flow16_acc17 (55e5d6b9)
+			{ "1bebcab193714ee264da7dc0a96e313d74ad4c71017fdea5314c8b07f6b56394", nullptr, 7406, 48, 5 }, // L_flow16_acc17 (34517926)
+			{ "13abff5d769ef56f99cb9ee7825968872e28395d77a6d344053c06cb08b8064c", nullptr, 7405, 48, 5 }, // L_3453044
+		};
+
+		std::map<std::string, size_t> index;
+		for (const auto& [dxil, row] : set.byDxil)
+			index.emplace(std::string(dxil), row);
+
+		for (const auto& exp : kWmmaLayers)
+		{
+			const auto* p = set.FindByDxil(exp.dxil);
+			CHECK(p != nullptr);
+			if (p)
+				CHECK(p->id == exp.id && p->pushBytes == exp.push && p->bindings == exp.bindings);
+
+			if (exp.ownDxil)
+			{
+				const auto resolved = xvk::ResolveProgramHash(index, exp.ownDxil);
+				CHECK(resolved == exp.dxil);
+				const auto* pOwn = set.FindByDxil(resolved);
+				CHECK(pOwn == p);
+			}
+		}
+
+		// Inverted-depth splat bidirectional alias resolution (Intel c3649191... -> replacement 6c9bf4b5... row 7434)
+		const auto splatResolved = xvk::ResolveProgramHash(index, "c3649191906bdd300462dbafe6add8f82b09e8e10c41e92784a209d99513224b");
+		const auto* splatProg = set.FindByDxil(splatResolved);
+		CHECK(splatProg && splatProg->id == 7434);
+	}
 
 	// The folder carries the input-copy shaders too, the ones built into the dll must be those
 	CheckInputCopy(dir);
