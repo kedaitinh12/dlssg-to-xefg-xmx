@@ -13,16 +13,18 @@ index 13cf691..0e9e9ab 100644
          stringQuirks.push_back("Fill XeFG input motion vectors with camera motion");
  
 diff --git a/OptiScaler/hooks/D3D12_Hooks.cpp b/OptiScaler/hooks/D3D12_Hooks.cpp
-index 872e351..03bccc5 100644
+index 872e351..76d01c9 100644
 --- a/OptiScaler/hooks/D3D12_Hooks.cpp
 +++ b/OptiScaler/hooks/D3D12_Hooks.cpp
-@@ -28,11 +28,13 @@
- #include <dxgi1_6.h>
- #include <d3d12shader.h>
- #include <misc/IdentifyGpu.h>
+@@ -4,6 +4,7 @@
+ 
+ #include <Util.h>
+ #include <Config.h>
 +#include <misc/CustomProviders.h>
  
- #include "Hook_Utils.h"
+ #include <magic_enum.hpp>
+ 
+@@ -33,6 +34,7 @@
  
  #include <algorithm>
  #include <array>
