@@ -39,6 +39,8 @@ namespace
 			return "XMX Port";
 		case Plugin::Network::Cuda:
 			return "CUDA";
+		case Plugin::Network::Wmma:
+			return "WMMA";
 		case Plugin::Network::Fallback:
 			return "Fallback (DP4a)";
 		default:
@@ -222,7 +224,7 @@ namespace
 			else
 			{
 				api->Text(std::format("Coop matrix (WMMA/XMX): ready \xC2\xB7 {}", shape).c_str());
-				api->ItemTooltip("Installed on this GPU, ready for the XMX Port and XMX (native) paths.");
+				api->ItemTooltip("Installed on this GPU, ready for the WMMA, XMX Port and XMX (native) paths.");
 			}
 
 			return;
@@ -276,10 +278,10 @@ namespace
 				line += std::format(" \xC2\xB7 {} model", model);
 
 			api->Text(line.c_str());
-			api->ItemTooltip("port: the ported MFG model, the XMX Port, XMX (native) and CUDA network paths\n"
+			api->ItemTooltip("port / WMMA: the ported MFG model, the WMMA, XMX Port, XMX (native) and CUDA network paths\n"
 							 "DP4a: XeFG's own model, the Fallback (DP4a) network path\n"
-							 "XeFG's own XMX network isn't used on Vulkan, XMX (native) runs the port. The CUDA path (and XMX (native)) puts the\n"
-							 "port's int8 layers on the tensor cores of an NVIDIA RTX GPU when it can, the XMX Port runs them as SPIR-V programs.");
+							 "XeFG's own XMX network isn't used on Vulkan, XMX (native) and WMMA run the port. The WMMA path puts the port's\n"
+							 "int8 layers on VK_KHR_cooperative_matrix (AMD RDNA 4 / RDNA 3 WMMA), CUDA puts them on NVIDIA tensor cores.");
 		}
 
 		DrawVulkanTensor();
@@ -415,34 +417,38 @@ namespace
 	{
 		api->Section("Settings");
 
-		static constexpr const char* PathNames[] = { "XMX Port", "CUDA", "Fallback (DP4a)", "XMX (native)" };
+		static constexpr const char* PathNames[] = { "XMX Port", "CUDA", "Fallback (DP4a)", "XMX (native)", "WMMA" };
 		const bool cudaDisabled = Plugin::cudaSupport.load() == Plugin::CudaSupport::Unsupported;
 		const bool xmxDisabled = Plugin::xmxSupport.load() == Plugin::XmxSupport::Unsupported;
+		const bool wmmaDisabled = Plugin::wmmaSupport.load() == Plugin::WmmaSupport::Unsupported;
 
 		int32_t path = (int32_t)Plugin::options.path.load();
 
 		// A saved choice the GPU doesn't support runs something else, show what is actually running
 		if (path == (int32_t)Plugin::Path::XmxNative && xmxDisabled)
-			path = cudaDisabled ? (int32_t)Plugin::Path::XmxPort : (int32_t)Plugin::Path::Cuda;
+			path = !cudaDisabled ? (int32_t)Plugin::Path::Cuda : !wmmaDisabled ? (int32_t)Plugin::Path::Wmma : (int32_t)Plugin::Path::XmxPort;
 
 		if (path == (int32_t)Plugin::Path::Cuda && cudaDisabled)
 			path = (int32_t)Plugin::Path::XmxPort;
 
-		const bool disabled[] = { false, cudaDisabled, false, xmxDisabled };
+		if (path == (int32_t)Plugin::Path::Wmma && wmmaDisabled)
+			path = (int32_t)Plugin::Path::XmxPort;
 
-		if (api->Combo("Network path", &path, PathNames, 4, disabled))
+		const bool disabled[] = { false, cudaDisabled, false, xmxDisabled, wmmaDisabled };
+
+		if (api->Combo("Network path", &path, PathNames, 5, disabled))
 		{
 			Plugin::options.path = (Plugin::Path)path;
 			api->SetInt(self, "NetworkPath", path);
 		}
 
 		api->ItemTooltip("XMX (native): XeFG's own XMX network, the default on Intel GPUs with XMX\n"
-						 "XMX Port: ported XMX model on DXIL\n"
+						 "XMX Port: ported XMX model on DXIL / SPIR-V (DP4a INT8)\n"
 						 "CUDA: ported XMX model on NVIDIA tensor cores, RTX GPUs only\n"
+						 "WMMA: ported XMX model accelerated with WMMA INT8 (AMD RDNA 4 / RDNA 3 WaveMatrix & Vulkan Cooperative Matrix)\n"
 						 "Fallback (DP4a): XeFG's default model\n"
-						 "Vulkan games run the ported model, on the tensor cores of an RTX GPU for CUDA and XMX (native) when the route is\n"
-						 "available, on VK_KHR_cooperative_matrix (AMD WMMA / Intel XMX) when available, or as SPIR-V programs for XMX Port.\n"
-						 "Fallback (DP4a) runs XeFG's own model (see Vulkan)");
+						 "Vulkan games run the ported model on VK_KHR_cooperative_matrix (AMD WMMA / Intel XMX) for WMMA, on NVIDIA tensor\n"
+						 "cores for CUDA, or as DP4a SPIR-V programs for XMX Port. Fallback (DP4a) runs XeFG's own model (see Vulkan)");
 
 		bool hudlessUi = Plugin::options.hudlessUi;
 
@@ -561,6 +567,8 @@ const char* Plugin::PathName(Path path)
 		return "Fallback (DP4a)";
 	case Path::XmxNative:
 		return "XMX (native)";
+	case Path::Wmma:
+		return "WMMA";
 	default:
 		return "Unknown";
 	}
@@ -606,7 +614,7 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* optiAp
 	Log::Info("OptiScaler plugin API version {}", api->version);
 
 	const int32_t path = api->GetInt(self, "NetworkPath", (int32_t)Plugin::options.path.load());
-	if (path >= (int32_t)Plugin::Path::XmxPort && path <= (int32_t)Plugin::Path::XmxNative)
+	if (path >= (int32_t)Plugin::Path::XmxPort && path <= (int32_t)Plugin::Path::Wmma)
 		Plugin::options.path = (Plugin::Path)path;
 
 	Plugin::options.hudlessUi = api->GetBool(self, "HudlessUi", Plugin::options.hudlessUi);

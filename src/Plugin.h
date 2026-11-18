@@ -14,6 +14,7 @@ namespace Plugin
 		Cuda,
 		Fallback, // DP4a model 18
 		XmxNative, // XeFG's own XMX network (17), no port, Intel GPUs with XMX only
+		Wmma, // Ported XMX model (16) with WMMA INT8 acceleration (AMD RDNA 4 / RDNA 3 & Vulkan Cooperative Matrix)
 	};
 
 	// The path's name in the menu and in the log
@@ -21,8 +22,8 @@ namespace Plugin
 
 	struct Options
 	{
-		// XeFG's own XMX network on Intel GPUs with XMX, the ported model on DXIL or CUDA tensor cores, or its DP4a
-		// model. Unsupported choices fall back the way the menu shows
+		// XeFG's own XMX network on Intel GPUs with XMX, the ported model on DXIL, CUDA tensor cores, or WMMA INT8,
+		// or its DP4a model. Unsupported choices fall back the way the menu shows
 		std::atomic<Path> path = Path::XmxNative;
 		// Lets XeFG composite the UI from the game's HUDless color instead of interpolating it with the scene
 		std::atomic_bool hudlessUi = true;
@@ -50,6 +51,15 @@ namespace Plugin
 
 	inline std::atomic<XmxSupport> xmxSupport = XmxSupport::Unknown;
 
+	enum class WmmaSupport : int32_t
+	{
+		Unknown, // The startup probe hasn't looked at a GPU yet
+		Supported, // AMD WMMA INT8 or Vulkan VK_KHR_cooperative_matrix INT8 is available on this GPU
+		Unsupported,
+	};
+
+	inline std::atomic<WmmaSupport> wmmaSupport = WmmaSupport::Unknown;
+
 	// Which network is running
 	enum class Network : int32_t
 	{
@@ -57,6 +67,7 @@ namespace Plugin
 		XmxNative, // XeFG's own XMX network (17)
 		XmxPort,
 		Cuda,
+		Wmma, // Ported XMX model (16) accelerated with WMMA INT8
 		Fallback, // DP4a model 18, the ported model isn't available
 	};
 
