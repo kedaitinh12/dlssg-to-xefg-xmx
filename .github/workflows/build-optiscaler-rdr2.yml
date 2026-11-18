@@ -1,0 +1,67 @@
+name: Build OptiScaler RDR2 Vulkan fix
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'patches/optiscaler-rdr2-api-selection.patch'
+      - '.github/workflows/build-optiscaler-rdr2.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: mod
+      - uses: actions/checkout@v4
+        with:
+          repository: optiscaler/OptiScaler
+          ref: 03b37db73979e042bce4be59f44d37f348ac6905
+          submodules: recursive
+          path: optiscaler
+      - name: Apply RDR2 patch to the version from the reported log
+        shell: pwsh
+        working-directory: optiscaler
+        run: |
+          git apply --check ../mod/patches/optiscaler-rdr2-api-selection.patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git apply ../mod/patches/optiscaler-rdr2-api-selection.patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: microsoft/setup-msbuild@v2
+      - name: Build patched OptiScaler
+        shell: pwsh
+        working-directory: optiscaler
+        run: |
+          msbuild OptiScaler.sln /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal '-flp:logfile=msbuild.log;verbosity=normal'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package only the replacement DLL and patch provenance
+        shell: pwsh
+        run: |
+          $dll = 'optiscaler/x64/Release/a/OptiScaler.dll'
+          if (-not (Test-Path $dll)) { throw "Missing patched OptiScaler.dll" }
+          New-Item -ItemType Directory -Force output | Out-Null
+          Copy-Item $dll output/OptiScaler.dll
+          Copy-Item mod/docs/RDR2_VULKAN_FIX_VI.md output/README_VI.md
+          Copy-Item mod/patches/optiscaler-rdr2-api-selection.patch output/
+          Copy-Item optiscaler/LICENSE output/LICENSE-OptiScaler
+          'OptiScaler base: 03b37db73979e042bce4be59f44d37f348ac6905' | Set-Content output/BUILD.txt
+          'Patch repository commit: ${{ github.sha }}' | Add-Content output/BUILD.txt
+          Get-FileHash output/OptiScaler.dll -Algorithm SHA256 | Format-List | Out-String | Add-Content output/BUILD.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OptiScaler-RDR2-Vulkan-fix
+          path: output/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: OptiScaler-RDR2-build-log
+          path: optiscaler/msbuild.log
+          if-no-files-found: ignore
