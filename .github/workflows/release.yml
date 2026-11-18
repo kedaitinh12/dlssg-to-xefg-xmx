@@ -62,32 +62,19 @@ jobs:
             python tools/ExtractXeFgVulkanPrograms.py $asi --output $target
           }
 
-          $exe = $null
-          $cmd = Get-Command glslangValidator -ErrorAction SilentlyContinue
-          if ($cmd) { $exe = $cmd.Source }
-          if (-not $exe -and $env:VULKAN_SDK) {
-            $candidate = Join-Path $env:VULKAN_SDK "Bin\glslangValidator.exe"
-            if (Test-Path $candidate) { $exe = $candidate }
-          }
-          if (-not $exe) {
-            $dlDir = Join-Path $env:RUNNER_TEMP "glslang-bin"
-            $zipPath = Join-Path $env:RUNNER_TEMP "glslang.zip"
-            New-Item -ItemType Directory -Path $dlDir -Force | Out-Null
-            foreach ($u in @(
-              "https://github.com/KhronosGroup/glslang/releases/latest/download/glslang-main-windows-x64-Release.zip",
-              "https://github.com/KhronosGroup/glslang/releases/download/main-tot/glslang-master-windows-Release.zip"
-            )) {
-              try {
-                Invoke-WebRequest -Uri $u -OutFile $zipPath -UseBasicParsing
-                Expand-Archive -Path $zipPath -DestinationPath $dlDir -Force
-                $found = Get-ChildItem -Path $dlDir -Recurse -Filter "glslangValidator.exe" | Select-Object -First 1
-                if ($found) { $exe = $found.FullName; break }
-              } catch {}
-            }
-          }
-          if ($exe -and (Test-Path $target)) {
-            python tools/GenerateXeFgCoopMat.py --glslang "$exe" --output (Join-Path $target "coopmat")
-            if ($LASTEXITCODE -ne 0) { throw "GenerateXeFgCoopMat.py failed" }
+      - name: Build Vulkan cooperative-matrix shaders (required)
+        id: coopmat
+        shell: pwsh
+        run: |
+          ./tools/BuildXeFgCoopMat.ps1 -Output bin/Release/xefg_mfg_programs/vulkan/coopmat
+          "built=true" >> $env:GITHUB_OUTPUT
+
+      - name: Require cooperative-matrix build success
+        if: always()
+        shell: pwsh
+        run: |
+          if ("${{ steps.coopmat.outcome }}" -ne "success" -or "${{ steps.coopmat.outputs.built }}" -ne "true") {
+            throw "Required cooperative-matrix shader build failed or was skipped"
           }
 
       - name: Package
@@ -111,6 +98,9 @@ jobs:
           if (-not (Test-Path (Join-Path $programs "programs.tsv"))) { throw "The XeFG MFG program set was not generated" }
           if (-not (Test-Path (Join-Path $programs "LICENSE"))) { throw "The XeFG MFG program LICENSE is missing" }
           if (-not (Test-Path (Join-Path $programs "xefg_cuda_layers.fatbin"))) { throw "The XeFG tensor-core fatbin was not generated" }
+
+          python tools/CheckXeFgCoopMat.py (Join-Path $programs "vulkan/coopmat")
+          if ($LASTEXITCODE -ne 0) { throw "Staged cooperative-matrix payload is invalid" }
 
           Add-Type -AssemblyName System.IO.Compression
           Add-Type -AssemblyName System.IO.Compression.FileSystem

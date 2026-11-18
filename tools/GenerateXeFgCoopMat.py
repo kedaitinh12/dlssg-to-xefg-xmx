@@ -7,6 +7,8 @@ Usage:
     python tools/GenerateXeFgCoopMat.py --output third_party/xefg_mfg_programs/vulkan/coopmat
 """
 import argparse
+import hashlib
+import struct
 import pathlib
 import shutil
 import subprocess
@@ -62,8 +64,13 @@ def main() -> int:
 
     args.output.mkdir(parents=True, exist_ok=True)
 
+    manifest = args.output / "coopmat_layers.tsv"
+    manifest.unlink(missing_ok=True)
+    rows = []
+
     for (name, family, in_b, out_b, bias, pool, relu, tile_h, zsplit, acc_bits, nt) in KERNELS:
         out_spv = args.output / f"{name}.spv"
+        out_spv.unlink(missing_ok=True)
         cmd = [
             args.glslang,
             "-V",
@@ -86,7 +93,14 @@ def main() -> int:
         if res.returncode != 0:
             print(f"FAIL {name}: {res.stderr or res.stdout}", file=sys.stderr)
             return res.returncode
-        print(f"ok   {out_spv.name} ({out_spv.stat().st_size} bytes)")
+        data = out_spv.read_bytes()
+        if len(data) < 20 or len(data) % 4 or struct.unpack_from("<I", data)[0] != 0x07230203:
+            print(f"error: invalid SPIR-V output: {out_spv}", file=sys.stderr)
+            return 1
+        rows.append(f"{name}\t{hashlib.sha256(data).hexdigest()}\t{len(data)}\n")
+        print(f"ok   {out_spv.name} ({len(data)} bytes)")
+
+    manifest.write_text("".join(rows), encoding="utf-8")
 
     return 0
 

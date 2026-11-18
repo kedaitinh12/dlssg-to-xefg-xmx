@@ -127,39 +127,15 @@ jobs:
         id: coopmat
         shell: pwsh
         run: |
-          $exe = $null
-          $cmd = Get-Command glslangValidator -ErrorAction SilentlyContinue
-          if ($cmd) { $exe = $cmd.Source }
-          if (-not $exe -and $env:VULKAN_SDK) {
-            $candidate = Join-Path $env:VULKAN_SDK "Bin\glslangValidator.exe"
-            if (Test-Path $candidate) { $exe = $candidate }
-          }
-          if (-not $exe) {
-            $dlDir = Join-Path $env:RUNNER_TEMP "glslang-bin"
-            $zipPath = Join-Path $env:RUNNER_TEMP "glslang.zip"
-            New-Item -ItemType Directory -Path $dlDir -Force | Out-Null
-            $urls = @(
-              "https://github.com/KhronosGroup/glslang/releases/latest/download/glslang-main-windows-x64-Release.zip",
-              "https://github.com/KhronosGroup/glslang/releases/download/main-tot/glslang-master-windows-Release.zip"
-            )
-            foreach ($u in $urls) {
-              try {
-                Invoke-WebRequest -Uri $u -OutFile $zipPath -UseBasicParsing
-                Expand-Archive -Path $zipPath -DestinationPath $dlDir -Force
-                $found = Get-ChildItem -Path $dlDir -Recurse -Filter "glslangValidator.exe" | Select-Object -First 1
-                if ($found) { $exe = $found.FullName; break }
-              } catch {
-                Write-Warning "Could not fetch glslang from $u : $_"
-              }
-            }
-          }
-          if ($exe) {
-            python tools/GenerateXeFgCoopMat.py --glslang "$exe" --output bin\Release\xefg_mfg_programs\vulkan\coopmat
-            if ($LASTEXITCODE -ne 0) { throw "GenerateXeFgCoopMat.py failed" }
-            "built=true" >> $env:GITHUB_OUTPUT
-          } else {
-            Write-Warning "glslangValidator not available; skipping optional coopmat SPIR-V compilation."
-            "built=false" >> $env:GITHUB_OUTPUT
+          ./tools/BuildXeFgCoopMat.ps1 -Output bin/Release/xefg_mfg_programs/vulkan/coopmat
+          "built=true" >> $env:GITHUB_OUTPUT
+
+      - name: Require cooperative-matrix build success
+        if: always()
+        shell: pwsh
+        run: |
+          if ("${{ steps.coopmat.outcome }}" -ne "success" -or "${{ steps.coopmat.outputs.built }}" -ne "true") {
+            throw "Required cooperative-matrix shader build failed or was skipped"
           }
 
       # Every function the sources mark as exported has to be in the dll's export table, the NGX D3D12 and Vulkan
@@ -202,13 +178,11 @@ jobs:
             foreach ($name in "programs.tsv", "SOURCE.txt", "LICENSE", "7400.spv", "7482.spv") {
               if (-not (Test-Path (Join-Path $programs "vulkan\$name"))) { throw "$name is missing from the Vulkan models" }
             }
-            if ("${{ steps.coopmat.outputs.built }}" -eq "true") {
-              foreach ($name in "coopmat_layers.tsv", "L_aa016078.spv", "L_3453044.spv") {
-                if (-not (Test-Path (Join-Path $programs "vulkan\coopmat\$name"))) { throw "$name is missing from the Vulkan WMMA/XMX coopmat shaders" }
-              }
-            }
             $models = (Get-Content (Join-Path $programs "vulkan\SOURCE.txt") -TotalCount 1)
           }
+
+          python tools/CheckXeFgCoopMat.py (Join-Path $programs "vulkan/coopmat")
+          if ($LASTEXITCODE -ne 0) { throw "Staged cooperative-matrix payload is invalid" }
 
           @(
             "### dlssg-to-xefg build ${{ github.run_number }}",
