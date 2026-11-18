@@ -47,10 +47,19 @@ class ShaderPort
 
 	static void read(uintptr_t p, void* out, size_t count)
 	{
-		SIZE_T got{};
+		if (!p || count > 1000000)
+			throw std::runtime_error("shader_port_read");
 
-		if (!p || count > 1000000 || !ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(p), out, count, &got) ||
-			got != count)
+		// Once ShaderPort is active in-process, dispatch() reads validated in-process STL strings/vectors directly
+		// without paying kernel syscall overhead via ReadProcessMemory on every shader lookup.
+		if (instance && instance->active)
+		{
+			std::memcpy(out, reinterpret_cast<const void*>(p), count);
+			return;
+		}
+
+		SIZE_T got{};
+		if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(p), out, count, &got) || got != count)
 		{
 			throw std::runtime_error("shader_port_read");
 		}
