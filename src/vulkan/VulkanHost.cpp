@@ -51,6 +51,11 @@ namespace
 		PFN_vkGetInstanceProcAddr loaderGipa = nullptr;
 		PFN_vkCreateInstance createInstance = nullptr;
 		PFN_vkCreateDevice createDevice = nullptr;
+		void* rawCreateInstance = nullptr;
+		void* rawCreateDevice = nullptr;
+		std::atomic<PFN_vkCreateInstance> gipaCreateInstance = nullptr;
+		std::atomic<PFN_vkCreateDevice> gipaCreateDevice = nullptr;
+		bool gipaHooked = false;
 		HMODULE(WINAPI* loadLibraryExW)(LPCWSTR, HANDLE, DWORD) = nullptr;
 	};
 
@@ -163,28 +168,58 @@ namespace
 		}
 	}
 
-	VKAPI_ATTR VkResult VKAPI_CALL HookCreateInstance(const VkInstanceCreateInfo* info,
+	struct ReentryGuard
+	{
+		bool& flag;
+		explicit ReentryGuard(bool& f) : flag(f) { flag = true; }
+		~ReentryGuard() { flag = false; }
+	};
+
+	VkResult CreateInstanceImpl(PFN_vkCreateInstance next, const VkInstanceCreateInfo* info,
 		const VkAllocationCallbacks* allocator, VkInstance* instance)
 	{
+		if (!next)
+			return VK_ERROR_INITIALIZATION_FAILED;
+
+		static thread_local bool inCreateInstance = false;
+		if (inCreateInstance)
+			return next(info, allocator, instance);
+
+		ReentryGuard guard(inCreateInstance);
+
 		State& s = S();
 		s.instanceCalls++;
 
 		InstanceEdit edit;
 		const VkInstanceCreateInfo* used = s.enabled ? PrepareInstance(info, edit) : info;
 
-		VkResult result = s.createInstance(used, allocator, instance);
+		VkResult result = next(used, allocator, instance);
 
 		if (result != VK_SUCCESS && used != info)
 		{
 			Log::Warn("The loader refused the instance at 1.3 ({}), created as the game asked", static_cast<int>(result));
 			used = info;
-			result = s.createInstance(info, allocator, instance);
+			result = next(info, allocator, instance);
 		}
 
 		if (result == VK_SUCCESS && instance && *instance)
 			InstanceCreated(*instance, used);
 
 		return result;
+	}
+
+	VKAPI_ATTR VkResult VKAPI_CALL HookCreateInstance(const VkInstanceCreateInfo* info,
+		const VkAllocationCallbacks* allocator, VkInstance* instance)
+	{
+		return CreateInstanceImpl(S().createInstance, info, allocator, instance);
+	}
+
+	VKAPI_ATTR VkResult VKAPI_CALL HookCreateInstanceViaGipa(const VkInstanceCreateInfo* info,
+		const VkAllocationCallbacks* allocator, VkInstance* instance)
+	{
+		State& s = S();
+		PFN_vkCreateInstance next = s.gipaCreateInstance.load(std::memory_order_acquire);
+		return CreateInstanceImpl(next ? next : s.createInstance, info, allocator, instance);
 	}
 
 	// ------------------------------------------------------------------------------------------------ device
@@ -572,9 +607,18 @@ namespace
 		}
 	}
 
-	VKAPI_ATTR VkResult VKAPI_CALL HookCreateDevice(VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
+	VkResult CreateDeviceImpl(PFN_vkCreateDevice next, VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
 		const VkAllocationCallbacks* allocator, VkDevice* device)
 	{
+		if (!next)
+			return VK_ERROR_INITIALIZATION_FAILED;
+
+		static thread_local bool inCreateDevice = false;
+		if (inCreateDevice)
+			return next(physical, info, allocator, device);
+
+		ReentryGuard guard(inCreateDevice);
+
 		State& s = S();
 		s.deviceCalls++;
 
@@ -583,7 +627,7 @@ namespace
 		if (s.enabled)
 			edit = PrepareDevice(physical, info);
 
-		VkResult result = s.createDevice(physical, edit ? &edit->info : info, allocator, device);
+		VkResult result = next(physical, edit ? &edit->info : info, allocator, device);
 
 		if (result != VK_SUCCESS && edit && edit->tensorAdded)
 		{
@@ -592,7 +636,7 @@ namespace
 			Log::Warn("The driver refused the device with the tensor/cooperative-matrix extensions ({}), trying again without them",
 				static_cast<int>(result));
 			edit->DropTensorExtensions();
-			result = s.createDevice(physical, &edit->info, allocator, device);
+			result = next(physical, &edit->info, allocator, device);
 		}
 
 		if (result != VK_SUCCESS && edit)
@@ -603,13 +647,64 @@ namespace
 				static_cast<int>(result));
 			edit.reset();
 			Refuse(physical, "device_features");
-			result = s.createDevice(physical, info, allocator, device);
+			result = next(physical, info, allocator, device);
 		}
 
 		if (result == VK_SUCCESS && edit && device && *device)
 			DeviceCreated(*edit, *device);
 
 		return result;
+	}
+
+	VKAPI_ATTR VkResult VKAPI_CALL HookCreateDevice(VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
+		const VkAllocationCallbacks* allocator, VkDevice* device)
+	{
+		return CreateDeviceImpl(S().createDevice, physical, info, allocator, device);
+	}
+
+	VKAPI_ATTR VkResult VKAPI_CALL HookCreateDeviceViaGipa(VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
+		const VkAllocationCallbacks* allocator, VkDevice* device)
+	{
+		State& s = S();
+		PFN_vkCreateDevice next = s.gipaCreateDevice.load(std::memory_order_acquire);
+		return CreateDeviceImpl(next ? next : s.createDevice, physical, info, allocator, device);
+	}
+
+	// OptiScaler hooks vulkan-1.dll before ASI plugins run and returns its own hkvkCreateDevice from
+	// vkGetInstanceProcAddr. Wrapping vkGetInstanceProcAddr catches games that resolve vkCreateDevice via GIPA
+	// and call OptiScaler's hook directly (whose saved trampoline would otherwise bypass our loader prologue hook).
+	VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL HookGetInstanceProcAddr(VkInstance instance, const char* pName)
+	{
+		State& s = S();
+		PFN_vkVoidFunction fn = s.loaderGipa ? s.loaderGipa(instance, pName) : nullptr;
+
+		if (!fn || !pName)
+			return fn;
+
+		if (std::strcmp(pName, "vkCreateDevice") == 0)
+		{
+			void* addr = reinterpret_cast<void*>(fn);
+			if (addr != s.rawCreateDevice &&
+				addr != reinterpret_cast<void*>(&HookCreateDevice) &&
+				addr != reinterpret_cast<void*>(&HookCreateDeviceViaGipa))
+			{
+				s.gipaCreateDevice.store(reinterpret_cast<PFN_vkCreateDevice>(fn), std::memory_order_release);
+				return reinterpret_cast<PFN_vkVoidFunction>(&HookCreateDeviceViaGipa);
+			}
+		}
+		else if (std::strcmp(pName, "vkCreateInstance") == 0)
+		{
+			void* addr = reinterpret_cast<void*>(fn);
+			if (addr != s.rawCreateInstance &&
+				addr != reinterpret_cast<void*>(&HookCreateInstance) &&
+				addr != reinterpret_cast<void*>(&HookCreateInstanceViaGipa))
+			{
+				s.gipaCreateInstance.store(reinterpret_cast<PFN_vkCreateInstance>(fn), std::memory_order_release);
+				return reinterpret_cast<PFN_vkVoidFunction>(&HookCreateInstanceViaGipa);
+			}
+		}
+
+		return fn;
 	}
 
 	// ------------------------------------------------------------------------------------------------ install
@@ -635,6 +730,8 @@ namespace
 			return false;
 		}
 
+		s.rawCreateInstance = reinterpret_cast<void*>(create);
+		s.rawCreateDevice = reinterpret_cast<void*>(createDevice);
 		s.loaderGipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(gipa);
 
 		auto fail = [&why](const char* what, MH_STATUS status)
@@ -667,6 +764,27 @@ namespace
 			MH_RemoveHook(reinterpret_cast<void*>(create));
 			MH_RemoveHook(reinterpret_cast<void*>(createDevice));
 			return fail("Can't enable the vkCreateDevice hook", status);
+		}
+
+		PFN_vkGetInstanceProcAddr gipaTrampoline = nullptr;
+		if (MH_CreateHook(reinterpret_cast<void*>(gipa), reinterpret_cast<void*>(&HookGetInstanceProcAddr),
+				reinterpret_cast<void**>(&gipaTrampoline)) == MH_OK)
+		{
+			s.loaderGipa = gipaTrampoline;
+			if (MH_EnableHook(reinterpret_cast<void*>(gipa)) == MH_OK)
+			{
+				s.gipaHooked = true;
+			}
+			else
+			{
+				s.loaderGipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(gipa);
+				MH_RemoveHook(reinterpret_cast<void*>(gipa));
+				Log::Warn("Vulkan hooks: couldn't enable vkGetInstanceProcAddr hook, using loader detours only");
+			}
+		}
+		else
+		{
+			Log::Warn("Vulkan hooks: couldn't hook vkGetInstanceProcAddr, using loader detours only");
 		}
 
 		s.loaderHooked = true;
