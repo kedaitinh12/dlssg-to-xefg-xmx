@@ -4,6 +4,7 @@
 #include <d3d12.h>
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -25,24 +26,30 @@ namespace DeferredDestroy
 	// Leaked on purpose: destroying XeFG contexts from our static destructors at process exit would call into a
 	// libxess_fg.dll that may already be torn down
 	inline std::vector<Entry>& entries = *new std::vector<Entry>;
-	inline uint64_t evaluations = 0;
+	inline std::atomic<uint64_t> evaluations{ 0 };
+	inline std::atomic<size_t> pendingCount{ 0 };
 
 	inline void Add(std::shared_ptr<void> object)
 	{
 		std::scoped_lock lock(mutex);
-		entries.push_back({ evaluations + Delay, std::move(object) });
+		entries.push_back({ evaluations.load(std::memory_order_relaxed) + Delay, std::move(object) });
+		pendingCount.store(entries.size(), std::memory_order_release);
 	}
 
 	inline void Collect(bool all = false)
 	{
+		const uint64_t now = evaluations.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (!all && pendingCount.load(std::memory_order_acquire) == 0)
+			return;
+
 		std::vector<Entry> due;
 		{
 			std::scoped_lock lock(mutex);
-			evaluations++;
 			auto split = std::partition(entries.begin(), entries.end(),
-				[all](const Entry& e) { return !all && e.destroyAt > evaluations; });
+				[all, now](const Entry& e) { return !all && e.destroyAt > now; });
 			due.assign(std::make_move_iterator(split), std::make_move_iterator(entries.end()));
 			entries.erase(split, entries.end());
+			pendingCount.store(entries.size(), std::memory_order_release);
 		}
 		// Destroyed here, outside the lock
 	}
@@ -80,15 +87,58 @@ inline void Barrier(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* resource
 	cmdList->ResourceBarrier(1, &barrier);
 }
 
-// Both resources are back in their states afterwards
+// Both resources are back in their states afterwards; transitions are batched into at most one ResourceBarrier call
+// before and one after CopyResource to halve CPU/GPU barrier overhead across all models.
 inline void Copy(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* destination, D3D12_RESOURCE_STATES destinationState,
 	ID3D12Resource* source, D3D12_RESOURCE_STATES sourceState)
 {
-	Barrier(cmdList, destination, destinationState, D3D12_RESOURCE_STATE_COPY_DEST);
-	Barrier(cmdList, source, sourceState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+	D3D12_RESOURCE_BARRIER before[2]{};
+	UINT beforeCount = 0;
+	if (destinationState != D3D12_RESOURCE_STATE_COPY_DEST)
+	{
+		before[beforeCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		before[beforeCount].Transition.pResource = destination;
+		before[beforeCount].Transition.StateBefore = destinationState;
+		before[beforeCount].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+		before[beforeCount].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		++beforeCount;
+	}
+	if (sourceState != D3D12_RESOURCE_STATE_COPY_SOURCE)
+	{
+		before[beforeCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		before[beforeCount].Transition.pResource = source;
+		before[beforeCount].Transition.StateBefore = sourceState;
+		before[beforeCount].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+		before[beforeCount].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		++beforeCount;
+	}
+	if (beforeCount)
+		cmdList->ResourceBarrier(beforeCount, before);
+
 	cmdList->CopyResource(destination, source);
-	Barrier(cmdList, destination, D3D12_RESOURCE_STATE_COPY_DEST, destinationState);
-	Barrier(cmdList, source, D3D12_RESOURCE_STATE_COPY_SOURCE, sourceState);
+
+	D3D12_RESOURCE_BARRIER after[2]{};
+	UINT afterCount = 0;
+	if (destinationState != D3D12_RESOURCE_STATE_COPY_DEST)
+	{
+		after[afterCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		after[afterCount].Transition.pResource = destination;
+		after[afterCount].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+		after[afterCount].Transition.StateAfter = destinationState;
+		after[afterCount].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		++afterCount;
+	}
+	if (sourceState != D3D12_RESOURCE_STATE_COPY_SOURCE)
+	{
+		after[afterCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		after[afterCount].Transition.pResource = source;
+		after[afterCount].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+		after[afterCount].Transition.StateAfter = sourceState;
+		after[afterCount].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		++afterCount;
+	}
+	if (afterCount)
+		cmdList->ResourceBarrier(afterCount, after);
 }
 
 // Typed formats for views on typeless or depth resources. 8-bit sRGB maps to UNORM, typed UAVs can't be sRGB

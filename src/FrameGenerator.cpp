@@ -781,28 +781,52 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 
 	// XeFG needs both frames to have hudless or neither
 	context->pairValid = captured && previous.valid && !reset && (frame.hudless != nullptr) == (previous.hudless != nullptr);
+	context->batchGeneratedThrough = 0;
+	context->directOutput = false;
 	frame.valid = captured;
 }
 
-FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsCommandList* cmdList, D3D12_RESOURCE_DESC outputDesc,
-	uint32_t frameIndex, uint32_t frameCount)
+FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* output,
+	D3D12_RESOURCE_DESC outputDesc, uint32_t frameIndex, uint32_t frameCount)
 {
 	if (!context || !context->pairValid)
 		return InterpolateResult::Skipped;
 
-	outputDesc.Format = settings.format;
-	outputDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-	// The game's output can live in a layout a committed UAV texture can't use
-	outputDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-
-	for (uint32_t i = 0; i < frameCount; i++)
+	// Multi-frame batch reuse: when frameIndex == 1 already generated the entire batch (1..frameCount) in one pass,
+	// subsequent evaluations in the same batch simply copy their pre-generated output without re-entering XeFG::Execute.
+	if (frameIndex > 1 && context->batchGeneratedThrough >= frameIndex &&
+		outputDesc.Width == settings.width && outputDesc.Height == settings.height &&
+		TypedFormat(outputDesc.Format) == settings.format &&
+		context->outputs[frameIndex - 1] != nullptr)
 	{
-		if (!context->outputs[i])
-			context->outputs[i] = CreateTexture(device.Get(), outputDesc, OutputState, L"dlssg-to-xefg output",
-				"XeFG output");
+		context->directOutput = false;
+		return InterpolateResult::Interpolated;
+	}
 
-		if (!context->outputs[i])
-			return InterpolateResult::Failed;
+	// Zero-copy in-place UAV fast-path for 2x FG (frameCount == 1) when the game's output texture is directly UAV-compatible
+	const bool canWriteDirect = frameCount == 1 && frameIndex == 1 && output != nullptr &&
+		outputDesc.Format == settings.format &&
+		(outputDesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0 &&
+		outputDesc.SampleDesc.Count == 1 &&
+		outputDesc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN;
+	context->directOutput = canWriteDirect;
+
+	if (!canWriteDirect)
+	{
+		outputDesc.Format = settings.format;
+		outputDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+		// The game's output can live in a layout a committed UAV texture can't use
+		outputDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+		for (uint32_t i = 0; i < frameCount; i++)
+		{
+			if (!context->outputs[i])
+				context->outputs[i] = CreateTexture(device.Get(), outputDesc, OutputState, L"dlssg-to-xefg output",
+					"XeFG output");
+
+			if (!context->outputs[i])
+				return InterpolateResult::Failed;
+		}
 	}
 
 	auto fill = [this](const Frame& frame, xefgd_frame_t& out)
@@ -820,14 +844,24 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 
 	// XeFG wants the same array for every frame of a pair
 	static_assert(sizeof(ComPtr<ID3D12Resource>) == sizeof(ID3D12Resource*));
-	params.ppOutputs = reinterpret_cast<ID3D12Resource* const*>(context->outputs);
+	ID3D12Resource* directOutputs[1]{ output };
+	params.ppOutputs = canWriteDirect ? directOutputs : reinterpret_cast<ID3D12Resource* const*>(context->outputs);
 	params.pOutputBases = context->outputBases;
 	params.numInterpolatedFrames = (uint8_t)frameCount;
 	params.uiCompositionEnabled = settings.uiMode != XEFGD_UI_MODE_AUTO;
 
-	// Frame 1 runs the per pair work and generates its frame, the rest only generate theirs
-	params.firstFrameIndex = frameIndex - 1;
-	params.frameCount = 1;
+	// When starting a batch at frameIndex == 1, generate all frameCount frames in one XeFG::Execute pass so intermediate
+	// feature pyramid and optical flow tensors stay hot in GPU L2/Infinity Cache across Fallback, XMX Port, and XMX Native.
+	if (frameIndex == 1)
+	{
+		params.firstFrameIndex = 0;
+		params.frameCount = (uint8_t)frameCount;
+	}
+	else
+	{
+		params.firstFrameIndex = frameIndex - 1;
+		params.frameCount = 1;
+	}
 
 	// Execute records the provider's dispatches into the caller's list; make sure that list's table is hooked too
 	if (UseCuda(settings.model))
@@ -838,7 +872,11 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 	auto result = XeFG::Execute(context->handle, cmdList, params);
 
 	if (result == XEFGD_RESULT_SUCCESS)
+	{
+		if (frameIndex == 1)
+			context->batchGeneratedThrough = frameCount;
 		return InterpolateResult::Interpolated;
+	}
 
 	if (result > 0)
 	{
@@ -894,7 +932,7 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 			CurrentNetwork(settings.model), context == nullptr, settings.format == DXGI_FORMAT_R16G16B16A16_FLOAT });
 	}
 
-	const auto result = Interpolate(cmdList, output->GetDesc(), frameIndex, frameCount);
+	const auto result = Interpolate(cmdList, output, output->GetDesc(), frameIndex, frameCount);
 
 	// A few frames after the path or context changed, say whether the hardware matrix route is actually the one running
 	if (result == InterpolateResult::Interpolated && !routeReported && ++routeFrames >= 8)
@@ -924,9 +962,14 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 
 	// Without a usable pair (first frame, reset) the real frame is shown again, that's not an error
 	if (result == InterpolateResult::Interpolated)
-		Copy(cmdList, output, OutputState, context->outputs[frameIndex - 1].Get(), OutputState);
+	{
+		if (!context->directOutput)
+			Copy(cmdList, output, OutputState, context->outputs[frameIndex - 1].Get(), OutputState);
+	}
 	else
+	{
 		Copy(cmdList, output, OutputState, backbuffer, BackbufferState);
+	}
 
 	return result == InterpolateResult::Failed ? NGX_FAIL : NGX_SUCCESS;
 }

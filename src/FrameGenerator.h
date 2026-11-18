@@ -63,6 +63,8 @@ private:
 
 		// The previous and the current real frame can be interpolated
 		bool pairValid = false;
+		uint32_t batchGeneratedThrough = 0;
+		bool directOutput = false;
 
 		~Context();
 	};
@@ -76,8 +78,8 @@ private:
 
 	bool CreateContext();
 	void CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const NGXParameter& params);
-	InterpolateResult Interpolate(ID3D12GraphicsCommandList* cmdList, D3D12_RESOURCE_DESC outputDesc,
-		uint32_t frameIndex, uint32_t frameCount);
+	InterpolateResult Interpolate(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* output,
+		D3D12_RESOURCE_DESC outputDesc, uint32_t frameIndex, uint32_t frameCount);
 
 	ComPtr<ID3D12Device> device;
 	Settings settings;
