@@ -193,6 +193,7 @@ namespace
 		bool cameraLogged = false;
 		uint64_t batches = 0, failures = 0, evaluations = 0, realCopies = 0, paused = 0;
 		std::string fault;
+		std::string initFault; // permanent missing-program failure for the current input configuration
 
 		// The batch's XeFG call, kept for its later evaluations, which each record their own output. XeFG takes the same
 		// output array for every call of a pair
@@ -704,13 +705,19 @@ namespace
 
 		ApplyTensorGate(d, model);
 
-		const bool same = f.context && f.width == bb.width && f.height == bb.height && f.format == format &&
+		const bool same = f.width == bb.width && f.height == bb.height && f.format == format &&
 			f.depthWidth == depth.width && f.depthHeight == depth.height && f.motionFormat == motionFormat &&
 			f.hudlessFormat == hudlessFormat && f.uiFormat == uiFormat && f.inverted == inverted &&
 			f.jittered == jittered && f.model == model;
 
-		if (same)
+		if (same && f.context)
 			return true;
+		if (same && !f.initFault.empty())
+		{
+			f.fault = f.initFault;
+			return false;
+		}
+		f.initFault.clear();
 
 		if (f.context)
 		{
@@ -780,6 +787,7 @@ namespace
 		XeFG::SetMaxInterpolatedFrames(MaxGenerated);
 		XeFG::OverrideModel(model);
 
+		const auto missingBefore = xvk::MissingProgramCount();
 		xefgd_handle_t context = nullptr;
 		xefgd_result_t result = CallXeFG("CreateContext", [&] { return XeFG::CreateContext(d3d, &context); });
 
@@ -806,6 +814,13 @@ namespace
 		{
 			CallXeFG("Destroy", [&] { return XeFG::Destroy(context); });
 			f.fault = "init_" + std::to_string(result);
+			if (xvk::MissingProgramCount() != missingBefore)
+			{
+				f.initFault = f.fault + "_missing_spirv";
+				f.fault = f.initFault;
+				Log::Error("Vulkan: missing shader during XeFG Init; retries stopped for this input configuration. "
+					"Install the corrected Vulkan payload and restart the game");
+			}
 			return false;
 		}
 

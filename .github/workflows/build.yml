@@ -306,6 +306,9 @@ jobs:
       - name: Build and run
         working-directory: tests/vulkan_programs
         run: |
+          python3 extractor_test.py
+          g++ -std=c++20 -Wall -Wextra -fsanitize=undefined -I ../../src lookup_test.cpp -o lookup_test
+          ./lookup_test
           g++ --version
           g++ -std=c++20 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -g \
             -DVULKANPROGRAMS_HOSTED -I stubs -I ../../src \

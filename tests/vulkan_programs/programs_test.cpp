@@ -752,14 +752,14 @@ static int RealSet(const fs::path& dir)
 
 	CHECK(set.present && set.Usable());
 	CHECK(set.programs.size() == 83);
-	CHECK(set.perOrigin[(size_t)VulkanPrograms::Origin::Port] == 25);
+	CHECK(set.perOrigin[(size_t)VulkanPrograms::Origin::Port] == 26);
 	CHECK(set.perOrigin[(size_t)VulkanPrograms::Origin::PortExtra] == 1);
 	CHECK(set.perOrigin[(size_t)VulkanPrograms::Origin::Intel] == 56);
-	CHECK(set.perOrigin[(size_t)VulkanPrograms::Origin::Unhashed] == 1);
-	CHECK(set.manifestSha256 == "18ce39ef3e69c064ba46ee70738b2e9cbf13e5fb000780e7061efc0543724079");
+	CHECK(set.perOrigin[(size_t)VulkanPrograms::Origin::Unhashed] == 0);
+	CHECK(set.manifestSha256 == "b2e2822b3281c31fc1f71e048e29ce283fc4e83e7f1b65651489ab1d9da5b37e");
 	CHECK(!set.build.empty() && IsHex(set.asiSha256));
 
-	// 82 programs have a DXIL source, each one is found by it and no two share one
+	// 83 programs have a DXIL source, each one is found by it and no two share one
 	size_t withDxil = 0;
 	std::set<std::string> modules;
 	for (const auto& program : set.programs)
@@ -786,8 +786,10 @@ static int RealSet(const fs::path& dir)
 		first->bindingRows[1] == (Binding{ 1, BindingType::StorageBuffer }) &&
 		first->bindingRows[2] == (Binding{ 64, BindingType::StorageBuffer }));
 
-	CHECK(withDxil == 82);
-	CHECK(set.byDxil.size() == 82);
+	CHECK(first->dxilSha256 == "00b1098a80a5e662de426284e6bf7bdf82ed236eb7c8aef1e74f9ebed204019a");
+    CHECK(set.FindByDxil("6c9bf4b59956c7fec3d764ffe6520e7aec3e6137553b9fca0ba65ecdd7642ce8")->id == 7434);
+    CHECK(withDxil == 83);
+	CHECK(set.byDxil.size() == 83);
 	CHECK(modules.size() == 82);   // two ids share one module
 	CHECK(set.totalBytes > 5000000 && set.totalBytes < 6000000);
 

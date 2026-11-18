@@ -5,8 +5,8 @@ MFG-Unlocker embeds the SPIR-V translations of every compute program XeSS Frame 
 compressed RCDATA resources, and describes them with two tables in the image's read-only data:
 
   * 12 byte records   { u32 id, u32 offset, u32 size }          where the SPIR-V module is at offset in the pack
-  * 40 byte records   { u32 id, u32 pad, char* spirvSha256, u32 bytes, u32 pushConstantBytes, u32 bindingStart,
-                        u32 bindingCount, char* sourceDxilSha256 }
+  * 40 byte records   { char* sourceDxilSha256, u32 id, u32 pad, char* spirvSha256, u32 bytes,
+                        u32 pushConstantBytes, u32 bindingStart, u32 bindingCount }
   * 4 byte records    { u16 binding, u16 type }               the descriptors of every program, bindingStart on, where
                         type is 0 storage buffer, 1 uniform buffer, 2 sampled image, 3 storage image, 4 sampler
 
@@ -388,13 +388,17 @@ def find_program_table(img, ids):
             records = []
             try:
                 for i, rid in enumerate(ids):
-                    at = pos + 40 * i
-                    f = struct.unpack_from("<IIQIIIIQ", d, at)
-                    if f[0] != rid or f[1] != 0:
+                    # The resource id is at +8, not the start of ProgramAsset.
+                    # Starting here would silently read the NEXT row's DXIL hash.
+                    at = pos - 8 + 40 * i
+                    if at < 0 or at + 40 > len(d):
+                        raise ExtractError("truncated program record")
+                    f = struct.unpack_from("<QIIQIIII", d, at)
+                    if f[1] != rid or f[2] != 0:
                         raise ExtractError("record %d is not in order" % i)
                     records.append(dict(
-                        id=f[0], sha256=read_hex_string(img, f[2]), bytes=f[3], push=f[4], bind_start=f[5],
-                        bind_count=f[6], source=read_hex_string(img, f[7]) if f[7] else None))
+                        id=f[1], sha256=read_hex_string(img, f[3]), bytes=f[4], push=f[5], bind_start=f[6],
+                        bind_count=f[7], source=read_hex_string(img, f[0]) if f[0] else None))
                 return records
             except ExtractError:
                 pass

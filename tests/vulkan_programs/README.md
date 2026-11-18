@@ -17,10 +17,10 @@ g++ -std=c++20 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=
     -I stubs -I ../../src programs_test.cpp ../../src/VulkanPrograms.cpp -o programs_test
 ./programs_test            # 206 checks, 0 failed
 ./programs_test --missing  # Installed() without a vulkan folder, 5 checks
-./programs_test --real DIR # DIR made by tools/ExtractXeFgVulkanPrograms.py, 280 checks
+./programs_test --real DIR # DIR made by tools/ExtractXeFgVulkanPrograms.py, 284 checks
 ```
 
-`--real` is for a folder the extractor made from a real `MFGUnlocker.asi`: 83 programs, every one verified, each of the 82 with
+`--real` is for a folder the extractor made from a real `MFGUnlocker.asi`: 83 programs, every one verified, each of the 83 with
 a DXIL source found by it, every program's descriptors, the manifest's SHA-256 and the origin counts as in the four 1.7.1 builds
 (1.7.1-beta2fix.1, 1.7.1-beta.3, 1.7.1-rc.2 and 1.7.1 final, file version 1.7.1.177), and the three `input_copy_<n>.spv` of the
 folder equal to the ones built into the dll. `build.yml` runs it when the repository has the models

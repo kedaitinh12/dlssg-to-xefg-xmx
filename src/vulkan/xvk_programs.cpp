@@ -1,5 +1,6 @@
 // Root signature (RTS0) parsing and the embedded SPIR-V program set (generate_xvk_programs.py).
 #include "xvk_internal.h"
+#include "VulkanProgramLookup.h"
 #include "../MfgPort/Sha256.h"
 #include "../VulkanPrograms.h"
 #include <map>
@@ -172,19 +173,6 @@ void ProgramSet::Load(HMODULE module)
     Log("program set: %zu programs from xefg_mfg_programs\\vulkan, manifest %.16s", index_.size(), set.manifestSha256.c_str());
 }
 
-namespace {
-// RTXMFG's own XeFG shaders (xess/generate_xess_shaders.py, the pinned SHA-256 of each compiled container) replace
-// exactly one Intel program each (xess/runtime_payload.cpp LoadReplacements) and were proven to produce
-// byte-identical results with the same root signature, so each runs as the SPIR-V of the program it replaces.
-constexpr std::pair<const char*, const char*> kReplacements[] = {
-    {"43ccfe670409fd807b604b870674012958fbb4067305a449304ee91ab6154f3f", "3f3f91d2ecd4345042f0519f7455776314be9e7730453a3fcb42c57f0acb49b5"},
-    {"6c9bf4b59956c7fec3d764ffe6520e7aec3e6137553b9fca0ba65ecdd7642ce8", "c3649191906bdd300462dbafe6add8f82b09e8e10c41e92784a209d99513224b"},
-    {"9900c30febf95bfa81b4da1178e5773863116beba4d3f032897da4254b6d8926", "01c8beac27d3f3f82ecba8f3dc2d9d8b60d4c175a41df3c24a24e8643f5578f5"},
-    {"e78063f97ad2c0913412f07589cd17d0f2a6ebeeb6edd70647a69cca6b6a02bf", "8291bbc36b1100b07d0788f35a3a9fadfbfcc2267ff0ccb7afb114d76f5d69fe"},
-    {"7a29fbf311cd8dee5b8c1cfdadf31ee983092a512cf9c10845a079b457eb62a9", "a60f7488872a675d66afd2bec02b0b89e3cc38c1c4ed1d25d745a7b2fe677412"},
-    {"ce847b58086ce7e9d25f7d8b90e989247cd4582226506d9552112f1ef4130643", "8c2efb9e955f39379a91887ed3d90412c4b7ae2c142a874e3da5f699de197f7c"},
-    {"efa8da5ef5f90c62b789b0fed8e77e2ce043e558d164cc552ca7fb9127cedb00", "40e159414d5b839ba7e0e07cbf8ff4ef425ee026c216b2928ef3bb6dd0e20d40"}};
-}
 
 const Program* ProgramSet::LoadRow(size_t rowIdx, const std::string& key)
 {
@@ -214,10 +202,7 @@ const Program* ProgramSet::LoadRow(size_t rowIdx, const std::string& key)
 
 const Program* ProgramSet::Find(const std::string& requested)
 {
-    std::string sha256 = requested;
-    if (index_.find(sha256) == index_.end())
-        for (const auto& [ours, intel] : kReplacements)
-            if (sha256 == ours) { sha256 = intel; break; }
+    const std::string sha256 = ResolveProgramHash(index_, requested);
     std::lock_guard lock(mutex_);
     auto row = index_.find(sha256);
     if (row == index_.end()) return nullptr;
@@ -226,10 +211,7 @@ const Program* ProgramSet::Find(const std::string& requested)
 
 const Program* ProgramSet::FindForRoot(const std::string& requested, const RootLayout& root)
 {
-    std::string sha256 = requested;
-    if (index_.find(sha256) == index_.end())
-        for (const auto& [ours, intel] : kReplacements)
-            if (sha256 == ours) { sha256 = intel; break; }
+    const std::string sha256 = ResolveProgramHash(index_, requested);
     std::lock_guard lock(mutex_);
     auto row = index_.find(sha256);
     if (row == index_.end()) return nullptr;
@@ -237,16 +219,9 @@ const Program* ProgramSet::FindForRoot(const std::string& requested, const RootL
     if (direct && MatchesRootLayout(*direct, root))
         return direct;
 
-    // Self-healing fallback for manifests where ExtractXeFgVulkanPrograms.py unpacked ProgramAsset starting at
-    // offset +8 (`resource`) instead of offset 0 (`dxilSha256`), shifting `sourceDxilSha256` by 1 row (`row + 1`).
-    const size_t nextRow = row->second + 1;
-    const Program* shifted = LoadRow(nextRow, sha256 + "#shifted");
-    if (shifted && MatchesRootLayout(*shifted, root)) {
-        Log("program set: %.16s matched shifted SPIR-V row %zu (id %u) by root signature",
-            sha256.c_str(), nextRow, VulkanPrograms::Installed().programs[nextRow].id);
-        return shifted;
-    }
-    return direct;
+    // Descriptor compatibility cannot establish shader identity. Never substitute
+    // a neighbouring program: different computations often share a root layout.
+    return nullptr;
 }
 
 namespace {

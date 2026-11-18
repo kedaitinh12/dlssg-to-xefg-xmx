@@ -454,6 +454,15 @@ VulkanPrograms::Set VulkanPrograms::Load(const std::filesystem::path& directory,
 			return set;
 		}
 
+        // These manifests came from the old extractor reading ProgramAsset at +8.
+        // Their SPIR-V hashes are valid, but every DXIL association is one row off.
+        if (set.manifestSha256 == "18ce39ef3e69c064ba46ee70738b2e9cbf13e5fb000780e7061efc0543724079" ||
+            set.manifestSha256 == "a0ac0a6fcb4502fc3f50596cfe971d5887f239872e900662784538aa53bd19b0")
+        {
+            problem("programs.tsv has shifted DXIL mappings; replace the Vulkan payload with the corrected package");
+            return set;
+        }
+
 		ReadSource(directory / "SOURCE.txt", set);
 
 		const std::string_view text(reinterpret_cast<const char*>(manifest.data()), manifest.size());
