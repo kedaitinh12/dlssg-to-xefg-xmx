@@ -93,6 +93,16 @@ jobs:
             python tests/vulkan_runtime/check_layer_tables.py --fatbin bin/Release/xefg_mfg_programs/xefg_cuda_layers.fatbin
           }
 
+      # Build the 16 D3D12 WMMA / dot4add_i8packed compute shaders (17 <program>.dxbc overrides) into bin\Release\xefg_mfg_programs\wmma
+      - name: Build D3D12 WMMA compute shaders (DXC cs_6_6)
+        id: wmma_d3d12
+        shell: pwsh
+        run: |
+          ./tools/GenerateXeFgWmma.ps1 -Output bin\Release\xefg_mfg_programs\wmma
+          python tools/CheckXeFgWmma.py bin/Release/xefg_mfg_programs/wmma
+          if ($LASTEXITCODE -ne 0) { throw "D3D12 WMMA shader validation failed" }
+          "built=true" >> $env:GITHUB_OUTPUT
+
       # The extractor fails when the program set of the asi doesn't check out against the hashes the asi lists itself, the
       # inspector when the asi isn't one this dll can use.
       - name: Vulkan models
@@ -122,8 +132,7 @@ jobs:
           Write-Host "Vulkan models from $source"
           exit 0
 
-      # Build the 16 SPV_KHR_cooperative_matrix shaders into bin\Release\xefg_mfg_programs\vulkan\coopmat for WMMA/XMX
-      - name: Build Vulkan cooperative-matrix shaders (WMMA/XMX)
+      - name: Build Vulkan cooperative-matrix shaders (required)
         id: coopmat
         shell: pwsh
         run: |
@@ -181,6 +190,8 @@ jobs:
             $models = (Get-Content (Join-Path $programs "vulkan\SOURCE.txt") -TotalCount 1)
           }
 
+          python tools/CheckXeFgWmma.py (Join-Path $programs "wmma")
+          if ($LASTEXITCODE -ne 0) { throw "Staged D3D12 WMMA payload is invalid" }
           python tools/CheckXeFgCoopMat.py (Join-Path $programs "vulkan/coopmat")
           if ($LASTEXITCODE -ne 0) { throw "Staged cooperative-matrix payload is invalid" }
 
@@ -189,7 +200,7 @@ jobs:
             "",
             "- Vulkan runtime: built in, Vulkan headers VK_HEADER_VERSION ${{ steps.vulkan.outputs.version }}",
             "- Vulkan models: $models",
-            "- Routes built in: XMX (native), XMX Port (DP4a INT8), CUDA Tensor Cores (sm_75/86/89/120), AMD WMMA INT8 (RDNA 4 / RDNA 3 & VK_KHR_cooperative_matrix)",
+            "- Routes built in: XMX (native), XMX Port (DP4a INT8), CUDA Tensor Cores (sm_75/86/89/120), AMD WMMA INT8 (D3D12 cs_6_6 & Vulkan VK_KHR_cooperative_matrix)",
             "- Artifact: ``custom\XeMFG XMX\dlssg\dlssg_to_xefg_intel_is_better.dll`` with ``xefg_mfg_programs`` beside it"
           ) -join "`n" >> $env:GITHUB_STEP_SUMMARY
 
