@@ -258,12 +258,19 @@ typedef enum VkBorderColor
 
 typedef enum VkAccessFlagBits
 {
+	VK_ACCESS_SHADER_READ_BIT = 0x00000020,
+	VK_ACCESS_SHADER_WRITE_BIT = 0x00000040,
+	VK_ACCESS_TRANSFER_READ_BIT = 0x00000800,
+	VK_ACCESS_TRANSFER_WRITE_BIT = 0x00001000,
 	VK_ACCESS_MEMORY_READ_BIT = 0x00008000,
 	VK_ACCESS_MEMORY_WRITE_BIT = 0x00010000,
 } VkAccessFlagBits;
 
 typedef enum VkPipelineStageFlagBits
 {
+	VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT = 0x00000800,
+	VK_PIPELINE_STAGE_TRANSFER_BIT = 0x00001000,
+	VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT = 0x00008000,
 	VK_PIPELINE_STAGE_ALL_COMMANDS_BIT = 0x00010000,
 } VkPipelineStageFlagBits;
 
@@ -300,6 +307,8 @@ typedef enum VkPresentModeKHR
 {
 	VK_PRESENT_MODE_IMMEDIATE_KHR = 0,
 	VK_PRESENT_MODE_MAILBOX_KHR = 1,
+	VK_PRESENT_MODE_FIFO_KHR = 2,
+	VK_PRESENT_MODE_FIFO_RELAXED_KHR = 3,
 } VkPresentModeKHR;
 
 typedef enum VkLatencyMarkerNV
@@ -1000,3 +1009,27 @@ typedef uint64_t(VKAPI_PTR* PFN_vkGetImageViewHandle64NVX)(VkDevice device, cons
 typedef VkResult(VKAPI_PTR* PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)(VkPhysicalDevice physicalDevice,
 	uint32_t* pPropertyCount, VkCooperativeMatrixPropertiesKHR* pProperties);
 typedef void(VKAPI_PTR* PFN_vkCmdPipelineBarrier2)(VkCommandBuffer commandBuffer, const VkDependencyInfo* pDependencyInfo);
+typedef struct VkQueue_T* VkQueue;
+typedef struct VkSwapchainKHR_T* VkSwapchainKHR;
+typedef struct VkSwapchainCreateInfoKHR
+{
+	VkStructureType sType;
+	const void* pNext;
+	VkPresentModeKHR presentMode;
+} VkSwapchainCreateInfoKHR;
+typedef struct VkPresentInfoKHR
+{
+	VkStructureType sType;
+	const void* pNext;
+	uint32_t waitSemaphoreCount;
+	const void* pWaitSemaphores;
+	uint32_t swapchainCount;
+	const VkSwapchainKHR* pSwapchains;
+	const uint32_t* pImageIndices;
+	VkResult* pResults;
+} VkPresentInfoKHR;
+typedef VkResult(VKAPI_PTR* PFN_vkCreateSwapchainKHR)(VkDevice device, const VkSwapchainCreateInfoKHR* pCreateInfo,
+	const VkAllocationCallbacks* pAllocator, VkSwapchainKHR* pSwapchain);
+typedef void(VKAPI_PTR* PFN_vkDestroySwapchainKHR)(VkDevice device, VkSwapchainKHR swapchain,
+	const VkAllocationCallbacks* pAllocator);
+typedef VkResult(VKAPI_PTR* PFN_vkQueuePresentKHR)(VkQueue queue, const VkPresentInfoKHR* pPresentInfo);
