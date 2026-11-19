@@ -117,6 +117,7 @@
     <ClInclude Include="src\FrameGenerator.h" />
     <ClInclude Include="src\Log.h" />
     <ClInclude Include="src\MfgKernels.h" />
+    <ClInclude Include="src\MfgPort\AdapterIdentity.h" />
     <ClInclude Include="src\MfgPort\MfgPortLog.h" />
     <ClInclude Include="src\MfgPort\ModelPort.h" />
     <ClInclude Include="src\MfgPort\RuntimeLayout.generated.h" />
