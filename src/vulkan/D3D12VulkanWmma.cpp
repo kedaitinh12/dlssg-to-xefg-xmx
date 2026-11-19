@@ -657,7 +657,20 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 	bool execOk = false;
 	if (xvk::BeginRecording(gBridge.xvkDevice.Get(), cmd))
 	{
-		if (SUCCEEDED(gBridge.xvkAlloc->Reset()) && SUCCEEDED(gBridge.xvkList->Reset(gBridge.xvkAlloc.Get(), nullptr)))
+		bool listReady = false;
+		if (!gBridge.xvkList)
+		{
+			listReady = SUCCEEDED(gBridge.xvkDevice->CreateCommandList(
+				0, D3D12_COMMAND_LIST_TYPE_DIRECT, gBridge.xvkAlloc.Get(), nullptr, IID_PPV_ARGS(&gBridge.xvkList))) &&
+				gBridge.xvkList != nullptr;
+		}
+		else
+		{
+			listReady = SUCCEEDED(gBridge.xvkAlloc->Reset()) &&
+				SUCCEEDED(gBridge.xvkList->Reset(gBridge.xvkAlloc.Get(), nullptr));
+		}
+
+		if (listReady)
 		{
 			const xefgd_result_t res = XeFG::Execute(gBridge.xefgContext, gBridge.xvkList.Get(), vkParams);
 			gBridge.xvkList->Close();
@@ -1090,12 +1103,12 @@ bool Install(ID3D12Device* d3dDevice, std::string& reason) noexcept
 	if (FAILED(xvk::CreateDevice(xvkDesc, IID_PPV_ARGS(&gBridge.xvkDevice))) || !gBridge.xvkDevice)
 		return fail("xvk_device_failed");
 
-	if (FAILED(gBridge.xvkDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&gBridge.xvkAlloc))) ||
-		FAILED(gBridge.xvkDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, gBridge.xvkAlloc.Get(), nullptr, IID_PPV_ARGS(&gBridge.xvkList))))
+	// Recorded xvk devices require an active xvk::BeginRecording(cmd) before
+	// CreateCommandList can open recording, so create xvkList lazily on first execute.
+	if (FAILED(gBridge.xvkDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&gBridge.xvkAlloc))) || !gBridge.xvkAlloc)
 	{
-		return fail("xvk_cmdlist_failed");
+		return fail("xvk_alloc_failed");
 	}
-	gBridge.xvkList->Close();
 
 	std::string coopReason;
 	if (!VulkanCoopMat::Install(gBridge.xvkDevice.Get(), coopReason))
