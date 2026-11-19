@@ -2,6 +2,7 @@
 #include "Log.h"
 #include "MfgKernels.h"
 #include "MfgPort/Cuda/cuda_route.h"
+#include "MfgPort/AdapterIdentity.h"
 #include "MfgPort/Wmma/wmma_route.h"
 #include "Plugin.h"
 #include "Util.h"
@@ -415,17 +416,26 @@ static bool PortAvailable()
 	return available;
 }
 
-// XeFG's own XMX check decides: a context with no override picks the XMX network only on Intel GPUs whose driver
-// reports XMX. Probed once for the first device, before the first override, and kept for the menu's support state.
+// XeFG's own XMX check plus real physical adapter verification (bypassing DXGI spoofing):
+// XMX (native) is strictly restricted to real Intel GPUs (vendor 0x8086) whose driver supports XMX.
 static int32_t NativeModel(ID3D12Device* device)
 {
 	static const int32_t model = [device]
 		{
+			const auto probe = device ? adapter_identity::Probe(device->GetAdapterLuid()) : adapter_identity::Result{};
+			const bool isRealIntel = (probe.vendorId == 0x8086);
 			const int32_t picked = XeFG::AutoModel(device);
+			const bool nativeXmxAllowed = isRealIntel && (picked == XeFGXmxModel);
 
-			Plugin::xmxSupport = picked == XeFGXmxModel ? Plugin::XmxSupport::Supported : Plugin::XmxSupport::Unsupported;
-			Log::Info("XeFG model: {}", picked);
-			return picked;
+			Plugin::xmxSupport = nativeXmxAllowed ? Plugin::XmxSupport::Supported : Plugin::XmxSupport::Unsupported;
+			if (picked == XeFGXmxModel && !isRealIntel)
+			{
+				Log::Warn("XeFG reported XMX model {} on non-Intel GPU (vendor 0x{:04X}, {}); restricting XMX (native) to Intel GPUs with XMX",
+					picked, probe.vendorId, adapter_identity::WideToAsciiJson(probe.description));
+			}
+			Log::Info("XeFG model: {} (real vendor 0x{:04X}, native XMX: {})",
+				picked, probe.vendorId, nativeXmxAllowed ? "supported" : "unsupported");
+			return nativeXmxAllowed ? XeFGXmxModel : MfgKernels::Dp4aModel;
 		}();
 
 	return model;
@@ -565,15 +575,14 @@ static bool UseCuda(int32_t model)
 	return path == Plugin::Path::Cuda || (path == Plugin::Path::XmxNative && Plugin::cudaSupport.load() == Plugin::CudaSupport::Supported);
 }
 
-// The ported model runs on the AMD WMMA INT8 route when WMMA is explicitly selected, or automatically on AMD RDNA 4
-// when XMX (native) is selected (RDNA 3 stays on XMX DP4a INT8 unless WMMA is explicitly selected).
+// The ported model runs on the AMD WMMA INT8 route only when WMMA is explicitly selected.
+// XMX (native) is strictly reserved for Intel GPUs with XMX support and falls back to XMX Port (or CUDA) elsewhere.
 static bool UseWmma(int32_t model)
 {
 	if (model != MfgKernels::MfgModel || !xefg_wmma::Supported())
 		return false;
 
-	const auto path = Plugin::options.path.load();
-	return path == Plugin::Path::Wmma || (path == Plugin::Path::XmxNative && xefg_wmma::IsRdna4());
+	return Plugin::options.path.load() == Plugin::Path::Wmma;
 }
 
 static Plugin::Network CurrentNetwork(int32_t model)

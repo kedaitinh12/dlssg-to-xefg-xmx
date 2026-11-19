@@ -419,14 +419,14 @@ namespace
 
 		static constexpr const char* PathNames[] = { "XMX Port", "CUDA", "Fallback (DP4a)", "XMX (native)", "WMMA" };
 		const bool cudaDisabled = Plugin::cudaSupport.load() == Plugin::CudaSupport::Unsupported;
-		const bool xmxDisabled = Plugin::xmxSupport.load() == Plugin::XmxSupport::Unsupported;
+		const bool xmxDisabled = Plugin::xmxSupport.load() != Plugin::XmxSupport::Supported;
 		const bool wmmaDisabled = Plugin::wmmaSupport.load() == Plugin::WmmaSupport::Unsupported;
 
 		int32_t path = (int32_t)Plugin::options.path.load();
 
 		// A saved choice the GPU doesn't support runs something else, show what is actually running
 		if (path == (int32_t)Plugin::Path::XmxNative && xmxDisabled)
-			path = !cudaDisabled ? (int32_t)Plugin::Path::Cuda : !wmmaDisabled ? (int32_t)Plugin::Path::Wmma : (int32_t)Plugin::Path::XmxPort;
+			path = !cudaDisabled ? (int32_t)Plugin::Path::Cuda : (int32_t)Plugin::Path::XmxPort;
 
 		if (path == (int32_t)Plugin::Path::Cuda && cudaDisabled)
 			path = (int32_t)Plugin::Path::XmxPort;
