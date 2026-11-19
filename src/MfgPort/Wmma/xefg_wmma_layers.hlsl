@@ -96,10 +96,12 @@ static const int ROWS   = LAYER_TILE_H / 4;
 groupshared uint4 win[2][WIN];
 groupshared uint4 wsm[2][LAYER_NT * 72];
 #else
-static const int ZPER  = LAYER_OUT / LAYER_ZSPLIT;
-static const int WBUFS = (ZPER * LAYER_IN > 1) ? 2 : 1;
+#define LAYER_ZPER  (LAYER_OUT / LAYER_ZSPLIT)
+#define LAYER_WBUFS (((LAYER_ZPER) * (LAYER_IN) > 1) ? 2 : 1)
+static const int ZPER  = LAYER_ZPER;
+static const int WBUFS = LAYER_WBUFS;
 groupshared uint4 win[LAYER_IN * WIN];
-groupshared uint4 wsm[WBUFS][144];
+groupshared uint4 wsm[LAYER_WBUFS][144];
 #endif
 
 // Zero-bank-conflict XOR weight swizzle within each 16-uint4 tap block (0..143)
@@ -266,15 +268,19 @@ void main(uint3 groupID : SV_GroupID, uint tid : SV_GroupIndex)
 
         for (int slice = 0; slice < LAYER_IN; ++slice)
         {
+#if LAYER_WBUFS > 1
             const int st = z * LAYER_IN + slice;
-            const int cur = (WBUFS > 1) ? ((st - firstBlock) & 1) : 0;
-            const bool hasNext = (WBUFS > 1) && (st + 1 < (zBegin + ZPER) * LAYER_IN);
+            const int cur = (st - firstBlock) & 1;
+            const bool hasNext = (st + 1 < (zBegin + ZPER) * LAYER_IN);
             if (hasNext)
             {
                 const int nxt = cur ^ 1;
                 for (uint wIdx = tid; wIdx < 144u; wIdx += 128u)
                     wsm[nxt][SwizzleWeightIdx(wIdx)] = tWeights[(st + 1) * 144 + int(wIdx)];
             }
+#else
+            const int cur = 0;
+#endif
 
             const int sliceBase = slice * WIN;
             [unroll]
@@ -306,8 +312,10 @@ void main(uint3 groupID : SV_GroupID, uint tid : SV_GroupIndex)
                     }
                 }
             }
+#if LAYER_WBUFS > 1
             if (hasNext)
                 GroupMemoryBarrierWithGroupSync();
+#endif
         }
 
         // Load only this thread's 8 channels of scale and bias (cuts 16 float VGPRs vs holding all 16)
