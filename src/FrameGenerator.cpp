@@ -422,7 +422,7 @@ static int32_t NativeModel(ID3D12Device* device)
 {
 	static const int32_t model = [device]
 		{
-			const auto probe = device ? adapter_identity::Probe(device->GetAdapterLuid()) : adapter_identity::Result{};
+			const auto probe = device ? adapter_identity::Probe(device->GetAdapterLuid()) : adapter_identity::ProbeResult{};
 			const bool isRealIntel = (probe.vendorId == 0x8086);
 			const int32_t picked = XeFG::AutoModel(device);
 			const bool nativeXmxAllowed = isRealIntel && (picked == XeFGXmxModel);
