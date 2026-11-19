@@ -3,8 +3,9 @@
 // This is MFG-Unlocker's xess/vulkan/vk_provider.cpp (MIT, Copyright (c) 2026 Michael Robles, see NOTICE.md) ported to
 // this repository: XeFG is driven through XeFG.h, the ported model comes from MfgKernels, the model follows the menu's
 // network path, and the programs are the ones in xefg_mfg_programs\vulkan (VulkanPrograms.h). The tensor-core route of an
-// NVIDIA GPU is in (VulkanTensor.h), selected by the CUDA network path. Left out: its GPU timing and its registration as an
-// OptiScaler provider.
+// NVIDIA GPU is in (VulkanTensor.h), selected by the CUDA network path. The cooperative-matrix route of an AMD RDNA3/RDNA4
+// or Intel Arc GPU is in (VulkanCoopMat.h), selected by the WMMA, XMX Port and XMX (native) network paths. Left out: its GPU
+// timing and its registration as an OptiScaler provider.
 //
 // Every evaluation records into the VkCommandBuffer the game gives NVSDK_NGX_VULKAN_EvaluateFeature. The game's images
 // are copied into images of the layer's own device, XeFG records its dispatches on a D3D12 command list of that device,
@@ -20,6 +21,7 @@
 #include "../Plugin.h"
 #include "../VulkanPrograms.h"
 #include "../XeFG.h"
+#include "VulkanCoopMat.h"
 #include "VulkanHost.h"
 #include "VulkanInputCopy.h"
 #include "VulkanPolicy.h"
@@ -120,6 +122,10 @@ namespace
 		// VulkanPolicy::DescribeTensor code
 		bool tensorInstalled = false;
 		std::string tensorReason = "not_attempted";
+		// The cooperative-matrix route (VulkanCoopMat.h) is installed on the layer's device. When it isn't, coopReason
+		// is the VulkanPolicy::DescribeCoopMatrix code
+		bool coopInstalled = false;
+		std::string coopReason = "not_attempted";
 
 #define VULKAN_RUNTIME_FIELD(name) PFN_##name name = nullptr;
 		VULKAN_RUNTIME_FNS(VULKAN_RUNTIME_FIELD)
@@ -140,9 +146,11 @@ namespace
 	std::string gDeviceReason = "not_initialized";
 	std::string gModelName;
 	std::string gTensorReason = "not_attempted";
+	std::string gCoopReason = "not_attempted";
 
 	// The route is replacing layers: installed, and the CUDA path selected with the ported model (ApplyTensorGate)
 	std::atomic_bool gTensorGate = false;
+	std::atomic_bool gCoopGate = false;
 
 	// One real frame's inputs, kept for the next batch as its previous frame
 	struct Slot
@@ -173,6 +181,8 @@ namespace
 		bool inverted = false;
 		bool jittered = false;
 		int32_t model = 0;
+		int32_t loggedPath = -1;
+		bool createFailed = false; // retried when settings or network path (including WMMA) change
 
 		std::array<Slot, 2> slots;
 		uint32_t current = 0;
@@ -183,9 +193,9 @@ namespace
 		uint32_t batchCount = 0;
 		bool batchReady = false;
 		bool cameraLogged = false;
-		bool realFormatLogged = false;
 		uint64_t batches = 0, failures = 0, evaluations = 0, realCopies = 0, paused = 0;
 		std::string fault;
+		std::string initFault; // permanent missing-program failure for the current input configuration
 
 		// The batch's XeFG call, kept for its later evaluations, which each record their own output. XeFG takes the same
 		// output array for every call of a pair
@@ -263,7 +273,8 @@ namespace
 
 	const char* ModelText(int32_t model)
 	{
-		return model == MfgKernels::MfgModel ? "port" : "DP4a";
+		return model != MfgKernels::MfgModel ? "DP4a"
+		     : (Plugin::options.path.load() == Plugin::Path::Wmma && gCoopGate.load() ? "WMMA" : "port");
 	}
 
 	// With gDevice.mutex held
@@ -272,6 +283,7 @@ namespace
 		std::scoped_lock lock(gStatusMutex);
 		gDeviceReason = d.reason;
 		gTensorReason = d.tensorReason;
+		gCoopReason = d.coopReason;
 	}
 
 	void SetModelName(int32_t model)
@@ -290,10 +302,17 @@ namespace
 
 		const auto* resource = static_cast<const NgxResource*>(value);
 
-		if (resource->type != NgxResourceImageView || !resource->image || !resource->width || !resource->height)
+		if (resource->type != NgxResourceImageView || !resource->image || !resource->width || !resource->height ||
+			!resource->range.levelCount || resource->range.layerCount != 1)
 			return nullptr;
 
 		return resource;
+	}
+
+	bool SameSubresource(const NgxResource& a, const NgxResource& b)
+	{
+		return a.image == b.image && a.range.baseMipLevel == b.range.baseMipLevel &&
+			a.range.baseArrayLayer == b.range.baseArrayLayer;
 	}
 
 	// Why a device the game created has no record: the reason the hooks gave, else what state they are in
@@ -315,21 +334,37 @@ namespace
 
 	// ------------------------------------------------------------------------------------------ recording
 
+	void StageBarrier(const Device& d, VkCommandBuffer command,
+		VkPipelineStageFlags srcStage, VkAccessFlags srcAccess,
+		VkPipelineStageFlags dstStage, VkAccessFlags dstAccess)
+	{
+		VkMemoryBarrier memory{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, srcAccess, dstAccess };
+		d.vkCmdPipelineBarrier(command, srcStage, dstStage, 0, 1, &memory, 0, nullptr, 0, nullptr);
+	}
+
 	void FullBarrier(const Device& d, VkCommandBuffer command)
 	{
-		VkMemoryBarrier memory{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT,
-			VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
-
-		d.vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
-			&memory, 0, nullptr, 0, nullptr);
+		StageBarrier(d, command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+			VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
 	}
 
 	void CopyImage(const Device& d, VkCommandBuffer command, VkImage source, VkImageLayout sourceLayout, VkImage target,
-		VkImageLayout targetLayout, uint32_t width, uint32_t height)
+		VkImageLayout targetLayout, uint32_t width, uint32_t height, const NgxResource* sourceResource = nullptr,
+		const NgxResource* targetResource = nullptr)
 	{
 		VkImageCopy region{};
 		region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
 		region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		if (sourceResource)
+		{
+			region.srcSubresource.mipLevel = sourceResource->range.baseMipLevel;
+			region.srcSubresource.baseArrayLayer = sourceResource->range.baseArrayLayer;
+		}
+		if (targetResource)
+		{
+			region.dstSubresource.mipLevel = targetResource->range.baseMipLevel;
+			region.dstSubresource.baseArrayLayer = targetResource->range.baseArrayLayer;
+		}
 		region.extent = { width, height, 1 };
 
 		d.vkCmdCopyImage(command, source, sourceLayout, target, targetLayout, 1, &region);
@@ -440,6 +475,35 @@ namespace
 			d.tensorInstalled ? Plugin::CudaSupport::Supported : Plugin::CudaSupport::Unsupported);
 	}
 
+	// The cooperative-matrix route on the layer's device, on an AMD RDNA3/RDNA4 (WMMA) or Intel Arc/Battlemage (XMX) GPU
+	// the hooks gave VK_KHR_cooperative_matrix: tried once per device, with DP4a SPIR-V fallback on any layer. With gDevice.mutex held
+	void InstallCoopMatrixRoute(Device& d, const VulkanHost::DeviceRecord& record)
+	{
+		std::string coopStatusReason;
+
+		if (!d.portInstalled)
+		{
+			coopStatusReason = "no_port";
+			xefg_cuda::ReportCoopMatrix(xefg_cuda::State::Unavailable, 0, 0, 0, 0, coopStatusReason.c_str());
+			Log::Info("Vulkan cooperative matrix: unavailable, {}", VulkanPolicy::DescribeCoopMatrix(coopStatusReason));
+		}
+		else if (!record.coopMatrixExtensions && record.vendor == 0x10DE)
+		{
+			// NVIDIA GPUs use the native CUDA cubin tensor-core route (VK_NVX_binary_import) unless cooperative matrix is enabled
+			coopStatusReason = "no_extensions";
+		}
+		else
+		{
+			d.coopInstalled = VulkanCoopMat::Install(d.d3d.Get(), coopStatusReason);
+		}
+
+		d.coopReason = d.coopInstalled ? std::string() : coopStatusReason;
+
+		auto unknown = Plugin::WmmaSupport::Unknown;
+		Plugin::wmmaSupport.compare_exchange_strong(unknown,
+			d.coopInstalled ? Plugin::WmmaSupport::Supported : Plugin::WmmaSupport::Unsupported);
+	}
+
 	// The layer's device on the game's, XeFG with its model, and the copy pipelines. With gDevice.mutex held
 	bool PrepareDevice(Device& d)
 	{
@@ -503,6 +567,9 @@ namespace
 		desc.tensorExtensions = record.tensorExtensions;
 		desc.binaryImportSpec = record.binaryImportSpec;
 		desc.imageViewHandleSpec = record.imageViewHandleSpec;
+		// What the hooks enabled for the VK_KHR_cooperative_matrix route (AMD WMMA / Intel XMX)
+		desc.coopMatrixExtensions = record.coopMatrixExtensions;
+		desc.coopMatrixSpec = record.coopMatrixSpec;
 
 		if (FAILED(xvk::CreateDevice(desc, IID_PPV_ARGS(&d.d3d))) || !d.d3d)
 		{
@@ -515,6 +582,7 @@ namespace
 		d.portInstalled = MfgKernels::Install(XeFG::Module());
 
 		InstallTensorRoute(d, record);
+		InstallCoopMatrixRoute(d, record);
 
 		if (!CreatePipelines(d))
 		{
@@ -525,9 +593,9 @@ namespace
 		d.ready = true;
 		d.reason.clear();
 
-		Log::Info("Vulkan XeMFG ready on queue family {}, vendor {:#06x}: {} programs, ported model {}, tensor cores {}, up to {}x",
+		Log::Info("Vulkan XeMFG ready on queue family {}, vendor {:#06x}: {} programs, ported model {}, tensor cores {}, coopmat {}, up to {}x",
 			d.family, d.vendor, VulkanPrograms::Installed().programs.size(), d.portInstalled ? "installed" : "not available",
-			d.tensorInstalled ? "ready" : "not available", MaxGenerated + 1);
+			d.tensorInstalled ? "ready" : "not available", d.coopInstalled ? "ready" : "not available", MaxGenerated + 1);
 
 		return true;
 	}
@@ -585,18 +653,34 @@ namespace
 	}
 
 	// The tensor-core route replaces layers while the ported model runs on the CUDA path (VulkanPolicy::UseTensorCores).
-	// The path can change without a new context, CUDA and XMX Port run the same model and only what executes the layers
-	// differs, so this is set on every batch. A layer the route can't take stays a SPIR-V program in the same frame
+	// The path can change without a new context, CUDA, WMMA, and XMX Port run the same model and only what executes the
+	// layers differs, so this is set on every batch. A layer the route can't take stays a SPIR-V program in the same frame
 	void ApplyTensorGate(const Device& d, int32_t model)
 	{
 		const auto path = Plugin::options.path.load();
-		const bool on = d.tensorInstalled && VulkanPolicy::UseTensorCores(model == MfgKernels::MfgModel,
+		const bool portModel = model == MfgKernels::MfgModel;
+		const bool on = d.tensorInstalled && VulkanPolicy::UseTensorCores(portModel,
 			path == Plugin::Path::Cuda, path == Plugin::Path::XmxNative);
 
 		xvk::SetTensorCoresEnabled(d.d3d.Get(), on);
 
 		if (gTensorGate.exchange(on) != on)
 			Log::Info("Vulkan tensor cores: {}", on ? "on, the CUDA path runs the int8 layers on the tensor cores" : "off");
+
+		// Native XeFG XMX is D3D12 Intel-only; on Vulkan, XMX (native) only maps to Intel cooperative-matrix hardware.
+		const bool intelNativeXmx = (path == Plugin::Path::XmxNative && d.vendor == 0x8086);
+		const bool coopOn = !on && d.coopInstalled && VulkanPolicy::UseCoopMatrix(portModel,
+			path == Plugin::Path::XmxPort, intelNativeXmx, path == Plugin::Path::Cuda,
+			path == Plugin::Path::Wmma);
+
+		xvk::SetCoopMatrixEnabled(d.d3d.Get(), coopOn);
+
+		if (gCoopGate.exchange(coopOn) != coopOn)
+		{
+			SetModelName(model);
+			Log::Info("Vulkan cooperative matrix (WMMA/XMX): {}",
+				coopOn ? "on, VK_KHR_cooperative_matrix runs the int8 layers on hardware matrix units" : "off");
+		}
 	}
 
 	// The network the menu and OptiScaler show for the model that runs
@@ -606,7 +690,14 @@ namespace
 			return Plugin::Network::Fallback;
 
 		// The route turns itself off after a driver fault, then the layers are the SPIR-V ones
-		return gTensorGate.load() && xefg_cuda::VulkanActive() ? Plugin::Network::Cuda : Plugin::Network::XmxPort;
+		if (gTensorGate.load() && xefg_cuda::VulkanActive())
+			return Plugin::Network::Cuda;
+
+		if (gCoopGate.load() && xefg_cuda::CoopMatrixActive() &&
+			(Plugin::options.path.load() == Plugin::Path::Wmma || gDevice.vendor == 0x1002))
+			return Plugin::Network::Wmma;
+
+		return Plugin::Network::XmxPort;
 	}
 
 	// The images of one feature: back buffer size and format, depth size (the motion vectors are resampled to it). XeFG's
@@ -634,13 +725,31 @@ namespace
 
 		ApplyTensorGate(d, model);
 
-		const bool same = f.context && f.width == bb.width && f.height == bb.height && f.format == format &&
+		const auto path = static_cast<int32_t>(Plugin::options.path.load());
+		if (path != f.loggedPath)
+		{
+			f.loggedPath = path;
+			f.createFailed = false;
+		}
+
+		const bool sameSettings = f.width == bb.width && f.height == bb.height && f.format == format &&
 			f.depthWidth == depth.width && f.depthHeight == depth.height && f.motionFormat == motionFormat &&
 			f.hudlessFormat == hudlessFormat && f.uiFormat == uiFormat && f.inverted == inverted &&
 			f.jittered == jittered && f.model == model;
 
-		if (same)
-			return true;
+		if (sameSettings)
+		{
+			if (f.context)
+				return true;
+			if (!f.initFault.empty())
+			{
+				f.fault = f.initFault;
+				return false;
+			}
+			if (f.createFailed)
+				return false;
+		}
+		f.initFault.clear();
 
 		if (f.context)
 		{
@@ -649,6 +758,7 @@ namespace
 		}
 
 		f.havePrevious = false;
+		f.createFailed = false;
 		f.width = bb.width;
 		f.height = bb.height;
 		f.format = format;
@@ -678,6 +788,7 @@ namespace
 					FAILED(CreateTexture(d3d, in.ui->width, in.ui->height, uiFormat, slot.ui))))
 			{
 				f.fault = "input_images";
+				f.createFailed = true;
 				return false;
 			}
 
@@ -687,6 +798,7 @@ namespace
 			if (!slot.depthView || !slot.motionView)
 			{
 				f.fault = "input_views";
+				f.createFailed = true;
 				return false;
 			}
 		}
@@ -696,6 +808,7 @@ namespace
 			if (FAILED(CreateTexture(d3d, f.width, f.height, format, output)))
 			{
 				f.fault = "output_images";
+				f.createFailed = true;
 				return false;
 			}
 		}
@@ -703,6 +816,7 @@ namespace
 		if (!f.allocator && FAILED(d3d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&f.allocator))))
 		{
 			f.fault = "allocator";
+			f.createFailed = true;
 			return false;
 		}
 
@@ -710,12 +824,14 @@ namespace
 		XeFG::SetMaxInterpolatedFrames(MaxGenerated);
 		XeFG::OverrideModel(model);
 
+		const auto missingBefore = xvk::MissingProgramCount();
 		xefgd_handle_t context = nullptr;
 		xefgd_result_t result = CallXeFG("CreateContext", [&] { return XeFG::CreateContext(d3d, &context); });
 
 		if (result != XEFGD_RESULT_SUCCESS || !context)
 		{
 			f.fault = "create_context_" + std::to_string(result);
+			f.createFailed = true;
 			return false;
 		}
 
@@ -736,6 +852,14 @@ namespace
 		{
 			CallXeFG("Destroy", [&] { return XeFG::Destroy(context); });
 			f.fault = "init_" + std::to_string(result);
+			f.createFailed = true;
+			if (xvk::MissingProgramCount() != missingBefore)
+			{
+				f.initFault = f.fault + "_missing_spirv";
+				f.fault = f.initFault;
+				Log::Error("Vulkan: missing shader during XeFG Init; retries stopped for this input configuration. "
+					"Install the corrected Vulkan payload and restart the game");
+			}
 			return false;
 		}
 
@@ -814,7 +938,10 @@ namespace
 
 		const xefgd_result_t result = CallXeFG("Execute", [&] { return XeFG::Execute(f.context, f.list.Get(), f.exec); });
 		f.list->Close();
-		FullBarrier(d, command);
+		StageBarrier(d, command,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+			VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
 
 		if (result != XEFGD_RESULT_SUCCESS)
 		{
@@ -849,34 +976,59 @@ namespace
 			return false;
 		}
 
+		if (!in.depth->imageView || !in.motion->imageView ||
+			!VulkanPolicy::SampledAspect(in.depth->range.aspectMask) ||
+			in.motion->range.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+			in.backbuffer->range.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT)
+		{
+			f.fault = "input_view_or_aspect";
+			return false;
+		}
+
+		// XeFG's UI inputs cover the output extent. A differently sized optional
+		// image cannot be described as the full backbuffer: ignore it this batch.
+		auto usableUi = [&](const NgxResource* image) {
+			return image && image->width == in.backbuffer->width && image->height == in.backbuffer->height &&
+				image->range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT;
+		};
+		if (!usableUi(in.hudless)) in.hudless = nullptr;
+		if (!usableUi(in.ui)) in.ui = nullptr;
+
 		const bool inverted = parameters.GetOr<uint32_t>("DLSSG.DepthInverted", 0) != 0;
 		const bool jittered = parameters.GetOr<uint32_t>("DLSSG.MvecJittered", 0) != 0;
 
 		if (!EnsureFeature(d, f, in, inverted, jittered))
 			return false;
 
-		// Takes effect from XeFG's next Execute on
-		XeFG::SetDebugLines(Plugin::options.debugLines);
+		// Takes effect from XeFG's next Execute on; only call into libxess_fg.dll when the toggle changes
+		const bool debugLines = Plugin::options.debugLines.load(std::memory_order_relaxed);
+		static std::atomic<int> sLastDebugLines{ -1 };
+		if (sLastDebugLines.exchange(debugLines ? 1 : 0, std::memory_order_relaxed) != (debugLines ? 1 : 0))
+			XeFG::SetDebugLines(debugLines);
 
 		const bool reset = parameters.GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
 		Slot& slot = f.slots[f.current];
 
-		// The frame's inputs
-		FullBarrier(d, command);
+		// The frame's inputs: wait for the game's prior writes before transfer/compute reads
+		StageBarrier(d, command,
+			VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_ACCESS_MEMORY_WRITE_BIT,
+			VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
 		CopyImage(d, command, in.backbuffer->image, GameLayout, xvk::ImageOf(slot.backbuffer.Get()),
-			VK_IMAGE_LAYOUT_GENERAL, f.width, f.height);
+			VK_IMAGE_LAYOUT_GENERAL, f.width, f.height, in.backbuffer);
 
 		slot.hasHudless = in.hudless && slot.hudless;
 
 		if (slot.hasHudless)
 			CopyImage(d, command, in.hudless->image, GameLayout, xvk::ImageOf(slot.hudless.Get()),
-				VK_IMAGE_LAYOUT_GENERAL, std::min(in.hudless->width, f.width), std::min(in.hudless->height, f.height));
+				VK_IMAGE_LAYOUT_GENERAL, f.width, f.height, in.hudless);
 
 		slot.hasUi = in.ui && slot.ui;
 
 		if (slot.hasUi)
 			CopyImage(d, command, in.ui->image, GameLayout, xvk::ImageOf(slot.ui.Get()), VK_IMAGE_LAYOUT_GENERAL,
-				std::min(in.ui->width, f.width), std::min(in.ui->height, f.height));
+				f.width, f.height, in.ui);
 
 		const auto& depth = *in.depth;
 		const auto& motion = *in.motion;
@@ -885,7 +1037,11 @@ namespace
 			depth.width, depth.height);
 		RecordSampledCopy(d, command, d.pipelines[VulkanPolicy::MotionCopyShader(static_cast<uint32_t>(f.motionFormat))],
 			motion.imageView, slot.motionView, f.depthWidth, f.depthHeight, motion.width, motion.height);
-		FullBarrier(d, command);
+		StageBarrier(d, command,
+			VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 
 		// The frame's constants. DLSSG.MvecScale is already a pixel scale of the motion vectors' extent (not
 		// Streamline's normalized one), carried to the depth size they are resampled to. XeFG's left handed projection is
@@ -927,7 +1083,7 @@ namespace
 		DescribeFrame(f, previous, f.exec.prev);
 		DescribeFrame(f, slot, f.exec.next);
 		f.exec.prev.resetHistory = 0;
-		f.exec.next.resetHistory = reset ? 1 : 0;
+		f.exec.next.resetHistory = (reset || !f.havePrevious) ? 1 : 0;
 
 		f.execOutputs = {};
 		f.execBases = {};
@@ -940,10 +1096,14 @@ namespace
 		f.exec.numInterpolatedFrames = static_cast<uint8_t>(count);
 		f.exec.uiCompositionEnabled = (slot.hasHudless || slot.hasUi) ? 1u : 0u;
 
+		if (!RecordOutputs(d, f, command, range))
+		{
+			f.havePrevious = false;
+			return false;
+		}
 		f.current ^= 1;
 		f.havePrevious = true;
-
-		return RecordOutputs(d, f, command, range);
+		return true;
 	}
 
 	// ------------------------------------------------------------------------------------- the provider table
@@ -1059,11 +1219,24 @@ namespace
 
 			const NgxResource* output = ImageParameter(*parameters, "DLSSG.OutputInterpolated");
 
-			if (!output)
+			if (!output || output->range.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT)
 				return NGX_FAIL_INVALID_PARAMETER;
+
+			// Vulkan dispatchable objects from another device must never reach xvk.
+			if (*reinterpret_cast<const void* const*>(command) !=
+				*reinterpret_cast<const void* const*>(d.device))
+				return NGX_FAIL_PLATFORM_ERROR;
 
 			const NgxResource* real = ImageParameter(*parameters, "DLSSG.OutputReal");
 			const NgxResource* backbuffer = ImageParameter(*parameters, "DLSSG.Backbuffer");
+
+			if (!backbuffer || backbuffer->range.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+				!VulkanPolicy::CopyCompatible(backbuffer->format, output->format) ||
+				output->width != backbuffer->width || output->height != backbuffer->height ||
+				(real && (real->range.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+					!VulkanPolicy::CopyCompatible(backbuffer->format, real->format) ||
+					SameSubresource(*real, *output))))
+				return NGX_FAIL_INVALID_PARAMETER;
 
 			if (!xvk::BeginRecording(d.d3d.Get(), command))
 				return NGX_FAIL_PLATFORM_ERROR;
@@ -1074,6 +1247,7 @@ namespace
 			// DLSSG.EnableInterp 0 pauses generation for this frame (a menu, a loading screen): no XeFG work and the next
 			// batch starts without a previous frame
 			const bool interpolate = parameters->GetOr<uint32_t>("DLSSG.EnableInterp", 1) != 0;
+			bool didExecute = false;
 
 			if (!interpolate)
 			{
@@ -1081,6 +1255,7 @@ namespace
 				f.havePrevious = false;
 				f.generatedThrough = 0;
 				f.paused++;
+				VulkanHost::NotifyPaused();
 			}
 			else if (VulkanPolicy::NewBatch(index, f.lastIndex, count, f.batchCount, f.batches))
 			{
@@ -1089,6 +1264,7 @@ namespace
 				f.generatedThrough = 0;
 				f.batchReady = GenerateBatch(d, f, command, *parameters, count,
 					VulkanPolicy::ExecuteRange(true, index, count, false));
+				didExecute = f.batchReady;
 				f.batches++;
 
 				Plugin::Report({ f.width, f.height, count, f.exec.uiCompositionEnabled != 0, NetworkOf(f.model),
@@ -1096,65 +1272,94 @@ namespace
 
 				if (!f.batchReady)
 				{
+					f.havePrevious = false;
+					VulkanHost::NotifyPaused();
 					if (++f.failures <= 16)
 						Log::Error("Vulkan: batch failed ({}), index {}, count {}", f.fault, index, count);
 				}
-				else if (f.batches == 1 || f.batches % 6000 == 0)
+				else
 				{
-					Log::Info("Vulkan: {} batches of {} generated frames, {} evaluations, {} failures, {} paused", f.batches,
-						count, f.evaluations, f.failures, f.paused);
+					VulkanHost::NotifyBatchStart(count);
+					if (f.batches == 1 || f.batches % 6000 == 0)
+					{
+						Log::Info("Vulkan: {} batches of {} generated frames, {} evaluations, {} failures, {} paused", f.batches,
+							count, f.evaluations, f.failures, f.paused);
+					}
 				}
 			}
 			else if (f.batchReady && index > f.generatedThrough)
 			{
 				const auto range = VulkanPolicy::ExecuteRange(false, index, f.batchCount, false);
 
-				if (range.record && f.context && !RecordOutputs(d, f, command, range) && ++f.failures <= 16)
-					Log::Error("Vulkan: output {} of {} failed ({})", index, f.batchCount, f.fault);
+				if (range.record && f.context)
+				{
+					if (!RecordOutputs(d, f, command, range))
+					{
+						f.batchReady = false;
+						f.havePrevious = false;
+						f.generatedThrough = 0;
+						VulkanHost::NotifyPaused();
+						if (++f.failures <= 16)
+							Log::Error("Vulkan: output {} of {} failed ({})", index, f.batchCount, f.fault);
+					}
+					else
+					{
+						didExecute = true;
+					}
+				}
 			}
 
 			f.lastIndex = index;
 
 			const bool copied = f.batchReady && index <= f.generatedThrough && index <= f.batchCount &&
 				f.outputs[index - 1];
+			const bool copyReal = real && !SameSubresource(*real, *backbuffer);
+			const bool copyFallback = !copied && backbuffer && !SameSubresource(*output, *backbuffer) &&
+				VulkanPolicy::CopyCompatible(output->format, backbuffer->format);
+			const bool anyCopy = copyReal || copied || copyFallback;
+
+			// RecordOutputs already emits a COMPUTE -> TRANSFER barrier; only emit a pre-copy barrier when
+			// no execute ran in this evaluation (paused, fallback, or pre-generated cache hit).
+			if (anyCopy && !didExecute)
+			{
+				StageBarrier(d, command,
+					VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+					VK_ACCESS_MEMORY_WRITE_BIT,
+					VK_PIPELINE_STAGE_TRANSFER_BIT,
+					VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+			}
+
+			// Preserve the real frame before writing an interpolated output that may alias the backbuffer.
+			// real and output are verified disjoint above, so both copies share one exit barrier.
+			if (copyReal)
+			{
+				if (copied)
+					CopyImage(d, command, xvk::ImageOf(f.slots[f.current ^ 1].backbuffer.Get()),
+						VK_IMAGE_LAYOUT_GENERAL, real->image, GameLayout,
+						std::min(f.width, real->width), std::min(f.height, real->height), nullptr, real);
+				else
+					CopyImage(d, command, backbuffer->image, GameLayout, real->image, GameLayout,
+						std::min(backbuffer->width, real->width), std::min(backbuffer->height, real->height), backbuffer, real);
+				f.realCopies++;
+			}
 
 			if (copied)
 			{
-				FullBarrier(d, command);
 				CopyImage(d, command, xvk::ImageOf(f.outputs[index - 1].Get()), VK_IMAGE_LAYOUT_GENERAL, output->image,
-					GameLayout, std::min(output->width, f.width), std::min(output->height, f.height));
-				FullBarrier(d, command);
+					GameLayout, std::min(output->width, f.width), std::min(output->height, f.height), nullptr, output);
 			}
-			else if (backbuffer && output->image != backbuffer->image && output->format == backbuffer->format)
+			else if (copyFallback)
 			{
 				// Paused, or the batch failed: the real frame takes the output's place, never its stale content
-				FullBarrier(d, command);
 				CopyImage(d, command, backbuffer->image, GameLayout, output->image, GameLayout,
-					std::min(backbuffer->width, output->width), std::min(backbuffer->height, output->height));
-				FullBarrier(d, command);
+					std::min(backbuffer->width, output->width), std::min(backbuffer->height, output->height), backbuffer, output);
 			}
 
-			// Streamline presents DLSSG.OutputReal as the real frame after the generated ones, left unwritten the real
-			// frame on screen is a stale one
-			if (real && backbuffer && real->image != backbuffer->image)
+			if (anyCopy)
 			{
-				if (real->format != backbuffer->format)
-				{
-					if (!f.realFormatLogged)
-					{
-						f.realFormatLogged = true;
-						Log::Warn("Vulkan: DLSSG.OutputReal is format {} and the back buffer {}, the real frame isn't copied",
-							static_cast<int>(real->format), static_cast<int>(backbuffer->format));
-					}
-				}
-				else
-				{
-					FullBarrier(d, command);
-					CopyImage(d, command, backbuffer->image, GameLayout, real->image, GameLayout,
-						std::min(backbuffer->width, real->width), std::min(backbuffer->height, real->height));
-					FullBarrier(d, command);
-					f.realCopies++;
-				}
+				StageBarrier(d, command,
+					VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+					VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
 			}
 
 			xvk::EndRecording(d.d3d.Get());
@@ -1164,6 +1369,10 @@ namespace
 		}
 		catch (...)
 		{
+			std::scoped_lock lock(gDevice.mutex);
+			f.batchReady = false;
+			f.havePrevious = false;
+			f.generatedThrough = 0;
 			if (recording)
 				xvk::EndRecording(gDevice.d3d.Get());
 
@@ -1366,6 +1575,43 @@ VulkanRuntime::TensorStatus VulkanRuntime::GetTensorStatus()
 	{
 		std::scoped_lock lock(gStatusMutex);
 		status.reason = gTensorReason;
+	}
+
+	return status;
+}
+
+VulkanRuntime::CoopMatrixStatus VulkanRuntime::GetCoopMatrixStatus()
+{
+	CoopMatrixStatus status;
+	const auto route = xefg_cuda::CoopMatrixSnapshot();
+
+	switch (route.state)
+	{
+	case xefg_cuda::State::Active:
+		status.state = TensorState::Active;
+		break;
+	case xefg_cuda::State::Unavailable:
+		status.state = TensorState::Unavailable;
+		break;
+	case xefg_cuda::State::Disabled:
+		status.state = TensorState::Disabled;
+		break;
+	default:
+		break;
+	}
+
+	status.reason = route.reason;
+	status.tileM = route.major;
+	status.tileN = route.minor & 0xFFFF;
+	status.tileK = (route.minor >> 16) & 0xFFFF;
+	status.launches = route.launches;
+	status.fallbacks = route.fallbacks;
+	status.replacing = status.state == TensorState::Active && gCoopGate.load();
+
+	if (status.state == TensorState::NotAttempted)
+	{
+		std::scoped_lock lock(gStatusMutex);
+		status.reason = gCoopReason;
 	}
 
 	return status;
