@@ -15,12 +15,19 @@ struct Status
 {
     State state{State::NotAttempted};
     Arch arch{Arch::Unknown};
+    uint32_t vendorId{};
     uint32_t deviceId{};
+    uint32_t dxgiVendorId{};
+    uint32_t dxgiDeviceId{};
+    bool dxgiSpoofed{false};
     uint32_t waveMmaTier{};
     uint32_t layers{};
+    uint32_t overrideLayers{};
     uint64_t launches{};
     uint64_t fallbacks{};
     uint64_t binds{};
+    std::string gpuName;
+    std::string probeSource;
     std::string reason;
 };
 

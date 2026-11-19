@@ -1,4 +1,5 @@
 #include "wmma_route.h"
+#include "../AdapterIdentity.h"
 #include "../Cuda/AdapterDiscovery.h"
 #include "../Cuda/OverlayNative.h"
 #include "../Cuda/cuda_layers.h"
@@ -33,9 +34,15 @@ std::atomic<LogFunction> gLog{};
 std::atomic<State> gState{State::NotAttempted};
 std::atomic<Arch> gArch{Arch::Unknown};
 std::atomic<bool> gActive{false};
+uint32_t gVendorId{};
 uint32_t gDeviceId{};
+uint32_t gDxgiVendorId{};
+uint32_t gDxgiDeviceId{};
+bool gDxgiSpoofed{false};
 uint32_t gWaveMmaTier{};
 uint32_t gOverrideLayers{};
+std::string gGpuName;
+std::string gProbeSource;
 std::string gReason;
 
 IUnknown* gDeviceIdentity{};
@@ -43,6 +50,7 @@ ID3D12Device* gDevice{};
 uintptr_t gProviderBegin{}, gProviderEnd{};
 uintptr_t gWrapperBegin{}, gWrapperEnd{};
 uintptr_t gRuntimeBegin{}, gRuntimeEnd{};
+bool gWrappedDevice{false};
 
 std::atomic<uint64_t> gLaunches{}, gFallbacks{}, gBinds{};
 std::atomic<uint32_t> gLayerCount{};
@@ -54,6 +62,23 @@ void Log(const char* stage, const std::string& fields) noexcept
 {
     if (const auto fn = gLog.load(std::memory_order_relaxed))
         fn(stage, fields);
+}
+
+void MarkUnavailable(const std::string& why, const std::string& extra = {}) noexcept
+{
+    try
+    {
+        gReason = why;
+        gState.store(State::Unavailable, std::memory_order_release);
+        std::string fields = "\"state\":\"unavailable\",\"reason\":\"" + why + "\"";
+        if (!extra.empty())
+            fields += "," + extra;
+        Log("wmma_route", fields);
+    }
+    catch (...)
+    {
+        gState.store(State::Unavailable, std::memory_order_release);
+    }
 }
 
 // Identifies AMD RDNA 4 (gfx1200/gfx1201: Radeon RX 9070 XT / 9070 / 9060 XT, PCI DeviceIDs 0x7550..0x75FF)
@@ -73,9 +98,13 @@ Arch DetectAmdArch(uint32_t vendorId, uint32_t deviceId, std::wstring_view descr
 
     if ((deviceId >= 0x7440 && deviceId <= 0x74FF) ||
         deviceId == 0x15BF || deviceId == 0x15C8 || deviceId == 0x150E ||
+        deviceId == 0x1506 || deviceId == 0x1586 || deviceId == 0x1681 ||
         description.find(L"RX 7") != std::wstring_view::npos ||
         description.find(L"780M") != std::wstring_view::npos ||
+        description.find(L"880M") != std::wstring_view::npos ||
         description.find(L"890M") != std::wstring_view::npos ||
+        description.find(L"8060S") != std::wstring_view::npos ||
+        description.find(L"8050S") != std::wstring_view::npos ||
         description.find(L"RDNA 3") != std::wstring_view::npos ||
         description.find(L"gfx11") != std::wstring_view::npos)
     {
@@ -750,12 +779,14 @@ bool FromWrapper(const void* address) noexcept
     return at >= gWrapperBegin && at < gWrapperEnd;
 }
 
+bool AcceptedCaller(const void* caller) noexcept;
+
 bool ProviderCall(const void* caller) noexcept
 {
     if (FromProvider(caller))
         return true;
     if (!FromWrapper(caller))
-        return false;
+        return gWrappedDevice && gWrapperBegin == 0 && AcceptedCaller(caller);
     std::array<void*, 16> frames{};
     const USHORT count = RtlCaptureStackBackTrace(0, USHORT(frames.size()), frames.data(), nullptr);
     size_t i = 0;
@@ -872,7 +903,15 @@ void Recognize(ID3D12Device* device, const D3D12_COMPUTE_PIPELINE_STATE_DESC& de
             wmmaDesc.CachedPSO = {};
             if (const auto createCompute = DeviceOriginal<CreateComputeFn>(device, kCreateComputePipelineState))
             {
-                createCompute(device, &wmmaDesc, IID_PPV_ARGS(&wmmaPso));
+                const HRESULT hr = createCompute(device, &wmmaDesc, IID_PPV_ARGS(&wmmaPso));
+                if (FAILED(hr))
+                {
+                    Log("wmma_pso_failed",
+                        std::string("\"program\":\"") + xefg_cuda::kLayers[i].info.program +
+                        "\",\"kernel\":\"" + xefg_cuda::kLayers[i].info.kernel +
+                        "\",\"hr\":\"" + adapter_identity::Hex32(static_cast<uint32_t>(hr)) +
+                        "\",\"bytes\":" + std::to_string(gShaderBlobs[i].size()));
+                }
             }
         }
 
@@ -1080,8 +1119,7 @@ bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem
         }
         if (!device || !providerModule)
         {
-            gReason = "no_device";
-            gState.store(State::Unavailable, std::memory_order_release);
+            MarkUnavailable("no_device");
             reason = gReason;
             return false;
         }
@@ -1092,6 +1130,7 @@ bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem
         {
             gReason = "environment_off";
             gState.store(State::Disabled, std::memory_order_release);
+            Log("wmma_route", "\"state\":\"disabled\",\"reason\":\"environment_off\"");
             reason = gReason;
             return false;
         }
@@ -1101,23 +1140,38 @@ bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem
         ComPtr<ID3D12Device> native;
         if (!ResolveNative(device, native, owner, how))
         {
-            gReason = "wrapped_device";
-            gState.store(State::Unavailable, std::memory_order_release);
+            Log("wmma_device", "\"owner\":\"" + owner + "\",\"native\":\"unresolved\"");
+            MarkUnavailable("wrapped_device", "\"owner\":\"" + owner + "\"");
             reason = gReason;
             return false;
         }
-        if (native.Get() != device)
+        gWrappedDevice = (native.Get() != device);
+        if (gWrappedDevice)
         {
+            void** wrapperVtable = *reinterpret_cast<void***>(device);
             HMODULE wrapper{};
-            if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-                    static_cast<LPCWSTR>(*reinterpret_cast<void**>(device)), &wrapper) ||
-                !ProviderRange(wrapper, gWrapperBegin, gWrapperEnd))
+            bool pinned = false;
+            if (wrapperVtable &&
+                GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                    reinterpret_cast<LPCWSTR>(wrapperVtable), &wrapper) &&
+                ProviderRange(wrapper, gWrapperBegin, gWrapperEnd))
             {
-                gReason = "wrapper_image";
-                gState.store(State::Unavailable, std::memory_order_release);
-                reason = gReason;
-                return false;
+                pinned = true;
             }
+            else if (wrapperVtable && wrapperVtable[0] &&
+                GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                    reinterpret_cast<LPCWSTR>(wrapperVtable[0]), &wrapper) &&
+                ProviderRange(wrapper, gWrapperBegin, gWrapperEnd))
+            {
+                pinned = true;
+            }
+            else
+            {
+                gWrapperBegin = gWrapperEnd = 0;
+            }
+            Log("wmma_device",
+                "\"owner\":\"" + owner + "\",\"native\":\"" + how +
+                "\",\"wrapper_image\":\"" + (pinned ? "pinned" : "dynamic_vtable") + "\"");
         }
         device = native.Get();
         {
@@ -1131,51 +1185,53 @@ bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem
         }
 
         const LUID luid = device->GetAdapterLuid();
-        ComPtr<IDXGIFactory4> factory;
-        ComPtr<IDXGIAdapter1> adapter;
-        DXGI_ADAPTER_DESC1 desc{};
-        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) ||
-            FAILED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter))) ||
-            FAILED(adapter->GetDesc1(&desc)))
-        {
-            gReason = "adapter_query";
-            gState.store(State::Unavailable, std::memory_order_release);
-            reason = gReason;
-            return false;
-        }
+        const auto probe = adapter_identity::Probe(luid);
 
-        // Log the exposed adapter identity; a host may hook GetDesc1.
+        gVendorId = probe.vendorId;
+        gDeviceId = probe.deviceId;
+        gDxgiVendorId = probe.dxgiVendorId;
+        gDxgiDeviceId = probe.dxgiDeviceId;
+        gDxgiSpoofed = probe.dxgiSpoofed;
+        gGpuName = adapter_identity::WideToAsciiJson(probe.description);
+        gProbeSource = probe.source;
+
+        const std::string umdAscii = adapter_identity::WideToAsciiJson(probe.umdLeaf, 64);
+
         Log("wmma_adapter_probe",
-            std::string("\"vendor_id\":") + std::to_string(desc.VendorId) +
-            ",\"device_id\":" + std::to_string(desc.DeviceId) +
-            ",\"source\":\"dxgi_getdesc1\"");
+            "\"luid\":\"" + adapter_identity::FormatLuid(luid) +
+            "\",\"vendor_id\":" + std::to_string(probe.vendorId) +
+            ",\"vendor_hex\":\"" + adapter_identity::Hex16(probe.vendorId) +
+            "\",\"vendor_name\":\"" + adapter_identity::VendorName(probe.vendorId) +
+            "\",\"device_id\":" + std::to_string(probe.deviceId) +
+            ",\"device_hex\":\"" + adapter_identity::Hex16(probe.deviceId) +
+            "\",\"gpu\":\"" + gGpuName +
+            "\",\"source\":\"" + probe.source +
+            "\",\"dxgi_vendor_id\":" + std::to_string(probe.dxgiVendorId) +
+            ",\"dxgi_device_id\":" + std::to_string(probe.dxgiDeviceId) +
+            ",\"dxgi_spoofed\":" + (probe.dxgiSpoofed ? "true" : "false") +
+            ",\"umd\":\"" + umdAscii +
+            "\",\"probes\":\"" + probe.probeTrail + "\"");
 
-        if (desc.VendorId != 0x1002)
+        if (probe.vendorId == 0)
         {
-            gReason = "not_amd";
-            gState.store(State::Unavailable, std::memory_order_release);
+            MarkUnavailable("adapter_query", "\"probes\":\"" + probe.probeTrail + "\"");
             reason = gReason;
             return false;
         }
 
-        const Arch arch = DetectAmdArch(desc.VendorId, desc.DeviceId, desc.Description);
-        if (arch == Arch::Unknown)
+        if (probe.vendorId != 0x1002)
         {
-            gReason = "architecture_unsupported";
-            gState.store(State::Unavailable, std::memory_order_release);
+            MarkUnavailable("not_amd",
+                "\"vendor_hex\":\"" + adapter_identity::Hex16(probe.vendorId) +
+                "\",\"device_hex\":\"" + adapter_identity::Hex16(probe.deviceId) +
+                "\",\"gpu\":\"" + gGpuName +
+                "\",\"source\":\"" + probe.source +
+                "\",\"dxgi_spoofed\":" + (probe.dxgiSpoofed ? "true" : "false"));
             reason = gReason;
             return false;
         }
 
-        if (!ProviderRange(providerModule, gProviderBegin, gProviderEnd))
-        {
-            gReason = "provider_image";
-            gState.store(State::Unavailable, std::memory_order_release);
-            reason = gReason;
-            return false;
-        }
-
-        // Query D3D12_FEATURE_D3D12_OPTIONS9 (27) for WaveMMA support when offered by the runtime
+        // Query D3D12_FEATURE_D3D12_OPTIONS9 (27) for WaveMMA support before architecture gating so diagnostics include it.
         struct Options9Stub
         {
             BOOL MeshShaderPipelineStatsSupported;
@@ -1188,18 +1244,45 @@ bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem
         if (SUCCEEDED(device->CheckFeatureSupport(static_cast<D3D12_FEATURE>(27), &options9, sizeof(options9))))
             gWaveMmaTier = options9.WaveMMATier;
 
-        ComPtr<IUnknown> identity;
-        if (FAILED(device->QueryInterface(IID_PPV_ARGS(&identity))))
+        const Arch arch = DetectAmdArch(probe.vendorId, probe.deviceId, probe.description);
+        if (arch == Arch::Unknown)
         {
-            gReason = "device_identity";
-            gState.store(State::Unavailable, std::memory_order_release);
+            MarkUnavailable("architecture_unsupported",
+                "\"vendor_hex\":\"0x1002\",\"device_hex\":\"" + adapter_identity::Hex16(probe.deviceId) +
+                "\",\"gpu\":\"" + gGpuName +
+                "\",\"wave_mma_tier\":" + std::to_string(gWaveMmaTier) +
+                ",\"source\":\"" + probe.source +
+                "\",\"umd\":\"" + umdAscii + "\"");
             reason = gReason;
             return false;
         }
 
-        gDeviceId = desc.DeviceId;
+        if (!ProviderRange(providerModule, gProviderBegin, gProviderEnd))
+        {
+            MarkUnavailable("provider_image");
+            reason = gReason;
+            return false;
+        }
+
+        ComPtr<IUnknown> identity;
+        if (FAILED(device->QueryInterface(IID_PPV_ARGS(&identity))))
+        {
+            MarkUnavailable("device_identity");
+            reason = gReason;
+            return false;
+        }
+
         gArch.store(arch, std::memory_order_release);
+        std::error_code dirEc;
+        const bool wmmaDirExists = std::filesystem::is_directory(wmmaDir, dirEc);
         gOverrideLayers = LoadWmmaOverrides(wmmaDir);
+        const size_t expectedLayers = std::size(xefg_cuda::kLayers);
+        Log("wmma_overrides",
+            "\"dir_exists\":" + std::string(wmmaDirExists ? "true" : "false") +
+            ",\"loaded\":" + std::to_string(gOverrideLayers) +
+            ",\"expected\":" + std::to_string(expectedLayers) +
+            ",\"missing\":" + std::to_string(expectedLayers - gOverrideLayers));
+
         gDeviceIdentity = identity.Detach();
         gDevice = device;
         gDevice->AddRef();
@@ -1207,8 +1290,9 @@ bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem
         std::string patchFailure;
         if (!PatchDevice(device, patchFailure))
         {
-            gReason = patchFailure;
-            gState.store(State::Unavailable, std::memory_order_release);
+            MarkUnavailable(patchFailure,
+                "\"device_hex\":\"" + adapter_identity::Hex16(gDeviceId) +
+                "\",\"gpu\":\"" + gGpuName + "\"");
             reason = gReason;
             return false;
         }
@@ -1219,9 +1303,13 @@ bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem
 
         Log("wmma_route",
             std::string("\"state\":\"active\",\"arch\":\"") + (arch == Arch::Rdna4 ? "rdna4_gfx12" : "rdna3_gfx11") +
-            "\",\"device_id\":" + std::to_string(gDeviceId) +
+            "\",\"vendor_hex\":\"0x1002\",\"device_id\":" + std::to_string(gDeviceId) +
+            ",\"device_hex\":\"" + adapter_identity::Hex16(gDeviceId) +
+            "\",\"gpu\":\"" + gGpuName +
+            "\",\"source\":\"" + gProbeSource +
+            "\",\"dxgi_spoofed\":" + (gDxgiSpoofed ? "true" : "false") +
             ",\"wave_mma_tier\":" + std::to_string(gWaveMmaTier) +
-            ",\"layers\":" + std::to_string(std::size(xefg_cuda::kLayers)) +
+            ",\"layers\":" + std::to_string(expectedLayers) +
             ",\"overrides\":" + std::to_string(gOverrideLayers) +
             ",\"device_vtables\":" + std::to_string(gDevicePatchCount.load()) +
             ",\"device\":\"" + how + "\"");
@@ -1341,14 +1429,27 @@ Status Snapshot() noexcept
     std::lock_guard lock(gMutex);
     s.state = gState.load(std::memory_order_acquire);
     s.arch = gArch.load(std::memory_order_acquire);
+    s.vendorId = gVendorId;
     s.deviceId = gDeviceId;
+    s.dxgiVendorId = gDxgiVendorId;
+    s.dxgiDeviceId = gDxgiDeviceId;
+    s.dxgiSpoofed = gDxgiSpoofed;
     s.waveMmaTier = gWaveMmaTier;
     const uint32_t recognized = gLayerCount.load(std::memory_order_relaxed);
     s.layers = recognized ? recognized : static_cast<uint32_t>(std::size(xefg_cuda::kLayers));
+    s.overrideLayers = gOverrideLayers;
     s.launches = gLaunches.load(std::memory_order_relaxed);
     s.fallbacks = gFallbacks.load(std::memory_order_relaxed);
     s.binds = gBinds.load(std::memory_order_relaxed);
-    try { s.reason = gReason; } catch (...) {}
+    try
+    {
+        s.gpuName = gGpuName;
+        s.probeSource = gProbeSource;
+        s.reason = gReason;
+    }
+    catch (...)
+    {
+    }
     return s;
 }
 } // namespace xefg_wmma
