@@ -288,6 +288,19 @@ void main(uint3 groupID : SV_GroupID, uint tid : SV_GroupIndex)
             {
                 const int dy = tap / 3;
                 const int dx = tap % 3;
+                // Hoist 128-bit LDS activation loads out of the inner w=0..3 loop (75% fewer win[] LDS reads)
+                uint4 avCache[ROWS][PY];
+                [unroll]
+                for (int r = 0; r < ROWS; ++r)
+                {
+                    const int yl = int(warp) + r * 4;
+                    [unroll]
+                    for (int py = 0; py < PY; ++py)
+                    {
+                        const int rowY = (PY > 1) ? (2 * yl + py) : yl;
+                        avCache[r][py] = win[sliceBase + (rowY + dy) * WIN_W + int(px) + dx];
+                    }
+                }
                 [unroll]
                 for (int w = 0; w < 4; ++w)
                 {
@@ -298,12 +311,10 @@ void main(uint3 groupID : SV_GroupID, uint tid : SV_GroupIndex)
                     [unroll]
                     for (int r = 0; r < ROWS; ++r)
                     {
-                        const int yl = int(warp) + r * 4;
                         [unroll]
                         for (int py = 0; py < PY; ++py)
                         {
-                            const int rowY = (PY > 1) ? (2 * yl + py) : yl;
-                            uint4 av = win[sliceBase + (rowY + dy) * WIN_W + int(px) + dx];
+                            uint4 av = avCache[r][py];
                             uint a = (w == 0) ? av.x : ((w == 1) ? av.y : ((w == 2) ? av.z : av.w));
                             [unroll]
                             for (int c = 0; c < 8; ++c)
@@ -491,6 +502,13 @@ void main(uint3 groupID : SV_GroupID, uint tid : SV_GroupIndex)
         {
             const int dy = tap / 3;
             const int dx = tap % 3;
+            uint4 avCache[ROWS];
+            [unroll]
+            for (int r = 0; r < ROWS; ++r)
+            {
+                const int yl = int(warp) + r * 4;
+                avCache[r] = win[cur][(yl + dy) * WIN_W + int(px) + dx];
+            }
             [unroll]
             for (int w = 0; w < 4; ++w)
             {
@@ -509,8 +527,7 @@ void main(uint3 groupID : SV_GroupID, uint tid : SV_GroupIndex)
                 [unroll]
                 for (int r = 0; r < ROWS; ++r)
                 {
-                    const int yl = int(warp) + r * 4;
-                    uint4 av = win[cur][(yl + dy) * WIN_W + int(px) + dx];
+                    uint4 av = avCache[r];
                     uint a = (w == 0) ? av.x : ((w == 1) ? av.y : ((w == 2) ? av.z : av.w));
                     [unroll]
                     for (int c = 0; c < 16; ++c)
@@ -518,6 +535,17 @@ void main(uint3 groupID : SV_GroupID, uint tid : SV_GroupIndex)
                 }
             }
         }
+    }
+
+    // Hoist per-channel Flow bias and negMul loads out of the ROWS loop
+    uint4 bvCache[4];
+    uint4 nvCache[4];
+    [unroll]
+    for (int w = 0; w < 4; ++w)
+    {
+        int ch4 = (n0 * 8 + int(halfCh) * 16) + w * 4;
+        bvCache[w] = tScale[ch4 >> 2];
+        nvCache[w] = tBias[ch4 >> 2];
     }
 
     // Barrier-free Wave32 epilogue using WaveReadLaneAt
@@ -528,9 +556,8 @@ void main(uint3 groupID : SV_GroupID, uint tid : SV_GroupIndex)
         [unroll]
         for (int w = 0; w < 4; ++w)
         {
-            int ch4 = (n0 * 8 + int(halfCh) * 16) + w * 4;
-            uint4 bv = tScale[ch4 >> 2];
-            uint4 nv = tBias[ch4 >> 2];
+            uint4 bv = bvCache[w];
+            uint4 nv = nvCache[w];
             int ib[4] = { int(bv.x), int(bv.y), int(bv.z), int(bv.w) };
             int ng[4] = { int(nv.x), int(nv.y), int(nv.z), int(nv.w) };
             uint packed = 0u;
