@@ -1,0 +1,54 @@
+From: Patch <patch@local>
+Subject: [PATCH] Fix D3D12->Vulkan WMMA bridge xvk_cmdlist_failed on recorded xvk device
+
+Recorded xvk devices require an open xvk::BeginRecording(cmd) before
+ID3D12Device::CreateCommandList can call CommandList::Begin(). Creating
+gBridge.xvkList eagerly during Init() always failed with
+'CommandList::Begin: no recording open on the recorded device'
+(xvk_cmdlist_failed), forcing fallback to D3D12 cs_6_6 overrides.
+
+Create only gBridge.xvkAlloc in Init() and lazily create gBridge.xvkList
+inside xvk::BeginRecording() on first execution, matching VulkanRuntime.cpp.
+---
+diff --git a/src/vulkan/D3D12VulkanWmma.cpp b/src/vulkan/D3D12VulkanWmma.cpp
+--- a/src/vulkan/D3D12VulkanWmma.cpp
++++ b/src/vulkan/D3D12VulkanWmma.cpp
+@@ -657,7 +657,20 @@
+ 	bool execOk = false;
+ 	if (xvk::BeginRecording(gBridge.xvkDevice.Get(), cmd))
+ 	{
+-		if (SUCCEEDED(gBridge.xvkAlloc->Reset()) && SUCCEEDED(gBridge.xvkList->Reset(gBridge.xvkAlloc.Get(), nullptr)))
++		bool listReady = false;
++		if (!gBridge.xvkList)
++		{
++			listReady = SUCCEEDED(gBridge.xvkDevice->CreateCommandList(
++				0, D3D12_COMMAND_LIST_TYPE_DIRECT, gBridge.xvkAlloc.Get(), nullptr, IID_PPV_ARGS(&gBridge.xvkList))) &&
++				gBridge.xvkList != nullptr;
++		}
++		else
++		{
++			listReady = SUCCEEDED(gBridge.xvkAlloc->Reset()) &&
++				SUCCEEDED(gBridge.xvkList->Reset(gBridge.xvkAlloc.Get(), nullptr));
++		}
++
++		if (listReady)
+ 		{
+ 			const xefgd_result_t res = XeFG::Execute(gBridge.xefgContext, gBridge.xvkList.Get(), vkParams);
+ 			gBridge.xvkList->Close();
+@@ -1090,12 +1103,12 @@
+ 	if (FAILED(xvk::CreateDevice(xvkDesc, IID_PPV_ARGS(&gBridge.xvkDevice))) || !gBridge.xvkDevice)
+ 		return fail("xvk_device_failed");
+ 
+-	if (FAILED(gBridge.xvkDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&gBridge.xvkAlloc))) ||
+-		FAILED(gBridge.xvkDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, gBridge.xvkAlloc.Get(), nullptr, IID_PPV_ARGS(&gBridge.xvkList))))
++	// Recorded xvk devices require an active xvk::BeginRecording(cmd) before
++	// CreateCommandList can open recording, so create xvkList lazily on first execute.
++	if (FAILED(gBridge.xvkDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&gBridge.xvkAlloc))) || !gBridge.xvkAlloc)
+ 	{
+-		return fail("xvk_cmdlist_failed");
++		return fail("xvk_alloc_failed");
+ 	}
+-	gBridge.xvkList->Close();
+ 
+ 	std::string coopReason;
+ 	if (!VulkanCoopMat::Install(gBridge.xvkDevice.Get(), coopReason))
