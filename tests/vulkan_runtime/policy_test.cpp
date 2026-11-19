@@ -373,6 +373,43 @@ int main()
 		}
 	}
 
+
+	// ---- recorded-mode Vulkan PresentPacer: burst smoothing, V-Sync FIFO bypass, late-frame no-debt, pause reset
+	{
+		VulkanPolicy::PresentPacer pacer;
+		constexpr uint64_t ms = 1'000'000ull;
+
+		// Before two batches establish cadence, never stall
+		pacer.OnBatchStart(100 * ms, 3);
+		CHECK(pacer.ComputePresentWaitNs(101 * ms, false) == 0);
+
+		// Second batch arrives 20 ms later (50 base FPS, 4x FG -> 200 FPS, target step = 20ms * 0.95 / 4 = 4.75 ms)
+		pacer.OnBatchStart(120 * ms, 3);
+		// G1 arrives on time at 120 ms (19 ms since last present at 101 ms -> no wait)
+		CHECK(pacer.ComputePresentWaitNs(120 * ms, false) == 0);
+		// G2 bursts 0.2 ms later -> should wait ~4.55 ms
+		const uint64_t waitG2 = pacer.ComputePresentWaitNs(120 * ms + 200'000ull, false);
+		CHECK(waitG2 == 4'550'000ull);
+		// G3 bursts 0.2 ms after G2's paced time -> should wait ~4.55 ms
+		const uint64_t waitG3 = pacer.ComputePresentWaitNs(124'750'000ull + 200'000ull, false);
+		CHECK(waitG3 == 4'550'000ull);
+		// Real frame arrives late (10 ms after G3) -> must NOT wait or accumulate debt
+		CHECK(pacer.ComputePresentWaitNs(140 * ms, false) == 0);
+
+		// V-Sync FIFO active -> always returns 0
+		pacer.OnBatchStart(140 * ms, 3);
+		CHECK(pacer.ComputePresentWaitNs(140 * ms + 100'000ull, true) == 0);
+
+		// Pause disengages pacer immediately
+		pacer.OnPaused();
+		CHECK(pacer.ComputePresentWaitNs(141 * ms, false) == 0);
+
+		// Inactivity beyond 250 ms auto-disengages
+		pacer.OnBatchStart(200 * ms, 1);
+		pacer.OnBatchStart(220 * ms, 1);
+		CHECK(pacer.ComputePresentWaitNs(500 * ms, false) == 0);
+	}
+
 	std::printf("%d checks, %d failed\n", checks, failures);
 	return failures ? 1 : 0;
 }
