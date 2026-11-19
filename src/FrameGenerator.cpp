@@ -501,10 +501,32 @@ void FrameGenerator::ProbeSupport(ID3D12Device* device)
 			{
 				Plugin::wmmaSupport = Plugin::WmmaSupport::Supported;
 				xefg_wmma::SetEnabled(false);
+				const auto st = xefg_wmma::Snapshot();
+				const char* archName = st.arch == xefg_wmma::Arch::Rdna4 ? "RDNA 4 (gfx12)" : "RDNA 3 (gfx11)";
+				if (st.dxgiSpoofed)
+				{
+					Log::Info("WMMA route ready: {} ({}, device 0x{:04X}, WaveMMA tier {}, {}/{} shader overrides, source: {}, bypassed DXGI spoof 0x{:04X}:0x{:04X})",
+						st.gpuName.empty() ? "AMD GPU" : st.gpuName, archName, st.deviceId, st.waveMmaTier,
+						st.overrideLayers, st.layers, st.probeSource, st.dxgiVendorId, st.dxgiDeviceId);
+				}
+				else
+				{
+					Log::Info("WMMA route ready: {} ({}, device 0x{:04X}, WaveMMA tier {}, {}/{} shader overrides, source: {})",
+						st.gpuName.empty() ? "AMD GPU" : st.gpuName, archName, st.deviceId, st.waveMmaTier,
+						st.overrideLayers, st.layers, st.probeSource);
+				}
+				if (st.overrideLayers == 0)
+				{
+					Log::Warn("WMMA route active, but 0/{} compiled .dxbc shaders were found in {}; layers will run on XMX DP4a until wmma/*.dxbc shaders are installed",
+						st.layers, (MfgKernels::ProgramsDirectory() / L"wmma").string());
+				}
 			}
 			else
 			{
-				Log::Info("WMMA route inactive: {}", wmmaReason);
+				const auto st = xefg_wmma::Snapshot();
+				Log::Info("WMMA route inactive: {} (real GPU: {}, vendor 0x{:04X}, device 0x{:04X}, source: {}, DXGI spoofed: {}, WaveMMA tier: {})",
+					wmmaReason, st.gpuName.empty() ? "unknown" : st.gpuName, st.vendorId, st.deviceId,
+					st.probeSource.empty() ? "none" : st.probeSource, st.dxgiSpoofed ? "true" : "false", st.waveMmaTier);
 			}
 		});
 }
@@ -724,8 +746,44 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 		const auto route = xefg_wmma::Snapshot();
 
 		if (route.state != xefg_wmma::State::Active)
-			Log::Warn("WMMA path selected, but the WMMA INT8 route is unavailable ({}), the XMX DP4a INT8 port runs instead",
-				route.reason.empty() ? std::string("not installed") : route.reason);
+		{
+			Log::Warn("WMMA path selected, but the WMMA INT8 route is unavailable ({}; GPU: {}, vendor 0x{:04X}, device 0x{:04X}, source: {}, DXGI spoofed: {}), the XMX DP4a INT8 port runs instead",
+				route.reason.empty() ? std::string("not installed") : route.reason,
+				route.gpuName.empty() ? std::string("unknown") : route.gpuName,
+				route.vendorId, route.deviceId,
+				route.probeSource.empty() ? std::string("none") : route.probeSource,
+				route.dxgiSpoofed ? "true" : "false");
+		}
+		else if (route.overrideLayers == 0)
+		{
+			Log::Warn("WMMA path selected on {} (0x{:04X}), but 0/{} WMMA .dxbc overrides are loaded; layers fall back to XMX DP4a INT8",
+				route.gpuName.empty() ? std::string("AMD GPU") : route.gpuName, route.deviceId, route.layers);
+		}
+	}
+	else if (pathChanged && !UseWmma(settings.model))
+	{
+		const auto route = xefg_wmma::Snapshot();
+		if (route.vendorId == 0x1002)
+		{
+			if (route.state != xefg_wmma::State::Active)
+			{
+				Log::Info("WMMA not selected on AMD GPU {} (0x{:04X}): route unavailable ({}, WaveMMA tier {}, source: {})",
+					route.gpuName.empty() ? std::string("unknown") : route.gpuName, route.deviceId,
+					route.reason.empty() ? std::string("not installed") : route.reason,
+					route.waveMmaTier, route.probeSource.empty() ? std::string("none") : route.probeSource);
+			}
+			else if (settings.model != MfgKernels::MfgModel)
+			{
+				Log::Info("WMMA not selected on AMD GPU {} (0x{:04X}): active model is {} (requires ported model {})",
+					route.gpuName.empty() ? std::string("unknown") : route.gpuName, route.deviceId,
+					settings.model, MfgKernels::MfgModel);
+			}
+			else
+			{
+				Log::Info("WMMA available on AMD GPU {} (0x{:04X}) but not active because Network path is '{}' (switch to WMMA to enable)",
+					route.gpuName.empty() ? std::string("unknown") : route.gpuName, route.deviceId, Plugin::PathName(path));
+			}
+		}
 	}
 
 	if (pathChanged && (UseCuda(settings.model) || UseWmma(settings.model)))
