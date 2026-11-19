@@ -120,8 +120,8 @@ namespace VulkanPolicy
 		std::memcpy(out, matrix, sizeof(matrix));
 	}
 
-	// VkFormat and DXGI_FORMAT values, spelled out so this header needs neither header. VulkanRuntime.cpp static_asserts
-	// every one of them against the real enums
+	// VkFormat and DXGI_FORMAT values, so this header needs neither header. VulkanRuntime.cpp static_asserts that these are
+	// the real enum values
 	namespace Vk
 	{
 		constexpr uint32_t R8G8B8A8Unorm = 37;
@@ -179,6 +179,18 @@ namespace VulkanPolicy
 			return {};
 		}
 	}
+
+	// The copy path only supports the color formats understood by XeFG. sRGB and
+	// UNORM twins have the same texel layout; RGBA/BGRA and packed HDR do not.
+	inline bool CopyCompatible(uint32_t source, uint32_t target) noexcept
+	{
+		const auto a = ColorFormat(source).dxgi;
+		return a != Dxgi::Unknown && a == ColorFormat(target).dxgi;
+	}
+
+	// Combined depth/stencil image views cannot be sampled by our float sampler.
+	// Callers must supply a single depth or color aspect (Vulkan bits 2 and 1).
+	inline bool SampledAspect(uint32_t aspect) noexcept { return aspect == 1 || aspect == 2; }
 
 	// The format of the motion vector copy: two 32-bit floats when the game's are, else two 16-bit ones
 	inline uint32_t MotionFormat(uint32_t vkFormat) noexcept
@@ -276,6 +288,63 @@ namespace VulkanPolicy
 		return portModel && (cudaPath || nativePath);
 	}
 
+	// The VK_KHR_cooperative_matrix route (AMD RDNA3/RDNA4 WMMA and Intel Arc/Battlemage XMX) replaces the int8 layers of
+	// the ported MFG model when the WMMA, XMX Port, XMX (native), or CUDA path is selected on a GPU where the NVIDIA CUDA
+	// cubin route isn't active. Fallback (DP4a) keeps XeFG's stock model.
+	inline bool UseCoopMatrix(bool portModel, bool xmxPortPath, bool xmxNativePath, bool cudaPath, bool wmmaPath = false) noexcept
+	{
+		return portModel && (xmxPortPath || xmxNativePath || cudaPath || wmmaPath);
+	}
+
+	// Identifies AMD RDNA 4 (gfx1200/gfx1201: RX 9070 XT / 9070 / 9060 XT, PCI DeviceID 0x7550..0x75FF), where 3rd-gen
+	// Matrix Cores deliver 2048 INT8 ops/clock/CU (4x DP4a's 512 ops/clock/CU).
+	inline bool IsAmdRdna4Device(uint32_t vendorId, uint32_t deviceId, std::string_view deviceName = {}) noexcept
+	{
+		if (vendorId != 0x1002)
+			return false;
+
+		if (deviceId >= 0x7550 && deviceId <= 0x75FF)
+			return true;
+
+		return deviceName.find("RX 90") != std::string_view::npos ||
+		       deviceName.find("RDNA 4") != std::string_view::npos ||
+		       deviceName.find("gfx12") != std::string_view::npos;
+	}
+
+	// What a reason code of the cooperative-matrix route means, for the log and the menu
+	inline std::string DescribeCoopMatrix(std::string_view reason)
+	{
+		struct Row
+		{
+			std::string_view code;
+			std::string_view text;
+		};
+
+		static constexpr Row CoopMatrixRows[] = {
+			{ "environment_off", "XEFG_COOP_MATRIX is off in the environment" },
+			{ "no_port", "the ported MFG model couldn't be installed in libxess_fg.dll" },
+			{ "already_attempted", "the cooperative-matrix route was already installed on this device" },
+			{ "no_extensions", "the game's device has no VK_KHR_cooperative_matrix enabled" },
+			{ "device_inputs", "the layer's device lacks what the cooperative-matrix route needs" },
+			{ "instance_functions", "the Vulkan loader lacks vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR" },
+			{ "device_functions", "the device lacks compute pipeline functions for cooperative matrices" },
+			{ "no_int8_tile", "the GPU offers no subgroup SINT8 x SINT8 -> SINT32 cooperative matrix tile" },
+			{ "no_s8_matrix_shape", "the GPU offers no subgroup SINT8 x SINT8 -> SINT32 cooperative matrix shape" },
+			{ "layout_create", "the cooperative-matrix descriptor or pipeline layout couldn't be created" },
+			{ "shader_dir_missing", "the SPV_KHR_cooperative_matrix shaders aren't installed in xefg_mfg_programs\\vulkan\\coopmat" },
+			{ "exception", "the cooperative-matrix route failed while installing" },
+			{ "driver_fault", "the driver faulted while launching a cooperative-matrix shader, the route turned itself off" },
+		};
+
+		for (const auto& row : CoopMatrixRows)
+		{
+			if (row.code == reason)
+				return std::string(row.text);
+		}
+
+		return std::string(reason);
+	}
+
 	// What a reason code of the tensor-core route means, for the log and the menu: why it isn't installed. The codes are
 	// MFG-Unlocker's (xess/vulkan/xvk_tensor.cpp), except the two this dll gives itself. A code this doesn't know is
 	// returned as it is
@@ -355,6 +424,7 @@ namespace VulkanPolicy
 			{ "no_graphics_family", "the game's device has no graphics queue family" },
 			{ "intel_adapter", "Intel GPUs aren't supported on Vulkan: XeFG's own network needs Intel's D3D12 driver path" },
 			{ "device_functions", "the device lacks functions the runtime needs" },
+			{ "feature_chain_unsupported", "a feature request needs editing behind an unknown pNext structure; the game keeps its original device request" },
 			{ "prepare_exception", "the hooks failed while preparing the device" },
 			{ "no_xefg", "no compatible libxess_fg.dll was found" },
 			{ "no_vulkan_models", "the Vulkan models aren't installed or don't check out (xefg_mfg_programs\\vulkan)" },
@@ -374,4 +444,134 @@ namespace VulkanPolicy
 
 		return std::string(reason);
 	}
+
+	// CPU-side Vulkan present pacer for recorded-mode Multi-Frame Generation (e.g. Streamline/OptiScaler on AMD/Intel
+	// GPUs where VK_NV_low_latency2 out-of-band pacing is unavailable and V-Sync FIFO is off).
+	// Tracks real-frame batch cadence with an EMA and spaces burst vkQueuePresentKHR calls evenly across
+	// T_real / (generatedCount + 1) without stalling late frames or interfering with V-Sync FIFO.
+	struct PresentPacer
+	{
+		static constexpr uint64_t MinBatchNs = 2'000'000ull;       // 2 ms (500 base FPS)
+		static constexpr uint64_t MaxBatchNs = 250'000'000ull;     // 250 ms (4 base FPS)
+		static constexpr uint64_t ActiveWindowNs = 250'000'000ull; // auto-disengage after 250 ms idle
+		static constexpr uint64_t MaxWaitNs = 25'000'000ull;       // 25 ms hard safety cap per present
+		static constexpr uint64_t TargetRatioNum = 95ull;          // 95% of nominal interval leaves scanout headroom
+		static constexpr uint64_t TargetRatioDen = 100ull;
+
+		uint64_t lastBatchNs = 0;
+		uint64_t emaBatchNs = 0;
+		uint64_t targetStepNs = 0;
+		uint64_t lastPresentNs = 0;
+		uint64_t activeUntilNs = 0;
+		uint32_t generatedCount = 0;
+		uint32_t presentsInBatch = 0;
+
+		void Reset() noexcept
+		{
+			lastBatchNs = 0;
+			emaBatchNs = 0;
+			targetStepNs = 0;
+			lastPresentNs = 0;
+			activeUntilNs = 0;
+			generatedCount = 0;
+			presentsInBatch = 0;
+		}
+
+		void OnPaused() noexcept
+		{
+			lastBatchNs = 0;
+			targetStepNs = 0;
+			activeUntilNs = 0;
+			generatedCount = 0;
+			presentsInBatch = 0;
+		}
+
+		void OnBatchStart(uint64_t nowNs, uint32_t count) noexcept
+		{
+			count = ClampCount(count);
+			generatedCount = count;
+			presentsInBatch = 0;
+			activeUntilNs = nowNs + ActiveWindowNs;
+
+			if (lastBatchNs != 0 && nowNs > lastBatchNs)
+			{
+				const uint64_t delta = nowNs - lastBatchNs;
+				if (delta >= MinBatchNs && delta <= MaxBatchNs)
+				{
+					if (emaBatchNs == 0)
+					{
+						emaBatchNs = delta;
+					}
+					else if (delta > emaBatchNs * 2ull || delta * 2ull < emaBatchNs)
+					{
+						// Rapidly adapt on large framerate shifts (e.g. menu -> gameplay or scene cut)
+						emaBatchNs = (emaBatchNs + delta) / 2ull;
+					}
+					else
+					{
+						// Smooth 0.25 EMA for stable cadence
+						emaBatchNs = (emaBatchNs * 3ull + delta) / 4ull;
+					}
+
+					const uint64_t totalFrames = static_cast<uint64_t>(count) + 1ull;
+					targetStepNs = (emaBatchNs * TargetRatioNum) / (totalFrames * TargetRatioDen);
+				}
+				else
+				{
+					// Long hitch or pause: keep EMA reset until two valid batches arrive
+					emaBatchNs = 0;
+					targetStepNs = 0;
+				}
+			}
+
+			lastBatchNs = nowNs;
+		}
+
+		// Returns nanoseconds to wait before calling vkQueuePresentKHR and advances lastPresentNs to the target time.
+		uint64_t ComputePresentWaitNs(uint64_t nowNs, bool vsyncFifo) noexcept
+		{
+			if (vsyncFifo)
+			{
+				lastPresentNs = nowNs;
+				return 0;
+			}
+
+			if (generatedCount == 0 || targetStepNs == 0 || nowNs > activeUntilNs)
+			{
+				lastPresentNs = nowNs;
+				return 0;
+			}
+
+			// Guard against runaway pacing if a menu/overlay presents without new FG batches
+			if (presentsInBatch >= generatedCount + 2u)
+			{
+				lastPresentNs = nowNs;
+				return 0;
+			}
+
+			++presentsInBatch;
+
+			if (lastPresentNs == 0 || nowNs <= lastPresentNs)
+			{
+				lastPresentNs = nowNs;
+				return 0;
+			}
+
+			const uint64_t desiredNs = lastPresentNs + targetStepNs;
+			if (nowNs >= desiredNs)
+			{
+				// On time or late: present immediately, never accumulate timing debt
+				lastPresentNs = nowNs;
+				return 0;
+			}
+
+			uint64_t waitNs = desiredNs - nowNs;
+			const uint64_t capNs = std::min(targetStepNs, MaxWaitNs);
+			if (waitNs > capNs)
+				waitNs = capNs;
+
+			lastPresentNs = nowNs + waitNs;
+			return waitNs;
+		}
+	};
 } // namespace VulkanPolicy
