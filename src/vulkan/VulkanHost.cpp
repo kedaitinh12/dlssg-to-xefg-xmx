@@ -14,6 +14,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -25,7 +26,9 @@ namespace
 {
 	constexpr size_t MaxInstances = 16;
 	constexpr size_t MaxDevices = 64;
+	constexpr size_t MaxSwapchains = 64;
 	constexpr wchar_t LoaderName[] = L"vulkan-1.dll";
+	constexpr DWORD HighResTimerFlag = 0x00000002u; // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 
 	struct State
 	{
@@ -33,6 +36,7 @@ namespace
 		std::mutex mutex;
 		std::map<VkInstance, uint32_t> instances; // the API version the instance was created with
 		std::map<VkDevice, VulkanHost::DeviceRecord> devices;
+		std::map<VkSwapchainKHR, VkPresentModeKHR> swapchains;
 		std::map<VkPhysicalDevice, std::string> refused;
 		std::string detail;
 		std::string lastRefusal;
@@ -49,14 +53,33 @@ namespace
 		std::atomic_uint32_t prepared = 0;
 
 		PFN_vkGetInstanceProcAddr loaderGipa = nullptr;
+		PFN_vkGetDeviceProcAddr loaderGdpa = nullptr;
 		PFN_vkCreateInstance createInstance = nullptr;
 		PFN_vkCreateDevice createDevice = nullptr;
+		PFN_vkCreateSwapchainKHR createSwapchain = nullptr;
+		PFN_vkDestroySwapchainKHR destroySwapchain = nullptr;
+		PFN_vkQueuePresentKHR queuePresent = nullptr;
 		void* rawCreateInstance = nullptr;
 		void* rawCreateDevice = nullptr;
+		void* rawGdpa = nullptr;
+		void* rawCreateSwapchain = nullptr;
+		void* rawDestroySwapchain = nullptr;
+		void* rawQueuePresent = nullptr;
 		std::atomic<PFN_vkCreateInstance> gipaCreateInstance = nullptr;
 		std::atomic<PFN_vkCreateDevice> gipaCreateDevice = nullptr;
+		std::atomic<PFN_vkGetDeviceProcAddr> gipaGdpa = nullptr;
+		std::atomic<PFN_vkCreateSwapchainKHR> gdpaCreateSwapchain = nullptr;
+		std::atomic<PFN_vkDestroySwapchainKHR> gdpaDestroySwapchain = nullptr;
+		std::atomic<PFN_vkQueuePresentKHR> gdpaQueuePresent = nullptr;
 		bool gipaHooked = false;
+		bool presentHooked = false;
 		HMODULE(WINAPI* loadLibraryExW)(LPCWSTR, HANDLE, DWORD) = nullptr;
+
+		// Dedicated lock for low-overhead present pacing
+		std::mutex pacerMutex;
+		VulkanPolicy::PresentPacer pacer;
+		std::atomic_bool hwPacingActive = false;
+		std::atomic_bool pacingLogged = false;
 	};
 
 	// Leaked on purpose: a game's thread can call the hooks while the process exits, after the static destructors
@@ -87,6 +110,101 @@ namespace
 		std::lock_guard lock(s.mutex);
 		s.hooks = hooks;
 		s.detail = std::move(detail);
+	}
+
+	enum class PacingMode { Off, Auto, Force };
+
+	PacingMode GetPacingMode() noexcept
+	{
+		static const PacingMode mode = [] {
+			wchar_t value[16]{};
+			const DWORD len = GetEnvironmentVariableW(L"XEFG_VK_PACING", value, 16);
+			if (len && len < 16)
+			{
+				if (value[0] == L'0' || _wcsicmp(value, L"off") == 0 || _wcsicmp(value, L"false") == 0)
+					return PacingMode::Off;
+				if (_wcsicmp(value, L"force") == 0 || _wcsicmp(value, L"always") == 0)
+					return PacingMode::Force;
+			}
+			return PacingMode::Auto;
+		}();
+		return mode;
+	}
+
+	bool PacingActive(const State& s) noexcept
+	{
+		const PacingMode mode = GetPacingMode();
+		if (mode == PacingMode::Off)
+			return false;
+		if (mode == PacingMode::Force)
+			return true;
+		return !s.hwPacingActive.load(std::memory_order_relaxed);
+	}
+
+	uint64_t NowNs() noexcept
+	{
+		static const uint64_t freq = [] {
+			LARGE_INTEGER f{};
+			QueryPerformanceFrequency(&f);
+			return f.QuadPart > 0 ? static_cast<uint64_t>(f.QuadPart) : 10'000'000ull;
+		}();
+		LARGE_INTEGER counter{};
+		QueryPerformanceCounter(&counter);
+		const uint64_t ticks = counter.QuadPart > 0 ? static_cast<uint64_t>(counter.QuadPart) : 0ull;
+		const uint64_t sec = ticks / freq;
+		const uint64_t rem = ticks % freq;
+		return sec * 1'000'000'000ull + (rem * 1'000'000'000ull) / freq;
+	}
+
+	// Sub-millisecond wait using a per-thread Windows 10/11 high-resolution waitable timer (avoiding winmm.dll
+	// which OptiScaler frequently proxies) plus a short QPC spin-wait tail.
+	void WaitPreciseNs(uint64_t waitNs) noexcept
+	{
+		if (waitNs == 0)
+			return;
+
+		const uint64_t deadline = NowNs() + waitNs;
+		constexpr uint64_t SpinTailNs = 1'200'000ull; // 1.2 ms QPC spin tail
+
+		using CreateWaitableTimerExWFn = HANDLE(WINAPI*)(void*, LPCWSTR, DWORD, DWORD);
+		static const auto createTimerEx = [] {
+			const HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+			return k32 ? reinterpret_cast<CreateWaitableTimerExWFn>(GetProcAddress(k32, "CreateWaitableTimerExW")) : nullptr;
+		}();
+
+		struct ThreadTimer
+		{
+			HANDLE handle = nullptr;
+			~ThreadTimer() { if (handle) CloseHandle(handle); }
+		};
+		static thread_local ThreadTimer timer;
+		static thread_local bool timerAttempted = false;
+		if (!timerAttempted)
+		{
+			timerAttempted = true;
+			if (createTimerEx)
+				timer.handle = createTimerEx(nullptr, nullptr, HighResTimerFlag, 0x001F0003u /* TIMER_ALL_ACCESS */);
+		}
+
+		uint64_t now = NowNs();
+		if (now + SpinTailNs < deadline)
+		{
+			const uint64_t sleepNs = (deadline - now) - SpinTailNs;
+			if (timer.handle)
+			{
+				LARGE_INTEGER due{};
+				due.QuadPart = -static_cast<int64_t>(sleepNs / 100ull); // relative 100 ns intervals
+				if (due.QuadPart < 0 && SetWaitableTimer(timer.handle, &due, 0, nullptr, nullptr, 0))
+					WaitForSingleObject(timer.handle, 50u);
+			}
+			else if (sleepNs >= 2'000'000ull)
+			{
+				Sleep(static_cast<DWORD>(sleepNs / 1'000'000ull));
+			}
+		}
+
+		while (NowNs() < deadline)
+			YieldProcessor();
 	}
 
 	// ----------------------------------------------------------------------------------------------- instance
@@ -486,6 +604,12 @@ namespace
 				edit->record.coopMatrixExtensions = true;
 			}
 
+			// Detect native NVIDIA hardware pacing extensions (e.g. VK_NV_present_metering / VK_NV_low_latency2)
+			// so the CPU present pacer automatically yields to hardware flip metering on NVIDIA GPUs.
+			edit->record.hwPacing =
+				(offered("VK_NV_present_metering") && enabled("VK_NV_present_metering")) ||
+				(offered("VK_NV_low_latency2") && enabled("VK_NV_low_latency2"));
+
 			edit->info = *info;
 			edit->info.enabledExtensionCount = static_cast<uint32_t>(edit->extensions.size());
 			edit->info.ppEnabledExtensionNames = edit->extensions.data();
@@ -592,15 +716,19 @@ namespace
 				s.refused.erase(edit.record.physical);
 			}
 
+			if (edit.record.hwPacing)
+				s.hwPacingActive.store(true, std::memory_order_relaxed);
+
 			s.prepared++;
-			Log::Info("Vulkan device {} prepared for XeFG: graphics family {}, vendor {:#06x}{}{}",
+			Log::Info("Vulkan device {} prepared for XeFG: graphics family {}, vendor {:#06x}{}{}{}",
 				static_cast<const void*>(device), edit.record.family, edit.record.vendor,
 				edit.record.tensorExtensions ? ", tensor-core extensions enabled"
 				: edit.record.vendor == 0x10DE ? (edit.record.binaryImportSpec && edit.record.imageViewHandleSpec
 					? ", tensor-core extensions not enabled (XEFG_TENSOR_CORES is off or the driver refused them)"
 					: ", the driver doesn't offer the tensor-core extensions")
 				: "",
-				edit.record.coopMatrixExtensions ? ", VK_KHR_cooperative_matrix enabled" : "");
+				edit.record.coopMatrixExtensions ? ", VK_KHR_cooperative_matrix enabled" : "",
+				edit.record.hwPacing ? ", hardware pacing detected (CPU present pacer auto-bypassed)" : "");
 		}
 		catch (...)
 		{
@@ -673,6 +801,201 @@ namespace
 	// OptiScaler hooks vulkan-1.dll before ASI plugins run and returns its own hkvkCreateDevice from
 	// vkGetInstanceProcAddr. Wrapping vkGetInstanceProcAddr catches games that resolve vkCreateDevice via GIPA
 	// and call OptiScaler's hook directly (whose saved trampoline would otherwise bypass our loader prologue hook).
+	// --------------------------------------------------------------------------------------- swapchain / present pacing
+
+	bool IsFifoMode(VkPresentModeKHR mode) noexcept
+	{
+		return mode == VK_PRESENT_MODE_FIFO_KHR || mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+	}
+
+	VkResult CreateSwapchainImpl(PFN_vkCreateSwapchainKHR next, VkDevice device,
+		const VkSwapchainCreateInfoKHR* info, const VkAllocationCallbacks* allocator, VkSwapchainKHR* swapchain)
+	{
+		if (!next)
+			return VK_ERROR_INITIALIZATION_FAILED;
+
+		static thread_local bool inCreateSwapchain = false;
+		if (inCreateSwapchain)
+			return next(device, info, allocator, swapchain);
+
+		ReentryGuard guard(inCreateSwapchain);
+		const VkResult result = next(device, info, allocator, swapchain);
+
+		if (result == VK_SUCCESS && info && swapchain && *swapchain)
+		{
+			State& s = S();
+			std::lock_guard lock(s.mutex);
+			if (s.swapchains.size() >= MaxSwapchains)
+				s.swapchains.clear();
+			s.swapchains[*swapchain] = info->presentMode;
+		}
+
+		return result;
+	}
+
+	void DestroySwapchainImpl(PFN_vkDestroySwapchainKHR next, VkDevice device, VkSwapchainKHR swapchain,
+		const VkAllocationCallbacks* allocator)
+	{
+		if (!next)
+			return;
+
+		static thread_local bool inDestroySwapchain = false;
+		if (inDestroySwapchain)
+		{
+			next(device, swapchain, allocator);
+			return;
+		}
+
+		ReentryGuard guard(inDestroySwapchain);
+		if (swapchain)
+		{
+			State& s = S();
+			std::lock_guard lock(s.mutex);
+			s.swapchains.erase(swapchain);
+		}
+		next(device, swapchain, allocator);
+	}
+
+	VkResult QueuePresentImpl(PFN_vkQueuePresentKHR next, VkQueue queue, const VkPresentInfoKHR* info)
+	{
+		if (!next)
+			return VK_ERROR_INITIALIZATION_FAILED;
+
+		static thread_local bool inQueuePresent = false;
+		if (inQueuePresent)
+			return next(queue, info);
+
+		ReentryGuard guard(inQueuePresent);
+
+		State& s = S();
+		if (PacingActive(s))
+		{
+			bool vsyncFifo = false;
+			if (info && info->swapchainCount > 0 && info->pSwapchains)
+			{
+				std::lock_guard lock(s.mutex);
+				const auto it = s.swapchains.find(info->pSwapchains[0]);
+				if (it != s.swapchains.end())
+					vsyncFifo = IsFifoMode(it->second);
+			}
+
+			uint64_t waitNs = 0;
+			{
+				std::lock_guard lock(s.pacerMutex);
+				waitNs = s.pacer.ComputePresentWaitNs(NowNs(), vsyncFifo);
+			}
+
+			if (waitNs > 0)
+			{
+				if (!s.pacingLogged.exchange(true, std::memory_order_relaxed))
+					Log::Info("Vulkan present pacer active (V-Sync FIFO off, smoothing multi-frame burst presents)");
+				WaitPreciseNs(waitNs);
+			}
+		}
+
+		return next(queue, info);
+	}
+
+	VKAPI_ATTR VkResult VKAPI_CALL HookCreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* info,
+		const VkAllocationCallbacks* allocator, VkSwapchainKHR* swapchain)
+	{
+		return CreateSwapchainImpl(S().createSwapchain, device, info, allocator, swapchain);
+	}
+
+	VKAPI_ATTR VkResult VKAPI_CALL HookCreateSwapchainViaGdpa(VkDevice device, const VkSwapchainCreateInfoKHR* info,
+		const VkAllocationCallbacks* allocator, VkSwapchainKHR* swapchain)
+	{
+		State& s = S();
+		PFN_vkCreateSwapchainKHR next = s.gdpaCreateSwapchain.load(std::memory_order_acquire);
+		return CreateSwapchainImpl(next ? next : s.createSwapchain, device, info, allocator, swapchain);
+	}
+
+	VKAPI_ATTR void VKAPI_CALL HookDestroySwapchain(VkDevice device, VkSwapchainKHR swapchain,
+		const VkAllocationCallbacks* allocator)
+	{
+		DestroySwapchainImpl(S().destroySwapchain, device, swapchain, allocator);
+	}
+
+	VKAPI_ATTR void VKAPI_CALL HookDestroySwapchainViaGdpa(VkDevice device, VkSwapchainKHR swapchain,
+		const VkAllocationCallbacks* allocator)
+	{
+		State& s = S();
+		PFN_vkDestroySwapchainKHR next = s.gdpaDestroySwapchain.load(std::memory_order_acquire);
+		DestroySwapchainImpl(next ? next : s.destroySwapchain, device, swapchain, allocator);
+	}
+
+	VKAPI_ATTR VkResult VKAPI_CALL HookQueuePresent(VkQueue queue, const VkPresentInfoKHR* info)
+	{
+		return QueuePresentImpl(S().queuePresent, queue, info);
+	}
+
+	VKAPI_ATTR VkResult VKAPI_CALL HookQueuePresentViaGdpa(VkQueue queue, const VkPresentInfoKHR* info)
+	{
+		State& s = S();
+		PFN_vkQueuePresentKHR next = s.gdpaQueuePresent.load(std::memory_order_acquire);
+		return QueuePresentImpl(next ? next : s.queuePresent, queue, info);
+	}
+
+	PFN_vkVoidFunction WrapDeviceProc(const char* pName, PFN_vkVoidFunction fn)
+	{
+		if (!fn || !pName)
+			return fn;
+
+		State& s = S();
+		void* addr = reinterpret_cast<void*>(fn);
+
+		if (std::strcmp(pName, "vkQueuePresentKHR") == 0)
+		{
+			if (addr != s.rawQueuePresent &&
+				addr != reinterpret_cast<void*>(&HookQueuePresent) &&
+				addr != reinterpret_cast<void*>(&HookQueuePresentViaGdpa))
+			{
+				s.gdpaQueuePresent.store(reinterpret_cast<PFN_vkQueuePresentKHR>(fn), std::memory_order_release);
+				return reinterpret_cast<PFN_vkVoidFunction>(&HookQueuePresentViaGdpa);
+			}
+		}
+		else if (std::strcmp(pName, "vkCreateSwapchainKHR") == 0)
+		{
+			if (addr != s.rawCreateSwapchain &&
+				addr != reinterpret_cast<void*>(&HookCreateSwapchain) &&
+				addr != reinterpret_cast<void*>(&HookCreateSwapchainViaGdpa))
+			{
+				s.gdpaCreateSwapchain.store(reinterpret_cast<PFN_vkCreateSwapchainKHR>(fn), std::memory_order_release);
+				return reinterpret_cast<PFN_vkVoidFunction>(&HookCreateSwapchainViaGdpa);
+			}
+		}
+		else if (std::strcmp(pName, "vkDestroySwapchainKHR") == 0)
+		{
+			if (addr != s.rawDestroySwapchain &&
+				addr != reinterpret_cast<void*>(&HookDestroySwapchain) &&
+				addr != reinterpret_cast<void*>(&HookDestroySwapchainViaGdpa))
+			{
+				s.gdpaDestroySwapchain.store(reinterpret_cast<PFN_vkDestroySwapchainKHR>(fn), std::memory_order_release);
+				return reinterpret_cast<PFN_vkVoidFunction>(&HookDestroySwapchainViaGdpa);
+			}
+		}
+
+		return fn;
+	}
+
+	VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL HookGetDeviceProcAddr(VkDevice device, const char* pName)
+	{
+		State& s = S();
+		PFN_vkVoidFunction fn = s.loaderGdpa ? s.loaderGdpa(device, pName) : nullptr;
+		return WrapDeviceProc(pName, fn);
+	}
+
+	VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL HookGetDeviceProcAddrViaGipa(VkDevice device, const char* pName)
+	{
+		State& s = S();
+		PFN_vkGetDeviceProcAddr next = s.gipaGdpa.load(std::memory_order_acquire);
+		PFN_vkVoidFunction fn = next ? next(device, pName) : (s.loaderGdpa ? s.loaderGdpa(device, pName) : nullptr);
+		return WrapDeviceProc(pName, fn);
+	}
+
+	// OptiScaler hooks vulkan-1.dll before ASI plugins run and returns its own hkvkCreateDevice from
+	// vkGetInstanceProcAddr. Wrapping vkGetInstanceProcAddr catches games that resolve vkCreateDevice via GIPA
+	// and call OptiScaler's hook directly (whose saved trampoline would otherwise bypass our loader prologue hook).
 	VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL HookGetInstanceProcAddr(VkInstance instance, const char* pName)
 	{
 		State& s = S();
@@ -702,6 +1025,21 @@ namespace
 				s.gipaCreateInstance.store(reinterpret_cast<PFN_vkCreateInstance>(fn), std::memory_order_release);
 				return reinterpret_cast<PFN_vkVoidFunction>(&HookCreateInstanceViaGipa);
 			}
+		}
+		else if (std::strcmp(pName, "vkGetDeviceProcAddr") == 0)
+		{
+			void* addr = reinterpret_cast<void*>(fn);
+			if (addr != s.rawGdpa &&
+				addr != reinterpret_cast<void*>(&HookGetDeviceProcAddr) &&
+				addr != reinterpret_cast<void*>(&HookGetDeviceProcAddrViaGipa))
+			{
+				s.gipaGdpa.store(reinterpret_cast<PFN_vkGetDeviceProcAddr>(fn), std::memory_order_release);
+				return reinterpret_cast<PFN_vkVoidFunction>(&HookGetDeviceProcAddrViaGipa);
+			}
+		}
+		else
+		{
+			return WrapDeviceProc(pName, fn);
 		}
 
 		return fn;
@@ -786,6 +1124,30 @@ namespace
 		{
 			Log::Warn("Vulkan hooks: couldn't hook vkGetInstanceProcAddr, using loader detours only");
 		}
+
+		// Optional present/swapchain hooks for recorded-mode frame pacing (non-fatal if unavailable)
+		auto tryHook = [](HMODULE mod, const char* name, void* detour, void** rawOut, auto& trampolineOut) -> bool {
+			FARPROC proc = GetProcAddress(mod, name);
+			if (!proc)
+				return false;
+			*rawOut = reinterpret_cast<void*>(proc);
+			std::remove_reference_t<decltype(trampolineOut)> tramp = nullptr;
+			if (MH_CreateHook(reinterpret_cast<void*>(proc), detour, reinterpret_cast<void**>(&tramp)) != MH_OK)
+				return false;
+			trampolineOut = tramp;
+			if (MH_EnableHook(reinterpret_cast<void*>(proc)) != MH_OK)
+			{
+				trampolineOut = nullptr;
+				MH_RemoveHook(reinterpret_cast<void*>(proc));
+				return false;
+			}
+			return true;
+		};
+
+		tryHook(loader, "vkGetDeviceProcAddr", reinterpret_cast<void*>(&HookGetDeviceProcAddr), &s.rawGdpa, s.loaderGdpa);
+		tryHook(loader, "vkCreateSwapchainKHR", reinterpret_cast<void*>(&HookCreateSwapchain), &s.rawCreateSwapchain, s.createSwapchain);
+		tryHook(loader, "vkDestroySwapchainKHR", reinterpret_cast<void*>(&HookDestroySwapchain), &s.rawDestroySwapchain, s.destroySwapchain);
+		s.presentHooked = tryHook(loader, "vkQueuePresentKHR", reinterpret_cast<void*>(&HookQueuePresent), &s.rawQueuePresent, s.queuePresent);
 
 		s.loaderHooked = true;
 		return true;
@@ -973,6 +1335,22 @@ std::string VulkanHost::RefusalFor(VkPhysicalDevice physical)
 
 	const auto found = s.refused.find(physical);
 	return found == s.refused.end() ? std::string() : found->second;
+}
+
+void VulkanHost::NotifyBatchStart(uint32_t generatedCount) noexcept
+{
+	State& s = S();
+	if (!PacingActive(s))
+		return;
+	std::lock_guard lock(s.pacerMutex);
+	s.pacer.OnBatchStart(NowNs(), generatedCount);
+}
+
+void VulkanHost::NotifyPaused() noexcept
+{
+	State& s = S();
+	std::lock_guard lock(s.pacerMutex);
+	s.pacer.OnPaused();
 }
 
 VulkanRuntime::Status VulkanHost::Snapshot()

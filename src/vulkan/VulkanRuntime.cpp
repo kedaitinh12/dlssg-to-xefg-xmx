@@ -334,13 +334,18 @@ namespace
 
 	// ------------------------------------------------------------------------------------------ recording
 
+	void StageBarrier(const Device& d, VkCommandBuffer command,
+		VkPipelineStageFlags srcStage, VkAccessFlags srcAccess,
+		VkPipelineStageFlags dstStage, VkAccessFlags dstAccess)
+	{
+		VkMemoryBarrier memory{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, srcAccess, dstAccess };
+		d.vkCmdPipelineBarrier(command, srcStage, dstStage, 0, 1, &memory, 0, nullptr, 0, nullptr);
+	}
+
 	void FullBarrier(const Device& d, VkCommandBuffer command)
 	{
-		VkMemoryBarrier memory{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT,
-			VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
-
-		d.vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
-			&memory, 0, nullptr, 0, nullptr);
+		StageBarrier(d, command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+			VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
 	}
 
 	void CopyImage(const Device& d, VkCommandBuffer command, VkImage source, VkImageLayout sourceLayout, VkImage target,
@@ -933,7 +938,10 @@ namespace
 
 		const xefgd_result_t result = CallXeFG("Execute", [&] { return XeFG::Execute(f.context, f.list.Get(), f.exec); });
 		f.list->Close();
-		FullBarrier(d, command);
+		StageBarrier(d, command,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+			VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
 
 		if (result != XEFGD_RESULT_SUCCESS)
 		{
@@ -1001,8 +1009,12 @@ namespace
 		const bool reset = parameters.GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
 		Slot& slot = f.slots[f.current];
 
-		// The frame's inputs
-		FullBarrier(d, command);
+		// The frame's inputs: wait for the game's prior writes before transfer/compute reads
+		StageBarrier(d, command,
+			VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_ACCESS_MEMORY_WRITE_BIT,
+			VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
 		CopyImage(d, command, in.backbuffer->image, GameLayout, xvk::ImageOf(slot.backbuffer.Get()),
 			VK_IMAGE_LAYOUT_GENERAL, f.width, f.height, in.backbuffer);
 
@@ -1025,7 +1037,11 @@ namespace
 			depth.width, depth.height);
 		RecordSampledCopy(d, command, d.pipelines[VulkanPolicy::MotionCopyShader(static_cast<uint32_t>(f.motionFormat))],
 			motion.imageView, slot.motionView, f.depthWidth, f.depthHeight, motion.width, motion.height);
-		FullBarrier(d, command);
+		StageBarrier(d, command,
+			VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 
 		// The frame's constants. DLSSG.MvecScale is already a pixel scale of the motion vectors' extent (not
 		// Streamline's normalized one), carried to the depth size they are resampled to. XeFG's left handed projection is
@@ -1231,6 +1247,7 @@ namespace
 			// DLSSG.EnableInterp 0 pauses generation for this frame (a menu, a loading screen): no XeFG work and the next
 			// batch starts without a previous frame
 			const bool interpolate = parameters->GetOr<uint32_t>("DLSSG.EnableInterp", 1) != 0;
+			bool didExecute = false;
 
 			if (!interpolate)
 			{
@@ -1238,6 +1255,7 @@ namespace
 				f.havePrevious = false;
 				f.generatedThrough = 0;
 				f.paused++;
+				VulkanHost::NotifyPaused();
 			}
 			else if (VulkanPolicy::NewBatch(index, f.lastIndex, count, f.batchCount, f.batches))
 			{
@@ -1246,6 +1264,7 @@ namespace
 				f.generatedThrough = 0;
 				f.batchReady = GenerateBatch(d, f, command, *parameters, count,
 					VulkanPolicy::ExecuteRange(true, index, count, false));
+				didExecute = f.batchReady;
 				f.batches++;
 
 				Plugin::Report({ f.width, f.height, count, f.exec.uiCompositionEnabled != 0, NetworkOf(f.model),
@@ -1254,26 +1273,39 @@ namespace
 				if (!f.batchReady)
 				{
 					f.havePrevious = false;
+					VulkanHost::NotifyPaused();
 					if (++f.failures <= 16)
 						Log::Error("Vulkan: batch failed ({}), index {}, count {}", f.fault, index, count);
 				}
-				else if (f.batches == 1 || f.batches % 6000 == 0)
+				else
 				{
-					Log::Info("Vulkan: {} batches of {} generated frames, {} evaluations, {} failures, {} paused", f.batches,
-						count, f.evaluations, f.failures, f.paused);
+					VulkanHost::NotifyBatchStart(count);
+					if (f.batches == 1 || f.batches % 6000 == 0)
+					{
+						Log::Info("Vulkan: {} batches of {} generated frames, {} evaluations, {} failures, {} paused", f.batches,
+							count, f.evaluations, f.failures, f.paused);
+					}
 				}
 			}
 			else if (f.batchReady && index > f.generatedThrough)
 			{
 				const auto range = VulkanPolicy::ExecuteRange(false, index, f.batchCount, false);
 
-				if (range.record && f.context && !RecordOutputs(d, f, command, range))
+				if (range.record && f.context)
 				{
-					f.batchReady = false;
-					f.havePrevious = false;
-					f.generatedThrough = 0;
-					if (++f.failures <= 16)
-						Log::Error("Vulkan: output {} of {} failed ({})", index, f.batchCount, f.fault);
+					if (!RecordOutputs(d, f, command, range))
+					{
+						f.batchReady = false;
+						f.havePrevious = false;
+						f.generatedThrough = 0;
+						VulkanHost::NotifyPaused();
+						if (++f.failures <= 16)
+							Log::Error("Vulkan: output {} of {} failed ({})", index, f.batchCount, f.fault);
+					}
+					else
+					{
+						didExecute = true;
+					}
 				}
 			}
 
@@ -1281,13 +1313,26 @@ namespace
 
 			const bool copied = f.batchReady && index <= f.generatedThrough && index <= f.batchCount &&
 				f.outputs[index - 1];
+			const bool copyReal = real && !SameSubresource(*real, *backbuffer);
+			const bool copyFallback = !copied && backbuffer && !SameSubresource(*output, *backbuffer) &&
+				VulkanPolicy::CopyCompatible(output->format, backbuffer->format);
+			const bool anyCopy = copyReal || copied || copyFallback;
 
-			// Preserve the real frame before writing an interpolated output that may
-			// alias the backbuffer. Later evaluations use this batch's saved input,
-			// because that game backbuffer may already hold an interpolated frame.
-			if (real && !SameSubresource(*real, *backbuffer))
+			// RecordOutputs already emits a COMPUTE -> TRANSFER barrier; only emit a pre-copy barrier when
+			// no execute ran in this evaluation (paused, fallback, or pre-generated cache hit).
+			if (anyCopy && !didExecute)
 			{
-				FullBarrier(d, command);
+				StageBarrier(d, command,
+					VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+					VK_ACCESS_MEMORY_WRITE_BIT,
+					VK_PIPELINE_STAGE_TRANSFER_BIT,
+					VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+			}
+
+			// Preserve the real frame before writing an interpolated output that may alias the backbuffer.
+			// real and output are verified disjoint above, so both copies share one exit barrier.
+			if (copyReal)
+			{
 				if (copied)
 					CopyImage(d, command, xvk::ImageOf(f.slots[f.current ^ 1].backbuffer.Get()),
 						VK_IMAGE_LAYOUT_GENERAL, real->image, GameLayout,
@@ -1295,24 +1340,26 @@ namespace
 				else
 					CopyImage(d, command, backbuffer->image, GameLayout, real->image, GameLayout,
 						std::min(backbuffer->width, real->width), std::min(backbuffer->height, real->height), backbuffer, real);
-				FullBarrier(d, command);
 				f.realCopies++;
 			}
 
 			if (copied)
 			{
-				FullBarrier(d, command);
 				CopyImage(d, command, xvk::ImageOf(f.outputs[index - 1].Get()), VK_IMAGE_LAYOUT_GENERAL, output->image,
 					GameLayout, std::min(output->width, f.width), std::min(output->height, f.height), nullptr, output);
-				FullBarrier(d, command);
 			}
-			else if (backbuffer && !SameSubresource(*output, *backbuffer) && VulkanPolicy::CopyCompatible(output->format, backbuffer->format))
+			else if (copyFallback)
 			{
 				// Paused, or the batch failed: the real frame takes the output's place, never its stale content
-				FullBarrier(d, command);
 				CopyImage(d, command, backbuffer->image, GameLayout, output->image, GameLayout,
 					std::min(backbuffer->width, output->width), std::min(backbuffer->height, output->height), backbuffer, output);
-				FullBarrier(d, command);
+			}
+
+			if (anyCopy)
+			{
+				StageBarrier(d, command,
+					VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+					VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
 			}
 
 			xvk::EndRecording(d.d3d.Get());

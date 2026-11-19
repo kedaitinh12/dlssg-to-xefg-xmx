@@ -36,6 +36,8 @@ namespace VulkanHost
 		// VK_KHR_cooperative_matrix (AMD RDNA3/RDNA4 WMMA and Intel Arc/Battlemage XMX)
 		bool coopMatrixExtensions = false;
 		uint32_t coopMatrixSpec = 0;
+		// Hardware flip metering / low-latency pacing (VK_NV_present_metering or VK_NV_low_latency2)
+		bool hwPacing = false;
 	};
 
 	// Installs the hooks, or arranges for them to be installed when vulkan-1.dll is loaded. Later calls do nothing. Not
@@ -51,6 +53,10 @@ namespace VulkanHost
 
 	// The reason code (VulkanPolicy::Describe) the hooks turned this physical device down for, empty when they didn't
 	std::string RefusalFor(VkPhysicalDevice physical);
+
+	// Frame-pacing cadence signals from VulkanRuntime::Evaluate (recorded-mode MFG)
+	void NotifyBatchStart(uint32_t generatedCount) noexcept;
+	void NotifyPaused() noexcept;
 
 	// For the log and the menu
 	VulkanRuntime::Status Snapshot();

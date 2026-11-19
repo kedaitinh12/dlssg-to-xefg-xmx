@@ -453,7 +453,7 @@ void Device::EndRecording()
         if (vk_.vkCreateEvent(device_, &info, nullptr, &event) != VK_SUCCESS) { Fault("recording event"); return; }
     }
     // Set once everything recorded before it has run; the epoch's objects are released after that.
-    vk_.vkCmdSetEvent(command, event, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    vk_.vkCmdSetEvent(command, event, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
     QueueSlot& slot = *slots_[0];
     uint64_t value = 0;
     {

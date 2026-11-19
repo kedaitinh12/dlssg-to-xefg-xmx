@@ -444,4 +444,134 @@ namespace VulkanPolicy
 
 		return std::string(reason);
 	}
+
+	// CPU-side Vulkan present pacer for recorded-mode Multi-Frame Generation (e.g. Streamline/OptiScaler on AMD/Intel
+	// GPUs where VK_NV_low_latency2 out-of-band pacing is unavailable and V-Sync FIFO is off).
+	// Tracks real-frame batch cadence with an EMA and spaces burst vkQueuePresentKHR calls evenly across
+	// T_real / (generatedCount + 1) without stalling late frames or interfering with V-Sync FIFO.
+	struct PresentPacer
+	{
+		static constexpr uint64_t MinBatchNs = 2'000'000ull;       // 2 ms (500 base FPS)
+		static constexpr uint64_t MaxBatchNs = 250'000'000ull;     // 250 ms (4 base FPS)
+		static constexpr uint64_t ActiveWindowNs = 250'000'000ull; // auto-disengage after 250 ms idle
+		static constexpr uint64_t MaxWaitNs = 25'000'000ull;       // 25 ms hard safety cap per present
+		static constexpr uint64_t TargetRatioNum = 95ull;          // 95% of nominal interval leaves scanout headroom
+		static constexpr uint64_t TargetRatioDen = 100ull;
+
+		uint64_t lastBatchNs = 0;
+		uint64_t emaBatchNs = 0;
+		uint64_t targetStepNs = 0;
+		uint64_t lastPresentNs = 0;
+		uint64_t activeUntilNs = 0;
+		uint32_t generatedCount = 0;
+		uint32_t presentsInBatch = 0;
+
+		void Reset() noexcept
+		{
+			lastBatchNs = 0;
+			emaBatchNs = 0;
+			targetStepNs = 0;
+			lastPresentNs = 0;
+			activeUntilNs = 0;
+			generatedCount = 0;
+			presentsInBatch = 0;
+		}
+
+		void OnPaused() noexcept
+		{
+			lastBatchNs = 0;
+			targetStepNs = 0;
+			activeUntilNs = 0;
+			generatedCount = 0;
+			presentsInBatch = 0;
+		}
+
+		void OnBatchStart(uint64_t nowNs, uint32_t count) noexcept
+		{
+			count = ClampCount(count);
+			generatedCount = count;
+			presentsInBatch = 0;
+			activeUntilNs = nowNs + ActiveWindowNs;
+
+			if (lastBatchNs != 0 && nowNs > lastBatchNs)
+			{
+				const uint64_t delta = nowNs - lastBatchNs;
+				if (delta >= MinBatchNs && delta <= MaxBatchNs)
+				{
+					if (emaBatchNs == 0)
+					{
+						emaBatchNs = delta;
+					}
+					else if (delta > emaBatchNs * 2ull || delta * 2ull < emaBatchNs)
+					{
+						// Rapidly adapt on large framerate shifts (e.g. menu -> gameplay or scene cut)
+						emaBatchNs = (emaBatchNs + delta) / 2ull;
+					}
+					else
+					{
+						// Smooth 0.25 EMA for stable cadence
+						emaBatchNs = (emaBatchNs * 3ull + delta) / 4ull;
+					}
+
+					const uint64_t totalFrames = static_cast<uint64_t>(count) + 1ull;
+					targetStepNs = (emaBatchNs * TargetRatioNum) / (totalFrames * TargetRatioDen);
+				}
+				else
+				{
+					// Long hitch or pause: keep EMA reset until two valid batches arrive
+					emaBatchNs = 0;
+					targetStepNs = 0;
+				}
+			}
+
+			lastBatchNs = nowNs;
+		}
+
+		// Returns nanoseconds to wait before calling vkQueuePresentKHR and advances lastPresentNs to the target time.
+		uint64_t ComputePresentWaitNs(uint64_t nowNs, bool vsyncFifo) noexcept
+		{
+			if (vsyncFifo)
+			{
+				lastPresentNs = nowNs;
+				return 0;
+			}
+
+			if (generatedCount == 0 || targetStepNs == 0 || nowNs > activeUntilNs)
+			{
+				lastPresentNs = nowNs;
+				return 0;
+			}
+
+			// Guard against runaway pacing if a menu/overlay presents without new FG batches
+			if (presentsInBatch >= generatedCount + 2u)
+			{
+				lastPresentNs = nowNs;
+				return 0;
+			}
+
+			++presentsInBatch;
+
+			if (lastPresentNs == 0 || nowNs <= lastPresentNs)
+			{
+				lastPresentNs = nowNs;
+				return 0;
+			}
+
+			const uint64_t desiredNs = lastPresentNs + targetStepNs;
+			if (nowNs >= desiredNs)
+			{
+				// On time or late: present immediately, never accumulate timing debt
+				lastPresentNs = nowNs;
+				return 0;
+			}
+
+			uint64_t waitNs = desiredNs - nowNs;
+			const uint64_t capNs = std::min(targetStepNs, MaxWaitNs);
+			if (waitNs > capNs)
+				waitNs = capNs;
+
+			lastPresentNs = nowNs + waitNs;
+			return waitNs;
+		}
+	};
 } // namespace VulkanPolicy
