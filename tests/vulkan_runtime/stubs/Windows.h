@@ -84,6 +84,15 @@ extern "C++"
 	DWORD GetEnvironmentVariableW(LPCWSTR name, LPWSTR value, DWORD size);
 	DWORD GetLastError();
 	HANDLE GetCurrentProcess();
+	union LARGE_INTEGER { int64_t QuadPart; };
+	BOOL QueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCount);
+	BOOL QueryPerformanceFrequency(LARGE_INTEGER* lpFrequency);
+	BOOL SetWaitableTimer(HANDLE hTimer, const LARGE_INTEGER* lpDueTime, long lPeriod,
+		void* pfnCompletionRoutine, void* lpArgToCompletionRoutine, BOOL fResume);
+	DWORD WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds);
+	BOOL CloseHandle(HANDLE hObject);
+	void Sleep(DWORD dwMilliseconds);
+	inline void YieldProcessor() {}
 	ULONGLONG GetTickCount64();
 	int WideCharToMultiByte(UINT codePage, DWORD flags, const wchar_t* wide, int wideCount, char* narrow, int narrowCount,
 		const char* defaultChar, BOOL* usedDefault);
