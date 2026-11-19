@@ -7,7 +7,12 @@
 #include "VulkanTensor.h"
 
 #include <MinHook.h>
+#ifdef _MSC_VER
 #include <intrin.h>
+#define XEFG_RETURN_ADDRESS() XEFG_RETURN_ADDRESS()
+#else
+#define XEFG_RETURN_ADDRESS() __builtin_return_address(0)
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -423,7 +428,7 @@ namespace
 	VKAPI_ATTR VkResult VKAPI_CALL HookCreateInstance(const VkInstanceCreateInfo* info,
 		const VkAllocationCallbacks* allocator, VkInstance* instance)
 	{
-		return CreateInstanceImpl(S().createInstance, info, allocator, instance, _ReturnAddress());
+		return CreateInstanceImpl(S().createInstance, info, allocator, instance, XEFG_RETURN_ADDRESS());
 	}
 
 	VKAPI_ATTR VkResult VKAPI_CALL HookCreateInstanceViaGipa(const VkInstanceCreateInfo* info,
@@ -431,7 +436,7 @@ namespace
 	{
 		State& s = S();
 		PFN_vkCreateInstance next = s.gipaCreateInstance.load(std::memory_order_acquire);
-		return CreateInstanceImpl(next ? next : s.createInstance, info, allocator, instance, _ReturnAddress());
+		return CreateInstanceImpl(next ? next : s.createInstance, info, allocator, instance, XEFG_RETURN_ADDRESS());
 	}
 
 	// ------------------------------------------------------------------------------------------------ device
@@ -894,7 +899,7 @@ namespace
 	VKAPI_ATTR VkResult VKAPI_CALL HookCreateDevice(VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
 		const VkAllocationCallbacks* allocator, VkDevice* device)
 	{
-		return CreateDeviceImpl(S().createDevice, physical, info, allocator, device, _ReturnAddress());
+		return CreateDeviceImpl(S().createDevice, physical, info, allocator, device, XEFG_RETURN_ADDRESS());
 	}
 
 	VKAPI_ATTR VkResult VKAPI_CALL HookCreateDeviceViaGipa(VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
@@ -902,7 +907,7 @@ namespace
 	{
 		State& s = S();
 		PFN_vkCreateDevice next = s.gipaCreateDevice.load(std::memory_order_acquire);
-		return CreateDeviceImpl(next ? next : s.createDevice, physical, info, allocator, device, _ReturnAddress());
+		return CreateDeviceImpl(next ? next : s.createDevice, physical, info, allocator, device, XEFG_RETURN_ADDRESS());
 	}
 
 	// OptiScaler hooks vulkan-1.dll before ASI plugins run and returns its own hkvkCreateDevice from
