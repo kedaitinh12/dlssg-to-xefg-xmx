@@ -1,6 +1,7 @@
 // Ported from MFG-Unlocker source/native/xess/cuda/cuda_route.cpp, MIT licensed, see NOTICE.md.
 #include "cuda_route.h"
 #include "xefg_cuda_params.h"
+#include "../AdapterIdentity.h"
 #include "AdapterDiscovery.h"
 #include "../Sha256.h"
 #include "OverlayNative.h"
@@ -234,12 +235,7 @@ bool Capability(const LUID& luid, int& major, int& minor, std::string& name)
 
 UINT VendorOf(const LUID& luid)
 {
-    ComPtr<IDXGIFactory4> factory;
-    ComPtr<IDXGIAdapter1> adapter;
-    DXGI_ADAPTER_DESC1 description{};
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) || FAILED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter)))
-        || FAILED(adapter->GetDesc1(&description))) return 0;
-    return description.VendorId;
+    return adapter_identity::Probe(luid).vendorId;
 }
 
 // ---- state -------------------------------------------------------------------------------------------
