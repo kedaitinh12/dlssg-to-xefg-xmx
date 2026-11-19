@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <cwchar>
 #include <map>
 #include <memory>
 #include <mutex>
