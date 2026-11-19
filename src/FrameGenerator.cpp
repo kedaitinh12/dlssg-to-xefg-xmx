@@ -3,6 +3,7 @@
 #include "MfgKernels.h"
 #include "MfgPort/Cuda/cuda_route.h"
 #include "MfgPort/AdapterIdentity.h"
+#include "D3D12VulkanWmma.h"
 #include "MfgPort/Wmma/wmma_route.h"
 #include "Plugin.h"
 #include "Util.h"
@@ -111,6 +112,17 @@ static const char* HdrDescription(DXGI_FORMAT format)
 
 FrameGenerator::Context::~Context()
 {
+	for (auto& out : outputs)
+		D3D12VulkanWmma::ForgetResource(out.Get());
+	for (auto& f : frames)
+	{
+		D3D12VulkanWmma::ForgetResource(f.backbuffer.Get());
+		D3D12VulkanWmma::ForgetResource(f.hudless.Get());
+		D3D12VulkanWmma::ForgetResource(f.depth.Get());
+		D3D12VulkanWmma::ForgetResource(f.mvecs.Get());
+	}
+	D3D12VulkanWmma::ResetContext();
+
 	if (handle)
 	{
 		if (auto result = XeFG::Destroy(handle); result != XEFGD_RESULT_SUCCESS)
@@ -140,9 +152,15 @@ static ComPtr<ID3D12Resource> CreateTexture(ID3D12Device* device, D3D12_RESOURCE
 	ComPtr<ID3D12Resource> texture;
 	D3D12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
 
-	if (HRESULT hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
-		IID_PPV_ARGS(&texture));
-		FAILED(hr))
+	const bool tryShared = D3D12VulkanWmma::WantsSharedTextures() && D3D12VulkanWmma::CanShareTexture(desc);
+	HRESULT hr = E_FAIL;
+	if (tryShared)
+		hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc, state, nullptr,
+			IID_PPV_ARGS(&texture));
+	if (FAILED(hr))
+		hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
+			IID_PPV_ARGS(&texture));
+	if (FAILED(hr))
 	{
 		// The desc is built from the game's resource, so it has to be in the message to identify the culprit
 		Log::Error("CreateCommittedResource error: {:X} for {}, {}x{}x{}, mips {}, format {}, flags {:X}, layout {}, samples {}/{}",
@@ -206,6 +224,7 @@ static bool Capture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, ID
 			copyDesc.SampleDesc.Quality != desc.SampleDesc.Quality || copyDesc.Layout != desc.Layout ||
 			copyDesc.Flags != desc.Flags)
 		{
+			D3D12VulkanWmma::ForgetResource(copy.Get());
 			DeferredDestroy::Add(std::make_shared<ComPtr<ID3D12Resource>>(std::move(copy)));
 		}
 	}
@@ -525,7 +544,19 @@ void FrameGenerator::ProbeSupport(ID3D12Device* device)
 						st.gpuName.empty() ? "AMD GPU" : st.gpuName, archName, st.deviceId, st.waveMmaTier,
 						st.overrideLayers, st.layers, st.probeSource);
 				}
-				if (st.overrideLayers == 0)
+				std::string vkWmmaReason;
+				if (D3D12VulkanWmma::Install(device, vkWmmaReason))
+				{
+					const auto vkSt = D3D12VulkanWmma::Snapshot();
+					Log::Info("WMMA hardware bridge active: D3D12 -> Vulkan VK_KHR_cooperative_matrix ({}x{}x{} s8->s32, {} hardware WMMA shaders)",
+						vkSt.tileM, vkSt.tileN, vkSt.tileK, vkSt.coopLayers);
+				}
+				else
+				{
+					Log::Info("WMMA D3D12->Vulkan hardware bridge unavailable ({}); falling back to D3D12 cs_6_6 overrides",
+						vkWmmaReason.empty() ? "unknown" : vkWmmaReason);
+				}
+				if (st.overrideLayers == 0 && !D3D12VulkanWmma::Active())
 				{
 					Log::Warn("WMMA route active, but 0/{} compiled .dxbc shaders were found in {}; layers will run on XMX DP4a until wmma/*.dxbc shaders are installed",
 						st.layers, (MfgKernels::ProgramsDirectory() / L"wmma").string());
@@ -861,17 +892,29 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 
 	// Multi-frame batch reuse: when frameIndex == 1 already generated the entire batch (1..frameCount) in one pass,
 	// subsequent evaluations in the same batch simply copy their pre-generated output without re-entering XeFG::Execute.
+	const bool useVulkanWmma = UseWmma(settings.model) && D3D12VulkanWmma::Active();
+
+	// Multi-frame batch reuse: when frameIndex == 1 already generated the entire batch (1..frameCount) in one pass,
+	// subsequent evaluations in the same batch simply copy their pre-generated output without re-entering XeFG::Execute.
 	if (frameIndex > 1 && context->batchGeneratedThrough >= frameIndex &&
 		outputDesc.Width == settings.width && outputDesc.Height == settings.height &&
 		TypedFormat(outputDesc.Format) == settings.format &&
 		context->outputs[frameIndex - 1] != nullptr)
 	{
-		context->directOutput = false;
+		if (useVulkanWmma &&
+			D3D12VulkanWmma::AppendOutputCopy(cmdList, context->outputs[frameIndex - 1].Get(), output, OutputState))
+		{
+			context->directOutput = true;
+		}
+		else
+		{
+			context->directOutput = false;
+		}
 		return InterpolateResult::Interpolated;
 	}
 
 	// Zero-copy in-place UAV fast-path for 2x FG (frameCount == 1) when the game's output texture is directly UAV-compatible
-	const bool canWriteDirect = frameCount == 1 && frameIndex == 1 && output != nullptr &&
+	const bool canWriteDirect = !useVulkanWmma && frameCount == 1 && frameIndex == 1 && output != nullptr &&
 		outputDesc.Format == settings.format &&
 		(outputDesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0 &&
 		outputDesc.SampleDesc.Count == 1 &&
@@ -928,6 +971,31 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 	{
 		params.firstFrameIndex = frameIndex - 1;
 		params.frameCount = 1;
+	}
+
+	// When WMMA is selected and the D3D12->Vulkan VK_KHR_cooperative_matrix bridge is active, run the full XeFG
+	// batch on Vulkan hardware WMMA (16x16x16 SINT8->SINT32) with 1 fence bounce instead of D3D12 cs_6_6 DP4a.
+	if (useVulkanWmma && frameIndex == 1 && output != nullptr)
+	{
+		const Frame& prevFrame = context->frames[context->current ^ 1];
+		const Frame& nextFrame = context->frames[context->current];
+		D3D12VulkanWmma::ContextSettings vkSettings{
+			settings.width, settings.height, settings.format, settings.initFlags, settings.uiMode, settings.model
+		};
+		D3D12VulkanWmma::FrameInputs vkPrev{
+			prevFrame.backbuffer.Get(), prevFrame.hudless.Get(), prevFrame.depth.Get(), prevFrame.mvecs.Get(), prevFrame.data
+		};
+		D3D12VulkanWmma::FrameInputs vkNext{
+			nextFrame.backbuffer.Get(), nextFrame.hudless.Get(), nextFrame.depth.Get(), nextFrame.mvecs.Get(), nextFrame.data
+		};
+		if (D3D12VulkanWmma::ScheduleBatch(cmdList, vkSettings, vkPrev, vkNext,
+			reinterpret_cast<ID3D12Resource* const*>(context->outputs), context->outputBases, frameCount,
+			output, OutputState))
+		{
+			context->batchGeneratedThrough = frameCount;
+			context->directOutput = true;
+			return InterpolateResult::Interpolated;
+		}
 	}
 
 	// Execute records the provider's dispatches into the caller's list; make sure that list's table is hooked too
@@ -1019,10 +1087,14 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 		else if (UseWmma(settings.model))
 		{
 			routeReported = true;
+			const auto vkWmma = D3D12VulkanWmma::Snapshot();
 			const auto route = xefg_wmma::Snapshot();
 
-			if (route.launches > routeLaunches)
-				Log::Info("WMMA route: {} WMMA INT8 dispatches accelerated ({} layer binds, {} layers recognized)",
+			if (vkWmma.active && vkWmma.batches > 0)
+				Log::Info("WMMA hardware route: {} Vulkan VK_KHR_cooperative_matrix ({}x{}x{}) batches executed ({} hardware WMMA shaders, {} fallbacks)",
+					vkWmma.batches, vkWmma.tileM, vkWmma.tileN, vkWmma.tileK, vkWmma.coopLayers, vkWmma.fallbacks);
+			else if (route.launches > routeLaunches)
+				Log::Info("WMMA D3D12 fallback route: {} cs_6_6 INT8 dispatches accelerated ({} layer binds, {} layers recognized)",
 					route.launches - routeLaunches, route.binds, route.layers);
 		}
 	}
