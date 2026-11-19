@@ -7,6 +7,7 @@
 #include "VulkanTensor.h"
 
 #include <MinHook.h>
+#include <intrin.h>
 
 #include <algorithm>
 #include <atomic>
@@ -80,6 +81,7 @@ namespace
 		VulkanPolicy::PresentPacer pacer;
 		std::atomic_bool hwPacingActive = false;
 		std::atomic_bool pacingLogged = false;
+		std::atomic_bool translationSkipLogged = false;
 	};
 
 	// Leaked on purpose: a game's thread can call the hooks while the process exits, after the static destructors
@@ -221,6 +223,91 @@ namespace
 		                                                                  : VK_API_VERSION_1_0;
 	}
 
+	bool ContainsInsensitive(const char* haystack, const char* needle) noexcept
+	{
+		if (!haystack || !needle || !*needle)
+			return false;
+		for (const char* p = haystack; *p; ++p)
+		{
+			const char* a = p;
+			const char* b = needle;
+			while (*a && *b)
+			{
+				const unsigned char ca = static_cast<unsigned char>(*a);
+				const unsigned char cb = static_cast<unsigned char>(*b);
+				const unsigned char la = (ca >= 'A' && ca <= 'Z') ? static_cast<unsigned char>(ca + 32) : ca;
+				const unsigned char lb = (cb >= 'A' && cb <= 'Z') ? static_cast<unsigned char>(cb + 32) : cb;
+				if (la != lb)
+					break;
+				++a;
+				++b;
+			}
+			if (!*b)
+				return true;
+		}
+		return false;
+	}
+
+	bool ContainsInsensitiveW(const wchar_t* haystack, const wchar_t* needle) noexcept
+	{
+		if (!haystack || !needle || !*needle)
+			return false;
+		for (const wchar_t* p = haystack; *p; ++p)
+		{
+			const wchar_t* a = p;
+			const wchar_t* b = needle;
+			while (*a && *b)
+			{
+				wchar_t la = (*a >= L'A' && *a <= L'Z') ? static_cast<wchar_t>(*a + 32) : *a;
+				wchar_t lb = (*b >= L'A' && *b <= L'Z') ? static_cast<wchar_t>(*b + 32) : *b;
+				if (la != lb)
+					break;
+				++a;
+				++b;
+			}
+			if (!*b)
+				return true;
+		}
+		return false;
+	}
+
+	// On Wine / Proton (Linux), D3D12/D3D11 games run through VKD3D-Proton or DXVK, which create internal
+	// Vulkan instances and devices inside d3d12.dll / d3d12core.dll / dxgi.dll / d3d11.dll.
+	// Mutating those internal instances/devices (extensions, pNext chains, swapchains) crashes VKD3D-Proton.
+	bool IsTranslationLayerInstance(const VkInstanceCreateInfo* info) noexcept
+	{
+		if (!info || !info->pApplicationInfo)
+			return false;
+		const char* engine = info->pApplicationInfo->pEngineName;
+		const char* app = info->pApplicationInfo->pApplicationName;
+		return ContainsInsensitive(engine, "dxvk") || ContainsInsensitive(engine, "vkd3d") ||
+		       ContainsInsensitive(app, "dxvk") || ContainsInsensitive(app, "vkd3d");
+	}
+
+	bool IsTranslationLayerCaller(const void* caller) noexcept
+	{
+		if (!caller)
+			return false;
+		HMODULE mod = nullptr;
+		if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		        reinterpret_cast<LPCWSTR>(caller), &mod) || !mod)
+			return false;
+		wchar_t path[MAX_PATH]{};
+		const DWORD len = GetModuleFileNameW(mod, path, MAX_PATH);
+		if (!len || len >= MAX_PATH)
+			return false;
+		const wchar_t* leaf = wcsrchr(path, L'\\');
+		leaf = leaf ? (leaf + 1) : path;
+		return _wcsicmp(leaf, L"d3d12.dll") == 0 ||
+		       _wcsicmp(leaf, L"d3d12core.dll") == 0 ||
+		       _wcsicmp(leaf, L"dxgi.dll") == 0 ||
+		       _wcsicmp(leaf, L"d3d11.dll") == 0 ||
+		       _wcsicmp(leaf, L"d3d9.dll") == 0 ||
+		       _wcsicmp(leaf, L"d3d8.dll") == 0 ||
+		       ContainsInsensitiveW(leaf, L"vkd3d") ||
+		       ContainsInsensitiveW(leaf, L"dxvk");
+	}
+
 	// XeFG's programs need Vulkan 1.3. A game that asks for less gets 1.3 when the loader has it: the physical device
 	// decides what the device can use, the instance only has to allow it
 	const VkInstanceCreateInfo* PrepareInstance(const VkInstanceCreateInfo* info, InstanceEdit& edit) noexcept
@@ -294,7 +381,7 @@ namespace
 	};
 
 	VkResult CreateInstanceImpl(PFN_vkCreateInstance next, const VkInstanceCreateInfo* info,
-		const VkAllocationCallbacks* allocator, VkInstance* instance)
+		const VkAllocationCallbacks* allocator, VkInstance* instance, const void* caller)
 	{
 		if (!next)
 			return VK_ERROR_INITIALIZATION_FAILED;
@@ -306,6 +393,13 @@ namespace
 		ReentryGuard guard(inCreateInstance);
 
 		State& s = S();
+		if (IsTranslationLayerInstance(info) || IsTranslationLayerCaller(caller))
+		{
+			if (!s.translationSkipLogged.exchange(true, std::memory_order_relaxed))
+				Log::Info("Vulkan hooks: skipping DXVK/VKD3D translation-layer instance/device (leaving D3D-on-Vulkan untouched)");
+			return next(info, allocator, instance);
+		}
+
 		s.instanceCalls++;
 
 		InstanceEdit edit;
@@ -329,7 +423,7 @@ namespace
 	VKAPI_ATTR VkResult VKAPI_CALL HookCreateInstance(const VkInstanceCreateInfo* info,
 		const VkAllocationCallbacks* allocator, VkInstance* instance)
 	{
-		return CreateInstanceImpl(S().createInstance, info, allocator, instance);
+		return CreateInstanceImpl(S().createInstance, info, allocator, instance, _ReturnAddress());
 	}
 
 	VKAPI_ATTR VkResult VKAPI_CALL HookCreateInstanceViaGipa(const VkInstanceCreateInfo* info,
@@ -337,7 +431,7 @@ namespace
 	{
 		State& s = S();
 		PFN_vkCreateInstance next = s.gipaCreateInstance.load(std::memory_order_acquire);
-		return CreateInstanceImpl(next ? next : s.createInstance, info, allocator, instance);
+		return CreateInstanceImpl(next ? next : s.createInstance, info, allocator, instance, _ReturnAddress());
 	}
 
 	// ------------------------------------------------------------------------------------------------ device
@@ -736,7 +830,7 @@ namespace
 	}
 
 	VkResult CreateDeviceImpl(PFN_vkCreateDevice next, VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
-		const VkAllocationCallbacks* allocator, VkDevice* device)
+		const VkAllocationCallbacks* allocator, VkDevice* device, const void* caller)
 	{
 		if (!next)
 			return VK_ERROR_INITIALIZATION_FAILED;
@@ -748,6 +842,19 @@ namespace
 		ReentryGuard guard(inCreateDevice);
 
 		State& s = S();
+		if (IsTranslationLayerCaller(caller))
+		{
+			if (!s.translationSkipLogged.exchange(true, std::memory_order_relaxed))
+				Log::Info("Vulkan hooks: skipping DXVK/VKD3D translation-layer instance/device (leaving D3D-on-Vulkan untouched)");
+			return next(physical, info, allocator, device);
+		}
+
+		{
+			std::lock_guard lock(s.mutex);
+			if (s.instances.empty())
+				return next(physical, info, allocator, device);
+		}
+
 		s.deviceCalls++;
 
 		std::unique_ptr<DeviceEdit> edit;
@@ -787,7 +894,7 @@ namespace
 	VKAPI_ATTR VkResult VKAPI_CALL HookCreateDevice(VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
 		const VkAllocationCallbacks* allocator, VkDevice* device)
 	{
-		return CreateDeviceImpl(S().createDevice, physical, info, allocator, device);
+		return CreateDeviceImpl(S().createDevice, physical, info, allocator, device, _ReturnAddress());
 	}
 
 	VKAPI_ATTR VkResult VKAPI_CALL HookCreateDeviceViaGipa(VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
@@ -795,7 +902,7 @@ namespace
 	{
 		State& s = S();
 		PFN_vkCreateDevice next = s.gipaCreateDevice.load(std::memory_order_acquire);
-		return CreateDeviceImpl(next ? next : s.createDevice, physical, info, allocator, device);
+		return CreateDeviceImpl(next ? next : s.createDevice, physical, info, allocator, device, _ReturnAddress());
 	}
 
 	// OptiScaler hooks vulkan-1.dll before ASI plugins run and returns its own hkvkCreateDevice from
@@ -821,7 +928,7 @@ namespace
 		ReentryGuard guard(inCreateSwapchain);
 		const VkResult result = next(device, info, allocator, swapchain);
 
-		if (result == VK_SUCCESS && info && swapchain && *swapchain)
+		if (result == VK_SUCCESS && info && swapchain && *swapchain && S().prepared.load(std::memory_order_relaxed) > 0)
 		{
 			State& s = S();
 			std::lock_guard lock(s.mutex);
@@ -868,7 +975,7 @@ namespace
 		ReentryGuard guard(inQueuePresent);
 
 		State& s = S();
-		if (PacingActive(s))
+		if (s.prepared.load(std::memory_order_relaxed) > 0 && PacingActive(s))
 		{
 			bool vsyncFifo = false;
 			if (info && info->swapchainCount > 0 && info->pSwapchains)

@@ -667,10 +667,10 @@ namespace
 		if (gTensorGate.exchange(on) != on)
 			Log::Info("Vulkan tensor cores: {}", on ? "on, the CUDA path runs the int8 layers on the tensor cores" : "off");
 
-		// When the CUDA cubin route is not active, the VK_KHR_cooperative_matrix route runs the int8 layers on
-		// AMD RDNA3/RDNA4 (WMMA) or Intel Arc (XMX) hardware for the WMMA, XMX Port, XMX (native), and CUDA paths
+		// Native XeFG XMX is D3D12 Intel-only; on Vulkan, XMX (native) only maps to Intel cooperative-matrix hardware.
+		const bool intelNativeXmx = (path == Plugin::Path::XmxNative && d.vendor == 0x8086);
 		const bool coopOn = !on && d.coopInstalled && VulkanPolicy::UseCoopMatrix(portModel,
-			path == Plugin::Path::XmxPort, path == Plugin::Path::XmxNative, path == Plugin::Path::Cuda,
+			path == Plugin::Path::XmxPort, intelNativeXmx, path == Plugin::Path::Cuda,
 			path == Plugin::Path::Wmma);
 
 		xvk::SetCoopMatrixEnabled(d.d3d.Get(), coopOn);
