@@ -1,0 +1,2388 @@
+From 5ec7a91a5eeef9fee58eec465bb21d3fdc926698 Mon Sep 17 00:00:00 2001
+From: dlssg-to-xefg <dev@local>
+Date: Thu, 19 Nov 2026 10:05:51 +0000
+Subject: [PATCH] fix: combine Vulkan frame-pacing/RDR2 fixes with WMMA real
+ GPU detection and diagnostics
+
+---
+ dlssg-to-xefg.vcxproj                      |   1 +
+ src/FrameGenerator.cpp                     |  66 ++-
+ src/MfgPort/AdapterIdentity.h              | 617 +++++++++++++++++++++
+ src/MfgPort/Cuda/cuda_route.cpp            |   8 +-
+ src/MfgPort/Wmma/wmma_route.cpp            | 209 +++++--
+ src/MfgPort/Wmma/wmma_route.h              |   7 +
+ src/Plugin.cpp                             |  28 +-
+ src/vulkan/VulkanHost.cpp                  | 514 ++++++++++++++++-
+ src/vulkan/VulkanHost.h                    |   6 +
+ src/vulkan/VulkanPolicy.h                  | 130 +++++
+ src/vulkan/VulkanRuntime.cpp               | 105 +++-
+ src/vulkan/xvk_device.cpp                  |   2 +-
+ tests/vulkan_runtime/policy_test.cpp       |  37 ++
+ tests/vulkan_runtime/stubs/Windows.h       |   9 +
+ tests/vulkan_runtime/stubs/vulkan/vulkan.h |  33 ++
+ 15 files changed, 1670 insertions(+), 102 deletions(-)
+ create mode 100644 src/MfgPort/AdapterIdentity.h
+
+diff --git a/dlssg-to-xefg.vcxproj b/dlssg-to-xefg.vcxproj
+index c9c630a..dd00bbe 100644
+--- a/dlssg-to-xefg.vcxproj
++++ b/dlssg-to-xefg.vcxproj
+@@ -117,6 +117,7 @@
+     <ClInclude Include="src\FrameGenerator.h" />
+     <ClInclude Include="src\Log.h" />
+     <ClInclude Include="src\MfgKernels.h" />
++    <ClInclude Include="src\MfgPort\AdapterIdentity.h" />
+     <ClInclude Include="src\MfgPort\MfgPortLog.h" />
+     <ClInclude Include="src\MfgPort\ModelPort.h" />
+     <ClInclude Include="src\MfgPort\RuntimeLayout.generated.h" />
+diff --git a/src/FrameGenerator.cpp b/src/FrameGenerator.cpp
+index 28a6f99..708b6e8 100644
+--- a/src/FrameGenerator.cpp
++++ b/src/FrameGenerator.cpp
+@@ -501,10 +501,32 @@ void FrameGenerator::ProbeSupport(ID3D12Device* device)
+ 			{
+ 				Plugin::wmmaSupport = Plugin::WmmaSupport::Supported;
+ 				xefg_wmma::SetEnabled(false);
++				const auto st = xefg_wmma::Snapshot();
++				const char* archName = st.arch == xefg_wmma::Arch::Rdna4 ? "RDNA 4 (gfx12)" : "RDNA 3 (gfx11)";
++				if (st.dxgiSpoofed)
++				{
++					Log::Info("WMMA route ready: {} ({}, device 0x{:04X}, WaveMMA tier {}, {}/{} shader overrides, source: {}, bypassed DXGI spoof 0x{:04X}:0x{:04X})",
++						st.gpuName.empty() ? "AMD GPU" : st.gpuName, archName, st.deviceId, st.waveMmaTier,
++						st.overrideLayers, st.layers, st.probeSource, st.dxgiVendorId, st.dxgiDeviceId);
++				}
++				else
++				{
++					Log::Info("WMMA route ready: {} ({}, device 0x{:04X}, WaveMMA tier {}, {}/{} shader overrides, source: {})",
++						st.gpuName.empty() ? "AMD GPU" : st.gpuName, archName, st.deviceId, st.waveMmaTier,
++						st.overrideLayers, st.layers, st.probeSource);
++				}
++				if (st.overrideLayers == 0)
++				{
++					Log::Warn("WMMA route active, but 0/{} compiled .dxbc shaders were found in {}; layers will run on XMX DP4a until wmma/*.dxbc shaders are installed",
++						st.layers, (MfgKernels::ProgramsDirectory() / L"wmma").string());
++				}
+ 			}
+-			else if (wmmaReason != "not_amd")
++			else
+ 			{
+-				Log::Info("WMMA route inactive: {}", wmmaReason);
++				const auto st = xefg_wmma::Snapshot();
++				Log::Info("WMMA route inactive: {} (real GPU: {}, vendor 0x{:04X}, device 0x{:04X}, source: {}, DXGI spoofed: {}, WaveMMA tier: {})",
++					wmmaReason, st.gpuName.empty() ? "unknown" : st.gpuName, st.vendorId, st.deviceId,
++					st.probeSource.empty() ? "none" : st.probeSource, st.dxgiSpoofed ? "true" : "false", st.waveMmaTier);
+ 			}
+ 		});
+ }
+@@ -724,8 +746,44 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const
+ 		const auto route = xefg_wmma::Snapshot();
+ 
+ 		if (route.state != xefg_wmma::State::Active)
+-			Log::Warn("WMMA path selected, but the WMMA INT8 route is unavailable ({}), the XMX DP4a INT8 port runs instead",
+-				route.reason.empty() ? std::string("not installed") : route.reason);
++		{
++			Log::Warn("WMMA path selected, but the WMMA INT8 route is unavailable ({}; GPU: {}, vendor 0x{:04X}, device 0x{:04X}, source: {}, DXGI spoofed: {}), the XMX DP4a INT8 port runs instead",
++				route.reason.empty() ? std::string("not installed") : route.reason,
++				route.gpuName.empty() ? std::string("unknown") : route.gpuName,
++				route.vendorId, route.deviceId,
++				route.probeSource.empty() ? std::string("none") : route.probeSource,
++				route.dxgiSpoofed ? "true" : "false");
++		}
++		else if (route.overrideLayers == 0)
++		{
++			Log::Warn("WMMA path selected on {} (0x{:04X}), but 0/{} WMMA .dxbc overrides are loaded; layers fall back to XMX DP4a INT8",
++				route.gpuName.empty() ? std::string("AMD GPU") : route.gpuName, route.deviceId, route.layers);
++		}
++	}
++	else if (pathChanged && !UseWmma(settings.model))
++	{
++		const auto route = xefg_wmma::Snapshot();
++		if (route.vendorId == 0x1002)
++		{
++			if (route.state != xefg_wmma::State::Active)
++			{
++				Log::Info("WMMA not selected on AMD GPU {} (0x{:04X}): route unavailable ({}, WaveMMA tier {}, source: {})",
++					route.gpuName.empty() ? std::string("unknown") : route.gpuName, route.deviceId,
++					route.reason.empty() ? std::string("not installed") : route.reason,
++					route.waveMmaTier, route.probeSource.empty() ? std::string("none") : route.probeSource);
++			}
++			else if (settings.model != MfgKernels::MfgModel)
++			{
++				Log::Info("WMMA not selected on AMD GPU {} (0x{:04X}): active model is {} (requires ported model {})",
++					route.gpuName.empty() ? std::string("unknown") : route.gpuName, route.deviceId,
++					settings.model, MfgKernels::MfgModel);
++			}
++			else
++			{
++				Log::Info("WMMA available on AMD GPU {} (0x{:04X}) but not active because Network path is '{}' (switch to WMMA to enable)",
++					route.gpuName.empty() ? std::string("unknown") : route.gpuName, route.deviceId, Plugin::PathName(path));
++			}
++		}
+ 	}
+ 
+ 	if (pathChanged && (UseCuda(settings.model) || UseWmma(settings.model)))
+diff --git a/src/MfgPort/AdapterIdentity.h b/src/MfgPort/AdapterIdentity.h
+new file mode 100644
+index 0000000..7095ed2
+--- /dev/null
++++ b/src/MfgPort/AdapterIdentity.h
+@@ -0,0 +1,617 @@
++#pragma once
++// True physical GPU adapter identification by LUID, resilient to DXGI/NVAPI spoofing (e.g. OptiScaler
++// SpoofDxgi=true, OptiPatcher.asi, or DLSS upscaler selection on AMD GPUs).
++//
++// Resolution order (all dynamically loaded, zero extra .lib link dependencies):
++//   1. DXCore (dxcore.dll -> DXCoreCreateAdapterFactory -> GetAdapterByLuid -> HardwareID + DriverDescription)
++//   2. WDDM Kernel D3DKMT (gdi32.dll -> D3DKMTOpenAdapterFromLuid -> KMTQAITYPE_PHYSICALADAPTERDEVICEIDS,
++//      KMTQAITYPE_ADAPTERREGISTRYINFO, KMTQAITYPE_UMDRIVERNAME)
++//   3. DXGI (CreateDXGIFactory1 -> EnumAdapterByLuid -> GetDesc1) — always queried to detect spoofing,
++//      used as fallback only if DXCore and D3DKMT both fail.
++//   4. EnumDisplayDevicesW (user32.dll) PCI VEN_XXXX&DEV_YYYY fallback when both DXCore and D3DKMT fail
++//      but driver DLL evidence (e.g. amdxc64.dll) indicates DXGI spoofing.
++
++#include <Windows.h>
++#include <dxgi1_4.h>
++#include <wrl/client.h>
++
++#if defined(__has_include)
++#if __has_include(<dxcore.h>)
++#include <dxcore.h>
++#define XEFG_HAS_DXCORE_HEADER 1
++#endif
++#endif
++
++#include <array>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <cwctype>
++#include <string>
++#include <string_view>
++
++namespace adapter_identity
++{
++struct ProbeResult
++{
++    uint32_t vendorId{};
++    uint32_t deviceId{};
++    uint32_t subSysId{};
++    uint32_t revision{};
++    std::wstring description;
++    std::string source;        // "dxcore", "d3dkmt_device_ids", "d3dkmt_umd", "enum_display_devices", "dxgi_getdesc1", "none"
++    std::wstring umdLeaf;      // e.g. L"amdxc64.dll"
++
++    bool dxgiQueried{false};
++    uint32_t dxgiVendorId{};
++    uint32_t dxgiDeviceId{};
++    std::wstring dxgiDescription;
++    bool dxgiSpoofed{false};
++
++    std::string probeTrail;    // Compact diagnostic summary of every probe layer
++};
++
++inline std::string Hex16(uint32_t value)
++{
++    char buf[16]{};
++    std::snprintf(buf, sizeof(buf), "0x%04X", value & 0xFFFFu);
++    return buf;
++}
++
++inline std::string Hex32(uint32_t value)
++{
++    char buf[16]{};
++    std::snprintf(buf, sizeof(buf), "0x%08X", value);
++    return buf;
++}
++
++inline std::string FormatLuid(const LUID& luid)
++{
++    char buf[32]{};
++    std::snprintf(buf, sizeof(buf), "0x%lX:0x%08lX",
++        static_cast<unsigned long>(luid.HighPart),
++        static_cast<unsigned long>(luid.LowPart));
++    return buf;
++}
++
++inline const char* VendorName(uint32_t vendorId) noexcept
++{
++    switch (vendorId)
++    {
++    case 0x1002: return "AMD";
++    case 0x10DE: return "NVIDIA";
++    case 0x8086: return "Intel";
++    case 0x1414: return "Microsoft";
++    default: return "Unknown";
++    }
++}
++
++inline std::string WideToAsciiJson(std::wstring_view text, size_t maxLen = 128)
++{
++    std::string out;
++    out.reserve((text.size() < maxLen ? text.size() : maxLen));
++    for (wchar_t ch : text)
++    {
++        if (ch == L'\0' || out.size() >= maxLen)
++            break;
++        if (ch >= 0x20 && ch < 0x7F && ch != L'"' && ch != L'\\')
++            out.push_back(static_cast<char>(ch));
++        else if (ch == L'\\' || ch == L'"')
++            out.push_back('_');
++    }
++    while (!out.empty() && out.back() == ' ')
++        out.pop_back();
++    return out;
++}
++
++inline std::wstring Utf8ToWide(const char* utf8)
++{
++    if (!utf8 || !utf8[0])
++        return {};
++    const int needed = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
++    if (needed <= 1)
++        return {};
++    std::wstring wide(static_cast<size_t>(needed - 1), L'\0');
++    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wide.data(), needed);
++    return wide;
++}
++
++inline std::wstring LeafName(std::wstring_view path)
++{
++    const size_t slash = path.find_last_of(L"\\/");
++    if (slash == std::wstring_view::npos)
++        return std::wstring(path);
++    return std::wstring(path.substr(slash + 1));
++}
++
++inline bool ContainsInsensitive(std::wstring_view haystack, std::wstring_view needle) noexcept
++{
++    if (needle.empty() || haystack.size() < needle.size())
++        return false;
++    for (size_t i = 0; i + needle.size() <= haystack.size(); ++i)
++    {
++        bool match = true;
++        for (size_t j = 0; j < needle.size(); ++j)
++        {
++            if (std::towlower(haystack[i + j]) != std::towlower(needle[j]))
++            {
++                match = false;
++                break;
++            }
++        }
++        if (match)
++            return true;
++    }
++    return false;
++}
++
++inline uint32_t VendorFromUmdLeaf(std::wstring_view umdLeaf) noexcept
++{
++    if (umdLeaf.empty())
++        return 0;
++    if (ContainsInsensitive(umdLeaf, L"amdxc") ||
++        ContainsInsensitive(umdLeaf, L"aticfx") ||
++        ContainsInsensitive(umdLeaf, L"atidxx") ||
++        ContainsInsensitive(umdLeaf, L"amdh2") ||
++        ContainsInsensitive(umdLeaf, L"atiumd"))
++        return 0x1002;
++    if (ContainsInsensitive(umdLeaf, L"nvwgf2um") ||
++        ContainsInsensitive(umdLeaf, L"nvldumdx") ||
++        ContainsInsensitive(umdLeaf, L"nvd3dum"))
++        return 0x10DE;
++    if (ContainsInsensitive(umdLeaf, L"igd12") ||
++        ContainsInsensitive(umdLeaf, L"igdumdim") ||
++        ContainsInsensitive(umdLeaf, L"igd10") ||
++        ContainsInsensitive(umdLeaf, L"igc"))
++        return 0x8086;
++    return 0;
++}
++
++inline bool ParseHex4(std::wstring_view s, uint32_t& out) noexcept
++{
++    if (s.size() < 4)
++        return false;
++    uint32_t val = 0;
++    for (size_t i = 0; i < 4; ++i)
++    {
++        wchar_t c = s[i];
++        uint32_t nibble = 0;
++        if (c >= L'0' && c <= L'9') nibble = static_cast<uint32_t>(c - L'0');
++        else if (c >= L'a' && c <= L'f') nibble = static_cast<uint32_t>(10 + c - L'a');
++        else if (c >= L'A' && c <= L'F') nibble = static_cast<uint32_t>(10 + c - L'A');
++        else return false;
++        val = (val << 4) | nibble;
++    }
++    out = val;
++    return true;
++}
++
++inline bool ParsePciVenDev(std::wstring_view deviceIdStr, uint32_t& vendorOut, uint32_t& deviceOut) noexcept
++{
++    vendorOut = 0;
++    deviceOut = 0;
++    for (size_t i = 0; i + 8 <= deviceIdStr.size(); ++i)
++    {
++        if (ContainsInsensitive(deviceIdStr.substr(i, 4), L"VEN_"))
++        {
++            ParseHex4(deviceIdStr.substr(i + 4, 4), vendorOut);
++            break;
++        }
++    }
++    for (size_t i = 0; i + 8 <= deviceIdStr.size(); ++i)
++    {
++        if (ContainsInsensitive(deviceIdStr.substr(i, 4), L"DEV_"))
++        {
++            ParseHex4(deviceIdStr.substr(i + 4, 4), deviceOut);
++            break;
++        }
++    }
++    return vendorOut != 0;
++}
++
++namespace detail
++{
++inline void AppendTrail(std::string& trail, const std::string& item)
++{
++    if (!trail.empty())
++        trail += ",";
++    trail += item;
++}
++
++inline bool ProbeDxCore(const LUID& luid, uint32_t& vendorId, uint32_t& deviceId,
++    uint32_t& subSysId, uint32_t& revision, std::wstring& description, std::string& trail) noexcept
++{
++#if defined(XEFG_HAS_DXCORE_HEADER)
++    using Microsoft::WRL::ComPtr;
++    using CreateFactoryFn = HRESULT (WINAPI*)(REFIID, void**);
++
++    HMODULE dxcore = LoadLibraryExW(L"dxcore.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
++    if (!dxcore)
++    {
++        AppendTrail(trail, "dxcore=missing");
++        return false;
++    }
++
++    auto* createFactory = reinterpret_cast<CreateFactoryFn>(GetProcAddress(dxcore, "DXCoreCreateAdapterFactory"));
++    if (!createFactory)
++    {
++        FreeLibrary(dxcore);
++        AppendTrail(trail, "dxcore=no_export");
++        return false;
++    }
++
++    bool ok = false;
++    {
++        ComPtr<IDXCoreAdapterFactory> factory;
++        ComPtr<IDXCoreAdapter> adapter;
++        if (SUCCEEDED(createFactory(IID_PPV_ARGS(&factory))) && factory &&
++            SUCCEEDED(factory->GetAdapterByLuid(luid, IID_PPV_ARGS(&adapter))) && adapter)
++        {
++            DXCoreHardwareID hwId{};
++            if (adapter->IsPropertySupported(DXCoreAdapterProperty::HardwareID) &&
++                SUCCEEDED(adapter->GetProperty(DXCoreAdapterProperty::HardwareID, sizeof(hwId), &hwId)) &&
++                hwId.vendorID != 0)
++            {
++                vendorId = hwId.vendorID;
++                deviceId = hwId.deviceID;
++                subSysId = hwId.subSysID;
++                revision = hwId.revision;
++                ok = true;
++            }
++
++            if (adapter->IsPropertySupported(DXCoreAdapterProperty::DriverDescription))
++            {
++                size_t descSize = 0;
++                if (SUCCEEDED(adapter->GetPropertySize(DXCoreAdapterProperty::DriverDescription, &descSize)) &&
++                    descSize > 0 && descSize <= 512)
++                {
++                    std::string utf8(descSize, '\0');
++                    if (SUCCEEDED(adapter->GetProperty(DXCoreAdapterProperty::DriverDescription, utf8.size(), utf8.data())))
++                    {
++                        utf8.back() = '\0';
++                        description = Utf8ToWide(utf8.c_str());
++                    }
++                }
++            }
++        }
++    }
++
++    FreeLibrary(dxcore);
++    if (ok)
++        AppendTrail(trail, "dxcore=ok(" + Hex16(vendorId) + ":" + Hex16(deviceId) + ")");
++    else
++        AppendTrail(trail, "dxcore=fail");
++    return ok;
++#else
++    (void)luid;
++    (void)vendorId;
++    (void)deviceId;
++    (void)subSysId;
++    (void)revision;
++    (void)description;
++    AppendTrail(trail, "dxcore=no_header");
++    return false;
++#endif
++}
++
++struct KmtOpenAdapterFromLuid
++{
++    LUID AdapterLuid;
++    UINT hAdapter;
++};
++
++struct KmtCloseAdapter
++{
++    UINT hAdapter;
++};
++
++struct KmtQueryAdapterInfo
++{
++    UINT hAdapter;
++    UINT Type;
++    VOID* pPrivateDriverData;
++    UINT PrivateDriverDataSize;
++};
++
++struct KmtUmdDriverName
++{
++    UINT Version; // 3 = DX12, 2 = DX11
++    WCHAR UmdFileName[MAX_PATH];
++};
++
++struct KmtAdapterRegistryInfo
++{
++    WCHAR AdapterString[MAX_PATH];
++    WCHAR BiosString[MAX_PATH];
++    WCHAR DacType[MAX_PATH];
++    WCHAR ChipType[MAX_PATH];
++};
++
++struct KmtDeviceIds
++{
++    UINT VendorID;
++    UINT DeviceID;
++    UINT SubVendorID;
++    UINT SubSystemID;
++    UINT RevisionID;
++    UINT BusType;
++};
++
++struct KmtQueryDeviceIds
++{
++    UINT PhysicalAdapterIndex;
++    KmtDeviceIds DeviceIds;
++};
++
++constexpr UINT kKmtQaiUmdDriverName = 1;
++constexpr UINT kKmtQaiAdapterRegistryInfo = 8;
++constexpr UINT kKmtQaiPhysicalAdapterDeviceIds = 31;
++
++inline bool ProbeD3dkmt(const LUID& luid, uint32_t& vendorId, uint32_t& deviceId,
++    uint32_t& subSysId, uint32_t& revision, std::wstring& description,
++    std::wstring& umdLeaf, std::string& trail) noexcept
++{
++    using OpenFn = LONG (WINAPI*)(KmtOpenAdapterFromLuid*);
++    using QueryFn = LONG (WINAPI*)(const KmtQueryAdapterInfo*);
++    using CloseFn = LONG (WINAPI*)(const KmtCloseAdapter*);
++
++    HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
++    bool loadedHere = false;
++    if (!gdi)
++    {
++        gdi = LoadLibraryExW(L"gdi32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
++        loadedHere = (gdi != nullptr);
++    }
++    if (!gdi)
++    {
++        AppendTrail(trail, "d3dkmt=no_gdi32");
++        return false;
++    }
++
++    auto* openAdapter = reinterpret_cast<OpenFn>(GetProcAddress(gdi, "D3DKMTOpenAdapterFromLuid"));
++    auto* queryInfo = reinterpret_cast<QueryFn>(GetProcAddress(gdi, "D3DKMTQueryAdapterInfo"));
++    auto* closeAdapter = reinterpret_cast<CloseFn>(GetProcAddress(gdi, "D3DKMTCloseAdapter"));
++    if (!openAdapter || !queryInfo || !closeAdapter)
++    {
++        if (loadedHere) FreeLibrary(gdi);
++        AppendTrail(trail, "d3dkmt=no_exports");
++        return false;
++    }
++
++    KmtOpenAdapterFromLuid openParams{};
++    openParams.AdapterLuid = luid;
++    if (openAdapter(&openParams) < 0 || openParams.hAdapter == 0)
++    {
++        if (loadedHere) FreeLibrary(gdi);
++        AppendTrail(trail, "d3dkmt=open_fail");
++        return false;
++    }
++
++    bool gotIds = false;
++    {
++        KmtQueryDeviceIds devIds{};
++        devIds.PhysicalAdapterIndex = 0;
++        KmtQueryAdapterInfo q{};
++        q.hAdapter = openParams.hAdapter;
++        q.Type = kKmtQaiPhysicalAdapterDeviceIds;
++        q.pPrivateDriverData = &devIds;
++        q.PrivateDriverDataSize = sizeof(devIds);
++        if (queryInfo(&q) >= 0 && devIds.DeviceIds.VendorID != 0)
++        {
++            vendorId = devIds.DeviceIds.VendorID;
++            deviceId = devIds.DeviceIds.DeviceID;
++            subSysId = devIds.DeviceIds.SubSystemID;
++            revision = devIds.DeviceIds.RevisionID;
++            gotIds = true;
++        }
++    }
++
++    if (description.empty())
++    {
++        KmtAdapterRegistryInfo regInfo{};
++        KmtQueryAdapterInfo q{};
++        q.hAdapter = openParams.hAdapter;
++        q.Type = kKmtQaiAdapterRegistryInfo;
++        q.pPrivateDriverData = &regInfo;
++        q.PrivateDriverDataSize = sizeof(regInfo);
++        if (queryInfo(&q) >= 0 && regInfo.AdapterString[0] != L'\0')
++        {
++            regInfo.AdapterString[MAX_PATH - 1] = L'\0';
++            description = regInfo.AdapterString;
++        }
++    }
++
++    {
++        for (UINT version : {3u, 2u})
++        {
++            KmtUmdDriverName umd{};
++            umd.Version = version;
++            KmtQueryAdapterInfo q{};
++            q.hAdapter = openParams.hAdapter;
++            q.Type = kKmtQaiUmdDriverName;
++            q.pPrivateDriverData = &umd;
++            q.PrivateDriverDataSize = sizeof(umd);
++            if (queryInfo(&q) >= 0 && umd.UmdFileName[0] != L'\0')
++            {
++                umd.UmdFileName[MAX_PATH - 1] = L'\0';
++                umdLeaf = LeafName(umd.UmdFileName);
++                break;
++            }
++        }
++    }
++
++    KmtCloseAdapter closeParams{openParams.hAdapter};
++    closeAdapter(&closeParams);
++    if (loadedHere) FreeLibrary(gdi);
++
++    if (gotIds)
++        AppendTrail(trail, "d3dkmt=ok(" + Hex16(vendorId) + ":" + Hex16(deviceId) + ")");
++    else if (!umdLeaf.empty())
++        AppendTrail(trail, "d3dkmt=umd(" + WideToAsciiJson(umdLeaf, 48) + ")");
++    else
++        AppendTrail(trail, "d3dkmt=no_ids");
++
++    return gotIds;
++}
++
++inline bool ProbeEnumDisplayDevices(uint32_t expectedVendor, uint32_t& vendorId,
++    uint32_t& deviceId, std::wstring& description, std::string& trail) noexcept
++{
++    using EnumFn = BOOL (WINAPI*)(LPCWSTR, DWORD, PDISPLAY_DEVICEW, DWORD);
++    HMODULE user32 = GetModuleHandleW(L"user32.dll");
++    bool loadedHere = false;
++    if (!user32)
++    {
++        user32 = LoadLibraryExW(L"user32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
++        loadedHere = (user32 != nullptr);
++    }
++    if (!user32)
++        return false;
++
++    auto* enumDev = reinterpret_cast<EnumFn>(GetProcAddress(user32, "EnumDisplayDevicesW"));
++    if (!enumDev)
++    {
++        if (loadedHere) FreeLibrary(user32);
++        return false;
++    }
++
++    bool found = false;
++    for (DWORD i = 0; i < 16; ++i)
++    {
++        DISPLAY_DEVICEW dd{};
++        dd.cb = sizeof(dd);
++        if (!enumDev(nullptr, i, &dd, 0))
++            break;
++        if (!(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP))
++            continue;
++        uint32_t ven = 0, dev = 0;
++        if (ParsePciVenDev(dd.DeviceID, ven, dev))
++        {
++            if (expectedVendor != 0 && ven != expectedVendor)
++                continue;
++            vendorId = ven;
++            deviceId = dev;
++            if (description.empty() && dd.DeviceString[0] != L'\0')
++                description = dd.DeviceString;
++            found = true;
++            break;
++        }
++    }
++
++    if (loadedHere) FreeLibrary(user32);
++    if (found)
++        AppendTrail(trail, "display_dev=ok(" + Hex16(vendorId) + ":" + Hex16(deviceId) + ")");
++    return found;
++}
++} // namespace detail
++
++inline ProbeResult Probe(const LUID& luid) noexcept
++{
++    ProbeResult result;
++    result.source = "none";
++
++    try
++    {
++        // 1. Always query DXGI GetDesc1 so we can detect & report spoofing (OptiScaler / OptiPatcher)
++        {
++            using Microsoft::WRL::ComPtr;
++            ComPtr<IDXGIFactory4> factory;
++            ComPtr<IDXGIAdapter1> adapter;
++            DXGI_ADAPTER_DESC1 desc{};
++            if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) &&
++                SUCCEEDED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter))) &&
++                SUCCEEDED(adapter->GetDesc1(&desc)))
++            {
++                result.dxgiQueried = true;
++                result.dxgiVendorId = desc.VendorId;
++                result.dxgiDeviceId = desc.DeviceId;
++                result.dxgiDescription = desc.Description;
++                detail::AppendTrail(result.probeTrail,
++                    "dxgi=ok(" + Hex16(desc.VendorId) + ":" + Hex16(desc.DeviceId) + ")");
++            }
++            else
++            {
++                detail::AppendTrail(result.probeTrail, "dxgi=fail");
++            }
++        }
++
++        // 2. Primary real-GPU probe: DXCore (unhooked by OptiScaler, exact LUID match)
++        uint32_t dxcoreVen{}, dxcoreDev{}, dxcoreSub{}, dxcoreRev{};
++        std::wstring dxcoreDesc;
++        const bool dxcoreOk = detail::ProbeDxCore(
++            luid, dxcoreVen, dxcoreDev, dxcoreSub, dxcoreRev, dxcoreDesc, result.probeTrail);
++
++        // 3. Secondary real-GPU probe: WDDM Kernel D3DKMT (exact LUID match + UMD driver DLL name)
++        uint32_t kmtVen{}, kmtDev{}, kmtSub{}, kmtRev{};
++        std::wstring kmtDesc;
++        const bool kmtOk = detail::ProbeD3dkmt(
++            luid, kmtVen, kmtDev, kmtSub, kmtRev, kmtDesc, result.umdLeaf, result.probeTrail);
++
++        if (dxcoreOk)
++        {
++            result.vendorId = dxcoreVen;
++            result.deviceId = dxcoreDev;
++            result.subSysId = dxcoreSub;
++            result.revision = dxcoreRev;
++            result.description = !dxcoreDesc.empty() ? dxcoreDesc : kmtDesc;
++            result.source = "dxcore";
++        }
++        else if (kmtOk)
++        {
++            result.vendorId = kmtVen;
++            result.deviceId = kmtDev;
++            result.subSysId = kmtSub;
++            result.revision = kmtRev;
++            result.description = kmtDesc;
++            result.source = "d3dkmt_device_ids";
++        }
++        else
++        {
++            // Fallback when both DXCore and D3DKMT DeviceIds failed (e.g. older OS / translation layer):
++            // Check if D3DKMT UMD driver name (for this exact LUID) or loaded amdxc64.dll reveals vendor.
++            const uint32_t umdVendor = VendorFromUmdLeaf(result.umdLeaf);
++            const bool amdDllLoaded = GetModuleHandleW(L"amdxc64.dll") != nullptr;
++            const uint32_t hintVendor = umdVendor ? umdVendor : (amdDllLoaded && result.dxgiVendorId != 0x1002 ? 0x1002u : 0u);
++
++            uint32_t ddVen{}, ddDev{};
++            std::wstring ddDesc = kmtDesc;
++            if (hintVendor != 0 && detail::ProbeEnumDisplayDevices(hintVendor, ddVen, ddDev, ddDesc, result.probeTrail))
++            {
++                result.vendorId = ddVen;
++                result.deviceId = ddDev;
++                result.description = ddDesc;
++                result.source = "enum_display_devices";
++            }
++            else if (umdVendor != 0)
++            {
++                result.vendorId = umdVendor;
++                result.deviceId = (result.dxgiVendorId == umdVendor) ? result.dxgiDeviceId : 0;
++                result.description = !kmtDesc.empty() ? kmtDesc : result.dxgiDescription;
++                result.source = "d3dkmt_umd";
++            }
++            else if (result.dxgiQueried)
++            {
++                result.vendorId = result.dxgiVendorId;
++                result.deviceId = result.dxgiDeviceId;
++                result.description = result.dxgiDescription;
++                result.source = "dxgi_getdesc1";
++            }
++        }
++
++        if (result.vendorId != 0 && result.dxgiQueried &&
++            (result.vendorId != result.dxgiVendorId ||
++             (result.deviceId != 0 && result.dxgiDeviceId != 0 && result.deviceId != result.dxgiDeviceId)))
++        {
++            result.dxgiSpoofed = true;
++        }
++
++        if (result.description.empty() && result.dxgiQueried && !result.dxgiSpoofed)
++            result.description = result.dxgiDescription;
++    }
++    catch (...)
++    {
++    }
++
++    return result;
++}
++} // namespace adapter_identity
+diff --git a/src/MfgPort/Cuda/cuda_route.cpp b/src/MfgPort/Cuda/cuda_route.cpp
+index 29e0fad..fc04de5 100644
+--- a/src/MfgPort/Cuda/cuda_route.cpp
++++ b/src/MfgPort/Cuda/cuda_route.cpp
+@@ -1,6 +1,7 @@
+ // Ported from MFG-Unlocker source/native/xess/cuda/cuda_route.cpp, MIT licensed, see NOTICE.md.
+ #include "cuda_route.h"
+ #include "xefg_cuda_params.h"
++#include "../AdapterIdentity.h"
+ #include "AdapterDiscovery.h"
+ #include "../Sha256.h"
+ #include "OverlayNative.h"
+@@ -234,12 +235,7 @@ bool Capability(const LUID& luid, int& major, int& minor, std::string& name)
+ 
+ UINT VendorOf(const LUID& luid)
+ {
+-    ComPtr<IDXGIFactory4> factory;
+-    ComPtr<IDXGIAdapter1> adapter;
+-    DXGI_ADAPTER_DESC1 description{};
+-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) || FAILED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter)))
+-        || FAILED(adapter->GetDesc1(&description))) return 0;
+-    return description.VendorId;
++    return adapter_identity::Probe(luid).vendorId;
+ }
+ 
+ // ---- state -------------------------------------------------------------------------------------------
+diff --git a/src/MfgPort/Wmma/wmma_route.cpp b/src/MfgPort/Wmma/wmma_route.cpp
+index 33a3079..3d7ace4 100644
+--- a/src/MfgPort/Wmma/wmma_route.cpp
++++ b/src/MfgPort/Wmma/wmma_route.cpp
+@@ -1,4 +1,5 @@
+ #include "wmma_route.h"
++#include "../AdapterIdentity.h"
+ #include "../Cuda/AdapterDiscovery.h"
+ #include "../Cuda/OverlayNative.h"
+ #include "../Cuda/cuda_layers.h"
+@@ -33,9 +34,15 @@ std::atomic<LogFunction> gLog{};
+ std::atomic<State> gState{State::NotAttempted};
+ std::atomic<Arch> gArch{Arch::Unknown};
+ std::atomic<bool> gActive{false};
++uint32_t gVendorId{};
+ uint32_t gDeviceId{};
++uint32_t gDxgiVendorId{};
++uint32_t gDxgiDeviceId{};
++bool gDxgiSpoofed{false};
+ uint32_t gWaveMmaTier{};
+ uint32_t gOverrideLayers{};
++std::string gGpuName;
++std::string gProbeSource;
+ std::string gReason;
+ 
+ IUnknown* gDeviceIdentity{};
+@@ -43,6 +50,7 @@ ID3D12Device* gDevice{};
+ uintptr_t gProviderBegin{}, gProviderEnd{};
+ uintptr_t gWrapperBegin{}, gWrapperEnd{};
+ uintptr_t gRuntimeBegin{}, gRuntimeEnd{};
++bool gWrappedDevice{false};
+ 
+ std::atomic<uint64_t> gLaunches{}, gFallbacks{}, gBinds{};
+ std::atomic<uint32_t> gLayerCount{};
+@@ -56,6 +64,23 @@ void Log(const char* stage, const std::string& fields) noexcept
+         fn(stage, fields);
+ }
+ 
++void MarkUnavailable(const std::string& why, const std::string& extra = {}) noexcept
++{
++    try
++    {
++        gReason = why;
++        gState.store(State::Unavailable, std::memory_order_release);
++        std::string fields = "\"state\":\"unavailable\",\"reason\":\"" + why + "\"";
++        if (!extra.empty())
++            fields += "," + extra;
++        Log("wmma_route", fields);
++    }
++    catch (...)
++    {
++        gState.store(State::Unavailable, std::memory_order_release);
++    }
++}
++
+ // Identifies AMD RDNA 4 (gfx1200/gfx1201: Radeon RX 9070 XT / 9070 / 9060 XT, PCI DeviceIDs 0x7550..0x75FF)
+ // vs. AMD RDNA 3 (gfx1100..gfx1103: Radeon RX 7900 / 7800 / 7700 / 7600 / 780M / 890M, PCI DeviceIDs 0x7440..0x74FF, 0x15BF, 0x15C8, 0x150E).
+ Arch DetectAmdArch(uint32_t vendorId, uint32_t deviceId, std::wstring_view description) noexcept
+@@ -73,9 +98,13 @@ Arch DetectAmdArch(uint32_t vendorId, uint32_t deviceId, std::wstring_view descr
+ 
+     if ((deviceId >= 0x7440 && deviceId <= 0x74FF) ||
+         deviceId == 0x15BF || deviceId == 0x15C8 || deviceId == 0x150E ||
++        deviceId == 0x1506 || deviceId == 0x1586 || deviceId == 0x1681 ||
+         description.find(L"RX 7") != std::wstring_view::npos ||
+         description.find(L"780M") != std::wstring_view::npos ||
++        description.find(L"880M") != std::wstring_view::npos ||
+         description.find(L"890M") != std::wstring_view::npos ||
++        description.find(L"8060S") != std::wstring_view::npos ||
++        description.find(L"8050S") != std::wstring_view::npos ||
+         description.find(L"RDNA 3") != std::wstring_view::npos ||
+         description.find(L"gfx11") != std::wstring_view::npos)
+     {
+@@ -750,12 +779,14 @@ bool FromWrapper(const void* address) noexcept
+     return at >= gWrapperBegin && at < gWrapperEnd;
+ }
+ 
++bool AcceptedCaller(const void* caller) noexcept;
++
+ bool ProviderCall(const void* caller) noexcept
+ {
+     if (FromProvider(caller))
+         return true;
+     if (!FromWrapper(caller))
+-        return false;
++        return gWrappedDevice && gWrapperBegin == 0 && AcceptedCaller(caller);
+     std::array<void*, 16> frames{};
+     const USHORT count = RtlCaptureStackBackTrace(0, USHORT(frames.size()), frames.data(), nullptr);
+     size_t i = 0;
+@@ -872,7 +903,15 @@ void Recognize(ID3D12Device* device, const D3D12_COMPUTE_PIPELINE_STATE_DESC& de
+             wmmaDesc.CachedPSO = {};
+             if (const auto createCompute = DeviceOriginal<CreateComputeFn>(device, kCreateComputePipelineState))
+             {
+-                createCompute(device, &wmmaDesc, IID_PPV_ARGS(&wmmaPso));
++                const HRESULT hr = createCompute(device, &wmmaDesc, IID_PPV_ARGS(&wmmaPso));
++                if (FAILED(hr))
++                {
++                    Log("wmma_pso_failed",
++                        std::string("\"program\":\"") + xefg_cuda::kLayers[i].info.program +
++                        "\",\"kernel\":\"" + xefg_cuda::kLayers[i].info.kernel +
++                        "\",\"hr\":\"" + adapter_identity::Hex32(static_cast<uint32_t>(hr)) +
++                        "\",\"bytes\":" + std::to_string(gShaderBlobs[i].size()));
++                }
+             }
+         }
+ 
+@@ -1080,8 +1119,7 @@ bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem
+         }
+         if (!device || !providerModule)
+         {
+-            gReason = "no_device";
+-            gState.store(State::Unavailable, std::memory_order_release);
++            MarkUnavailable("no_device");
+             reason = gReason;
+             return false;
+         }
+@@ -1092,6 +1130,7 @@ bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem
+         {
+             gReason = "environment_off";
+             gState.store(State::Disabled, std::memory_order_release);
++            Log("wmma_route", "\"state\":\"disabled\",\"reason\":\"environment_off\"");
+             reason = gReason;
+             return false;
+         }
+@@ -1101,23 +1140,38 @@ bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem
+         ComPtr<ID3D12Device> native;
+         if (!ResolveNative(device, native, owner, how))
+         {
+-            gReason = "wrapped_device";
+-            gState.store(State::Unavailable, std::memory_order_release);
++            Log("wmma_device", "\"owner\":\"" + owner + "\",\"native\":\"unresolved\"");
++            MarkUnavailable("wrapped_device", "\"owner\":\"" + owner + "\"");
+             reason = gReason;
+             return false;
+         }
+-        if (native.Get() != device)
++        gWrappedDevice = (native.Get() != device);
++        if (gWrappedDevice)
+         {
++            void** wrapperVtable = *reinterpret_cast<void***>(device);
+             HMODULE wrapper{};
+-            if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+-                    static_cast<LPCWSTR>(*reinterpret_cast<void**>(device)), &wrapper) ||
+-                !ProviderRange(wrapper, gWrapperBegin, gWrapperEnd))
++            bool pinned = false;
++            if (wrapperVtable &&
++                GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
++                    reinterpret_cast<LPCWSTR>(wrapperVtable), &wrapper) &&
++                ProviderRange(wrapper, gWrapperBegin, gWrapperEnd))
+             {
+-                gReason = "wrapper_image";
+-                gState.store(State::Unavailable, std::memory_order_release);
+-                reason = gReason;
+-                return false;
++                pinned = true;
+             }
++            else if (wrapperVtable && wrapperVtable[0] &&
++                GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
++                    reinterpret_cast<LPCWSTR>(wrapperVtable[0]), &wrapper) &&
++                ProviderRange(wrapper, gWrapperBegin, gWrapperEnd))
++            {
++                pinned = true;
++            }
++            else
++            {
++                gWrapperBegin = gWrapperEnd = 0;
++            }
++            Log("wmma_device",
++                "\"owner\":\"" + owner + "\",\"native\":\"" + how +
++                "\",\"wrapper_image\":\"" + (pinned ? "pinned" : "dynamic_vtable") + "\"");
+         }
+         device = native.Get();
+         {
+@@ -1131,45 +1185,53 @@ bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem
+         }
+ 
+         const LUID luid = device->GetAdapterLuid();
+-        ComPtr<IDXGIFactory4> factory;
+-        ComPtr<IDXGIAdapter1> adapter;
+-        DXGI_ADAPTER_DESC1 desc{};
+-        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) ||
+-            FAILED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter))) ||
+-            FAILED(adapter->GetDesc1(&desc)))
++        const auto probe = adapter_identity::Probe(luid);
++
++        gVendorId = probe.vendorId;
++        gDeviceId = probe.deviceId;
++        gDxgiVendorId = probe.dxgiVendorId;
++        gDxgiDeviceId = probe.dxgiDeviceId;
++        gDxgiSpoofed = probe.dxgiSpoofed;
++        gGpuName = adapter_identity::WideToAsciiJson(probe.description);
++        gProbeSource = probe.source;
++
++        const std::string umdAscii = adapter_identity::WideToAsciiJson(probe.umdLeaf, 64);
++
++        Log("wmma_adapter_probe",
++            "\"luid\":\"" + adapter_identity::FormatLuid(luid) +
++            "\",\"vendor_id\":" + std::to_string(probe.vendorId) +
++            ",\"vendor_hex\":\"" + adapter_identity::Hex16(probe.vendorId) +
++            "\",\"vendor_name\":\"" + adapter_identity::VendorName(probe.vendorId) +
++            "\",\"device_id\":" + std::to_string(probe.deviceId) +
++            ",\"device_hex\":\"" + adapter_identity::Hex16(probe.deviceId) +
++            "\",\"gpu\":\"" + gGpuName +
++            "\",\"source\":\"" + probe.source +
++            "\",\"dxgi_vendor_id\":" + std::to_string(probe.dxgiVendorId) +
++            ",\"dxgi_device_id\":" + std::to_string(probe.dxgiDeviceId) +
++            ",\"dxgi_spoofed\":" + (probe.dxgiSpoofed ? "true" : "false") +
++            ",\"umd\":\"" + umdAscii +
++            "\",\"probes\":\"" + probe.probeTrail + "\"");
++
++        if (probe.vendorId == 0)
+         {
+-            gReason = "adapter_query";
+-            gState.store(State::Unavailable, std::memory_order_release);
++            MarkUnavailable("adapter_query", "\"probes\":\"" + probe.probeTrail + "\"");
+             reason = gReason;
+             return false;
+         }
+ 
+-        if (desc.VendorId != 0x1002)
++        if (probe.vendorId != 0x1002)
+         {
+-            gReason = "not_amd";
+-            gState.store(State::Unavailable, std::memory_order_release);
++            MarkUnavailable("not_amd",
++                "\"vendor_hex\":\"" + adapter_identity::Hex16(probe.vendorId) +
++                "\",\"device_hex\":\"" + adapter_identity::Hex16(probe.deviceId) +
++                "\",\"gpu\":\"" + gGpuName +
++                "\",\"source\":\"" + probe.source +
++                "\",\"dxgi_spoofed\":" + (probe.dxgiSpoofed ? "true" : "false"));
+             reason = gReason;
+             return false;
+         }
+ 
+-        const Arch arch = DetectAmdArch(desc.VendorId, desc.DeviceId, desc.Description);
+-        if (arch == Arch::Unknown)
+-        {
+-            gReason = "architecture_unsupported";
+-            gState.store(State::Unavailable, std::memory_order_release);
+-            reason = gReason;
+-            return false;
+-        }
+-
+-        if (!ProviderRange(providerModule, gProviderBegin, gProviderEnd))
+-        {
+-            gReason = "provider_image";
+-            gState.store(State::Unavailable, std::memory_order_release);
+-            reason = gReason;
+-            return false;
+-        }
+-
+-        // Query D3D12_FEATURE_D3D12_OPTIONS9 (27) for WaveMMA support when offered by the runtime
++        // Query D3D12_FEATURE_D3D12_OPTIONS9 (27) for WaveMMA support before architecture gating so diagnostics include it.
+         struct Options9Stub
+         {
+             BOOL MeshShaderPipelineStatsSupported;
+@@ -1182,18 +1244,45 @@ bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem
+         if (SUCCEEDED(device->CheckFeatureSupport(static_cast<D3D12_FEATURE>(27), &options9, sizeof(options9))))
+             gWaveMmaTier = options9.WaveMMATier;
+ 
++        const Arch arch = DetectAmdArch(probe.vendorId, probe.deviceId, probe.description);
++        if (arch == Arch::Unknown)
++        {
++            MarkUnavailable("architecture_unsupported",
++                "\"vendor_hex\":\"0x1002\",\"device_hex\":\"" + adapter_identity::Hex16(probe.deviceId) +
++                "\",\"gpu\":\"" + gGpuName +
++                "\",\"wave_mma_tier\":" + std::to_string(gWaveMmaTier) +
++                ",\"source\":\"" + probe.source +
++                "\",\"umd\":\"" + umdAscii + "\"");
++            reason = gReason;
++            return false;
++        }
++
++        if (!ProviderRange(providerModule, gProviderBegin, gProviderEnd))
++        {
++            MarkUnavailable("provider_image");
++            reason = gReason;
++            return false;
++        }
++
+         ComPtr<IUnknown> identity;
+         if (FAILED(device->QueryInterface(IID_PPV_ARGS(&identity))))
+         {
+-            gReason = "device_identity";
+-            gState.store(State::Unavailable, std::memory_order_release);
++            MarkUnavailable("device_identity");
+             reason = gReason;
+             return false;
+         }
+ 
+-        gDeviceId = desc.DeviceId;
+         gArch.store(arch, std::memory_order_release);
++        std::error_code dirEc;
++        const bool wmmaDirExists = std::filesystem::is_directory(wmmaDir, dirEc);
+         gOverrideLayers = LoadWmmaOverrides(wmmaDir);
++        const size_t expectedLayers = std::size(xefg_cuda::kLayers);
++        Log("wmma_overrides",
++            "\"dir_exists\":" + std::string(wmmaDirExists ? "true" : "false") +
++            ",\"loaded\":" + std::to_string(gOverrideLayers) +
++            ",\"expected\":" + std::to_string(expectedLayers) +
++            ",\"missing\":" + std::to_string(expectedLayers - gOverrideLayers));
++
+         gDeviceIdentity = identity.Detach();
+         gDevice = device;
+         gDevice->AddRef();
+@@ -1201,8 +1290,9 @@ bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem
+         std::string patchFailure;
+         if (!PatchDevice(device, patchFailure))
+         {
+-            gReason = patchFailure;
+-            gState.store(State::Unavailable, std::memory_order_release);
++            MarkUnavailable(patchFailure,
++                "\"device_hex\":\"" + adapter_identity::Hex16(gDeviceId) +
++                "\",\"gpu\":\"" + gGpuName + "\"");
+             reason = gReason;
+             return false;
+         }
+@@ -1213,9 +1303,13 @@ bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem
+ 
+         Log("wmma_route",
+             std::string("\"state\":\"active\",\"arch\":\"") + (arch == Arch::Rdna4 ? "rdna4_gfx12" : "rdna3_gfx11") +
+-            "\",\"device_id\":" + std::to_string(gDeviceId) +
++            "\",\"vendor_hex\":\"0x1002\",\"device_id\":" + std::to_string(gDeviceId) +
++            ",\"device_hex\":\"" + adapter_identity::Hex16(gDeviceId) +
++            "\",\"gpu\":\"" + gGpuName +
++            "\",\"source\":\"" + gProbeSource +
++            "\",\"dxgi_spoofed\":" + (gDxgiSpoofed ? "true" : "false") +
+             ",\"wave_mma_tier\":" + std::to_string(gWaveMmaTier) +
+-            ",\"layers\":" + std::to_string(std::size(xefg_cuda::kLayers)) +
++            ",\"layers\":" + std::to_string(expectedLayers) +
+             ",\"overrides\":" + std::to_string(gOverrideLayers) +
+             ",\"device_vtables\":" + std::to_string(gDevicePatchCount.load()) +
+             ",\"device\":\"" + how + "\"");
+@@ -1335,14 +1429,27 @@ Status Snapshot() noexcept
+     std::lock_guard lock(gMutex);
+     s.state = gState.load(std::memory_order_acquire);
+     s.arch = gArch.load(std::memory_order_acquire);
++    s.vendorId = gVendorId;
+     s.deviceId = gDeviceId;
++    s.dxgiVendorId = gDxgiVendorId;
++    s.dxgiDeviceId = gDxgiDeviceId;
++    s.dxgiSpoofed = gDxgiSpoofed;
+     s.waveMmaTier = gWaveMmaTier;
+     const uint32_t recognized = gLayerCount.load(std::memory_order_relaxed);
+     s.layers = recognized ? recognized : static_cast<uint32_t>(std::size(xefg_cuda::kLayers));
++    s.overrideLayers = gOverrideLayers;
+     s.launches = gLaunches.load(std::memory_order_relaxed);
+     s.fallbacks = gFallbacks.load(std::memory_order_relaxed);
+     s.binds = gBinds.load(std::memory_order_relaxed);
+-    try { s.reason = gReason; } catch (...) {}
++    try
++    {
++        s.gpuName = gGpuName;
++        s.probeSource = gProbeSource;
++        s.reason = gReason;
++    }
++    catch (...)
++    {
++    }
+     return s;
+ }
+ } // namespace xefg_wmma
+diff --git a/src/MfgPort/Wmma/wmma_route.h b/src/MfgPort/Wmma/wmma_route.h
+index 6f42294..66b3299 100644
+--- a/src/MfgPort/Wmma/wmma_route.h
++++ b/src/MfgPort/Wmma/wmma_route.h
+@@ -15,12 +15,19 @@ struct Status
+ {
+     State state{State::NotAttempted};
+     Arch arch{Arch::Unknown};
++    uint32_t vendorId{};
+     uint32_t deviceId{};
++    uint32_t dxgiVendorId{};
++    uint32_t dxgiDeviceId{};
++    bool dxgiSpoofed{false};
+     uint32_t waveMmaTier{};
+     uint32_t layers{};
++    uint32_t overrideLayers{};
+     uint64_t launches{};
+     uint64_t fallbacks{};
+     uint64_t binds{};
++    std::string gpuName;
++    std::string probeSource;
+     std::string reason;
+ };
+ 
+diff --git a/src/Plugin.cpp b/src/Plugin.cpp
+index 07b1112..2e10364 100644
+--- a/src/Plugin.cpp
++++ b/src/Plugin.cpp
+@@ -511,7 +511,9 @@ namespace
+ 		return {};
+ 	}
+ 
+-	void StartFromAsi()
++	std::once_flag asiStartOnce;
++
++	void StartFromAsiImpl()
+ 	{
+ 		const auto self = ThisModulePath();
+ 		Log::Info("InitializeASI, {}", self.string());
+@@ -553,6 +555,11 @@ namespace
+ 		Log::Info("Starting {}", main.string());
+ 		start();
+ 	}
++
++	void StartFromAsi()
++	{
++		std::call_once(asiStartOnce, StartFromAsiImpl);
++	}
+ } // namespace
+ 
+ const char* Plugin::PathName(Path path)
+@@ -604,9 +611,26 @@ extern "C" __declspec(dllexport) void InitializeASI()
+ 
+ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* optiApi, OptiPlugin* plugin)
+ {
+-	// The early copy has done its job in InitializeASI, the menu and the settings are the real dll's
++	// The early copy has no menu or settings of its own; those belong to the main dll.
++	// OptiScaler v10+ may invoke OptiPluginInit without calling InitializeASI when OptiPluginInit is exported,
++	// so trigger StartFromAsi() here as well (idempotent via std::call_once).
+ 	if (IsEarlyCopy())
++	{
++		try
++		{
++			StartFromAsi();
++		}
++		catch (const std::exception& error)
++		{
++			Log::Error("OptiPluginInit (early copy): {}", error.what());
++		}
++		catch (...)
++		{
++			Log::Error("OptiPluginInit (early copy) failed");
++		}
++
+ 		return false;
++	}
+ 
+ 	api = optiApi;
+ 	self = plugin;
+diff --git a/src/vulkan/VulkanHost.cpp b/src/vulkan/VulkanHost.cpp
+index b4ee11c..ef6befb 100644
+--- a/src/vulkan/VulkanHost.cpp
++++ b/src/vulkan/VulkanHost.cpp
+@@ -14,6 +14,7 @@
+ #include <map>
+ #include <memory>
+ #include <mutex>
++#include <type_traits>
+ #include <utility>
+ #include <vector>
+ 
+@@ -25,7 +26,9 @@ namespace
+ {
+ 	constexpr size_t MaxInstances = 16;
+ 	constexpr size_t MaxDevices = 64;
++	constexpr size_t MaxSwapchains = 64;
+ 	constexpr wchar_t LoaderName[] = L"vulkan-1.dll";
++	constexpr DWORD HighResTimerFlag = 0x00000002u; // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+ 
+ 	struct State
+ 	{
+@@ -33,6 +36,7 @@ namespace
+ 		std::mutex mutex;
+ 		std::map<VkInstance, uint32_t> instances; // the API version the instance was created with
+ 		std::map<VkDevice, VulkanHost::DeviceRecord> devices;
++		std::map<VkSwapchainKHR, VkPresentModeKHR> swapchains;
+ 		std::map<VkPhysicalDevice, std::string> refused;
+ 		std::string detail;
+ 		std::string lastRefusal;
+@@ -49,9 +53,33 @@ namespace
+ 		std::atomic_uint32_t prepared = 0;
+ 
+ 		PFN_vkGetInstanceProcAddr loaderGipa = nullptr;
++		PFN_vkGetDeviceProcAddr loaderGdpa = nullptr;
+ 		PFN_vkCreateInstance createInstance = nullptr;
+ 		PFN_vkCreateDevice createDevice = nullptr;
++		PFN_vkCreateSwapchainKHR createSwapchain = nullptr;
++		PFN_vkDestroySwapchainKHR destroySwapchain = nullptr;
++		PFN_vkQueuePresentKHR queuePresent = nullptr;
++		void* rawCreateInstance = nullptr;
++		void* rawCreateDevice = nullptr;
++		void* rawGdpa = nullptr;
++		void* rawCreateSwapchain = nullptr;
++		void* rawDestroySwapchain = nullptr;
++		void* rawQueuePresent = nullptr;
++		std::atomic<PFN_vkCreateInstance> gipaCreateInstance = nullptr;
++		std::atomic<PFN_vkCreateDevice> gipaCreateDevice = nullptr;
++		std::atomic<PFN_vkGetDeviceProcAddr> gipaGdpa = nullptr;
++		std::atomic<PFN_vkCreateSwapchainKHR> gdpaCreateSwapchain = nullptr;
++		std::atomic<PFN_vkDestroySwapchainKHR> gdpaDestroySwapchain = nullptr;
++		std::atomic<PFN_vkQueuePresentKHR> gdpaQueuePresent = nullptr;
++		bool gipaHooked = false;
++		bool presentHooked = false;
+ 		HMODULE(WINAPI* loadLibraryExW)(LPCWSTR, HANDLE, DWORD) = nullptr;
++
++		// Dedicated lock for low-overhead present pacing
++		std::mutex pacerMutex;
++		VulkanPolicy::PresentPacer pacer;
++		std::atomic_bool hwPacingActive = false;
++		std::atomic_bool pacingLogged = false;
+ 	};
+ 
+ 	// Leaked on purpose: a game's thread can call the hooks while the process exits, after the static destructors
+@@ -84,6 +112,101 @@ namespace
+ 		s.detail = std::move(detail);
+ 	}
+ 
++	enum class PacingMode { Off, Auto, Force };
++
++	PacingMode GetPacingMode() noexcept
++	{
++		static const PacingMode mode = [] {
++			wchar_t value[16]{};
++			const DWORD len = GetEnvironmentVariableW(L"XEFG_VK_PACING", value, 16);
++			if (len && len < 16)
++			{
++				if (value[0] == L'0' || _wcsicmp(value, L"off") == 0 || _wcsicmp(value, L"false") == 0)
++					return PacingMode::Off;
++				if (_wcsicmp(value, L"force") == 0 || _wcsicmp(value, L"always") == 0)
++					return PacingMode::Force;
++			}
++			return PacingMode::Auto;
++		}();
++		return mode;
++	}
++
++	bool PacingActive(const State& s) noexcept
++	{
++		const PacingMode mode = GetPacingMode();
++		if (mode == PacingMode::Off)
++			return false;
++		if (mode == PacingMode::Force)
++			return true;
++		return !s.hwPacingActive.load(std::memory_order_relaxed);
++	}
++
++	uint64_t NowNs() noexcept
++	{
++		static const uint64_t freq = [] {
++			LARGE_INTEGER f{};
++			QueryPerformanceFrequency(&f);
++			return f.QuadPart > 0 ? static_cast<uint64_t>(f.QuadPart) : 10'000'000ull;
++		}();
++		LARGE_INTEGER counter{};
++		QueryPerformanceCounter(&counter);
++		const uint64_t ticks = counter.QuadPart > 0 ? static_cast<uint64_t>(counter.QuadPart) : 0ull;
++		const uint64_t sec = ticks / freq;
++		const uint64_t rem = ticks % freq;
++		return sec * 1'000'000'000ull + (rem * 1'000'000'000ull) / freq;
++	}
++
++	// Sub-millisecond wait using a per-thread Windows 10/11 high-resolution waitable timer (avoiding winmm.dll
++	// which OptiScaler frequently proxies) plus a short QPC spin-wait tail.
++	void WaitPreciseNs(uint64_t waitNs) noexcept
++	{
++		if (waitNs == 0)
++			return;
++
++		const uint64_t deadline = NowNs() + waitNs;
++		constexpr uint64_t SpinTailNs = 1'200'000ull; // 1.2 ms QPC spin tail
++
++		using CreateWaitableTimerExWFn = HANDLE(WINAPI*)(void*, LPCWSTR, DWORD, DWORD);
++		static const auto createTimerEx = [] {
++			const HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
++			return k32 ? reinterpret_cast<CreateWaitableTimerExWFn>(GetProcAddress(k32, "CreateWaitableTimerExW")) : nullptr;
++		}();
++
++		struct ThreadTimer
++		{
++			HANDLE handle = nullptr;
++			~ThreadTimer() { if (handle) CloseHandle(handle); }
++		};
++		static thread_local ThreadTimer timer;
++		static thread_local bool timerAttempted = false;
++		if (!timerAttempted)
++		{
++			timerAttempted = true;
++			if (createTimerEx)
++				timer.handle = createTimerEx(nullptr, nullptr, HighResTimerFlag, 0x001F0003u /* TIMER_ALL_ACCESS */);
++		}
++
++		uint64_t now = NowNs();
++		if (now + SpinTailNs < deadline)
++		{
++			const uint64_t sleepNs = (deadline - now) - SpinTailNs;
++			if (timer.handle)
++			{
++				LARGE_INTEGER due{};
++				due.QuadPart = -static_cast<int64_t>(sleepNs / 100ull); // relative 100 ns intervals
++				if (due.QuadPart < 0 && SetWaitableTimer(timer.handle, &due, 0, nullptr, nullptr, 0))
++					WaitForSingleObject(timer.handle, 50u);
++			}
++			else if (sleepNs >= 2'000'000ull)
++			{
++				Sleep(static_cast<DWORD>(sleepNs / 1'000'000ull));
++			}
++		}
++
++		while (NowNs() < deadline)
++			YieldProcessor();
++	}
++
+ 	// ----------------------------------------------------------------------------------------------- instance
+ 
+ 	struct InstanceEdit
+@@ -163,22 +286,38 @@ namespace
+ 		}
+ 	}
+ 
+-	VKAPI_ATTR VkResult VKAPI_CALL HookCreateInstance(const VkInstanceCreateInfo* info,
++	struct ReentryGuard
++	{
++		bool& flag;
++		explicit ReentryGuard(bool& f) : flag(f) { flag = true; }
++		~ReentryGuard() { flag = false; }
++	};
++
++	VkResult CreateInstanceImpl(PFN_vkCreateInstance next, const VkInstanceCreateInfo* info,
+ 		const VkAllocationCallbacks* allocator, VkInstance* instance)
+ 	{
++		if (!next)
++			return VK_ERROR_INITIALIZATION_FAILED;
++
++		static thread_local bool inCreateInstance = false;
++		if (inCreateInstance)
++			return next(info, allocator, instance);
++
++		ReentryGuard guard(inCreateInstance);
++
+ 		State& s = S();
+ 		s.instanceCalls++;
+ 
+ 		InstanceEdit edit;
+ 		const VkInstanceCreateInfo* used = s.enabled ? PrepareInstance(info, edit) : info;
+ 
+-		VkResult result = s.createInstance(used, allocator, instance);
++		VkResult result = next(used, allocator, instance);
+ 
+ 		if (result != VK_SUCCESS && used != info)
+ 		{
+ 			Log::Warn("The loader refused the instance at 1.3 ({}), created as the game asked", static_cast<int>(result));
+ 			used = info;
+-			result = s.createInstance(info, allocator, instance);
++			result = next(info, allocator, instance);
+ 		}
+ 
+ 		if (result == VK_SUCCESS && instance && *instance)
+@@ -187,6 +326,20 @@ namespace
+ 		return result;
+ 	}
+ 
++	VKAPI_ATTR VkResult VKAPI_CALL HookCreateInstance(const VkInstanceCreateInfo* info,
++		const VkAllocationCallbacks* allocator, VkInstance* instance)
++	{
++		return CreateInstanceImpl(S().createInstance, info, allocator, instance);
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL HookCreateInstanceViaGipa(const VkInstanceCreateInfo* info,
++		const VkAllocationCallbacks* allocator, VkInstance* instance)
++	{
++		State& s = S();
++		PFN_vkCreateInstance next = s.gipaCreateInstance.load(std::memory_order_acquire);
++		return CreateInstanceImpl(next ? next : s.createInstance, info, allocator, instance);
++	}
++
+ 	// ------------------------------------------------------------------------------------------------ device
+ 
+ 	struct DeviceEdit
+@@ -451,6 +604,12 @@ namespace
+ 				edit->record.coopMatrixExtensions = true;
+ 			}
+ 
++			// Detect native NVIDIA hardware pacing extensions (e.g. VK_NV_present_metering / VK_NV_low_latency2)
++			// so the CPU present pacer automatically yields to hardware flip metering on NVIDIA GPUs.
++			edit->record.hwPacing =
++				(offered("VK_NV_present_metering") && enabled("VK_NV_present_metering")) ||
++				(offered("VK_NV_low_latency2") && enabled("VK_NV_low_latency2"));
++
+ 			edit->info = *info;
+ 			edit->info.enabledExtensionCount = static_cast<uint32_t>(edit->extensions.size());
+ 			edit->info.ppEnabledExtensionNames = edit->extensions.data();
+@@ -557,24 +716,37 @@ namespace
+ 				s.refused.erase(edit.record.physical);
+ 			}
+ 
++			if (edit.record.hwPacing)
++				s.hwPacingActive.store(true, std::memory_order_relaxed);
++
+ 			s.prepared++;
+-			Log::Info("Vulkan device {} prepared for XeFG: graphics family {}, vendor {:#06x}{}{}",
++			Log::Info("Vulkan device {} prepared for XeFG: graphics family {}, vendor {:#06x}{}{}{}",
+ 				static_cast<const void*>(device), edit.record.family, edit.record.vendor,
+ 				edit.record.tensorExtensions ? ", tensor-core extensions enabled"
+ 				: edit.record.vendor == 0x10DE ? (edit.record.binaryImportSpec && edit.record.imageViewHandleSpec
+ 					? ", tensor-core extensions not enabled (XEFG_TENSOR_CORES is off or the driver refused them)"
+ 					: ", the driver doesn't offer the tensor-core extensions")
+ 				: "",
+-				edit.record.coopMatrixExtensions ? ", VK_KHR_cooperative_matrix enabled" : "");
++				edit.record.coopMatrixExtensions ? ", VK_KHR_cooperative_matrix enabled" : "",
++				edit.record.hwPacing ? ", hardware pacing detected (CPU present pacer auto-bypassed)" : "");
+ 		}
+ 		catch (...)
+ 		{
+ 		}
+ 	}
+ 
+-	VKAPI_ATTR VkResult VKAPI_CALL HookCreateDevice(VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
++	VkResult CreateDeviceImpl(PFN_vkCreateDevice next, VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
+ 		const VkAllocationCallbacks* allocator, VkDevice* device)
+ 	{
++		if (!next)
++			return VK_ERROR_INITIALIZATION_FAILED;
++
++		static thread_local bool inCreateDevice = false;
++		if (inCreateDevice)
++			return next(physical, info, allocator, device);
++
++		ReentryGuard guard(inCreateDevice);
++
+ 		State& s = S();
+ 		s.deviceCalls++;
+ 
+@@ -583,7 +755,7 @@ namespace
+ 		if (s.enabled)
+ 			edit = PrepareDevice(physical, info);
+ 
+-		VkResult result = s.createDevice(physical, edit ? &edit->info : info, allocator, device);
++		VkResult result = next(physical, edit ? &edit->info : info, allocator, device);
+ 
+ 		if (result != VK_SUCCESS && edit && edit->tensorAdded)
+ 		{
+@@ -592,7 +764,7 @@ namespace
+ 			Log::Warn("The driver refused the device with the tensor/cooperative-matrix extensions ({}), trying again without them",
+ 				static_cast<int>(result));
+ 			edit->DropTensorExtensions();
+-			result = s.createDevice(physical, &edit->info, allocator, device);
++			result = next(physical, &edit->info, allocator, device);
+ 		}
+ 
+ 		if (result != VK_SUCCESS && edit)
+@@ -603,7 +775,7 @@ namespace
+ 				static_cast<int>(result));
+ 			edit.reset();
+ 			Refuse(physical, "device_features");
+-			result = s.createDevice(physical, info, allocator, device);
++			result = next(physical, info, allocator, device);
+ 		}
+ 
+ 		if (result == VK_SUCCESS && edit && device && *device)
+@@ -612,6 +784,267 @@ namespace
+ 		return result;
+ 	}
+ 
++	VKAPI_ATTR VkResult VKAPI_CALL HookCreateDevice(VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
++		const VkAllocationCallbacks* allocator, VkDevice* device)
++	{
++		return CreateDeviceImpl(S().createDevice, physical, info, allocator, device);
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL HookCreateDeviceViaGipa(VkPhysicalDevice physical, const VkDeviceCreateInfo* info,
++		const VkAllocationCallbacks* allocator, VkDevice* device)
++	{
++		State& s = S();
++		PFN_vkCreateDevice next = s.gipaCreateDevice.load(std::memory_order_acquire);
++		return CreateDeviceImpl(next ? next : s.createDevice, physical, info, allocator, device);
++	}
++
++	// OptiScaler hooks vulkan-1.dll before ASI plugins run and returns its own hkvkCreateDevice from
++	// vkGetInstanceProcAddr. Wrapping vkGetInstanceProcAddr catches games that resolve vkCreateDevice via GIPA
++	// and call OptiScaler's hook directly (whose saved trampoline would otherwise bypass our loader prologue hook).
++	// --------------------------------------------------------------------------------------- swapchain / present pacing
++
++	bool IsFifoMode(VkPresentModeKHR mode) noexcept
++	{
++		return mode == VK_PRESENT_MODE_FIFO_KHR || mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
++	}
++
++	VkResult CreateSwapchainImpl(PFN_vkCreateSwapchainKHR next, VkDevice device,
++		const VkSwapchainCreateInfoKHR* info, const VkAllocationCallbacks* allocator, VkSwapchainKHR* swapchain)
++	{
++		if (!next)
++			return VK_ERROR_INITIALIZATION_FAILED;
++
++		static thread_local bool inCreateSwapchain = false;
++		if (inCreateSwapchain)
++			return next(device, info, allocator, swapchain);
++
++		ReentryGuard guard(inCreateSwapchain);
++		const VkResult result = next(device, info, allocator, swapchain);
++
++		if (result == VK_SUCCESS && info && swapchain && *swapchain)
++		{
++			State& s = S();
++			std::lock_guard lock(s.mutex);
++			if (s.swapchains.size() >= MaxSwapchains)
++				s.swapchains.clear();
++			s.swapchains[*swapchain] = info->presentMode;
++		}
++
++		return result;
++	}
++
++	void DestroySwapchainImpl(PFN_vkDestroySwapchainKHR next, VkDevice device, VkSwapchainKHR swapchain,
++		const VkAllocationCallbacks* allocator)
++	{
++		if (!next)
++			return;
++
++		static thread_local bool inDestroySwapchain = false;
++		if (inDestroySwapchain)
++		{
++			next(device, swapchain, allocator);
++			return;
++		}
++
++		ReentryGuard guard(inDestroySwapchain);
++		if (swapchain)
++		{
++			State& s = S();
++			std::lock_guard lock(s.mutex);
++			s.swapchains.erase(swapchain);
++		}
++		next(device, swapchain, allocator);
++	}
++
++	VkResult QueuePresentImpl(PFN_vkQueuePresentKHR next, VkQueue queue, const VkPresentInfoKHR* info)
++	{
++		if (!next)
++			return VK_ERROR_INITIALIZATION_FAILED;
++
++		static thread_local bool inQueuePresent = false;
++		if (inQueuePresent)
++			return next(queue, info);
++
++		ReentryGuard guard(inQueuePresent);
++
++		State& s = S();
++		if (PacingActive(s))
++		{
++			bool vsyncFifo = false;
++			if (info && info->swapchainCount > 0 && info->pSwapchains)
++			{
++				std::lock_guard lock(s.mutex);
++				const auto it = s.swapchains.find(info->pSwapchains[0]);
++				if (it != s.swapchains.end())
++					vsyncFifo = IsFifoMode(it->second);
++			}
++
++			uint64_t waitNs = 0;
++			{
++				std::lock_guard lock(s.pacerMutex);
++				waitNs = s.pacer.ComputePresentWaitNs(NowNs(), vsyncFifo);
++			}
++
++			if (waitNs > 0)
++			{
++				if (!s.pacingLogged.exchange(true, std::memory_order_relaxed))
++					Log::Info("Vulkan present pacer active (V-Sync FIFO off, smoothing multi-frame burst presents)");
++				WaitPreciseNs(waitNs);
++			}
++		}
++
++		return next(queue, info);
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL HookCreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* info,
++		const VkAllocationCallbacks* allocator, VkSwapchainKHR* swapchain)
++	{
++		return CreateSwapchainImpl(S().createSwapchain, device, info, allocator, swapchain);
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL HookCreateSwapchainViaGdpa(VkDevice device, const VkSwapchainCreateInfoKHR* info,
++		const VkAllocationCallbacks* allocator, VkSwapchainKHR* swapchain)
++	{
++		State& s = S();
++		PFN_vkCreateSwapchainKHR next = s.gdpaCreateSwapchain.load(std::memory_order_acquire);
++		return CreateSwapchainImpl(next ? next : s.createSwapchain, device, info, allocator, swapchain);
++	}
++
++	VKAPI_ATTR void VKAPI_CALL HookDestroySwapchain(VkDevice device, VkSwapchainKHR swapchain,
++		const VkAllocationCallbacks* allocator)
++	{
++		DestroySwapchainImpl(S().destroySwapchain, device, swapchain, allocator);
++	}
++
++	VKAPI_ATTR void VKAPI_CALL HookDestroySwapchainViaGdpa(VkDevice device, VkSwapchainKHR swapchain,
++		const VkAllocationCallbacks* allocator)
++	{
++		State& s = S();
++		PFN_vkDestroySwapchainKHR next = s.gdpaDestroySwapchain.load(std::memory_order_acquire);
++		DestroySwapchainImpl(next ? next : s.destroySwapchain, device, swapchain, allocator);
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL HookQueuePresent(VkQueue queue, const VkPresentInfoKHR* info)
++	{
++		return QueuePresentImpl(S().queuePresent, queue, info);
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL HookQueuePresentViaGdpa(VkQueue queue, const VkPresentInfoKHR* info)
++	{
++		State& s = S();
++		PFN_vkQueuePresentKHR next = s.gdpaQueuePresent.load(std::memory_order_acquire);
++		return QueuePresentImpl(next ? next : s.queuePresent, queue, info);
++	}
++
++	PFN_vkVoidFunction WrapDeviceProc(const char* pName, PFN_vkVoidFunction fn)
++	{
++		if (!fn || !pName)
++			return fn;
++
++		State& s = S();
++		void* addr = reinterpret_cast<void*>(fn);
++
++		if (std::strcmp(pName, "vkQueuePresentKHR") == 0)
++		{
++			if (addr != s.rawQueuePresent &&
++				addr != reinterpret_cast<void*>(&HookQueuePresent) &&
++				addr != reinterpret_cast<void*>(&HookQueuePresentViaGdpa))
++			{
++				s.gdpaQueuePresent.store(reinterpret_cast<PFN_vkQueuePresentKHR>(fn), std::memory_order_release);
++				return reinterpret_cast<PFN_vkVoidFunction>(&HookQueuePresentViaGdpa);
++			}
++		}
++		else if (std::strcmp(pName, "vkCreateSwapchainKHR") == 0)
++		{
++			if (addr != s.rawCreateSwapchain &&
++				addr != reinterpret_cast<void*>(&HookCreateSwapchain) &&
++				addr != reinterpret_cast<void*>(&HookCreateSwapchainViaGdpa))
++			{
++				s.gdpaCreateSwapchain.store(reinterpret_cast<PFN_vkCreateSwapchainKHR>(fn), std::memory_order_release);
++				return reinterpret_cast<PFN_vkVoidFunction>(&HookCreateSwapchainViaGdpa);
++			}
++		}
++		else if (std::strcmp(pName, "vkDestroySwapchainKHR") == 0)
++		{
++			if (addr != s.rawDestroySwapchain &&
++				addr != reinterpret_cast<void*>(&HookDestroySwapchain) &&
++				addr != reinterpret_cast<void*>(&HookDestroySwapchainViaGdpa))
++			{
++				s.gdpaDestroySwapchain.store(reinterpret_cast<PFN_vkDestroySwapchainKHR>(fn), std::memory_order_release);
++				return reinterpret_cast<PFN_vkVoidFunction>(&HookDestroySwapchainViaGdpa);
++			}
++		}
++
++		return fn;
++	}
++
++	VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL HookGetDeviceProcAddr(VkDevice device, const char* pName)
++	{
++		State& s = S();
++		PFN_vkVoidFunction fn = s.loaderGdpa ? s.loaderGdpa(device, pName) : nullptr;
++		return WrapDeviceProc(pName, fn);
++	}
++
++	VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL HookGetDeviceProcAddrViaGipa(VkDevice device, const char* pName)
++	{
++		State& s = S();
++		PFN_vkGetDeviceProcAddr next = s.gipaGdpa.load(std::memory_order_acquire);
++		PFN_vkVoidFunction fn = next ? next(device, pName) : (s.loaderGdpa ? s.loaderGdpa(device, pName) : nullptr);
++		return WrapDeviceProc(pName, fn);
++	}
++
++	// OptiScaler hooks vulkan-1.dll before ASI plugins run and returns its own hkvkCreateDevice from
++	// vkGetInstanceProcAddr. Wrapping vkGetInstanceProcAddr catches games that resolve vkCreateDevice via GIPA
++	// and call OptiScaler's hook directly (whose saved trampoline would otherwise bypass our loader prologue hook).
++	VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL HookGetInstanceProcAddr(VkInstance instance, const char* pName)
++	{
++		State& s = S();
++		PFN_vkVoidFunction fn = s.loaderGipa ? s.loaderGipa(instance, pName) : nullptr;
++
++		if (!fn || !pName)
++			return fn;
++
++		if (std::strcmp(pName, "vkCreateDevice") == 0)
++		{
++			void* addr = reinterpret_cast<void*>(fn);
++			if (addr != s.rawCreateDevice &&
++				addr != reinterpret_cast<void*>(&HookCreateDevice) &&
++				addr != reinterpret_cast<void*>(&HookCreateDeviceViaGipa))
++			{
++				s.gipaCreateDevice.store(reinterpret_cast<PFN_vkCreateDevice>(fn), std::memory_order_release);
++				return reinterpret_cast<PFN_vkVoidFunction>(&HookCreateDeviceViaGipa);
++			}
++		}
++		else if (std::strcmp(pName, "vkCreateInstance") == 0)
++		{
++			void* addr = reinterpret_cast<void*>(fn);
++			if (addr != s.rawCreateInstance &&
++				addr != reinterpret_cast<void*>(&HookCreateInstance) &&
++				addr != reinterpret_cast<void*>(&HookCreateInstanceViaGipa))
++			{
++				s.gipaCreateInstance.store(reinterpret_cast<PFN_vkCreateInstance>(fn), std::memory_order_release);
++				return reinterpret_cast<PFN_vkVoidFunction>(&HookCreateInstanceViaGipa);
++			}
++		}
++		else if (std::strcmp(pName, "vkGetDeviceProcAddr") == 0)
++		{
++			void* addr = reinterpret_cast<void*>(fn);
++			if (addr != s.rawGdpa &&
++				addr != reinterpret_cast<void*>(&HookGetDeviceProcAddr) &&
++				addr != reinterpret_cast<void*>(&HookGetDeviceProcAddrViaGipa))
++			{
++				s.gipaGdpa.store(reinterpret_cast<PFN_vkGetDeviceProcAddr>(fn), std::memory_order_release);
++				return reinterpret_cast<PFN_vkVoidFunction>(&HookGetDeviceProcAddrViaGipa);
++			}
++		}
++		else
++		{
++			return WrapDeviceProc(pName, fn);
++		}
++
++		return fn;
++	}
++
+ 	// ------------------------------------------------------------------------------------------------ install
+ 
+ 	// With the install lock held
+@@ -635,6 +1068,8 @@ namespace
+ 			return false;
+ 		}
+ 
++		s.rawCreateInstance = reinterpret_cast<void*>(create);
++		s.rawCreateDevice = reinterpret_cast<void*>(createDevice);
+ 		s.loaderGipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(gipa);
+ 
+ 		auto fail = [&why](const char* what, MH_STATUS status)
+@@ -669,6 +1104,51 @@ namespace
+ 			return fail("Can't enable the vkCreateDevice hook", status);
+ 		}
+ 
++		PFN_vkGetInstanceProcAddr gipaTrampoline = nullptr;
++		if (MH_CreateHook(reinterpret_cast<void*>(gipa), reinterpret_cast<void*>(&HookGetInstanceProcAddr),
++				reinterpret_cast<void**>(&gipaTrampoline)) == MH_OK)
++		{
++			s.loaderGipa = gipaTrampoline;
++			if (MH_EnableHook(reinterpret_cast<void*>(gipa)) == MH_OK)
++			{
++				s.gipaHooked = true;
++			}
++			else
++			{
++				s.loaderGipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(gipa);
++				MH_RemoveHook(reinterpret_cast<void*>(gipa));
++				Log::Warn("Vulkan hooks: couldn't enable vkGetInstanceProcAddr hook, using loader detours only");
++			}
++		}
++		else
++		{
++			Log::Warn("Vulkan hooks: couldn't hook vkGetInstanceProcAddr, using loader detours only");
++		}
++
++		// Optional present/swapchain hooks for recorded-mode frame pacing (non-fatal if unavailable)
++		auto tryHook = [](HMODULE mod, const char* name, void* detour, void** rawOut, auto& trampolineOut) -> bool {
++			FARPROC proc = GetProcAddress(mod, name);
++			if (!proc)
++				return false;
++			*rawOut = reinterpret_cast<void*>(proc);
++			std::remove_reference_t<decltype(trampolineOut)> tramp = nullptr;
++			if (MH_CreateHook(reinterpret_cast<void*>(proc), detour, reinterpret_cast<void**>(&tramp)) != MH_OK)
++				return false;
++			trampolineOut = tramp;
++			if (MH_EnableHook(reinterpret_cast<void*>(proc)) != MH_OK)
++			{
++				trampolineOut = nullptr;
++				MH_RemoveHook(reinterpret_cast<void*>(proc));
++				return false;
++			}
++			return true;
++		};
++
++		tryHook(loader, "vkGetDeviceProcAddr", reinterpret_cast<void*>(&HookGetDeviceProcAddr), &s.rawGdpa, s.loaderGdpa);
++		tryHook(loader, "vkCreateSwapchainKHR", reinterpret_cast<void*>(&HookCreateSwapchain), &s.rawCreateSwapchain, s.createSwapchain);
++		tryHook(loader, "vkDestroySwapchainKHR", reinterpret_cast<void*>(&HookDestroySwapchain), &s.rawDestroySwapchain, s.destroySwapchain);
++		s.presentHooked = tryHook(loader, "vkQueuePresentKHR", reinterpret_cast<void*>(&HookQueuePresent), &s.rawQueuePresent, s.queuePresent);
++
+ 		s.loaderHooked = true;
+ 		return true;
+ 	}
+@@ -857,6 +1337,22 @@ std::string VulkanHost::RefusalFor(VkPhysicalDevice physical)
+ 	return found == s.refused.end() ? std::string() : found->second;
+ }
+ 
++void VulkanHost::NotifyBatchStart(uint32_t generatedCount) noexcept
++{
++	State& s = S();
++	if (!PacingActive(s))
++		return;
++	std::lock_guard lock(s.pacerMutex);
++	s.pacer.OnBatchStart(NowNs(), generatedCount);
++}
++
++void VulkanHost::NotifyPaused() noexcept
++{
++	State& s = S();
++	std::lock_guard lock(s.pacerMutex);
++	s.pacer.OnPaused();
++}
++
+ VulkanRuntime::Status VulkanHost::Snapshot()
+ {
+ 	State& s = S();
+diff --git a/src/vulkan/VulkanHost.h b/src/vulkan/VulkanHost.h
+index 3410e07..39af4da 100644
+--- a/src/vulkan/VulkanHost.h
++++ b/src/vulkan/VulkanHost.h
+@@ -36,6 +36,8 @@ namespace VulkanHost
+ 		// VK_KHR_cooperative_matrix (AMD RDNA3/RDNA4 WMMA and Intel Arc/Battlemage XMX)
+ 		bool coopMatrixExtensions = false;
+ 		uint32_t coopMatrixSpec = 0;
++		// Hardware flip metering / low-latency pacing (VK_NV_present_metering or VK_NV_low_latency2)
++		bool hwPacing = false;
+ 	};
+ 
+ 	// Installs the hooks, or arranges for them to be installed when vulkan-1.dll is loaded. Later calls do nothing. Not
+@@ -52,6 +54,10 @@ namespace VulkanHost
+ 	// The reason code (VulkanPolicy::Describe) the hooks turned this physical device down for, empty when they didn't
+ 	std::string RefusalFor(VkPhysicalDevice physical);
+ 
++	// Frame-pacing cadence signals from VulkanRuntime::Evaluate (recorded-mode MFG)
++	void NotifyBatchStart(uint32_t generatedCount) noexcept;
++	void NotifyPaused() noexcept;
++
+ 	// For the log and the menu
+ 	VulkanRuntime::Status Snapshot();
+ } // namespace VulkanHost
+diff --git a/src/vulkan/VulkanPolicy.h b/src/vulkan/VulkanPolicy.h
+index e2138cc..32d5c3d 100644
+--- a/src/vulkan/VulkanPolicy.h
++++ b/src/vulkan/VulkanPolicy.h
+@@ -444,4 +444,134 @@ namespace VulkanPolicy
+ 
+ 		return std::string(reason);
+ 	}
++
++	// CPU-side Vulkan present pacer for recorded-mode Multi-Frame Generation (e.g. Streamline/OptiScaler on AMD/Intel
++	// GPUs where VK_NV_low_latency2 out-of-band pacing is unavailable and V-Sync FIFO is off).
++	// Tracks real-frame batch cadence with an EMA and spaces burst vkQueuePresentKHR calls evenly across
++	// T_real / (generatedCount + 1) without stalling late frames or interfering with V-Sync FIFO.
++	struct PresentPacer
++	{
++		static constexpr uint64_t MinBatchNs = 2'000'000ull;       // 2 ms (500 base FPS)
++		static constexpr uint64_t MaxBatchNs = 250'000'000ull;     // 250 ms (4 base FPS)
++		static constexpr uint64_t ActiveWindowNs = 250'000'000ull; // auto-disengage after 250 ms idle
++		static constexpr uint64_t MaxWaitNs = 25'000'000ull;       // 25 ms hard safety cap per present
++		static constexpr uint64_t TargetRatioNum = 95ull;          // 95% of nominal interval leaves scanout headroom
++		static constexpr uint64_t TargetRatioDen = 100ull;
++
++		uint64_t lastBatchNs = 0;
++		uint64_t emaBatchNs = 0;
++		uint64_t targetStepNs = 0;
++		uint64_t lastPresentNs = 0;
++		uint64_t activeUntilNs = 0;
++		uint32_t generatedCount = 0;
++		uint32_t presentsInBatch = 0;
++
++		void Reset() noexcept
++		{
++			lastBatchNs = 0;
++			emaBatchNs = 0;
++			targetStepNs = 0;
++			lastPresentNs = 0;
++			activeUntilNs = 0;
++			generatedCount = 0;
++			presentsInBatch = 0;
++		}
++
++		void OnPaused() noexcept
++		{
++			lastBatchNs = 0;
++			targetStepNs = 0;
++			activeUntilNs = 0;
++			generatedCount = 0;
++			presentsInBatch = 0;
++		}
++
++		void OnBatchStart(uint64_t nowNs, uint32_t count) noexcept
++		{
++			count = ClampCount(count);
++			generatedCount = count;
++			presentsInBatch = 0;
++			activeUntilNs = nowNs + ActiveWindowNs;
++
++			if (lastBatchNs != 0 && nowNs > lastBatchNs)
++			{
++				const uint64_t delta = nowNs - lastBatchNs;
++				if (delta >= MinBatchNs && delta <= MaxBatchNs)
++				{
++					if (emaBatchNs == 0)
++					{
++						emaBatchNs = delta;
++					}
++					else if (delta > emaBatchNs * 2ull || delta * 2ull < emaBatchNs)
++					{
++						// Rapidly adapt on large framerate shifts (e.g. menu -> gameplay or scene cut)
++						emaBatchNs = (emaBatchNs + delta) / 2ull;
++					}
++					else
++					{
++						// Smooth 0.25 EMA for stable cadence
++						emaBatchNs = (emaBatchNs * 3ull + delta) / 4ull;
++					}
++
++					const uint64_t totalFrames = static_cast<uint64_t>(count) + 1ull;
++					targetStepNs = (emaBatchNs * TargetRatioNum) / (totalFrames * TargetRatioDen);
++				}
++				else
++				{
++					// Long hitch or pause: keep EMA reset until two valid batches arrive
++					emaBatchNs = 0;
++					targetStepNs = 0;
++				}
++			}
++
++			lastBatchNs = nowNs;
++		}
++
++		// Returns nanoseconds to wait before calling vkQueuePresentKHR and advances lastPresentNs to the target time.
++		uint64_t ComputePresentWaitNs(uint64_t nowNs, bool vsyncFifo) noexcept
++		{
++			if (vsyncFifo)
++			{
++				lastPresentNs = nowNs;
++				return 0;
++			}
++
++			if (generatedCount == 0 || targetStepNs == 0 || nowNs > activeUntilNs)
++			{
++				lastPresentNs = nowNs;
++				return 0;
++			}
++
++			// Guard against runaway pacing if a menu/overlay presents without new FG batches
++			if (presentsInBatch >= generatedCount + 2u)
++			{
++				lastPresentNs = nowNs;
++				return 0;
++			}
++
++			++presentsInBatch;
++
++			if (lastPresentNs == 0 || nowNs <= lastPresentNs)
++			{
++				lastPresentNs = nowNs;
++				return 0;
++			}
++
++			const uint64_t desiredNs = lastPresentNs + targetStepNs;
++			if (nowNs >= desiredNs)
++			{
++				// On time or late: present immediately, never accumulate timing debt
++				lastPresentNs = nowNs;
++				return 0;
++			}
++
++			uint64_t waitNs = desiredNs - nowNs;
++			const uint64_t capNs = std::min(targetStepNs, MaxWaitNs);
++			if (waitNs > capNs)
++				waitNs = capNs;
++
++			lastPresentNs = nowNs + waitNs;
++			return waitNs;
++		}
++	};
+ } // namespace VulkanPolicy
+diff --git a/src/vulkan/VulkanRuntime.cpp b/src/vulkan/VulkanRuntime.cpp
+index 3e7d1b9..9011fbc 100644
+--- a/src/vulkan/VulkanRuntime.cpp
++++ b/src/vulkan/VulkanRuntime.cpp
+@@ -334,13 +334,18 @@ namespace
+ 
+ 	// ------------------------------------------------------------------------------------------ recording
+ 
+-	void FullBarrier(const Device& d, VkCommandBuffer command)
++	void StageBarrier(const Device& d, VkCommandBuffer command,
++		VkPipelineStageFlags srcStage, VkAccessFlags srcAccess,
++		VkPipelineStageFlags dstStage, VkAccessFlags dstAccess)
+ 	{
+-		VkMemoryBarrier memory{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT,
+-			VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
++		VkMemoryBarrier memory{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, srcAccess, dstAccess };
++		d.vkCmdPipelineBarrier(command, srcStage, dstStage, 0, 1, &memory, 0, nullptr, 0, nullptr);
++	}
+ 
+-		d.vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
+-			&memory, 0, nullptr, 0, nullptr);
++	void FullBarrier(const Device& d, VkCommandBuffer command)
++	{
++		StageBarrier(d, command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
++			VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+ 	}
+ 
+ 	void CopyImage(const Device& d, VkCommandBuffer command, VkImage source, VkImageLayout sourceLayout, VkImage target,
+@@ -933,7 +938,10 @@ namespace
+ 
+ 		const xefgd_result_t result = CallXeFG("Execute", [&] { return XeFG::Execute(f.context, f.list.Get(), f.exec); });
+ 		f.list->Close();
+-		FullBarrier(d, command);
++		StageBarrier(d, command,
++			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
++			VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++			VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+ 
+ 		if (result != XEFGD_RESULT_SUCCESS)
+ 		{
+@@ -1001,8 +1009,12 @@ namespace
+ 		const bool reset = parameters.GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
+ 		Slot& slot = f.slots[f.current];
+ 
+-		// The frame's inputs
+-		FullBarrier(d, command);
++		// The frame's inputs: wait for the game's prior writes before transfer/compute reads
++		StageBarrier(d, command,
++			VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
++			VK_ACCESS_MEMORY_WRITE_BIT,
++			VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++			VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+ 		CopyImage(d, command, in.backbuffer->image, GameLayout, xvk::ImageOf(slot.backbuffer.Get()),
+ 			VK_IMAGE_LAYOUT_GENERAL, f.width, f.height, in.backbuffer);
+ 
+@@ -1025,7 +1037,11 @@ namespace
+ 			depth.width, depth.height);
+ 		RecordSampledCopy(d, command, d.pipelines[VulkanPolicy::MotionCopyShader(static_cast<uint32_t>(f.motionFormat))],
+ 			motion.imageView, slot.motionView, f.depthWidth, f.depthHeight, motion.width, motion.height);
+-		FullBarrier(d, command);
++		StageBarrier(d, command,
++			VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++			VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
++			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++			VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+ 
+ 		// The frame's constants. DLSSG.MvecScale is already a pixel scale of the motion vectors' extent (not
+ 		// Streamline's normalized one), carried to the depth size they are resampled to. XeFG's left handed projection is
+@@ -1231,6 +1247,7 @@ namespace
+ 			// DLSSG.EnableInterp 0 pauses generation for this frame (a menu, a loading screen): no XeFG work and the next
+ 			// batch starts without a previous frame
+ 			const bool interpolate = parameters->GetOr<uint32_t>("DLSSG.EnableInterp", 1) != 0;
++			bool didExecute = false;
+ 
+ 			if (!interpolate)
+ 			{
+@@ -1238,6 +1255,7 @@ namespace
+ 				f.havePrevious = false;
+ 				f.generatedThrough = 0;
+ 				f.paused++;
++				VulkanHost::NotifyPaused();
+ 			}
+ 			else if (VulkanPolicy::NewBatch(index, f.lastIndex, count, f.batchCount, f.batches))
+ 			{
+@@ -1246,6 +1264,7 @@ namespace
+ 				f.generatedThrough = 0;
+ 				f.batchReady = GenerateBatch(d, f, command, *parameters, count,
+ 					VulkanPolicy::ExecuteRange(true, index, count, false));
++				didExecute = f.batchReady;
+ 				f.batches++;
+ 
+ 				Plugin::Report({ f.width, f.height, count, f.exec.uiCompositionEnabled != 0, NetworkOf(f.model),
+@@ -1254,26 +1273,39 @@ namespace
+ 				if (!f.batchReady)
+ 				{
+ 					f.havePrevious = false;
++					VulkanHost::NotifyPaused();
+ 					if (++f.failures <= 16)
+ 						Log::Error("Vulkan: batch failed ({}), index {}, count {}", f.fault, index, count);
+ 				}
+-				else if (f.batches == 1 || f.batches % 6000 == 0)
++				else
+ 				{
+-					Log::Info("Vulkan: {} batches of {} generated frames, {} evaluations, {} failures, {} paused", f.batches,
+-						count, f.evaluations, f.failures, f.paused);
++					VulkanHost::NotifyBatchStart(count);
++					if (f.batches == 1 || f.batches % 6000 == 0)
++					{
++						Log::Info("Vulkan: {} batches of {} generated frames, {} evaluations, {} failures, {} paused", f.batches,
++							count, f.evaluations, f.failures, f.paused);
++					}
+ 				}
+ 			}
+ 			else if (f.batchReady && index > f.generatedThrough)
+ 			{
+ 				const auto range = VulkanPolicy::ExecuteRange(false, index, f.batchCount, false);
+ 
+-				if (range.record && f.context && !RecordOutputs(d, f, command, range))
++				if (range.record && f.context)
+ 				{
+-					f.batchReady = false;
+-					f.havePrevious = false;
+-					f.generatedThrough = 0;
+-					if (++f.failures <= 16)
+-						Log::Error("Vulkan: output {} of {} failed ({})", index, f.batchCount, f.fault);
++					if (!RecordOutputs(d, f, command, range))
++					{
++						f.batchReady = false;
++						f.havePrevious = false;
++						f.generatedThrough = 0;
++						VulkanHost::NotifyPaused();
++						if (++f.failures <= 16)
++							Log::Error("Vulkan: output {} of {} failed ({})", index, f.batchCount, f.fault);
++					}
++					else
++					{
++						didExecute = true;
++					}
+ 				}
+ 			}
+ 
+@@ -1281,13 +1313,26 @@ namespace
+ 
+ 			const bool copied = f.batchReady && index <= f.generatedThrough && index <= f.batchCount &&
+ 				f.outputs[index - 1];
++			const bool copyReal = real && !SameSubresource(*real, *backbuffer);
++			const bool copyFallback = !copied && backbuffer && !SameSubresource(*output, *backbuffer) &&
++				VulkanPolicy::CopyCompatible(output->format, backbuffer->format);
++			const bool anyCopy = copyReal || copied || copyFallback;
++
++			// RecordOutputs already emits a COMPUTE -> TRANSFER barrier; only emit a pre-copy barrier when
++			// no execute ran in this evaluation (paused, fallback, or pre-generated cache hit).
++			if (anyCopy && !didExecute)
++			{
++				StageBarrier(d, command,
++					VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
++					VK_ACCESS_MEMORY_WRITE_BIT,
++					VK_PIPELINE_STAGE_TRANSFER_BIT,
++					VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
++			}
+ 
+-			// Preserve the real frame before writing an interpolated output that may
+-			// alias the backbuffer. Later evaluations use this batch's saved input,
+-			// because that game backbuffer may already hold an interpolated frame.
+-			if (real && !SameSubresource(*real, *backbuffer))
++			// Preserve the real frame before writing an interpolated output that may alias the backbuffer.
++			// real and output are verified disjoint above, so both copies share one exit barrier.
++			if (copyReal)
+ 			{
+-				FullBarrier(d, command);
+ 				if (copied)
+ 					CopyImage(d, command, xvk::ImageOf(f.slots[f.current ^ 1].backbuffer.Get()),
+ 						VK_IMAGE_LAYOUT_GENERAL, real->image, GameLayout,
+@@ -1295,24 +1340,26 @@ namespace
+ 				else
+ 					CopyImage(d, command, backbuffer->image, GameLayout, real->image, GameLayout,
+ 						std::min(backbuffer->width, real->width), std::min(backbuffer->height, real->height), backbuffer, real);
+-				FullBarrier(d, command);
+ 				f.realCopies++;
+ 			}
+ 
+ 			if (copied)
+ 			{
+-				FullBarrier(d, command);
+ 				CopyImage(d, command, xvk::ImageOf(f.outputs[index - 1].Get()), VK_IMAGE_LAYOUT_GENERAL, output->image,
+ 					GameLayout, std::min(output->width, f.width), std::min(output->height, f.height), nullptr, output);
+-				FullBarrier(d, command);
+ 			}
+-			else if (backbuffer && !SameSubresource(*output, *backbuffer) && VulkanPolicy::CopyCompatible(output->format, backbuffer->format))
++			else if (copyFallback)
+ 			{
+ 				// Paused, or the batch failed: the real frame takes the output's place, never its stale content
+-				FullBarrier(d, command);
+ 				CopyImage(d, command, backbuffer->image, GameLayout, output->image, GameLayout,
+ 					std::min(backbuffer->width, output->width), std::min(backbuffer->height, output->height), backbuffer, output);
+-				FullBarrier(d, command);
++			}
++
++			if (anyCopy)
++			{
++				StageBarrier(d, command,
++					VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++					VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+ 			}
+ 
+ 			xvk::EndRecording(d.d3d.Get());
+diff --git a/src/vulkan/xvk_device.cpp b/src/vulkan/xvk_device.cpp
+index dfdde99..6de11ac 100644
+--- a/src/vulkan/xvk_device.cpp
++++ b/src/vulkan/xvk_device.cpp
+@@ -453,7 +453,7 @@ void Device::EndRecording()
+         if (vk_.vkCreateEvent(device_, &info, nullptr, &event) != VK_SUCCESS) { Fault("recording event"); return; }
+     }
+     // Set once everything recorded before it has run; the epoch's objects are released after that.
+-    vk_.vkCmdSetEvent(command, event, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
++    vk_.vkCmdSetEvent(command, event, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
+     QueueSlot& slot = *slots_[0];
+     uint64_t value = 0;
+     {
+diff --git a/tests/vulkan_runtime/policy_test.cpp b/tests/vulkan_runtime/policy_test.cpp
+index 72adc54..d35b706 100644
+--- a/tests/vulkan_runtime/policy_test.cpp
++++ b/tests/vulkan_runtime/policy_test.cpp
+@@ -373,6 +373,43 @@ int main()
+ 		}
+ 	}
+ 
++
++	// ---- recorded-mode Vulkan PresentPacer: burst smoothing, V-Sync FIFO bypass, late-frame no-debt, pause reset
++	{
++		VulkanPolicy::PresentPacer pacer;
++		constexpr uint64_t ms = 1'000'000ull;
++
++		// Before two batches establish cadence, never stall
++		pacer.OnBatchStart(100 * ms, 3);
++		CHECK(pacer.ComputePresentWaitNs(101 * ms, false) == 0);
++
++		// Second batch arrives 20 ms later (50 base FPS, 4x FG -> 200 FPS, target step = 20ms * 0.95 / 4 = 4.75 ms)
++		pacer.OnBatchStart(120 * ms, 3);
++		// G1 arrives on time at 120 ms (19 ms since last present at 101 ms -> no wait)
++		CHECK(pacer.ComputePresentWaitNs(120 * ms, false) == 0);
++		// G2 bursts 0.2 ms later -> should wait ~4.55 ms
++		const uint64_t waitG2 = pacer.ComputePresentWaitNs(120 * ms + 200'000ull, false);
++		CHECK(waitG2 == 4'550'000ull);
++		// G3 bursts 0.2 ms after G2's paced time -> should wait ~4.55 ms
++		const uint64_t waitG3 = pacer.ComputePresentWaitNs(124'750'000ull + 200'000ull, false);
++		CHECK(waitG3 == 4'550'000ull);
++		// Real frame arrives late (10 ms after G3) -> must NOT wait or accumulate debt
++		CHECK(pacer.ComputePresentWaitNs(140 * ms, false) == 0);
++
++		// V-Sync FIFO active -> always returns 0
++		pacer.OnBatchStart(140 * ms, 3);
++		CHECK(pacer.ComputePresentWaitNs(140 * ms + 100'000ull, true) == 0);
++
++		// Pause disengages pacer immediately
++		pacer.OnPaused();
++		CHECK(pacer.ComputePresentWaitNs(141 * ms, false) == 0);
++
++		// Inactivity beyond 250 ms auto-disengages
++		pacer.OnBatchStart(200 * ms, 1);
++		pacer.OnBatchStart(220 * ms, 1);
++		CHECK(pacer.ComputePresentWaitNs(500 * ms, false) == 0);
++	}
++
+ 	std::printf("%d checks, %d failed\n", checks, failures);
+ 	return failures ? 1 : 0;
+ }
+diff --git a/tests/vulkan_runtime/stubs/Windows.h b/tests/vulkan_runtime/stubs/Windows.h
+index e3a24da..c8b5cf8 100644
+--- a/tests/vulkan_runtime/stubs/Windows.h
++++ b/tests/vulkan_runtime/stubs/Windows.h
+@@ -84,6 +84,15 @@ extern "C++"
+ 	DWORD GetEnvironmentVariableW(LPCWSTR name, LPWSTR value, DWORD size);
+ 	DWORD GetLastError();
+ 	HANDLE GetCurrentProcess();
++	union LARGE_INTEGER { int64_t QuadPart; };
++	BOOL QueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCount);
++	BOOL QueryPerformanceFrequency(LARGE_INTEGER* lpFrequency);
++	BOOL SetWaitableTimer(HANDLE hTimer, const LARGE_INTEGER* lpDueTime, long lPeriod,
++		void* pfnCompletionRoutine, void* lpArgToCompletionRoutine, BOOL fResume);
++	DWORD WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds);
++	BOOL CloseHandle(HANDLE hObject);
++	void Sleep(DWORD dwMilliseconds);
++	inline void YieldProcessor() {}
+ 	ULONGLONG GetTickCount64();
+ 	int WideCharToMultiByte(UINT codePage, DWORD flags, const wchar_t* wide, int wideCount, char* narrow, int narrowCount,
+ 		const char* defaultChar, BOOL* usedDefault);
+diff --git a/tests/vulkan_runtime/stubs/vulkan/vulkan.h b/tests/vulkan_runtime/stubs/vulkan/vulkan.h
+index 3cfa07b..fb7b4a5 100644
+--- a/tests/vulkan_runtime/stubs/vulkan/vulkan.h
++++ b/tests/vulkan_runtime/stubs/vulkan/vulkan.h
+@@ -258,12 +258,19 @@ typedef enum VkBorderColor
+ 
+ typedef enum VkAccessFlagBits
+ {
++	VK_ACCESS_SHADER_READ_BIT = 0x00000020,
++	VK_ACCESS_SHADER_WRITE_BIT = 0x00000040,
++	VK_ACCESS_TRANSFER_READ_BIT = 0x00000800,
++	VK_ACCESS_TRANSFER_WRITE_BIT = 0x00001000,
+ 	VK_ACCESS_MEMORY_READ_BIT = 0x00008000,
+ 	VK_ACCESS_MEMORY_WRITE_BIT = 0x00010000,
+ } VkAccessFlagBits;
+ 
+ typedef enum VkPipelineStageFlagBits
+ {
++	VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT = 0x00000800,
++	VK_PIPELINE_STAGE_TRANSFER_BIT = 0x00001000,
++	VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT = 0x00008000,
+ 	VK_PIPELINE_STAGE_ALL_COMMANDS_BIT = 0x00010000,
+ } VkPipelineStageFlagBits;
+ 
+@@ -300,6 +307,8 @@ typedef enum VkPresentModeKHR
+ {
+ 	VK_PRESENT_MODE_IMMEDIATE_KHR = 0,
+ 	VK_PRESENT_MODE_MAILBOX_KHR = 1,
++	VK_PRESENT_MODE_FIFO_KHR = 2,
++	VK_PRESENT_MODE_FIFO_RELAXED_KHR = 3,
+ } VkPresentModeKHR;
+ 
+ typedef enum VkLatencyMarkerNV
+@@ -1000,3 +1009,27 @@ typedef uint64_t(VKAPI_PTR* PFN_vkGetImageViewHandle64NVX)(VkDevice device, cons
+ typedef VkResult(VKAPI_PTR* PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)(VkPhysicalDevice physicalDevice,
+ 	uint32_t* pPropertyCount, VkCooperativeMatrixPropertiesKHR* pProperties);
+ typedef void(VKAPI_PTR* PFN_vkCmdPipelineBarrier2)(VkCommandBuffer commandBuffer, const VkDependencyInfo* pDependencyInfo);
++typedef struct VkQueue_T* VkQueue;
++typedef struct VkSwapchainKHR_T* VkSwapchainKHR;
++typedef struct VkSwapchainCreateInfoKHR
++{
++	VkStructureType sType;
++	const void* pNext;
++	VkPresentModeKHR presentMode;
++} VkSwapchainCreateInfoKHR;
++typedef struct VkPresentInfoKHR
++{
++	VkStructureType sType;
++	const void* pNext;
++	uint32_t waitSemaphoreCount;
++	const void* pWaitSemaphores;
++	uint32_t swapchainCount;
++	const VkSwapchainKHR* pSwapchains;
++	const uint32_t* pImageIndices;
++	VkResult* pResults;
++} VkPresentInfoKHR;
++typedef VkResult(VKAPI_PTR* PFN_vkCreateSwapchainKHR)(VkDevice device, const VkSwapchainCreateInfoKHR* pCreateInfo,
++	const VkAllocationCallbacks* pAllocator, VkSwapchainKHR* pSwapchain);
++typedef void(VKAPI_PTR* PFN_vkDestroySwapchainKHR)(VkDevice device, VkSwapchainKHR swapchain,
++	const VkAllocationCallbacks* pAllocator);
++typedef VkResult(VKAPI_PTR* PFN_vkQueuePresentKHR)(VkQueue queue, const VkPresentInfoKHR* pPresentInfo);
+-- 
+2.39.5
+
