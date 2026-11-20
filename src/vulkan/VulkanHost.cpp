@@ -1272,13 +1272,10 @@ namespace
 		// layering MinHook over the detoured short stub can corrupt the trampoline and crash during swapchain creation.
 		auto isUnsafeShortStub = [](FARPROC proc) -> bool {
 			const auto* b = reinterpret_cast<const uint8_t*>(proc);
-			// Already detoured by OptiScaler/overlay (JMP rel32, JMP rel8, JMP [rip+disp32], or mov rax/jmp rax)
-			if (b[0] == 0xE9 || b[0] == 0xEB || (b[0] == 0xFF && b[1] == 0x25))
-				return true;
-			// Short loader device-dispatch trampoline: mov rax, [rcx] (48 8B 01) + jmp [rax+disp] (FF 60 / FF A0)
-			if (b[0] == 0x48 && b[1] == 0x8B && b[2] == 0x01 && b[3] == 0xFF && (b[4] == 0x60 || b[4] == 0xA0))
-				return true;
-			return false;
+			// Skip only when already detoured by OptiScaler/overlay (JMP rel32, JMP rel8, or JMP [rip+disp32]).
+			// Clean un-detoured vulkan-1.dll dispatch stubs (mov rax, [rcx]; jmp [rax+disp32]) are safe for MinHook
+			// and are needed for the Vulkan Present Pacer when V-Sync FIFO is off.
+			return b[0] == 0xE9 || b[0] == 0xEB || (b[0] == 0xFF && b[1] == 0x25);
 		};
 
 		auto tryHook = [&](HMODULE mod, const char* name, void* detour, void** rawOut, auto& trampolineOut, bool skipUnsafeStub) -> bool {

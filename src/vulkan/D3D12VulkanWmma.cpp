@@ -169,6 +169,7 @@ struct Bridge
 	ComPtr<ID3D12Device> d3dDevice;
 	ComPtr<ID3D12Device> nativeD3DDevice;
 	ComPtr<ID3D12Fence> sharedFence;
+	ComPtr<ID3D12Fence> nativeSharedFence;
 	HANDLE fenceEvent = nullptr;
 	std::atomic<uint64_t> fenceValue{ 0 };
 	PostCopyRing directRing;
@@ -263,16 +264,25 @@ bool PatchQueueVtable(ID3D12CommandQueue* queue, ExecuteCommandListsFn hookFn) n
 	if (n >= gQueueHooks.size())
 		return false;
 
-	DWORD oldProtect = 0;
-	if (!VirtualProtect(&vt[kExecuteCommandListsSlot], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect))
-		return false;
+	void* orig = vt[kExecuteCommandListsSlot];
+	if (orig == reinterpret_cast<void*>(hookFn))
+		return true;
 
-	void* orig = InterlockedExchangePointer(&vt[kExecuteCommandListsSlot], reinterpret_cast<void*>(hookFn));
-	DWORD ignored = 0;
-	VirtualProtect(&vt[kExecuteCommandListsSlot], sizeof(void*), oldProtect, &ignored);
-
+	// Publish the original pointer before patching the vtable slot so concurrent ExecuteCommandLists callers
+	// on other threads never observe a null FindOriginalExecute result and drop GPU work.
 	gQueueHooks[n] = { vt, reinterpret_cast<ExecuteCommandListsFn>(orig) };
 	gQueueHookCount.store(n + 1, std::memory_order_release);
+
+	DWORD oldProtect = 0;
+	if (!VirtualProtect(&vt[kExecuteCommandListsSlot], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect))
+	{
+		gQueueHookCount.store(n, std::memory_order_release);
+		return false;
+	}
+
+	InterlockedExchangePointer(&vt[kExecuteCommandListsSlot], reinterpret_cast<void*>(hookFn));
+	DWORD ignored = 0;
+	VirtualProtect(&vt[kExecuteCommandListsSlot], sizeof(void*), oldProtect, &ignored);
 	return true;
 }
 
@@ -707,10 +717,22 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 		return;
 	}
 
+	// Match fence and post-copy command list device layer (wrapper vs unwrapped native) to the queue.
+	ComPtr<ID3D12Device> queueDev;
+	const bool isNativeQueue = SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&queueDev))) && queueDev &&
+		gBridge.nativeD3DDevice && queueDev.Get() == gBridge.nativeD3DDevice.Get() &&
+		gBridge.nativeD3DDevice.Get() != gBridge.d3dDevice.Get();
+	ID3D12Fence* useFence = (isNativeQueue && gBridge.nativeSharedFence)
+		? gBridge.nativeSharedFence.Get()
+		: gBridge.sharedFence.Get();
+	ID3D12Device* ringDev = (isNativeQueue && gBridge.nativeD3DDevice)
+		? gBridge.nativeD3DDevice.Get()
+		: gBridge.d3dDevice.Get();
+
 	// 1) D3D12 signals Vulkan that CaptureRealFrame copies are complete.
 	const uint64_t waitVal = gBridge.fenceValue.fetch_add(1, std::memory_order_acq_rel) + 1;
 	const uint64_t signalVal = gBridge.fenceValue.fetch_add(1, std::memory_order_acq_rel) + 1;
-	if (FAILED(queue->Signal(gBridge.sharedFence.Get(), waitVal)))
+	if (FAILED(queue->Signal(useFence, waitVal)))
 	{
 		gBridge.fallbacks.fetch_add(1, std::memory_order_relaxed);
 		return;
@@ -741,7 +763,7 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 	gBridge.vkSlotDoneFence[vkSlot] = signalVal;
 
 	// 3) D3D12 waits on Vulkan completion (GPU-side wait, zero CPU stall).
-	queue->Wait(gBridge.sharedFence.Get(), signalVal);
+	queue->Wait(useFence, signalVal);
 
 	// 4) Copy generated shared outputs into the game's output texture(s) on D3D12.
 	if (!batch.copies.empty())
@@ -752,10 +774,10 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 			: D3D12_COMMAND_LIST_TYPE_DIRECT;
 		PostCopyRing& ring = (useType == D3D12_COMMAND_LIST_TYPE_COMPUTE) ? gBridge.computeRing : gBridge.directRing;
 
-		if (EnsurePostCopyRing(gBridge.d3dDevice.Get(), useType, ring))
+		if (EnsurePostCopyRing(ringDev, useType, ring))
 		{
 			const uint32_t slot = ring.cursor++ % kRingSize;
-			WaitFenceCpu(gBridge.sharedFence.Get(), gBridge.fenceEvent, ring.doneFence[slot]);
+			WaitFenceCpu(useFence, gBridge.fenceEvent, ring.doneFence[slot]);
 			if (SUCCEEDED(ring.alloc[slot]->Reset()) &&
 				SUCCEEDED(ring.list[slot]->Reset(ring.alloc[slot].Get(), nullptr)))
 			{
@@ -767,7 +789,7 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 				origExec(queue, 1, postLists);
 
 				const uint64_t doneVal = gBridge.fenceValue.fetch_add(1, std::memory_order_acq_rel) + 1;
-				queue->Signal(gBridge.sharedFence.Get(), doneVal);
+				queue->Signal(useFence, doneVal);
 				ring.doneFence[slot] = doneVal;
 			}
 		}
@@ -1080,6 +1102,9 @@ bool Install(ID3D12Device* d3dDevice, std::string& reason) noexcept
 	semImport.handle = fenceHandle;
 
 	const VkResult semRes = gBridge.vkImportSemaphoreWin32HandleKHR(gBridge.device, &semImport);
+	ComPtr<ID3D12Device> nativeDev = UnwrapNativeDevice(d3dDevice);
+	if (semRes == VK_SUCCESS && nativeDev && nativeDev.Get() != d3dDevice)
+		nativeDev->OpenSharedHandle(fenceHandle, IID_PPV_ARGS(&gBridge.nativeSharedFence));
 	CloseHandle(fenceHandle);
 	if (semRes != VK_SUCCESS)
 		return fail("semaphore_import_failed");
