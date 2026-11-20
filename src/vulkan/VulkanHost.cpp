@@ -402,6 +402,38 @@ namespace
 		}
 	}
 
+	// Capture a pre-existing VkInstance that was created before our hooks were installed (common in emulators like
+	// Longshot that create VkInstance before loading version.dll/OptiScaler, then resolve vkCreateDevice via GIPA).
+	// Stored with apiVersion == 0 so PrepareDevice validates Vulkan 1.3 support directly against the physical device.
+	void TrackLateInstance(VkInstance instance, const void* caller) noexcept
+	{
+		if (!instance || IsTranslationLayerCaller(caller))
+			return;
+		try
+		{
+			State& s = S();
+			bool added = false;
+			{
+				std::lock_guard lock(s.mutex);
+				for (const auto& entry : s.instances)
+				{
+					if (entry.first == instance)
+						return;
+				}
+				if (s.instances.size() >= MaxInstances)
+					s.instances.erase(s.instances.begin());
+				s.instances.emplace_back(instance, 0u);
+				added = true;
+			}
+			if (added)
+				Log::Info("Vulkan hooks: adopted pre-existing VkInstance {} via vkGetInstanceProcAddr",
+					static_cast<const void*>(instance));
+		}
+		catch (...)
+		{
+		}
+	}
+
 	struct ReentryGuard
 	{
 		bool& flag;
@@ -621,7 +653,10 @@ namespace
 			if (!edit->record.instance)
 				return Refuse(physical, "instance_unknown");
 
-			if (instanceVersion < xvk::kRequiredApiVersion)
+			// instanceVersion == 0 means the VkInstance was created before our hooks loaded and adopted via GIPA.
+			// Let the Vulkan 1.1+ function lookups and physical device 1.3 feature checks below validate it; if the
+			// driver rejects the edited VkDeviceCreateInfo, CreateDeviceImpl falls back safely to the unedited request.
+			if (instanceVersion != 0 && instanceVersion < xvk::kRequiredApiVersion)
 				return Refuse(physical, "instance_api_version");
 
 			const auto gipa = s.loaderGipa;
@@ -928,7 +963,11 @@ namespace
 		{
 			std::lock_guard lock(s.mutex);
 			if (s.instances.empty())
+			{
+				Log::Warn("Vulkan hooks: vkCreateDevice called for physical device {} with no tracked VkInstance",
+					static_cast<const void*>(physical));
 				return next(physical, info, allocator, device);
+			}
 		}
 
 		s.deviceCalls++;
@@ -1102,6 +1141,9 @@ namespace
 	VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL HookGetInstanceProcAddr(VkInstance instance, const char* pName)
 	{
 		State& s = S();
+		if (instance)
+			TrackLateInstance(instance, XEFG_RETURN_ADDRESS());
+
 		PFN_vkVoidFunction fn = s.loaderGipa ? s.loaderGipa(instance, pName) : nullptr;
 
 		if (!fn || !pName)
@@ -1224,11 +1266,30 @@ namespace
 			Log::Warn("Vulkan hooks: couldn't hook vkGetInstanceProcAddr, using loader detours only");
 		}
 
-		// Optional present/swapchain hooks for recorded-mode frame pacing (non-fatal if unavailable)
-		auto tryHook = [](HMODULE mod, const char* name, void* detour, void** rawOut, auto& trampolineOut) -> bool {
+		// Optional present/swapchain hooks for recorded-mode frame pacing (non-fatal if unavailable).
+		// Device-level Vulkan loader exports (vkCreateSwapchainKHR, vkDestroySwapchainKHR, vkQueuePresentKHR) are tiny
+		// dispatch stubs (mov rax, [rcx]; jmp [rax+off]). If OptiScaler/Detours already patched a stub (0xE9/0xEB/0xFF 0x25),
+		// layering MinHook over the detoured short stub can corrupt the trampoline and crash during swapchain creation.
+		auto isUnsafeShortStub = [](FARPROC proc) -> bool {
+			const auto* b = reinterpret_cast<const uint8_t*>(proc);
+			// Already detoured by OptiScaler/overlay (JMP rel32, JMP rel8, JMP [rip+disp32], or mov rax/jmp rax)
+			if (b[0] == 0xE9 || b[0] == 0xEB || (b[0] == 0xFF && b[1] == 0x25))
+				return true;
+			// Short loader device-dispatch trampoline: mov rax, [rcx] (48 8B 01) + jmp [rax+disp] (FF 60 / FF A0)
+			if (b[0] == 0x48 && b[1] == 0x8B && b[2] == 0x01 && b[3] == 0xFF && (b[4] == 0x60 || b[4] == 0xA0))
+				return true;
+			return false;
+		};
+
+		auto tryHook = [&](HMODULE mod, const char* name, void* detour, void** rawOut, auto& trampolineOut, bool skipUnsafeStub) -> bool {
 			FARPROC proc = GetProcAddress(mod, name);
 			if (!proc)
 				return false;
+			if (skipUnsafeStub && isUnsafeShortStub(proc))
+			{
+				Log::Info("Vulkan hooks: skipping inline hook on {} (short/already-detoured dispatch stub)", name);
+				return false;
+			}
 			*rawOut = reinterpret_cast<void*>(proc);
 			std::remove_reference_t<decltype(trampolineOut)> tramp = nullptr;
 			if (MH_CreateHook(reinterpret_cast<void*>(proc), detour, reinterpret_cast<void**>(&tramp)) != MH_OK)
@@ -1243,10 +1304,10 @@ namespace
 			return true;
 		};
 
-		tryHook(loader, "vkDestroyInstance", reinterpret_cast<void*>(&HookDestroyInstance), &s.rawDestroyInstance, s.destroyInstance);
-		tryHook(loader, "vkCreateSwapchainKHR", reinterpret_cast<void*>(&HookCreateSwapchain), &s.rawCreateSwapchain, s.createSwapchain);
-		tryHook(loader, "vkDestroySwapchainKHR", reinterpret_cast<void*>(&HookDestroySwapchain), &s.rawDestroySwapchain, s.destroySwapchain);
-		s.presentHooked = tryHook(loader, "vkQueuePresentKHR", reinterpret_cast<void*>(&HookQueuePresent), &s.rawQueuePresent, s.queuePresent);
+		tryHook(loader, "vkDestroyInstance", reinterpret_cast<void*>(&HookDestroyInstance), &s.rawDestroyInstance, s.destroyInstance, false);
+		tryHook(loader, "vkCreateSwapchainKHR", reinterpret_cast<void*>(&HookCreateSwapchain), &s.rawCreateSwapchain, s.createSwapchain, true);
+		tryHook(loader, "vkDestroySwapchainKHR", reinterpret_cast<void*>(&HookDestroySwapchain), &s.rawDestroySwapchain, s.destroySwapchain, true);
+		s.presentHooked = tryHook(loader, "vkQueuePresentKHR", reinterpret_cast<void*>(&HookQueuePresent), &s.rawQueuePresent, s.queuePresent, true);
 
 		s.loaderHooked = true;
 		return true;
