@@ -102,6 +102,18 @@ extern "C++"
 		WORD dmSize;
 		DWORD dmDisplayFrequency;
 	};
+	struct HMONITOR__;
+	using HMONITOR = HMONITOR__*;
+	#define MONITOR_DEFAULTTONEAREST 0x00000002
+	#define CCHDEVICENAME 32
+	struct MONITORINFOEXW
+	{
+		DWORD cbSize;
+		wchar_t szDevice[CCHDEVICENAME];
+	};
+	HWND GetForegroundWindow();
+	HMONITOR MonitorFromWindow(HWND hwnd, DWORD dwFlags);
+	BOOL GetMonitorInfoW(HMONITOR hMonitor, MONITORINFOEXW* lpmi);
 	BOOL EnumDisplaySettingsW(LPCWSTR lpszDeviceName, DWORD iModeNum, DEVMODEW* lpDevMode);
 	int _wcsicmp(const wchar_t* a, const wchar_t* b);
 
