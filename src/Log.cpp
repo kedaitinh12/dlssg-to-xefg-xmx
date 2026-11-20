@@ -21,6 +21,5 @@ void Log::Write(std::string_view level, std::string_view message)
 		OutputDebugStringA(line.c_str());
 
 	file.write(line.data(), static_cast<std::streamsize>(line.size()));
-	if (level == "ERROR" || level == "WARN")
-		file.flush();
+	file.flush();
 }
