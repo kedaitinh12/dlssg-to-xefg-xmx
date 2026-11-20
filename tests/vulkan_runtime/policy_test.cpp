@@ -383,18 +383,47 @@ int main()
 		pacer.OnBatchStart(100 * ms, 3);
 		CHECK(pacer.ComputePresentWaitNs(101 * ms, false) == 0);
 
-		// Second batch arrives 20 ms later (50 base FPS, 4x FG -> 200 FPS, target step = 20ms * 0.95 / 4 = 4.75 ms)
+		// Second batch arrives 20 ms later (50 base FPS, 4x FG -> 200 FPS, target step = 20ms * 0.92 / 4 = 4.60 ms)
 		pacer.OnBatchStart(120 * ms, 3);
 		// G1 arrives on time at 120 ms (19 ms since last present at 101 ms -> no wait)
 		CHECK(pacer.ComputePresentWaitNs(120 * ms, false) == 0);
-		// G2 bursts 0.2 ms later -> should wait ~4.55 ms
+		// G2 bursts 0.2 ms later -> should wait ~4.40 ms
 		const uint64_t waitG2 = pacer.ComputePresentWaitNs(120 * ms + 200'000ull, false);
-		CHECK(waitG2 == 4'550'000ull);
-		// G3 bursts 0.2 ms after G2's paced time -> should wait ~4.55 ms
-		const uint64_t waitG3 = pacer.ComputePresentWaitNs(124'750'000ull + 200'000ull, false);
-		CHECK(waitG3 == 4'550'000ull);
+		CHECK(waitG2 == 4'400'000ull);
+		// G3 bursts 0.2 ms after G2's paced time -> should wait ~4.40 ms
+		const uint64_t waitG3 = pacer.ComputePresentWaitNs(124'600'000ull + 200'000ull, false);
+		CHECK(waitG3 == 4'400'000ull);
 		// Real frame arrives late (10 ms after G3) -> must NOT wait or accumulate debt
 		CHECK(pacer.ComputePresentWaitNs(140 * ms, false) == 0);
+
+		// RDR2 Vulkan regression: steady 50 FPS (20 ms) 3x FG hit by a 36 ms hitch followed by a 10 ms catch-up frame
+		// must NOT inflate emaBatchNs or cascade waits into subsequent batches.
+		VulkanPolicy::PresentPacer rdr2;
+		uint64_t t = 1000 * ms;
+		for (int i = 0; i < 6; ++i)
+		{
+			rdr2.OnBatchStart(t, 2);
+			(void)rdr2.ComputePresentWaitNs(t, false);
+			(void)rdr2.ComputePresentWaitNs(t + 6 * ms, false);
+			(void)rdr2.ComputePresentWaitNs(t + 12 * ms, false);
+			t += 20 * ms;
+		}
+		const uint64_t steadyStep = rdr2.targetStepNs;
+		CHECK(steadyStep == (20 * ms * 92ull) / (3ull * 100ull));
+
+		// Single 36 ms asset-streaming hitch -> drains immediately (0 wait) and preserves steady cadence
+		t += 16 * ms; // total delta = 36 ms
+		rdr2.OnBatchStart(t, 2);
+		CHECK(rdr2.ComputePresentWaitNs(t, false) == 0);
+		CHECK(rdr2.ComputePresentWaitNs(t + 200'000ull, false) == 0);
+		CHECK(rdr2.ComputePresentWaitNs(t + 400'000ull, false) == 0);
+		CHECK(rdr2.targetStepNs == steadyStep);
+
+		// Catch-up frame arrives 10 ms later -> G1 must NOT block behind stale debt, and step stays bounded <= steadyStep
+		t += 10 * ms;
+		rdr2.OnBatchStart(t, 2);
+		CHECK(rdr2.targetStepNs <= steadyStep);
+		CHECK(rdr2.ComputePresentWaitNs(t, false) == 0);
 
 		// V-Sync FIFO active -> always returns 0
 		pacer.OnBatchStart(140 * ms, 3);
