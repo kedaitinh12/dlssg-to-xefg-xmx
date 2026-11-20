@@ -1,0 +1,668 @@
+From 788acb1c47709ee490d36487b7051fa7f83c8228 Mon Sep 17 00:00:00 2001
+From: dlssg-to-xefg <dev@local>
+Date: Fri, 20 Nov 2026 10:09:00 +0000
+Subject: [PATCH] Consolidate WMMA freeze/init fixes, .asi/.dll bridge
+ coexistence, and safe Vulkan stub checks
+
+1. D3D12->Vulkan WMMA bridge init, freeze & queue fixes (D3D12VulkanWmma.cpp, FrameGenerator.cpp):
+   - Wrap XeFG::CreateContext + XeFG::Init on recorded xvk device in VkCommandBuffer +
+     xvk::BeginRecording()/EndRecording() + vkQueueSubmit/vkQueueWaitIdle.
+   - Cache failed ContextSettings so failed XeFG::Init never retries every frame.
+   - Open xvk::BeginRecording() before copyInput() so pendingInit_ layout transitions flush first.
+   - Pre-warm D3D12VulkanWmma::EnsureContext() inside FrameGenerator::CreateContext() so
+     pipeline compilation never stalls Streamline's 500ms waitCPUFence deadline.
+   - Fix PatchQueueVtable race condition and separate wrapped vs native shared fence / PostCopyRing.
+
+2. Bulletproof .asi/.dll WMMA bridge bypass & Longshot-safe stub check (VulkanHost.h, VulkanHost.cpp):
+   - Add thread-local VulkanHost::SetInternalBridgeBypass() RAII guard around D3D12VulkanWmma::Install
+     alongside IsSelfModuleCaller + ignoredInstances tracking, so intermediate hooks (OptiScaler/overlays)
+     can never expose the private WMMA bridge instance/device to VulkanHost.
+   - Harden isUnsafeShortStub to verify >= 14 bytes of INT3/NOP padding after 6/9-byte loader dispatch
+     stubs, preserving Vulkan Present Pacer on standard padded stubs while avoiding Longshot crashes.
+---
+ src/FrameGenerator.cpp         |  11 ++
+ src/vulkan/D3D12VulkanWmma.cpp | 245 +++++++++++++++++++++++----------
+ src/vulkan/VulkanHost.cpp      | 108 +++++++++++++--
+ src/vulkan/VulkanHost.h        |   4 +
+ 4 files changed, 287 insertions(+), 81 deletions(-)
+
+diff --git a/src/FrameGenerator.cpp b/src/FrameGenerator.cpp
+index 4448a47..2cf9234 100644
+--- a/src/FrameGenerator.cpp
++++ b/src/FrameGenerator.cpp
+@@ -683,6 +683,17 @@ bool FrameGenerator::CreateContext()
+ 
+ 	context = std::move(newContext);
+ 
++	// Pre-warm the Vulkan WMMA bridge context during CreateContext rather than lazily inside EvaluateFeature,
++	// so Vulkan pipeline compilation and weight upload never stall Streamline's 500ms waitCPUFence deadline
++	// (which caused freezes in The Witcher 3 and Cyberpunk 2077 when switching to WMMA).
++	if (UseWmma(settings.model) && D3D12VulkanWmma::Active())
++	{
++		const D3D12VulkanWmma::ContextSettings vkSettings{
++			settings.width, settings.height, settings.format, settings.initFlags, settings.uiMode, settings.model
++		};
++		D3D12VulkanWmma::EnsureContext(vkSettings);
++	}
++
+ 	routeLaunches = UseWmma(settings.model) ? xefg_wmma::Snapshot().launches : xefg_cuda::Snapshot().launches;
+ 	routeFrames = 0;
+ 	routeReported = false;
+diff --git a/src/vulkan/D3D12VulkanWmma.cpp b/src/vulkan/D3D12VulkanWmma.cpp
+index ab3187e..9a32108 100644
+--- a/src/vulkan/D3D12VulkanWmma.cpp
++++ b/src/vulkan/D3D12VulkanWmma.cpp
+@@ -9,6 +9,7 @@
+ #include "../XeFG.h"
+ #include "xvk.h"
+ #include "VulkanCoopMat.h"
++#include "VulkanHost.h"
+ #include "VulkanPolicy.h"
+ 
+ #include <wrl/client.h>
+@@ -169,10 +170,13 @@ struct Bridge
+ 	ComPtr<ID3D12Device> d3dDevice;
+ 	ComPtr<ID3D12Device> nativeD3DDevice;
+ 	ComPtr<ID3D12Fence> sharedFence;
++	ComPtr<ID3D12Fence> nativeSharedFence;
+ 	HANDLE fenceEvent = nullptr;
+ 	std::atomic<uint64_t> fenceValue{ 0 };
+ 	PostCopyRing directRing;
+ 	PostCopyRing computeRing;
++	PostCopyRing nativeDirectRing;
++	PostCopyRing nativeComputeRing;
+ 
+ 	// Vulkan side
+ 	HMODULE vulkanDll = nullptr;
+@@ -199,6 +203,8 @@ struct Bridge
+ 	ComPtr<ID3D12GraphicsCommandList> xvkList;
+ 	xefgd_handle_t xefgContext = nullptr;
+ 	ContextSettings contextSettings{};
++	bool contextFailed = false;
++	ContextSettings failedContextSettings{};
+ 	uint32_t tileM = 0;
+ 	uint32_t tileN = 0;
+ 	uint32_t tileK = 0;
+@@ -263,16 +269,25 @@ bool PatchQueueVtable(ID3D12CommandQueue* queue, ExecuteCommandListsFn hookFn) n
+ 	if (n >= gQueueHooks.size())
+ 		return false;
+ 
++	void* orig = vt[kExecuteCommandListsSlot];
++	if (orig == reinterpret_cast<void*>(hookFn))
++		return true;
++
++	// Publish the original pointer before patching the vtable slot so concurrent ExecuteCommandLists callers
++	// on other threads never observe a null FindOriginalExecute result and drop GPU work.
++	gQueueHooks[n] = { vt, reinterpret_cast<ExecuteCommandListsFn>(orig) };
++	gQueueHookCount.store(n + 1, std::memory_order_release);
++
+ 	DWORD oldProtect = 0;
+ 	if (!VirtualProtect(&vt[kExecuteCommandListsSlot], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect))
++	{
++		gQueueHookCount.store(n, std::memory_order_release);
+ 		return false;
++	}
+ 
+-	void* orig = InterlockedExchangePointer(&vt[kExecuteCommandListsSlot], reinterpret_cast<void*>(hookFn));
++	InterlockedExchangePointer(&vt[kExecuteCommandListsSlot], reinterpret_cast<void*>(hookFn));
+ 	DWORD ignored = 0;
+ 	VirtualProtect(&vt[kExecuteCommandListsSlot], sizeof(void*), oldProtect, &ignored);
+-
+-	gQueueHooks[n] = { vt, reinterpret_cast<ExecuteCommandListsFn>(orig) };
+-	gQueueHookCount.store(n + 1, std::memory_order_release);
+ 	return true;
+ }
+ 
+@@ -608,55 +623,57 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
+ 		return;
+ 	}
+ 
+-	// Copy D3D12 shared inputs into xvk's GENERAL-layout textures.
+-	auto copyInput = [&](SharedImport* imp) {
+-		if (!imp)
+-			return;
+-		VkImage xvkImg = xvk::ImageOf(imp->xvkResource.Get());
+-		RecordImageBarrier(gBridge, cmd, imp->vkImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+-			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+-		RecordImageBarrier(gBridge, cmd, xvkImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+-			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+-			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+-		RecordCopyImage(gBridge, cmd, imp->vkImage, xvkImg, imp->width, imp->height);
+-		RecordImageBarrier(gBridge, cmd, xvkImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+-			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+-			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+-	};
+-
+-	copyInput(prevBB);
+-	copyInput(prevD);
+-	copyInput(prevMV);
+-	copyInput(prevHL);
+-	copyInput(nextBB);
+-	copyInput(nextD);
+-	copyInput(nextMV);
+-	copyInput(nextHL);
+-
+-	// Record the entire XeFG batch (all 28 layers, with 17 INT8 layers on hardware VK_KHR_cooperative_matrix).
+-	xefgd_exec_params_t vkParams{};
+-	vkParams.prev = batch.prevData;
+-	vkParams.prev.backBuffer.pResource = prevBB->xvkResource.Get();
+-	vkParams.prev.depth.pResource = prevD->xvkResource.Get();
+-	vkParams.prev.motionVectors.pResource = prevMV->xvkResource.Get();
+-	vkParams.prev.hudlessColor.pResource = prevHL ? prevHL->xvkResource.Get() : nullptr;
+-
+-	vkParams.next = batch.nextData;
+-	vkParams.next.backBuffer.pResource = nextBB->xvkResource.Get();
+-	vkParams.next.depth.pResource = nextD->xvkResource.Get();
+-	vkParams.next.motionVectors.pResource = nextMV->xvkResource.Get();
+-	vkParams.next.hudlessColor.pResource = nextHL ? nextHL->xvkResource.Get() : nullptr;
+-
+-	vkParams.ppOutputs = xvkOutPtrs;
+-	vkParams.pOutputBases = batch.outputBases;
+-	vkParams.numInterpolatedFrames = static_cast<uint8_t>(batch.frameCount);
+-	vkParams.firstFrameIndex = 0;
+-	vkParams.frameCount = static_cast<uint8_t>(batch.frameCount);
+-	vkParams.uiCompositionEnabled = batch.settings.uiMode != XEFGD_UI_MODE_AUTO;
+-
++	// Open xvk recording BEFORE copyInput so any pendingInit_ (UNDEFINED -> GENERAL)
++	// layout transitions on newly created xvk resources flush before we copy frame pixels into them.
+ 	bool execOk = false;
+ 	if (xvk::BeginRecording(gBridge.xvkDevice.Get(), cmd))
+ 	{
++		// Copy D3D12 shared inputs into xvk's GENERAL-layout textures.
++		auto copyInput = [&](SharedImport* imp) {
++			if (!imp)
++				return;
++			VkImage xvkImg = xvk::ImageOf(imp->xvkResource.Get());
++			RecordImageBarrier(gBridge, cmd, imp->vkImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
++				VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
++			RecordImageBarrier(gBridge, cmd, xvkImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
++				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
++				VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
++			RecordCopyImage(gBridge, cmd, imp->vkImage, xvkImg, imp->width, imp->height);
++			RecordImageBarrier(gBridge, cmd, xvkImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
++				VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
++		};
++
++		copyInput(prevBB);
++		copyInput(prevD);
++		copyInput(prevMV);
++		copyInput(prevHL);
++		copyInput(nextBB);
++		copyInput(nextD);
++		copyInput(nextMV);
++		copyInput(nextHL);
++
++		// Record the entire XeFG batch (all 28 layers, with 17 INT8 layers on hardware VK_KHR_cooperative_matrix).
++		xefgd_exec_params_t vkParams{};
++		vkParams.prev = batch.prevData;
++		vkParams.prev.backBuffer.pResource = prevBB->xvkResource.Get();
++		vkParams.prev.depth.pResource = prevD->xvkResource.Get();
++		vkParams.prev.motionVectors.pResource = prevMV->xvkResource.Get();
++		vkParams.prev.hudlessColor.pResource = prevHL ? prevHL->xvkResource.Get() : nullptr;
++
++		vkParams.next = batch.nextData;
++		vkParams.next.backBuffer.pResource = nextBB->xvkResource.Get();
++		vkParams.next.depth.pResource = nextD->xvkResource.Get();
++		vkParams.next.motionVectors.pResource = nextMV->xvkResource.Get();
++		vkParams.next.hudlessColor.pResource = nextHL ? nextHL->xvkResource.Get() : nullptr;
++
++		vkParams.ppOutputs = xvkOutPtrs;
++		vkParams.pOutputBases = batch.outputBases;
++		vkParams.numInterpolatedFrames = static_cast<uint8_t>(batch.frameCount);
++		vkParams.firstFrameIndex = 0;
++		vkParams.frameCount = static_cast<uint8_t>(batch.frameCount);
++		vkParams.uiCompositionEnabled = batch.settings.uiMode != XEFGD_UI_MODE_AUTO;
++
+ 		bool listReady = false;
+ 		if (!gBridge.xvkList)
+ 		{
+@@ -707,10 +724,22 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
+ 		return;
+ 	}
+ 
++	// Match fence and post-copy command list device layer (wrapper vs unwrapped native) to the queue.
++	ComPtr<ID3D12Device> queueDev;
++	const bool isNativeQueue = SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&queueDev))) && queueDev &&
++		gBridge.nativeD3DDevice && queueDev.Get() == gBridge.nativeD3DDevice.Get() &&
++		gBridge.nativeD3DDevice.Get() != gBridge.d3dDevice.Get();
++	ID3D12Fence* useFence = (isNativeQueue && gBridge.nativeSharedFence)
++		? gBridge.nativeSharedFence.Get()
++		: gBridge.sharedFence.Get();
++	ID3D12Device* ringDev = (isNativeQueue && gBridge.nativeD3DDevice)
++		? gBridge.nativeD3DDevice.Get()
++		: gBridge.d3dDevice.Get();
++
+ 	// 1) D3D12 signals Vulkan that CaptureRealFrame copies are complete.
+ 	const uint64_t waitVal = gBridge.fenceValue.fetch_add(1, std::memory_order_acq_rel) + 1;
+ 	const uint64_t signalVal = gBridge.fenceValue.fetch_add(1, std::memory_order_acq_rel) + 1;
+-	if (FAILED(queue->Signal(gBridge.sharedFence.Get(), waitVal)))
++	if (FAILED(queue->Signal(useFence, waitVal)))
+ 	{
+ 		gBridge.fallbacks.fetch_add(1, std::memory_order_relaxed);
+ 		return;
+@@ -741,7 +770,7 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
+ 	gBridge.vkSlotDoneFence[vkSlot] = signalVal;
+ 
+ 	// 3) D3D12 waits on Vulkan completion (GPU-side wait, zero CPU stall).
+-	queue->Wait(gBridge.sharedFence.Get(), signalVal);
++	queue->Wait(useFence, signalVal);
+ 
+ 	// 4) Copy generated shared outputs into the game's output texture(s) on D3D12.
+ 	if (!batch.copies.empty())
+@@ -750,12 +779,14 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
+ 		const D3D12_COMMAND_LIST_TYPE useType = (qType == D3D12_COMMAND_LIST_TYPE_COMPUTE)
+ 			? D3D12_COMMAND_LIST_TYPE_COMPUTE
+ 			: D3D12_COMMAND_LIST_TYPE_DIRECT;
+-		PostCopyRing& ring = (useType == D3D12_COMMAND_LIST_TYPE_COMPUTE) ? gBridge.computeRing : gBridge.directRing;
++		PostCopyRing& ring = isNativeQueue
++			? ((useType == D3D12_COMMAND_LIST_TYPE_COMPUTE) ? gBridge.nativeComputeRing : gBridge.nativeDirectRing)
++			: ((useType == D3D12_COMMAND_LIST_TYPE_COMPUTE) ? gBridge.computeRing : gBridge.directRing);
+ 
+-		if (EnsurePostCopyRing(gBridge.d3dDevice.Get(), useType, ring))
++		if (EnsurePostCopyRing(ringDev, useType, ring))
+ 		{
+ 			const uint32_t slot = ring.cursor++ % kRingSize;
+-			WaitFenceCpu(gBridge.sharedFence.Get(), gBridge.fenceEvent, ring.doneFence[slot]);
++			WaitFenceCpu(useFence, gBridge.fenceEvent, ring.doneFence[slot]);
+ 			if (SUCCEEDED(ring.alloc[slot]->Reset()) &&
+ 				SUCCEEDED(ring.list[slot]->Reset(ring.alloc[slot].Get(), nullptr)))
+ 			{
+@@ -767,7 +798,7 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
+ 				origExec(queue, 1, postLists);
+ 
+ 				const uint64_t doneVal = gBridge.fenceValue.fetch_add(1, std::memory_order_acq_rel) + 1;
+-				queue->Signal(gBridge.sharedFence.Get(), doneVal);
++				queue->Signal(useFence, doneVal);
+ 				ring.doneFence[slot] = doneVal;
+ 			}
+ 		}
+@@ -851,6 +882,12 @@ bool Install(ID3D12Device* d3dDevice, std::string& reason) noexcept
+ 	if (!VulkanPrograms::Installed().Usable())
+ 		return fail("no_vulkan_models");
+ 
++	struct ScopedVulkanHostBypass
++	{
++		ScopedVulkanHostBypass() noexcept { VulkanHost::SetInternalBridgeBypass(true); }
++		~ScopedVulkanHostBypass() noexcept { VulkanHost::SetInternalBridgeBypass(false); }
++	} bypassHost;
++
+ 	// Load vulkan-1.dll dynamically so we have zero link-time dependency on Vulkan.
+ 	gBridge.vulkanDll = LoadLibraryW(L"vulkan-1.dll");
+ 	if (!gBridge.vulkanDll)
+@@ -1080,6 +1117,9 @@ bool Install(ID3D12Device* d3dDevice, std::string& reason) noexcept
+ 	semImport.handle = fenceHandle;
+ 
+ 	const VkResult semRes = gBridge.vkImportSemaphoreWin32HandleKHR(gBridge.device, &semImport);
++	ComPtr<ID3D12Device> nativeDev = UnwrapNativeDevice(d3dDevice);
++	if (semRes == VK_SUCCESS && nativeDev && nativeDev.Get() != d3dDevice)
++		nativeDev->OpenSharedHandle(fenceHandle, IID_PPV_ARGS(&gBridge.nativeSharedFence));
+ 	CloseHandle(fenceHandle);
+ 	if (semRes != VK_SUCCESS)
+ 		return fail("semaphore_import_failed");
+@@ -1156,37 +1196,78 @@ bool Install(ID3D12Device* d3dDevice, std::string& reason) noexcept
+ 	return true;
+ }
+ 
++bool SameContextSettings(const ContextSettings& a, const ContextSettings& b) noexcept
++{
++	return a.width == b.width &&
++		a.height == b.height &&
++		a.format == b.format &&
++		a.initFlags == b.initFlags &&
++		a.uiMode == b.uiMode &&
++		a.model == b.model;
++}
++
+ bool EnsureContext(const ContextSettings& settings) noexcept
+ {
+ 	std::lock_guard lock(gBridge.mutex);
+ 	if (!gBridge.active.load(std::memory_order_acquire) || !gBridge.xvkDevice)
+ 		return false;
+ 
+-	if (gBridge.xefgContext &&
+-		gBridge.contextSettings.width == settings.width &&
+-		gBridge.contextSettings.height == settings.height &&
+-		gBridge.contextSettings.format == settings.format &&
+-		gBridge.contextSettings.initFlags == settings.initFlags &&
+-		gBridge.contextSettings.uiMode == settings.uiMode &&
+-		gBridge.contextSettings.model == settings.model)
+-	{
++	if (gBridge.xefgContext && SameContextSettings(gBridge.contextSettings, settings))
+ 		return true;
+-	}
++
++	if (gBridge.contextFailed && SameContextSettings(gBridge.failedContextSettings, settings))
++		return false;
++
++	auto markFailed = [&]() noexcept {
++		gBridge.contextFailed = true;
++		gBridge.failedContextSettings = settings;
++		return false;
++	};
++
++	// Drain in-flight Vulkan work so destroying any prior context and reusing cmdBufs[0]
++	// for XeFG::Init weight uploads is completely safe.
++	if (gBridge.queue && gBridge.vkQueueWaitIdle)
++		gBridge.vkQueueWaitIdle(gBridge.queue);
++	for (uint32_t i = 0; i < kRingSize; ++i)
++		gBridge.vkSlotDoneFence[i] = 0;
+ 
+ 	if (gBridge.xefgContext)
+ 	{
+-		gBridge.vkQueueWaitIdle(gBridge.queue);
+ 		XeFG::Destroy(gBridge.xefgContext);
+ 		gBridge.xefgContext = nullptr;
+ 	}
+ 
+ 	XeFG::OverrideModel(settings.model);
+ 
++	// Recorded xvk devices require an open VkCommandBuffer + xvk::BeginRecording()
++	// during XeFG::Init because libxess_fg creates internal command lists to upload
++	// neural network weights and initialize resources.
++	VkCommandBuffer initCmd = gBridge.cmdBufs[0];
++	gBridge.vkResetCommandBuffer(initCmd, 0);
++	VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
++	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++	if (gBridge.vkBeginCommandBuffer(initCmd, &beginInfo) != VK_SUCCESS)
++	{
++		Log::Warn("D3D12->Vulkan WMMA bridge: vkBeginCommandBuffer failed for XeFG::Init, falling back to D3D12");
++		return markFailed();
++	}
++
++	if (!xvk::BeginRecording(gBridge.xvkDevice.Get(), initCmd))
++	{
++		gBridge.vkEndCommandBuffer(initCmd);
++		Log::Warn("D3D12->Vulkan WMMA bridge: xvk::BeginRecording failed for XeFG::Init, falling back to D3D12");
++		return markFailed();
++	}
++
+ 	xefgd_handle_t ctx = nullptr;
+-	if (XeFG::CreateContext(gBridge.xvkDevice.Get(), &ctx) != XEFGD_RESULT_SUCCESS || !ctx)
++	const xefgd_result_t createRes = XeFG::CreateContext(gBridge.xvkDevice.Get(), &ctx);
++	if (createRes != XEFGD_RESULT_SUCCESS || !ctx)
+ 	{
+-		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::CreateContext failed, falling back to D3D12");
+-		return false;
++		xvk::EndRecording(gBridge.xvkDevice.Get());
++		gBridge.vkEndCommandBuffer(initCmd);
++		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::CreateContext failed (result {}), falling back to D3D12",
++			static_cast<int>(createRes));
++		return markFailed();
+ 	}
+ 
+ 	xefgd_init_params_t init{};
+@@ -1194,17 +1275,36 @@ bool EnsureContext(const ContextSettings& settings) noexcept
+ 	init.backBufferFormat = static_cast<uint32_t>(settings.format);
+ 	init.initFlags = settings.initFlags;
+ 	init.maxInterpolatedFrames = kMaxFrames;
++	init.creationNodeMask = 1;
++	init.visibleNodeMask = 1;
+ 	init.uiMode = settings.uiMode;
+ 
+-	if (XeFG::Init(ctx, init) != XEFGD_RESULT_SUCCESS)
++	const xefgd_result_t initRes = XeFG::Init(ctx, init);
++	xvk::EndRecording(gBridge.xvkDevice.Get());
++	const VkResult endRes = gBridge.vkEndCommandBuffer(initCmd);
++
++	if (initRes != XEFGD_RESULT_SUCCESS || endRes != VK_SUCCESS)
+ 	{
+ 		XeFG::Destroy(ctx);
+-		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init failed, falling back to D3D12");
+-		return false;
++		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init failed (result {}, vkEnd {}), falling back to D3D12",
++			static_cast<int>(initRes), static_cast<int>(endRes));
++		return markFailed();
++	}
++
++	VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
++	submitInfo.commandBufferCount = 1;
++	submitInfo.pCommandBuffers = &initCmd;
++	if (gBridge.vkQueueSubmit(gBridge.queue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS)
++	{
++		XeFG::Destroy(ctx);
++		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init vkQueueSubmit failed, falling back to D3D12");
++		return markFailed();
+ 	}
++	gBridge.vkQueueWaitIdle(gBridge.queue);
+ 
+ 	gBridge.xefgContext = ctx;
+ 	gBridge.contextSettings = settings;
++	gBridge.contextFailed = false;
+ 	Log::Info("D3D12->Vulkan WMMA bridge context ready: {}x{}, format {}, model {}, {}x{}x{} hardware WMMA",
+ 		settings.width, settings.height, static_cast<uint32_t>(settings.format), settings.model,
+ 		gBridge.tileM, gBridge.tileN, gBridge.tileK);
+@@ -1214,6 +1314,7 @@ bool EnsureContext(const ContextSettings& settings) noexcept
+ void ResetContext() noexcept
+ {
+ 	std::lock_guard lock(gBridge.mutex);
++	gBridge.contextFailed = false;
+ 	if (gBridge.xefgContext)
+ 	{
+ 		if (gBridge.queue && gBridge.vkQueueWaitIdle)
+diff --git a/src/vulkan/VulkanHost.cpp b/src/vulkan/VulkanHost.cpp
+index 49103df..c9be266 100644
+--- a/src/vulkan/VulkanHost.cpp
++++ b/src/vulkan/VulkanHost.cpp
+@@ -22,6 +22,7 @@
+ #include <memory>
+ #include <mutex>
+ #include <type_traits>
++#include <unordered_set>
+ #include <utility>
+ #include <vector>
+ 
+@@ -42,6 +43,7 @@ namespace
+ 		// The maps and the strings, held briefly and never while calling out
+ 		std::mutex mutex;
+ 		std::vector<std::pair<VkInstance, uint32_t>> instances; // live instances in creation order (newest checked first)
++		std::unordered_set<VkInstance> ignoredInstances; // skipped translation-layer / internal WMMA bridge instances
+ 		std::map<VkDevice, VulkanHost::DeviceRecord> devices;
+ 		std::map<VkSwapchainKHR, VkPresentModeKHR> swapchains;
+ 		std::map<VkPhysicalDevice, std::string> refused;
+@@ -87,6 +89,7 @@ namespace
+ 		std::atomic_bool hwPacingActive = false;
+ 		std::atomic_bool pacingLogged = false;
+ 		std::atomic_bool translationSkipLogged = false;
++		std::atomic_bool selfSkipLogged = false;
+ 	};
+ 
+ 	// Leaked on purpose: a game's thread can call the hooks while the process exits, after the static destructors
+@@ -279,6 +282,45 @@ namespace
+ 	// On Wine / Proton (Linux), D3D12/D3D11 games run through VKD3D-Proton or DXVK, which create internal
+ 	// Vulkan instances and devices inside d3d12.dll / d3d12core.dll / dxgi.dll / d3d11.dll.
+ 	// Mutating those internal instances/devices (extensions, pNext chains, swapchains) crashes VKD3D-Proton.
++	thread_local int gInternalBridgeBypassDepth = 0;
++
++	bool IsInternalBridgeBypassed() noexcept
++	{
++		return gInternalBridgeBypassDepth > 0;
++	}
++
++	HMODULE SelfModule() noexcept
++	{
++		HMODULE mod = nullptr;
++		GetModuleHandleExW(
++			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++			reinterpret_cast<LPCWSTR>(&SelfModule), &mod);
++		return mod;
++	}
++
++	bool IsSelfModuleCaller(const void* caller) noexcept
++	{
++		if (!caller)
++			return false;
++		static const HMODULE self = SelfModule();
++		if (!self)
++			return false;
++		HMODULE mod = nullptr;
++		if (!GetModuleHandleExW(
++				GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++				reinterpret_cast<LPCWSTR>(caller), &mod) || !mod)
++			return false;
++		return mod == self;
++	}
++
++	bool IsInternalBridgeInstance(const VkInstanceCreateInfo* info) noexcept
++	{
++		if (!info || !info->pApplicationInfo)
++			return false;
++		const char* app = info->pApplicationInfo->pApplicationName;
++		return app && std::strcmp(app, "dlssg-to-xefg-wmma") == 0;
++	}
++
+ 	bool IsTranslationLayerInstance(const VkInstanceCreateInfo* info) noexcept
+ 	{
+ 		if (!info || !info->pApplicationInfo)
+@@ -286,8 +328,7 @@ namespace
+ 		const char* engine = info->pApplicationInfo->pEngineName;
+ 		const char* app = info->pApplicationInfo->pApplicationName;
+ 		return ContainsInsensitive(engine, "dxvk") || ContainsInsensitive(engine, "vkd3d") ||
+-		       ContainsInsensitive(app, "dxvk") || ContainsInsensitive(app, "vkd3d") ||
+-		       (app && std::strcmp(app, "dlssg-to-xefg-wmma") == 0);
++		       ContainsInsensitive(app, "dxvk") || ContainsInsensitive(app, "vkd3d");
+ 	}
+ 
+ 	bool IsTranslationLayerCaller(const void* caller) noexcept
+@@ -373,6 +414,7 @@ namespace
+ 				std::remove_if(s.instances.begin(), s.instances.end(),
+ 					[instance](const auto& entry) { return entry.first == instance; }),
+ 				s.instances.end());
++			s.ignoredInstances.erase(instance);
+ 
+ 			if (s.instances.size() >= MaxInstances)
+ 				s.instances.erase(s.instances.begin());
+@@ -396,6 +438,7 @@ namespace
+ 				std::remove_if(s.instances.begin(), s.instances.end(),
+ 					[instance](const auto& entry) { return entry.first == instance; }),
+ 				s.instances.end());
++			s.ignoredInstances.erase(instance);
+ 		}
+ 		catch (...)
+ 		{
+@@ -407,7 +450,7 @@ namespace
+ 	// Stored with apiVersion == 0 so PrepareDevice validates Vulkan 1.3 support directly against the physical device.
+ 	void TrackLateInstance(VkInstance instance, const void* caller) noexcept
+ 	{
+-		if (!instance || IsTranslationLayerCaller(caller))
++		if (!instance || IsInternalBridgeBypassed() || IsTranslationLayerCaller(caller) || IsSelfModuleCaller(caller))
+ 			return;
+ 		try
+ 		{
+@@ -415,6 +458,8 @@ namespace
+ 			bool added = false;
+ 			{
+ 				std::lock_guard lock(s.mutex);
++				if (s.ignoredInstances.count(instance) != 0)
++					return;
+ 				for (const auto& entry : s.instances)
+ 				{
+ 					if (entry.first == instance)
+@@ -454,11 +499,33 @@ namespace
+ 		ReentryGuard guard(inCreateInstance);
+ 
+ 		State& s = S();
+-		if (IsTranslationLayerInstance(info) || IsTranslationLayerCaller(caller))
++		const bool internalBridge = IsInternalBridgeBypassed() || IsInternalBridgeInstance(info) || IsSelfModuleCaller(caller);
++		if (internalBridge || IsTranslationLayerInstance(info) || IsTranslationLayerCaller(caller))
+ 		{
+-			if (!s.translationSkipLogged.exchange(true, std::memory_order_relaxed))
++			if (internalBridge)
++			{
++				if (!s.selfSkipLogged.exchange(true, std::memory_order_relaxed))
++					Log::Info("Vulkan hooks: bypassing internal D3D12->Vulkan WMMA bridge instance/device");
++			}
++			else if (!s.translationSkipLogged.exchange(true, std::memory_order_relaxed))
++			{
+ 				Log::Info("Vulkan hooks: skipping DXVK/VKD3D translation-layer instance/device (leaving D3D-on-Vulkan untouched)");
+-			return next(info, allocator, instance);
++			}
++			const VkResult result = next(info, allocator, instance);
++			if (result == VK_SUCCESS && instance && *instance)
++			{
++				try
++				{
++					std::lock_guard lock(s.mutex);
++					if (s.ignoredInstances.size() >= MaxInstances * 2)
++						s.ignoredInstances.clear();
++					s.ignoredInstances.insert(*instance);
++				}
++				catch (...)
++				{
++				}
++			}
++			return result;
+ 		}
+ 
+ 		s.instanceCalls++;
+@@ -953,6 +1020,12 @@ namespace
+ 		ReentryGuard guard(inCreateDevice);
+ 
+ 		State& s = S();
++		if (IsInternalBridgeBypassed() || IsSelfModuleCaller(caller))
++		{
++			if (!s.selfSkipLogged.exchange(true, std::memory_order_relaxed))
++				Log::Info("Vulkan hooks: bypassing internal D3D12->Vulkan WMMA bridge instance/device");
++			return next(physical, info, allocator, device);
++		}
+ 		if (IsTranslationLayerCaller(caller))
+ 		{
+ 			if (!s.translationSkipLogged.exchange(true, std::memory_order_relaxed))
+@@ -1272,12 +1345,21 @@ namespace
+ 		// layering MinHook over the detoured short stub can corrupt the trampoline and crash during swapchain creation.
+ 		auto isUnsafeShortStub = [](FARPROC proc) -> bool {
+ 			const auto* b = reinterpret_cast<const uint8_t*>(proc);
+-			// Already detoured by OptiScaler/overlay (JMP rel32, JMP rel8, JMP [rip+disp32], or mov rax/jmp rax)
++			// Already detoured by OptiScaler/overlay (JMP rel32, JMP rel8, or JMP [rip+disp32]).
+ 			if (b[0] == 0xE9 || b[0] == 0xEB || (b[0] == 0xFF && b[1] == 0x25))
+ 				return true;
+-			// Short loader device-dispatch trampoline: mov rax, [rcx] (48 8B 01) + jmp [rax+disp] (FF 60 / FF A0)
++			// Short loader device-dispatch trampoline: mov rax, [rcx] (48 8B 01) + jmp [rax+disp8/disp32] (FF 60 / FF A0).
++			// Safe only when followed by INT3/NOP padding out to >= 14 bytes; tightly packed stubs risk corrupting
++			// adjacent functions if MinHook falls back to an absolute jump (e.g. Longshot / custom loaders).
+ 			if (b[0] == 0x48 && b[1] == 0x8B && b[2] == 0x01 && b[3] == 0xFF && (b[4] == 0x60 || b[4] == 0xA0))
+-				return true;
++			{
++				const size_t stubLen = (b[4] == 0x60) ? 6u : 9u;
++				for (size_t i = stubLen; i < 14u; ++i)
++				{
++					if (b[i] != 0xCC && b[i] != 0x90)
++						return true;
++				}
++			}
+ 			return false;
+ 		};
+ 
+@@ -1497,6 +1579,14 @@ std::string VulkanHost::RefusalFor(VkPhysicalDevice physical)
+ 	return found == s.refused.end() ? std::string() : found->second;
+ }
+ 
++void VulkanHost::SetInternalBridgeBypass(bool bypass) noexcept
++{
++	if (bypass)
++		++gInternalBridgeBypassDepth;
++	else if (gInternalBridgeBypassDepth > 0)
++		--gInternalBridgeBypassDepth;
++}
++
+ void VulkanHost::NotifyBatchStart(uint32_t generatedCount) noexcept
+ {
+ 	State& s = S();
+diff --git a/src/vulkan/VulkanHost.h b/src/vulkan/VulkanHost.h
+index 39af4da..f0e9a90 100644
+--- a/src/vulkan/VulkanHost.h
++++ b/src/vulkan/VulkanHost.h
+@@ -54,6 +54,10 @@ namespace VulkanHost
+ 	// The reason code (VulkanPolicy::Describe) the hooks turned this physical device down for, empty when they didn't
+ 	std::string RefusalFor(VkPhysicalDevice physical);
+ 
++	// Temporarily bypasses VulkanHost instance/device hooks on the current thread (used by D3D12VulkanWmma
++	// so intermediate wrappers like OptiScaler/overlays cannot mask the internal bridge caller).
++	void SetInternalBridgeBypass(bool bypass) noexcept;
++
+ 	// Frame-pacing cadence signals from VulkanRuntime::Evaluate (recorded-mode MFG)
+ 	void NotifyBatchStart(uint32_t generatedCount) noexcept;
+ 	void NotifyPaused() noexcept;
+-- 
+2.39.5
+
