@@ -22,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -42,6 +43,7 @@ namespace
 		// The maps and the strings, held briefly and never while calling out
 		std::mutex mutex;
 		std::vector<std::pair<VkInstance, uint32_t>> instances; // live instances in creation order (newest checked first)
+		std::unordered_set<VkInstance> ignoredInstances; // skipped translation-layer / internal WMMA bridge instances
 		std::map<VkDevice, VulkanHost::DeviceRecord> devices;
 		std::map<VkSwapchainKHR, VkPresentModeKHR> swapchains;
 		std::map<VkPhysicalDevice, std::string> refused;
@@ -87,6 +89,7 @@ namespace
 		std::atomic_bool hwPacingActive = false;
 		std::atomic_bool pacingLogged = false;
 		std::atomic_bool translationSkipLogged = false;
+		std::atomic_bool selfSkipLogged = false;
 	};
 
 	// Leaked on purpose: a game's thread can call the hooks while the process exits, after the static destructors
@@ -279,6 +282,45 @@ namespace
 	// On Wine / Proton (Linux), D3D12/D3D11 games run through VKD3D-Proton or DXVK, which create internal
 	// Vulkan instances and devices inside d3d12.dll / d3d12core.dll / dxgi.dll / d3d11.dll.
 	// Mutating those internal instances/devices (extensions, pNext chains, swapchains) crashes VKD3D-Proton.
+	thread_local int gInternalBridgeBypassDepth = 0;
+
+	bool IsInternalBridgeBypassed() noexcept
+	{
+		return gInternalBridgeBypassDepth > 0;
+	}
+
+	HMODULE SelfModule() noexcept
+	{
+		HMODULE mod = nullptr;
+		GetModuleHandleExW(
+			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			reinterpret_cast<LPCWSTR>(&SelfModule), &mod);
+		return mod;
+	}
+
+	bool IsSelfModuleCaller(const void* caller) noexcept
+	{
+		if (!caller)
+			return false;
+		static const HMODULE self = SelfModule();
+		if (!self)
+			return false;
+		HMODULE mod = nullptr;
+		if (!GetModuleHandleExW(
+				GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				reinterpret_cast<LPCWSTR>(caller), &mod) || !mod)
+			return false;
+		return mod == self;
+	}
+
+	bool IsInternalBridgeInstance(const VkInstanceCreateInfo* info) noexcept
+	{
+		if (!info || !info->pApplicationInfo)
+			return false;
+		const char* app = info->pApplicationInfo->pApplicationName;
+		return app && std::strcmp(app, "dlssg-to-xefg-wmma") == 0;
+	}
+
 	bool IsTranslationLayerInstance(const VkInstanceCreateInfo* info) noexcept
 	{
 		if (!info || !info->pApplicationInfo)
@@ -286,8 +328,7 @@ namespace
 		const char* engine = info->pApplicationInfo->pEngineName;
 		const char* app = info->pApplicationInfo->pApplicationName;
 		return ContainsInsensitive(engine, "dxvk") || ContainsInsensitive(engine, "vkd3d") ||
-		       ContainsInsensitive(app, "dxvk") || ContainsInsensitive(app, "vkd3d") ||
-		       (app && std::strcmp(app, "dlssg-to-xefg-wmma") == 0);
+		       ContainsInsensitive(app, "dxvk") || ContainsInsensitive(app, "vkd3d");
 	}
 
 	bool IsTranslationLayerCaller(const void* caller) noexcept
@@ -373,6 +414,7 @@ namespace
 				std::remove_if(s.instances.begin(), s.instances.end(),
 					[instance](const auto& entry) { return entry.first == instance; }),
 				s.instances.end());
+			s.ignoredInstances.erase(instance);
 
 			if (s.instances.size() >= MaxInstances)
 				s.instances.erase(s.instances.begin());
@@ -396,6 +438,7 @@ namespace
 				std::remove_if(s.instances.begin(), s.instances.end(),
 					[instance](const auto& entry) { return entry.first == instance; }),
 				s.instances.end());
+			s.ignoredInstances.erase(instance);
 		}
 		catch (...)
 		{
@@ -407,7 +450,7 @@ namespace
 	// Stored with apiVersion == 0 so PrepareDevice validates Vulkan 1.3 support directly against the physical device.
 	void TrackLateInstance(VkInstance instance, const void* caller) noexcept
 	{
-		if (!instance || IsTranslationLayerCaller(caller))
+		if (!instance || IsInternalBridgeBypassed() || IsTranslationLayerCaller(caller) || IsSelfModuleCaller(caller))
 			return;
 		try
 		{
@@ -415,6 +458,8 @@ namespace
 			bool added = false;
 			{
 				std::lock_guard lock(s.mutex);
+				if (s.ignoredInstances.count(instance) != 0)
+					return;
 				for (const auto& entry : s.instances)
 				{
 					if (entry.first == instance)
@@ -454,11 +499,33 @@ namespace
 		ReentryGuard guard(inCreateInstance);
 
 		State& s = S();
-		if (IsTranslationLayerInstance(info) || IsTranslationLayerCaller(caller))
+		const bool internalBridge = IsInternalBridgeBypassed() || IsInternalBridgeInstance(info) || IsSelfModuleCaller(caller);
+		if (internalBridge || IsTranslationLayerInstance(info) || IsTranslationLayerCaller(caller))
 		{
-			if (!s.translationSkipLogged.exchange(true, std::memory_order_relaxed))
+			if (internalBridge)
+			{
+				if (!s.selfSkipLogged.exchange(true, std::memory_order_relaxed))
+					Log::Info("Vulkan hooks: bypassing internal D3D12->Vulkan WMMA bridge instance/device");
+			}
+			else if (!s.translationSkipLogged.exchange(true, std::memory_order_relaxed))
+			{
 				Log::Info("Vulkan hooks: skipping DXVK/VKD3D translation-layer instance/device (leaving D3D-on-Vulkan untouched)");
-			return next(info, allocator, instance);
+			}
+			const VkResult result = next(info, allocator, instance);
+			if (result == VK_SUCCESS && instance && *instance)
+			{
+				try
+				{
+					std::lock_guard lock(s.mutex);
+					if (s.ignoredInstances.size() >= MaxInstances * 2)
+						s.ignoredInstances.clear();
+					s.ignoredInstances.insert(*instance);
+				}
+				catch (...)
+				{
+				}
+			}
+			return result;
 		}
 
 		s.instanceCalls++;
@@ -953,6 +1020,12 @@ namespace
 		ReentryGuard guard(inCreateDevice);
 
 		State& s = S();
+		if (IsInternalBridgeBypassed() || IsSelfModuleCaller(caller))
+		{
+			if (!s.selfSkipLogged.exchange(true, std::memory_order_relaxed))
+				Log::Info("Vulkan hooks: bypassing internal D3D12->Vulkan WMMA bridge instance/device");
+			return next(physical, info, allocator, device);
+		}
 		if (IsTranslationLayerCaller(caller))
 		{
 			if (!s.translationSkipLogged.exchange(true, std::memory_order_relaxed))
@@ -1272,10 +1345,22 @@ namespace
 		// layering MinHook over the detoured short stub can corrupt the trampoline and crash during swapchain creation.
 		auto isUnsafeShortStub = [](FARPROC proc) -> bool {
 			const auto* b = reinterpret_cast<const uint8_t*>(proc);
-			// Skip only when already detoured by OptiScaler/overlay (JMP rel32, JMP rel8, or JMP [rip+disp32]).
-			// Clean un-detoured vulkan-1.dll dispatch stubs (mov rax, [rcx]; jmp [rax+disp32]) are safe for MinHook
-			// and are needed for the Vulkan Present Pacer when V-Sync FIFO is off.
-			return b[0] == 0xE9 || b[0] == 0xEB || (b[0] == 0xFF && b[1] == 0x25);
+			// Already detoured by OptiScaler/overlay (JMP rel32, JMP rel8, or JMP [rip+disp32]).
+			if (b[0] == 0xE9 || b[0] == 0xEB || (b[0] == 0xFF && b[1] == 0x25))
+				return true;
+			// Short loader device-dispatch trampoline: mov rax, [rcx] (48 8B 01) + jmp [rax+disp8/disp32] (FF 60 / FF A0).
+			// Safe only when followed by INT3/NOP padding out to >= 14 bytes; tightly packed stubs risk corrupting
+			// adjacent functions if MinHook falls back to an absolute jump (e.g. Longshot / custom loaders).
+			if (b[0] == 0x48 && b[1] == 0x8B && b[2] == 0x01 && b[3] == 0xFF && (b[4] == 0x60 || b[4] == 0xA0))
+			{
+				const size_t stubLen = (b[4] == 0x60) ? 6u : 9u;
+				for (size_t i = stubLen; i < 14u; ++i)
+				{
+					if (b[i] != 0xCC && b[i] != 0x90)
+						return true;
+				}
+			}
+			return false;
 		};
 
 		auto tryHook = [&](HMODULE mod, const char* name, void* detour, void** rawOut, auto& trampolineOut, bool skipUnsafeStub) -> bool {
@@ -1492,6 +1577,14 @@ std::string VulkanHost::RefusalFor(VkPhysicalDevice physical)
 
 	const auto found = s.refused.find(physical);
 	return found == s.refused.end() ? std::string() : found->second;
+}
+
+void VulkanHost::SetInternalBridgeBypass(bool bypass) noexcept
+{
+	if (bypass)
+		++gInternalBridgeBypassDepth;
+	else if (gInternalBridgeBypassDepth > 0)
+		--gInternalBridgeBypassDepth;
 }
 
 void VulkanHost::NotifyBatchStart(uint32_t generatedCount) noexcept

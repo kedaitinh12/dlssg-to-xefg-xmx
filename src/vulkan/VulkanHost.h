@@ -54,6 +54,10 @@ namespace VulkanHost
 	// The reason code (VulkanPolicy::Describe) the hooks turned this physical device down for, empty when they didn't
 	std::string RefusalFor(VkPhysicalDevice physical);
 
+	// Temporarily bypasses VulkanHost instance/device hooks on the current thread (used by D3D12VulkanWmma
+	// so intermediate wrappers like OptiScaler/overlays cannot mask the internal bridge caller).
+	void SetInternalBridgeBypass(bool bypass) noexcept;
+
 	// Frame-pacing cadence signals from VulkanRuntime::Evaluate (recorded-mode MFG)
 	void NotifyBatchStart(uint32_t generatedCount) noexcept;
 	void NotifyPaused() noexcept;

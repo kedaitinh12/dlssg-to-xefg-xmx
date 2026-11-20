@@ -9,6 +9,7 @@
 #include "../XeFG.h"
 #include "xvk.h"
 #include "VulkanCoopMat.h"
+#include "VulkanHost.h"
 #include "VulkanPolicy.h"
 
 #include <wrl/client.h>
@@ -174,6 +175,8 @@ struct Bridge
 	std::atomic<uint64_t> fenceValue{ 0 };
 	PostCopyRing directRing;
 	PostCopyRing computeRing;
+	PostCopyRing nativeDirectRing;
+	PostCopyRing nativeComputeRing;
 
 	// Vulkan side
 	HMODULE vulkanDll = nullptr;
@@ -200,6 +203,8 @@ struct Bridge
 	ComPtr<ID3D12GraphicsCommandList> xvkList;
 	xefgd_handle_t xefgContext = nullptr;
 	ContextSettings contextSettings{};
+	bool contextFailed = false;
+	ContextSettings failedContextSettings{};
 	uint32_t tileM = 0;
 	uint32_t tileN = 0;
 	uint32_t tileK = 0;
@@ -618,55 +623,57 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 		return;
 	}
 
-	// Copy D3D12 shared inputs into xvk's GENERAL-layout textures.
-	auto copyInput = [&](SharedImport* imp) {
-		if (!imp)
-			return;
-		VkImage xvkImg = xvk::ImageOf(imp->xvkResource.Get());
-		RecordImageBarrier(gBridge, cmd, imp->vkImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-		RecordImageBarrier(gBridge, cmd, xvkImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
-			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-		RecordCopyImage(gBridge, cmd, imp->vkImage, xvkImg, imp->width, imp->height);
-		RecordImageBarrier(gBridge, cmd, xvkImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-	};
-
-	copyInput(prevBB);
-	copyInput(prevD);
-	copyInput(prevMV);
-	copyInput(prevHL);
-	copyInput(nextBB);
-	copyInput(nextD);
-	copyInput(nextMV);
-	copyInput(nextHL);
-
-	// Record the entire XeFG batch (all 28 layers, with 17 INT8 layers on hardware VK_KHR_cooperative_matrix).
-	xefgd_exec_params_t vkParams{};
-	vkParams.prev = batch.prevData;
-	vkParams.prev.backBuffer.pResource = prevBB->xvkResource.Get();
-	vkParams.prev.depth.pResource = prevD->xvkResource.Get();
-	vkParams.prev.motionVectors.pResource = prevMV->xvkResource.Get();
-	vkParams.prev.hudlessColor.pResource = prevHL ? prevHL->xvkResource.Get() : nullptr;
-
-	vkParams.next = batch.nextData;
-	vkParams.next.backBuffer.pResource = nextBB->xvkResource.Get();
-	vkParams.next.depth.pResource = nextD->xvkResource.Get();
-	vkParams.next.motionVectors.pResource = nextMV->xvkResource.Get();
-	vkParams.next.hudlessColor.pResource = nextHL ? nextHL->xvkResource.Get() : nullptr;
-
-	vkParams.ppOutputs = xvkOutPtrs;
-	vkParams.pOutputBases = batch.outputBases;
-	vkParams.numInterpolatedFrames = static_cast<uint8_t>(batch.frameCount);
-	vkParams.firstFrameIndex = 0;
-	vkParams.frameCount = static_cast<uint8_t>(batch.frameCount);
-	vkParams.uiCompositionEnabled = batch.settings.uiMode != XEFGD_UI_MODE_AUTO;
-
+	// Open xvk recording BEFORE copyInput so any pendingInit_ (UNDEFINED -> GENERAL)
+	// layout transitions on newly created xvk resources flush before we copy frame pixels into them.
 	bool execOk = false;
 	if (xvk::BeginRecording(gBridge.xvkDevice.Get(), cmd))
 	{
+		// Copy D3D12 shared inputs into xvk's GENERAL-layout textures.
+		auto copyInput = [&](SharedImport* imp) {
+			if (!imp)
+				return;
+			VkImage xvkImg = xvk::ImageOf(imp->xvkResource.Get());
+			RecordImageBarrier(gBridge, cmd, imp->vkImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+				VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+			RecordImageBarrier(gBridge, cmd, xvkImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+				VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+			RecordCopyImage(gBridge, cmd, imp->vkImage, xvkImg, imp->width, imp->height);
+			RecordImageBarrier(gBridge, cmd, xvkImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+				VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+		};
+
+		copyInput(prevBB);
+		copyInput(prevD);
+		copyInput(prevMV);
+		copyInput(prevHL);
+		copyInput(nextBB);
+		copyInput(nextD);
+		copyInput(nextMV);
+		copyInput(nextHL);
+
+		// Record the entire XeFG batch (all 28 layers, with 17 INT8 layers on hardware VK_KHR_cooperative_matrix).
+		xefgd_exec_params_t vkParams{};
+		vkParams.prev = batch.prevData;
+		vkParams.prev.backBuffer.pResource = prevBB->xvkResource.Get();
+		vkParams.prev.depth.pResource = prevD->xvkResource.Get();
+		vkParams.prev.motionVectors.pResource = prevMV->xvkResource.Get();
+		vkParams.prev.hudlessColor.pResource = prevHL ? prevHL->xvkResource.Get() : nullptr;
+
+		vkParams.next = batch.nextData;
+		vkParams.next.backBuffer.pResource = nextBB->xvkResource.Get();
+		vkParams.next.depth.pResource = nextD->xvkResource.Get();
+		vkParams.next.motionVectors.pResource = nextMV->xvkResource.Get();
+		vkParams.next.hudlessColor.pResource = nextHL ? nextHL->xvkResource.Get() : nullptr;
+
+		vkParams.ppOutputs = xvkOutPtrs;
+		vkParams.pOutputBases = batch.outputBases;
+		vkParams.numInterpolatedFrames = static_cast<uint8_t>(batch.frameCount);
+		vkParams.firstFrameIndex = 0;
+		vkParams.frameCount = static_cast<uint8_t>(batch.frameCount);
+		vkParams.uiCompositionEnabled = batch.settings.uiMode != XEFGD_UI_MODE_AUTO;
+
 		bool listReady = false;
 		if (!gBridge.xvkList)
 		{
@@ -772,7 +779,9 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 		const D3D12_COMMAND_LIST_TYPE useType = (qType == D3D12_COMMAND_LIST_TYPE_COMPUTE)
 			? D3D12_COMMAND_LIST_TYPE_COMPUTE
 			: D3D12_COMMAND_LIST_TYPE_DIRECT;
-		PostCopyRing& ring = (useType == D3D12_COMMAND_LIST_TYPE_COMPUTE) ? gBridge.computeRing : gBridge.directRing;
+		PostCopyRing& ring = isNativeQueue
+			? ((useType == D3D12_COMMAND_LIST_TYPE_COMPUTE) ? gBridge.nativeComputeRing : gBridge.nativeDirectRing)
+			: ((useType == D3D12_COMMAND_LIST_TYPE_COMPUTE) ? gBridge.computeRing : gBridge.directRing);
 
 		if (EnsurePostCopyRing(ringDev, useType, ring))
 		{
@@ -872,6 +881,12 @@ bool Install(ID3D12Device* d3dDevice, std::string& reason) noexcept
 
 	if (!VulkanPrograms::Installed().Usable())
 		return fail("no_vulkan_models");
+
+	struct ScopedVulkanHostBypass
+	{
+		ScopedVulkanHostBypass() noexcept { VulkanHost::SetInternalBridgeBypass(true); }
+		~ScopedVulkanHostBypass() noexcept { VulkanHost::SetInternalBridgeBypass(false); }
+	} bypassHost;
 
 	// Load vulkan-1.dll dynamically so we have zero link-time dependency on Vulkan.
 	gBridge.vulkanDll = LoadLibraryW(L"vulkan-1.dll");
@@ -1181,37 +1196,78 @@ bool Install(ID3D12Device* d3dDevice, std::string& reason) noexcept
 	return true;
 }
 
+bool SameContextSettings(const ContextSettings& a, const ContextSettings& b) noexcept
+{
+	return a.width == b.width &&
+		a.height == b.height &&
+		a.format == b.format &&
+		a.initFlags == b.initFlags &&
+		a.uiMode == b.uiMode &&
+		a.model == b.model;
+}
+
 bool EnsureContext(const ContextSettings& settings) noexcept
 {
 	std::lock_guard lock(gBridge.mutex);
 	if (!gBridge.active.load(std::memory_order_acquire) || !gBridge.xvkDevice)
 		return false;
 
-	if (gBridge.xefgContext &&
-		gBridge.contextSettings.width == settings.width &&
-		gBridge.contextSettings.height == settings.height &&
-		gBridge.contextSettings.format == settings.format &&
-		gBridge.contextSettings.initFlags == settings.initFlags &&
-		gBridge.contextSettings.uiMode == settings.uiMode &&
-		gBridge.contextSettings.model == settings.model)
-	{
+	if (gBridge.xefgContext && SameContextSettings(gBridge.contextSettings, settings))
 		return true;
-	}
+
+	if (gBridge.contextFailed && SameContextSettings(gBridge.failedContextSettings, settings))
+		return false;
+
+	auto markFailed = [&]() noexcept {
+		gBridge.contextFailed = true;
+		gBridge.failedContextSettings = settings;
+		return false;
+	};
+
+	// Drain in-flight Vulkan work so destroying any prior context and reusing cmdBufs[0]
+	// for XeFG::Init weight uploads is completely safe.
+	if (gBridge.queue && gBridge.vkQueueWaitIdle)
+		gBridge.vkQueueWaitIdle(gBridge.queue);
+	for (uint32_t i = 0; i < kRingSize; ++i)
+		gBridge.vkSlotDoneFence[i] = 0;
 
 	if (gBridge.xefgContext)
 	{
-		gBridge.vkQueueWaitIdle(gBridge.queue);
 		XeFG::Destroy(gBridge.xefgContext);
 		gBridge.xefgContext = nullptr;
 	}
 
 	XeFG::OverrideModel(settings.model);
 
-	xefgd_handle_t ctx = nullptr;
-	if (XeFG::CreateContext(gBridge.xvkDevice.Get(), &ctx) != XEFGD_RESULT_SUCCESS || !ctx)
+	// Recorded xvk devices require an open VkCommandBuffer + xvk::BeginRecording()
+	// during XeFG::Init because libxess_fg creates internal command lists to upload
+	// neural network weights and initialize resources.
+	VkCommandBuffer initCmd = gBridge.cmdBufs[0];
+	gBridge.vkResetCommandBuffer(initCmd, 0);
+	VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	if (gBridge.vkBeginCommandBuffer(initCmd, &beginInfo) != VK_SUCCESS)
 	{
-		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::CreateContext failed, falling back to D3D12");
-		return false;
+		Log::Warn("D3D12->Vulkan WMMA bridge: vkBeginCommandBuffer failed for XeFG::Init, falling back to D3D12");
+		return markFailed();
+	}
+
+	if (!xvk::BeginRecording(gBridge.xvkDevice.Get(), initCmd))
+	{
+		gBridge.vkEndCommandBuffer(initCmd);
+		Log::Warn("D3D12->Vulkan WMMA bridge: xvk::BeginRecording failed for XeFG::Init, falling back to D3D12");
+		return markFailed();
+	}
+
+	xefgd_handle_t ctx = nullptr;
+	const xefgd_result_t createRes = XeFG::CreateContext(gBridge.xvkDevice.Get(), &ctx);
+	if (createRes != XEFGD_RESULT_SUCCESS || !ctx)
+	{
+		xvk::EndRecording(gBridge.xvkDevice.Get());
+		gBridge.vkEndCommandBuffer(initCmd);
+		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::CreateContext failed (result {}), falling back to D3D12",
+			static_cast<int>(createRes));
+		return markFailed();
 	}
 
 	xefgd_init_params_t init{};
@@ -1219,17 +1275,36 @@ bool EnsureContext(const ContextSettings& settings) noexcept
 	init.backBufferFormat = static_cast<uint32_t>(settings.format);
 	init.initFlags = settings.initFlags;
 	init.maxInterpolatedFrames = kMaxFrames;
+	init.creationNodeMask = 1;
+	init.visibleNodeMask = 1;
 	init.uiMode = settings.uiMode;
 
-	if (XeFG::Init(ctx, init) != XEFGD_RESULT_SUCCESS)
+	const xefgd_result_t initRes = XeFG::Init(ctx, init);
+	xvk::EndRecording(gBridge.xvkDevice.Get());
+	const VkResult endRes = gBridge.vkEndCommandBuffer(initCmd);
+
+	if (initRes != XEFGD_RESULT_SUCCESS || endRes != VK_SUCCESS)
 	{
 		XeFG::Destroy(ctx);
-		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init failed, falling back to D3D12");
-		return false;
+		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init failed (result {}, vkEnd {}), falling back to D3D12",
+			static_cast<int>(initRes), static_cast<int>(endRes));
+		return markFailed();
 	}
+
+	VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+	submitInfo.commandBufferCount = 1;
+	submitInfo.pCommandBuffers = &initCmd;
+	if (gBridge.vkQueueSubmit(gBridge.queue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS)
+	{
+		XeFG::Destroy(ctx);
+		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init vkQueueSubmit failed, falling back to D3D12");
+		return markFailed();
+	}
+	gBridge.vkQueueWaitIdle(gBridge.queue);
 
 	gBridge.xefgContext = ctx;
 	gBridge.contextSettings = settings;
+	gBridge.contextFailed = false;
 	Log::Info("D3D12->Vulkan WMMA bridge context ready: {}x{}, format {}, model {}, {}x{}x{} hardware WMMA",
 		settings.width, settings.height, static_cast<uint32_t>(settings.format), settings.model,
 		gBridge.tileM, gBridge.tileN, gBridge.tileK);
@@ -1239,6 +1314,7 @@ bool EnsureContext(const ContextSettings& settings) noexcept
 void ResetContext() noexcept
 {
 	std::lock_guard lock(gBridge.mutex);
+	gBridge.contextFailed = false;
 	if (gBridge.xefgContext)
 	{
 		if (gBridge.queue && gBridge.vkQueueWaitIdle)
