@@ -10,6 +10,7 @@
 
 #include <DirectXMath.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cwchar>
 #include <filesystem>
