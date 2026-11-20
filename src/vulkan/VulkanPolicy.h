@@ -445,84 +445,139 @@ namespace VulkanPolicy
 		return std::string(reason);
 	}
 
-	// CPU-side Vulkan present pacer for recorded-mode Multi-Frame Generation (e.g. Streamline/OptiScaler on AMD/Intel
-	// GPUs where VK_NV_low_latency2 out-of-band pacing is unavailable and V-Sync FIFO is off).
-	// Tracks real-frame batch cadence with an EMA and spaces burst vkQueuePresentKHR calls evenly across
-	// T_real / (generatedCount + 1) without stalling late frames or interfering with V-Sync FIFO.
+	// CPU-side Vulkan present pacer for recorded-mode Multi-Frame Generation (e.g. Streamline/OptiScaler on GPUs
+	// without hardware flip metering and with V-Sync FIFO off).
+	// Tracks real-frame batch cadence with a 5-sample median-filtered EMA (rejecting single-frame asset-streaming
+	// hitches so they cannot inflate targetStepNs into a multi-frame stutter cascade), drains immediately after a
+	// hitch, and bounds each present to its batch-relative slot deadline so timing debt never spills across batches.
 	struct PresentPacer
 	{
 		static constexpr uint64_t MinBatchNs = 2'000'000ull;       // 2 ms (500 base FPS)
 		static constexpr uint64_t MaxBatchNs = 250'000'000ull;     // 250 ms (4 base FPS)
 		static constexpr uint64_t ActiveWindowNs = 250'000'000ull; // auto-disengage after 250 ms idle
 		static constexpr uint64_t MaxWaitNs = 25'000'000ull;       // 25 ms hard safety cap per present
-		static constexpr uint64_t TargetRatioNum = 95ull;          // 95% of nominal interval leaves scanout headroom
+		static constexpr uint64_t TargetRatioNum = 92ull;          // 92% of nominal interval leaves scanout & jitter headroom
 		static constexpr uint64_t TargetRatioDen = 100ull;
+		static constexpr uint64_t HitchThresholdNum = 130ull;      // >30% over steady cadence = hitch spike, drain immediately
+		static constexpr uint64_t HitchThresholdDen = 100ull;
+		static constexpr uint32_t MedianWindow = 5u;
 
 		uint64_t lastBatchNs = 0;
+		uint64_t batchStartNs = 0;
 		uint64_t emaBatchNs = 0;
 		uint64_t targetStepNs = 0;
 		uint64_t lastPresentNs = 0;
 		uint64_t activeUntilNs = 0;
+		uint64_t recentDeltas[MedianWindow]{};
+		uint32_t recentCount = 0;
+		uint32_t recentWrite = 0;
 		uint32_t generatedCount = 0;
 		uint32_t presentsInBatch = 0;
+		bool skipBatch = false;
 
 		void Reset() noexcept
 		{
 			lastBatchNs = 0;
+			batchStartNs = 0;
 			emaBatchNs = 0;
 			targetStepNs = 0;
 			lastPresentNs = 0;
 			activeUntilNs = 0;
+			std::memset(recentDeltas, 0, sizeof(recentDeltas));
+			recentCount = 0;
+			recentWrite = 0;
 			generatedCount = 0;
 			presentsInBatch = 0;
+			skipBatch = false;
 		}
 
 		void OnPaused() noexcept
 		{
 			lastBatchNs = 0;
+			batchStartNs = 0;
 			targetStepNs = 0;
 			activeUntilNs = 0;
 			generatedCount = 0;
 			presentsInBatch = 0;
+			skipBatch = false;
 		}
 
 		void OnBatchStart(uint64_t nowNs, uint32_t count) noexcept
 		{
 			count = ClampCount(count);
+			const uint32_t prevTotal = generatedCount ? (generatedCount + 1u) : 0u;
+			const bool prevIncomplete = lastBatchNs != 0 && prevTotal != 0 && presentsInBatch < prevTotal;
+
 			generatedCount = count;
 			presentsInBatch = 0;
+			batchStartNs = nowNs;
 			activeUntilNs = nowNs + ActiveWindowNs;
+			skipBatch = false;
 
 			if (lastBatchNs != 0 && nowNs > lastBatchNs)
 			{
 				const uint64_t delta = nowNs - lastBatchNs;
 				if (delta >= MinBatchNs && delta <= MaxBatchNs)
 				{
+					const bool isHitch = emaBatchNs != 0 &&
+						delta * HitchThresholdDen > emaBatchNs * HitchThresholdNum;
+
+					recentDeltas[recentWrite] = delta;
+					recentWrite = (recentWrite + 1u) % MedianWindow;
+					if (recentCount < MedianWindow)
+						++recentCount;
+
+					uint64_t sorted[MedianWindow]{};
+					for (uint32_t i = 0; i < recentCount; ++i)
+						sorted[i] = recentDeltas[i];
+					std::sort(sorted, sorted + recentCount);
+					const uint64_t medianDelta = sorted[recentCount / 2u];
+
 					if (emaBatchNs == 0)
 					{
-						emaBatchNs = delta;
+						emaBatchNs = medianDelta;
 					}
-					else if (delta > emaBatchNs * 2ull || delta * 2ull < emaBatchNs)
+					else if (!isHitch)
 					{
-						// Rapidly adapt on large framerate shifts (e.g. menu -> gameplay or scene cut)
-						emaBatchNs = (emaBatchNs + delta) / 2ull;
-					}
-					else
-					{
-						// Smooth 0.25 EMA for stable cadence
-						emaBatchNs = (emaBatchNs * 3ull + delta) / 4ull;
+						if (medianDelta < emaBatchNs || medianDelta > emaBatchNs * 2ull || medianDelta * 2ull < emaBatchNs)
+						{
+							// Adapt quickly downward (catch-up / higher FPS) or on sustained framerate shifts
+							emaBatchNs = (emaBatchNs + medianDelta) / 2ull;
+						}
+						else
+						{
+							// Smooth 0.25 EMA on the median-filtered cadence
+							emaBatchNs = (emaBatchNs * 3ull + medianDelta) / 4ull;
+						}
 					}
 
 					const uint64_t totalFrames = static_cast<uint64_t>(count) + 1ull;
 					targetStepNs = (emaBatchNs * TargetRatioNum) / (totalFrames * TargetRatioDen);
+
+					// On a hitch spike or unfinished prior batch, clear stale present debt and let this batch drain
+					if (isHitch)
+					{
+						lastPresentNs = 0;
+						skipBatch = true;
+					}
+					else if (prevIncomplete)
+					{
+						lastPresentNs = 0;
+					}
 				}
 				else
 				{
-					// Long hitch or pause: keep EMA reset until two valid batches arrive
+					// Long hitch or pause: reset cadence state until two valid batches arrive
 					emaBatchNs = 0;
 					targetStepNs = 0;
+					lastPresentNs = 0;
+					recentCount = 0;
+					recentWrite = 0;
 				}
 			}
+
+			if (lastPresentNs > nowNs)
+				lastPresentNs = nowNs;
 
 			lastBatchNs = nowNs;
 		}
@@ -536,7 +591,7 @@ namespace VulkanPolicy
 				return 0;
 			}
 
-			if (generatedCount == 0 || targetStepNs == 0 || nowNs > activeUntilNs)
+			if (skipBatch || generatedCount == 0 || targetStepNs == 0 || nowNs > activeUntilNs)
 			{
 				lastPresentNs = nowNs;
 				return 0;
@@ -549,7 +604,7 @@ namespace VulkanPolicy
 				return 0;
 			}
 
-			++presentsInBatch;
+			const uint32_t slotIndex = presentsInBatch++;
 
 			if (lastPresentNs == 0 || nowNs <= lastPresentNs)
 			{
@@ -557,7 +612,15 @@ namespace VulkanPolicy
 				return 0;
 			}
 
-			const uint64_t desiredNs = lastPresentNs + targetStepNs;
+			// Bound every present by its batch-relative slot deadline so presents never spill into the next real frame
+			uint64_t desiredNs = lastPresentNs + targetStepNs;
+			if (batchStartNs != 0)
+			{
+				const uint64_t slotDeadlineNs = batchStartNs + (static_cast<uint64_t>(slotIndex) + 1ull) * targetStepNs;
+				if (desiredNs > slotDeadlineNs)
+					desiredNs = slotDeadlineNs;
+			}
+
 			if (nowNs >= desiredNs)
 			{
 				// On time or late: present immediately, never accumulate timing debt
