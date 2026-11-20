@@ -96,6 +96,13 @@ extern "C++"
 	ULONGLONG GetTickCount64();
 	int WideCharToMultiByte(UINT codePage, DWORD flags, const wchar_t* wide, int wideCount, char* narrow, int narrowCount,
 		const char* defaultChar, BOOL* usedDefault);
+	#define ENUM_CURRENT_SETTINGS ((DWORD)-1)
+	struct DEVMODEW
+	{
+		WORD dmSize;
+		DWORD dmDisplayFrequency;
+	};
+	BOOL EnumDisplaySettingsW(LPCWSTR lpszDeviceName, DWORD iModeNum, DEVMODEW* lpDevMode);
 	int _wcsicmp(const wchar_t* a, const wchar_t* b);
 
 	// std::filesystem::path::c_str() is wchar_t on Windows and char on the Linux this is checked on, these two let the
