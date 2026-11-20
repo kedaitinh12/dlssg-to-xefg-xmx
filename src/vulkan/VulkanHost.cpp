@@ -1108,6 +1108,20 @@ namespace
 	{
 		DEVMODEW dm{};
 		dm.dmSize = sizeof(dm);
+		if (HWND fg = GetForegroundWindow())
+		{
+			if (HMONITOR mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST))
+			{
+				MONITORINFOEXW mi{};
+				mi.cbSize = sizeof(mi);
+				if (GetMonitorInfoW(mon, &mi) &&
+					EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) &&
+					dm.dmDisplayFrequency >= 48u && dm.dmDisplayFrequency <= 1000u)
+				{
+					return dm.dmDisplayFrequency;
+				}
+			}
+		}
 		if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency >= 48u && dm.dmDisplayFrequency <= 1000u)
 			return dm.dmDisplayFrequency;
 		return 0;
