@@ -20,6 +20,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -82,6 +83,16 @@ VkFormat DxgiToVkFormat(DXGI_FORMAT fmt) noexcept
 	case DXGI_FORMAT_R16G16_FLOAT:
 	case DXGI_FORMAT_R16G16_TYPELESS:
 		return VK_FORMAT_R16G16_SFLOAT;
+	case DXGI_FORMAT_R16G16_SNORM:
+		return VK_FORMAT_R16G16_SNORM;
+	case DXGI_FORMAT_R16G16_UNORM:
+		return VK_FORMAT_R16G16_UNORM;
+	case DXGI_FORMAT_R16G16B16A16_UNORM:
+		return VK_FORMAT_R16G16B16A16_UNORM;
+	case DXGI_FORMAT_R32_UINT:
+		return VK_FORMAT_R32_UINT;
+	case DXGI_FORMAT_R16_UINT:
+		return VK_FORMAT_R16_UINT;
 	case DXGI_FORMAT_R32G32_FLOAT:
 	case DXGI_FORMAT_R32G32_TYPELESS:
 		return VK_FORMAT_R32G32_SFLOAT;
@@ -143,8 +154,7 @@ struct PostCopyRing
 	X(vkResetCommandBuffer)                      \
 	X(vkBeginCommandBuffer)                      \
 	X(vkEndCommandBuffer)                        \
-	X(vkQueueSubmit)                             \
-	X(vkQueueWaitIdle)                           \
+	X(vkQueueSubmit2)                            \
 	X(vkCreateImage)                             \
 	X(vkDestroyImage)                            \
 	X(vkGetImageMemoryRequirements)              \
@@ -190,6 +200,7 @@ struct Bridge
 	VkCommandPool cmdPool = VK_NULL_HANDLE;
 	VkCommandBuffer cmdBufs[kRingSize]{};
 	uint64_t vkSlotDoneFence[kRingSize]{};
+	uint64_t lastSubmittedVkFence = 0;
 	uint32_t vkCursor = 0;
 	VkSemaphore sharedSemaphore = VK_NULL_HANDLE;
 
@@ -203,6 +214,9 @@ struct Bridge
 	ComPtr<ID3D12GraphicsCommandList> xvkList;
 	xefgd_handle_t xefgContext = nullptr;
 	ContextSettings contextSettings{};
+	std::atomic<bool> contextReady{ false };
+	std::atomic<bool> initInFlight{ false };
+	std::atomic<bool> resetRequested{ false };
 	bool contextFailed = false;
 	ContextSettings failedContextSettings{};
 	uint32_t tileM = 0;
@@ -212,6 +226,7 @@ struct Bridge
 
 	// Cached D3D12 -> Vulkan shared imports keyed by ID3D12Resource*
 	std::unordered_map<ID3D12Resource*, SharedImport> imports;
+	std::atomic<size_t> importCount{ 0 };
 
 	// Pending batches keyed by ID3D12GraphicsCommandList*
 	std::mutex pendingMutex;
@@ -365,6 +380,18 @@ void WaitFenceCpu(ID3D12Fence* fence, HANDLE ev, uint64_t target) noexcept
 		WaitForSingleObject(ev, 5000);
 }
 
+// Bounded timeline-semaphore drain (replaces unbounded vkQueueWaitIdle so a stalled queue can never freeze the game).
+bool DrainVulkanQueueLocked(uint64_t timeoutNs) noexcept
+{
+	if (!gBridge.lastSubmittedVkFence || !gBridge.device || !gBridge.sharedSemaphore || !gBridge.vkWaitSemaphores)
+		return true;
+	VkSemaphoreWaitInfo waitInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+	waitInfo.semaphoreCount = 1;
+	waitInfo.pSemaphores = &gBridge.sharedSemaphore;
+	waitInfo.pValues = &gBridge.lastSubmittedVkFence;
+	return gBridge.vkWaitSemaphores(gBridge.device, &waitInfo, timeoutNs) == VK_SUCCESS;
+}
+
 uint32_t FindMemoryType(const VkPhysicalDeviceMemoryProperties& props, uint32_t typeBits, VkMemoryPropertyFlags required) noexcept
 {
 	for (uint32_t i = 0; i < props.memoryTypeCount; ++i)
@@ -406,17 +433,35 @@ SharedImport* GetOrImportLocked(Bridge& b, ID3D12Resource* d3dRes, bool isOutput
 	if (it != b.imports.end())
 		return &it->second;
 
+	auto logImportFail = [](const char* step, const D3D12_RESOURCE_DESC& d, int64_t code) noexcept {
+		static std::atomic<bool> logged{ false };
+		if (!logged.exchange(true, std::memory_order_relaxed))
+			Log::Warn("D3D12->Vulkan WMMA bridge: resource import failed at {} (fmt={}, {}x{}, flags={:#x}, code={:#x}), falling back to D3D12",
+				step, static_cast<uint32_t>(d.Format), static_cast<uint64_t>(d.Width), d.Height,
+				static_cast<uint32_t>(d.Flags), static_cast<uint64_t>(code));
+	};
+
 	const D3D12_RESOURCE_DESC desc = d3dRes->GetDesc();
 	if (!CanShareTexture(desc))
+	{
+		logImportFail("CanShareTexture", desc, 0);
 		return nullptr;
+	}
 
 	const VkFormat vkFmt = DxgiToVkFormat(desc.Format);
 	if (vkFmt == VK_FORMAT_UNDEFINED)
+	{
+		logImportFail("DxgiToVkFormat", desc, static_cast<int64_t>(desc.Format));
 		return nullptr;
+	}
 
 	HANDLE ntHandle = nullptr;
-	if (FAILED(b.d3dDevice->CreateSharedHandle(d3dRes, nullptr, GENERIC_ALL, nullptr, &ntHandle)) || !ntHandle)
+	const HRESULT shareHr = b.d3dDevice->CreateSharedHandle(d3dRes, nullptr, GENERIC_ALL, nullptr, &ntHandle);
+	if (FAILED(shareHr) || !ntHandle)
+	{
+		logImportFail("CreateSharedHandle", desc, static_cast<int64_t>(shareHr));
 		return nullptr;
+	}
 
 	VkExternalMemoryImageCreateInfo extInfo{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
 	extInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
@@ -506,6 +551,7 @@ SharedImport* GetOrImportLocked(Bridge& b, ID3D12Resource* d3dRes, bool isOutput
 	}
 
 	auto [inserted, _] = b.imports.emplace(d3dRes, std::move(imp));
+	b.importCount.store(b.imports.size(), std::memory_order_release);
 	return &inserted->second;
 }
 
@@ -610,7 +656,16 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 		waitInfo.semaphoreCount = 1;
 		waitInfo.pSemaphores = &gBridge.sharedSemaphore;
 		waitInfo.pValues = &gBridge.vkSlotDoneFence[vkSlot];
-		gBridge.vkWaitSemaphores(gBridge.device, &waitInfo, 5'000'000'000ull);
+		const VkResult waitRes = gBridge.vkWaitSemaphores(gBridge.device, &waitInfo, 1'000'000'000ull);
+		if (waitRes != VK_SUCCESS)
+		{
+			Log::Warn("D3D12->Vulkan WMMA bridge: vkWaitSemaphores timed out/failed (result {}), disabling bridge and falling back to D3D12",
+				static_cast<int>(waitRes));
+			gBridge.active.store(false, std::memory_order_release);
+			gBridge.contextReady.store(false, std::memory_order_release);
+			gBridge.fallbacks.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
 	}
 
 	VkCommandBuffer cmd = gBridge.cmdBufs[vkSlot];
@@ -746,28 +801,35 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 	}
 
 	// 2) Vulkan runs the entire XeFG batch (all 17 hardware WMMA INT8 layers) in one submission.
-	const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-	VkTimelineSemaphoreSubmitInfo timelineInfo{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
-	timelineInfo.waitSemaphoreValueCount = 1;
-	timelineInfo.pWaitSemaphoreValues = &waitVal;
-	timelineInfo.signalSemaphoreValueCount = 1;
-	timelineInfo.pSignalSemaphoreValues = &signalVal;
+	// Use Vulkan 1.3 vkQueueSubmit2 (synchronization2) to avoid OptiScaler's Vulkan_wDx12::hk_vkQueueSubmit hook.
+	VkSemaphoreSubmitInfo waitSemInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+	waitSemInfo.semaphore = gBridge.sharedSemaphore;
+	waitSemInfo.value = waitVal;
+	waitSemInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
 
-	VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO, &timelineInfo };
-	submitInfo.waitSemaphoreCount = 1;
-	submitInfo.pWaitSemaphores = &gBridge.sharedSemaphore;
-	submitInfo.pWaitDstStageMask = &waitStage;
-	submitInfo.commandBufferCount = 1;
-	submitInfo.pCommandBuffers = &cmd;
-	submitInfo.signalSemaphoreCount = 1;
-	submitInfo.pSignalSemaphores = &gBridge.sharedSemaphore;
+	VkCommandBufferSubmitInfo cmdInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+	cmdInfo.commandBuffer = cmd;
 
-	if (gBridge.vkQueueSubmit(gBridge.queue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS)
+	VkSemaphoreSubmitInfo signalSemInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+	signalSemInfo.semaphore = gBridge.sharedSemaphore;
+	signalSemInfo.value = signalVal;
+	signalSemInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+	VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+	submitInfo.waitSemaphoreInfoCount = 1;
+	submitInfo.pWaitSemaphoreInfos = &waitSemInfo;
+	submitInfo.commandBufferInfoCount = 1;
+	submitInfo.pCommandBufferInfos = &cmdInfo;
+	submitInfo.signalSemaphoreInfoCount = 1;
+	submitInfo.pSignalSemaphoreInfos = &signalSemInfo;
+
+	if (gBridge.vkQueueSubmit2(gBridge.queue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS)
 	{
 		gBridge.fallbacks.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
 	gBridge.vkSlotDoneFence[vkSlot] = signalVal;
+	gBridge.lastSubmittedVkFence = signalVal;
 
 	// 3) D3D12 waits on Vulkan completion (GPU-side wait, zero CPU stall).
 	queue->Wait(useFence, signalVal);
@@ -1224,10 +1286,15 @@ bool EnsureContext(const ContextSettings& settings) noexcept
 		return false;
 	};
 
-	// Drain in-flight Vulkan work so destroying any prior context and reusing cmdBufs[0]
-	// for XeFG::Init weight uploads is completely safe.
-	if (gBridge.queue && gBridge.vkQueueWaitIdle)
-		gBridge.vkQueueWaitIdle(gBridge.queue);
+	// Drain in-flight Vulkan work with a bounded timeout so destroying any prior context and
+	// reusing cmdBufs[0] for XeFG::Init weight uploads can never hang indefinitely.
+	gBridge.contextReady.store(false, std::memory_order_release);
+	if (!DrainVulkanQueueLocked(500'000'000ull))
+	{
+		Log::Warn("D3D12->Vulkan WMMA bridge: timed out draining prior Vulkan work, disabling bridge and falling back to D3D12");
+		gBridge.active.store(false, std::memory_order_release);
+		return markFailed();
+	}
 	for (uint32_t i = 0; i < kRingSize; ++i)
 		gBridge.vkSlotDoneFence[i] = 0;
 
@@ -1291,34 +1358,99 @@ bool EnsureContext(const ContextSettings& settings) noexcept
 		return markFailed();
 	}
 
-	VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-	submitInfo.commandBufferCount = 1;
-	submitInfo.pCommandBuffers = &initCmd;
-	if (gBridge.vkQueueSubmit(gBridge.queue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS)
+	// Submit XeFG::Init weight uploads via Vulkan 1.3 vkQueueSubmit2 (bypassing OptiScaler's
+	// Vulkan_wDx12::hk_vkQueueSubmit hook) and wait on a timeline semaphore with a bounded timeout
+	// instead of infinite vkQueueWaitIdle so a driver/interop stall can never freeze the game.
+	const uint64_t initDoneVal = gBridge.fenceValue.fetch_add(1, std::memory_order_acq_rel) + 1;
+	VkCommandBufferSubmitInfo cmdInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+	cmdInfo.commandBuffer = initCmd;
+
+	VkSemaphoreSubmitInfo signalInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+	signalInfo.semaphore = gBridge.sharedSemaphore;
+	signalInfo.value = initDoneVal;
+	signalInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+	VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+	submitInfo.commandBufferInfoCount = 1;
+	submitInfo.pCommandBufferInfos = &cmdInfo;
+	submitInfo.signalSemaphoreInfoCount = 1;
+	submitInfo.pSignalSemaphoreInfos = &signalInfo;
+
+	const VkResult subRes = gBridge.vkQueueSubmit2(gBridge.queue, 1, &submitInfo, VK_NULL_HANDLE);
+	if (subRes != VK_SUCCESS)
 	{
 		XeFG::Destroy(ctx);
-		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init vkQueueSubmit failed, falling back to D3D12");
+		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init vkQueueSubmit2 failed (result {}), falling back to D3D12",
+			static_cast<int>(subRes));
 		return markFailed();
 	}
-	gBridge.vkQueueWaitIdle(gBridge.queue);
+	gBridge.lastSubmittedVkFence = initDoneVal;
+	gBridge.vkSlotDoneFence[0] = initDoneVal;
+
+	VkSemaphoreWaitInfo waitInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+	waitInfo.semaphoreCount = 1;
+	waitInfo.pSemaphores = &gBridge.sharedSemaphore;
+	waitInfo.pValues = &initDoneVal;
+	const VkResult waitRes = gBridge.vkWaitSemaphores(gBridge.device, &waitInfo, 2'000'000'000ull);
+	if (waitRes != VK_SUCCESS)
+	{
+		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init vkWaitSemaphores timed out/failed (result {}), disabling bridge and falling back to D3D12",
+			static_cast<int>(waitRes));
+		gBridge.active.store(false, std::memory_order_release);
+		gBridge.contextReady.store(false, std::memory_order_release);
+		return markFailed();
+	}
+
+	if (gBridge.resetRequested.exchange(false, std::memory_order_acq_rel))
+	{
+		XeFG::Destroy(ctx);
+		return false;
+	}
 
 	gBridge.xefgContext = ctx;
 	gBridge.contextSettings = settings;
 	gBridge.contextFailed = false;
+	gBridge.contextReady.store(true, std::memory_order_release);
 	Log::Info("D3D12->Vulkan WMMA bridge context ready: {}x{}, format {}, model {}, {}x{}x{} hardware WMMA",
 		settings.width, settings.height, static_cast<uint32_t>(settings.format), settings.model,
 		gBridge.tileM, gBridge.tileN, gBridge.tileK);
 	return true;
 }
 
+void WarmupContextAsync(const ContextSettings& settings) noexcept
+{
+	if (!Active())
+		return;
+	if (gBridge.initInFlight.exchange(true, std::memory_order_acq_rel))
+		return;
+
+	gBridge.resetRequested.store(false, std::memory_order_release);
+	try
+	{
+		std::thread([settings]() noexcept {
+			EnsureContext(settings);
+			gBridge.initInFlight.store(false, std::memory_order_release);
+		}).detach();
+	}
+	catch (...)
+	{
+		gBridge.initInFlight.store(false, std::memory_order_release);
+	}
+}
+
 void ResetContext() noexcept
 {
+	gBridge.contextReady.store(false, std::memory_order_release);
+	if (gBridge.initInFlight.load(std::memory_order_acquire))
+	{
+		gBridge.resetRequested.store(true, std::memory_order_release);
+		return;
+	}
 	std::lock_guard lock(gBridge.mutex);
 	gBridge.contextFailed = false;
 	if (gBridge.xefgContext)
 	{
-		if (gBridge.queue && gBridge.vkQueueWaitIdle)
-			gBridge.vkQueueWaitIdle(gBridge.queue);
+		DrainVulkanQueueLocked(500'000'000ull);
 		XeFG::Destroy(gBridge.xefgContext);
 		gBridge.xefgContext = nullptr;
 	}
@@ -1339,12 +1471,33 @@ bool ScheduleBatch(
 		return false;
 	if (!prev.backbuffer || !prev.depth || !prev.mvecs || !next.backbuffer || !next.depth || !next.mvecs)
 		return false;
-	if (!EnsureContext(settings))
+
+	// Never block the game/Streamline render thread while Vulkan context init is running asynchronously.
+	if (gBridge.initInFlight.load(std::memory_order_acquire))
 		return false;
 
-	// Verify all participating textures can be imported into Vulkan before deferring D3D12 execution.
+	if (!gBridge.contextReady.load(std::memory_order_acquire))
+	{
+		{
+			std::lock_guard lock(gBridge.mutex);
+			if (gBridge.contextFailed && SameContextSettings(gBridge.failedContextSettings, settings))
+				return false;
+		}
+		WarmupContextAsync(settings);
+		return false;
+	}
+
+	// Verify context settings still match and all participating textures can be imported into Vulkan.
 	{
 		std::lock_guard lock(gBridge.mutex);
+		if (!gBridge.xefgContext || !SameContextSettings(gBridge.contextSettings, settings))
+		{
+			const bool alreadyFailed = gBridge.contextFailed && SameContextSettings(gBridge.failedContextSettings, settings);
+			gBridge.contextReady.store(false, std::memory_order_release);
+			if (!alreadyFailed)
+				WarmupContextAsync(settings);
+			return false;
+		}
 		if (!GetOrImportLocked(gBridge, prev.backbuffer, false) ||
 			!GetOrImportLocked(gBridge, prev.depth, false) ||
 			!GetOrImportLocked(gBridge, prev.mvecs, false) ||
@@ -1424,16 +1577,16 @@ bool AppendOutputCopy(
 
 void ForgetResource(ID3D12Resource* resource) noexcept
 {
-	if (!resource)
+	if (!resource || gBridge.importCount.load(std::memory_order_acquire) == 0)
 		return;
 	std::lock_guard lock(gBridge.mutex);
 	auto it = gBridge.imports.find(resource);
 	if (it != gBridge.imports.end())
 	{
-		if (gBridge.queue && gBridge.vkQueueWaitIdle)
-			gBridge.vkQueueWaitIdle(gBridge.queue);
+		DrainVulkanQueueLocked(500'000'000ull);
 		DestroyImport(gBridge, it->second);
 		gBridge.imports.erase(it);
+		gBridge.importCount.store(gBridge.imports.size(), std::memory_order_release);
 	}
 }
 

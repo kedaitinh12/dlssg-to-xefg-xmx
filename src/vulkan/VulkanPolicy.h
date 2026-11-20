@@ -474,6 +474,20 @@ namespace VulkanPolicy
 		uint32_t generatedCount = 0;
 		uint32_t presentsInBatch = 0;
 		bool skipBatch = false;
+		// Auto VRR (Hz - 3) cap & Queue-Pressure Guard state
+		uint32_t displayRefreshHz = 0;
+		bool autoVrrEnabled = false;
+		uint32_t pressureStreak = 0;
+
+		void SetDisplayRefreshHz(uint32_t hz) noexcept
+		{
+			displayRefreshHz = hz;
+		}
+
+		void SetAutoVrrEnabled(bool enabled) noexcept
+		{
+			autoVrrEnabled = enabled;
+		}
 
 		void Reset() noexcept
 		{
@@ -489,6 +503,7 @@ namespace VulkanPolicy
 			generatedCount = 0;
 			presentsInBatch = 0;
 			skipBatch = false;
+			pressureStreak = 0;
 		}
 
 		void OnPaused() noexcept
@@ -500,13 +515,14 @@ namespace VulkanPolicy
 			generatedCount = 0;
 			presentsInBatch = 0;
 			skipBatch = false;
+			pressureStreak = 0;
 		}
 
 		void OnBatchStart(uint64_t nowNs, uint32_t count) noexcept
 		{
 			count = ClampCount(count);
 			const uint32_t prevTotal = generatedCount ? (generatedCount + 1u) : 0u;
-			const bool prevIncomplete = lastBatchNs != 0 && prevTotal != 0 && presentsInBatch < prevTotal;
+			const bool prevIncomplete = lastBatchNs != 0 && targetStepNs != 0 && prevTotal != 0 && presentsInBatch < prevTotal;
 
 			generatedCount = count;
 			presentsInBatch = 0;
@@ -554,8 +570,28 @@ namespace VulkanPolicy
 					const uint64_t totalFrames = static_cast<uint64_t>(count) + 1ull;
 					targetStepNs = (emaBatchNs * TargetRatioNum) / (totalFrames * TargetRatioDen);
 
-					// On a hitch spike or unfinished prior batch, clear stale present debt and let this batch drain
-					if (isHitch)
+					// Auto VRR (Hz - 3) floor: keep generated presents inside the display's VRR window
+					if (autoVrrEnabled && displayRefreshHz >= 48u)
+					{
+						const uint64_t vrrMinStepNs = 1'000'000'000ull / static_cast<uint64_t>(displayRefreshHz - 3u);
+						if (targetStepNs < vrrMinStepNs)
+							targetStepNs = std::min(vrrMinStepNs, MaxWaitNs);
+					}
+
+					// Queue-Pressure Guard: detect sustained GPU/render-queue saturation and drop artificial CPU sleep
+					const bool queuePressure = prevIncomplete || (emaBatchNs != 0 && delta * 100ull > emaBatchNs * 135ull);
+					if (queuePressure)
+					{
+						if (pressureStreak < 8u)
+							++pressureStreak;
+					}
+					else if (pressureStreak > 0u)
+					{
+						--pressureStreak;
+					}
+
+					// On a hitch spike or sustained queue pressure, clear stale present debt and let this batch drain
+					if (isHitch || pressureStreak >= 2u)
 					{
 						lastPresentNs = 0;
 						skipBatch = true;

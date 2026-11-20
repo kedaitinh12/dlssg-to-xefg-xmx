@@ -1,6 +1,7 @@
 #include "VulkanHost.h"
 
 #include "../Log.h"
+#include "../Plugin.h"
 #include "VulkanCoopMat.h"
 #include "VulkanPolicy.h"
 #include "VulkanFeatureChain.h"
@@ -1103,6 +1104,15 @@ namespace
 		return mode == VK_PRESENT_MODE_FIFO_KHR || mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
 	}
 
+	uint32_t QueryDisplayRefreshHz() noexcept
+	{
+		DEVMODEW dm{};
+		dm.dmSize = sizeof(dm);
+		if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency >= 48u && dm.dmDisplayFrequency <= 1000u)
+			return dm.dmDisplayFrequency;
+		return 0;
+	}
+
 	VkResult CreateSwapchainImpl(PFN_vkCreateSwapchainKHR next, VkDevice device,
 		const VkSwapchainCreateInfoKHR* info, const VkAllocationCallbacks* allocator, VkSwapchainKHR* swapchain)
 	{
@@ -1123,6 +1133,12 @@ namespace
 			if (s.swapchains.size() >= MaxSwapchains)
 				s.swapchains.clear();
 			s.swapchains[*swapchain] = info->presentMode;
+			const uint32_t hz = QueryDisplayRefreshHz();
+			if (hz)
+			{
+				std::lock_guard pLock(s.pacerMutex);
+				s.pacer.SetDisplayRefreshHz(hz);
+			}
 		}
 
 		return result;
@@ -1177,6 +1193,10 @@ namespace
 			uint64_t waitNs = 0;
 			{
 				std::lock_guard lock(s.pacerMutex);
+				const bool autoVrr = Plugin::options.autoVrrPacing.load(std::memory_order_relaxed);
+				s.pacer.SetAutoVrrEnabled(autoVrr);
+				if (autoVrr && s.pacer.displayRefreshHz == 0)
+					s.pacer.SetDisplayRefreshHz(QueryDisplayRefreshHz());
 				waitNs = s.pacer.ComputePresentWaitNs(NowNs(), vsyncFifo);
 			}
 
