@@ -1,0 +1,26 @@
+From 9a3a8c91b5fe507a96549b122b663d0d28e4378f Mon Sep 17 00:00:00 2001
+From: dlssg-to-xefg <dev@local>
+Date: Fri, 20 Nov 2026 15:28:03 +0000
+Subject: [PATCH] Fix MSVC build error C2065: use std::size(kLayers) instead of
+ kLayerCount in cuda_route.cpp
+
+---
+ src/MfgPort/Cuda/cuda_route.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/MfgPort/Cuda/cuda_route.cpp b/src/MfgPort/Cuda/cuda_route.cpp
+index e40f601..b4a53ae 100644
+--- a/src/MfgPort/Cuda/cuda_route.cpp
++++ b/src/MfgPort/Cuda/cuda_route.cpp
+@@ -489,7 +489,7 @@ struct PersistentHeapCache
+ {
+     ID3D12DescriptorHeap* heap{};
+     std::array<DescCacheEntry, kDescCacheSlots> descCache{};
+-    std::array<LayerReplayEntry, kLayerCount> layerCache{};
++    std::array<LayerReplayEntry, std::size(kLayers)> layerCache{};
+ 
+     void BindHeap(ID3D12DescriptorHeap* nextHeap) noexcept
+     {
+-- 
+2.39.5
+
