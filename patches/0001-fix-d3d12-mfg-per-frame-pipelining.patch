@@ -1,0 +1,78 @@
+From fb40c4a20a3144a232c149d2c56bcf390deb8a1b Mon Sep 17 00:00:00 2001
+From: dlssg-to-xefg <dev@local>
+Date: Thu, 19 Nov 2026 22:51:35 +0000
+Subject: [PATCH] Fix D3D12 MFG GPU stall by restoring per-frame XeFG::Execute
+ pipelining
+
+On native D3D12 (including NVIDIA CUDA Tensor Core and Intel XMX paths),
+generating all frameCount interpolated frames in a single XeFG::Execute
+burst at frameIndex == 1 front-loads the GPU queue and introduces a
+~6-7 ms synchronization gap before the next real frame batch under
+Streamline + V-Sync + XeLL (~10% FPS drop and 80-90% GPU utilization).
+
+Restore per-frame XeFG::Execute (firstFrameIndex = frameIndex - 1,
+frameCount = 1) on native D3D12 while keeping multi-frame batch reuse
+exclusively for the D3D12->Vulkan WMMA bridge (ScheduleBatch).
+---
+ src/FrameGenerator.cpp | 28 +++++++---------------------
+ 1 file changed, 7 insertions(+), 21 deletions(-)
+
+diff --git a/src/FrameGenerator.cpp b/src/FrameGenerator.cpp
+index cfa08a9..4448a47 100644
+--- a/src/FrameGenerator.cpp
++++ b/src/FrameGenerator.cpp
+@@ -890,13 +890,11 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
+ 	if (!context || !context->pairValid)
+ 		return InterpolateResult::Skipped;
+ 
+-	// Multi-frame batch reuse: when frameIndex == 1 already generated the entire batch (1..frameCount) in one pass,
+-	// subsequent evaluations in the same batch simply copy their pre-generated output without re-entering XeFG::Execute.
+ 	const bool useVulkanWmma = UseWmma(settings.model) && D3D12VulkanWmma::Active();
+ 
+-	// Multi-frame batch reuse: when frameIndex == 1 already generated the entire batch (1..frameCount) in one pass,
+-	// subsequent evaluations in the same batch simply copy their pre-generated output without re-entering XeFG::Execute.
+-	if (frameIndex > 1 && context->batchGeneratedThrough >= frameIndex &&
++	// Multi-frame batch reuse (D3D12->Vulkan WMMA bridge only): when ScheduleBatch already generated 1..frameCount
++	// at frameIndex == 1 to keep a single D3D12<->Vulkan fence bounce, subsequent calls copy the pre-generated output.
++	if (useVulkanWmma && frameIndex > 1 && context->batchGeneratedThrough >= frameIndex &&
+ 		outputDesc.Width == settings.width && outputDesc.Height == settings.height &&
+ 		TypedFormat(outputDesc.Format) == settings.format &&
+ 		context->outputs[frameIndex - 1] != nullptr)
+@@ -960,18 +958,10 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
+ 	params.numInterpolatedFrames = (uint8_t)frameCount;
+ 	params.uiCompositionEnabled = settings.uiMode != XEFGD_UI_MODE_AUTO;
+ 
+-	// When starting a batch at frameIndex == 1, generate all frameCount frames in one XeFG::Execute pass so intermediate
+-	// feature pyramid and optical flow tensors stay hot in GPU L2/Infinity Cache across Fallback, XMX Port, and XMX Native.
+-	if (frameIndex == 1)
+-	{
+-		params.firstFrameIndex = 0;
+-		params.frameCount = (uint8_t)frameCount;
+-	}
+-	else
+-	{
+-		params.firstFrameIndex = frameIndex - 1;
+-		params.frameCount = 1;
+-	}
++	// Execute one interpolated frame per Evaluate call on native D3D12 so GPU work stays pipelined with
++	// Streamline/V-Sync/XeLL presents and the game's next real frame, avoiding front-loaded batch stalls.
++	params.firstFrameIndex = frameIndex - 1;
++	params.frameCount = 1;
+ 
+ 	// When WMMA is selected and the D3D12->Vulkan VK_KHR_cooperative_matrix bridge is active, run the full XeFG
+ 	// batch on Vulkan hardware WMMA (16x16x16 SINT8->SINT32) with 1 fence bounce instead of D3D12 cs_6_6 DP4a.
+@@ -1007,11 +997,7 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
+ 	auto result = XeFG::Execute(context->handle, cmdList, params);
+ 
+ 	if (result == XEFGD_RESULT_SUCCESS)
+-	{
+-		if (frameIndex == 1)
+-			context->batchGeneratedThrough = frameCount;
+ 		return InterpolateResult::Interpolated;
+-	}
+ 
+ 	if (result > 0)
+ 	{
+-- 
+2.39.5
+
