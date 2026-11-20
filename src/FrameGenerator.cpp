@@ -191,9 +191,143 @@ static void MakeReadableDepth(D3D12_RESOURCE_DESC& desc)
 	}
 }
 
+static bool IsDepth32StencilFormat(DXGI_FORMAT fmt) noexcept
+{
+	return fmt == DXGI_FORMAT_R32G8X24_TYPELESS ||
+		fmt == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
+		fmt == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+}
+
+// Extracts plane 0 (32-bit float depth) from a D32_FLOAT_S8X24 / R32G8X24 depth-stencil texture into a plain
+// D3D12_HEAP_FLAG_SHARED R32_FLOAT Texture2D via a DEFAULT-heap scratch buffer so the D3D12->Vulkan WMMA bridge
+// can import depth without hitting D3D12's ban on sharing ALLOW_DEPTH_STENCIL resources.
+static bool CaptureDepth32Plane0(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* source,
+	D3D12_RESOURCE_STATES sourceState, ComPtr<ID3D12Resource>& copy, ComPtr<ID3D12Resource>& scratch, const char* purpose)
+{
+	const D3D12_RESOURCE_DESC srcDesc = source->GetDesc();
+	D3D12_RESOURCE_DESC dstDesc = srcDesc;
+	dstDesc.Format = DXGI_FORMAT_R32_FLOAT;
+	dstDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+	dstDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+	dstDesc.MipLevels = 1;
+	dstDesc.DepthOrArraySize = 1;
+
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT srcFootprint{};
+	UINT64 srcBytes = 0;
+	device->GetCopyableFootprints(&srcDesc, 0, 1, 0, &srcFootprint, nullptr, nullptr, &srcBytes);
+
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT dstFootprint{};
+	UINT64 dstBytes = 0;
+	device->GetCopyableFootprints(&dstDesc, 0, 1, 0, &dstFootprint, nullptr, nullptr, &dstBytes);
+
+	if (!srcBytes || !dstBytes || srcFootprint.Footprint.RowPitch != dstFootprint.Footprint.RowPitch)
+		return false;
+
+	const UINT64 bufBytes = std::max(srcBytes, dstBytes);
+	if (scratch && scratch->GetDesc().Width < bufBytes)
+	{
+		DeferredDestroy::Add(std::make_shared<ComPtr<ID3D12Resource>>(std::move(scratch)));
+	}
+	if (!scratch)
+	{
+		D3D12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
+		D3D12_RESOURCE_DESC bufDesc{};
+		bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		bufDesc.Width = bufBytes;
+		bufDesc.Height = 1;
+		bufDesc.DepthOrArraySize = 1;
+		bufDesc.MipLevels = 1;
+		bufDesc.Format = DXGI_FORMAT_UNKNOWN;
+		bufDesc.SampleDesc.Count = 1;
+		bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bufDesc,
+				D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&scratch))) || !scratch)
+			return false;
+		scratch->SetName(L"dlssg-to-xefg depth plane0 scratch");
+	}
+
+	if (copy)
+	{
+		const auto copyDesc = copy->GetDesc();
+		if (copyDesc.Dimension != dstDesc.Dimension || copyDesc.Width != dstDesc.Width || copyDesc.Height != dstDesc.Height ||
+			copyDesc.DepthOrArraySize != dstDesc.DepthOrArraySize || copyDesc.MipLevels != dstDesc.MipLevels ||
+			copyDesc.Format != dstDesc.Format || copyDesc.SampleDesc.Count != dstDesc.SampleDesc.Count ||
+			copyDesc.Layout != dstDesc.Layout || copyDesc.Flags != dstDesc.Flags)
+		{
+			D3D12VulkanWmma::ForgetResource(copy.Get());
+			DeferredDestroy::Add(std::make_shared<ComPtr<ID3D12Resource>>(std::move(copy)));
+		}
+	}
+	if (!copy)
+		copy = CreateTexture(device, dstDesc, XeFGInputState, L"dlssg-to-xefg depth plane0 copy", purpose);
+	if (!copy)
+		return false;
+
+	D3D12_RESOURCE_BARRIER pre[2]{};
+	UINT preCount = 0;
+	if (sourceState != D3D12_RESOURCE_STATE_COPY_SOURCE)
+	{
+		pre[preCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		pre[preCount].Transition = { source, 0, sourceState, D3D12_RESOURCE_STATE_COPY_SOURCE };
+		++preCount;
+	}
+	if (XeFGInputState != D3D12_RESOURCE_STATE_COPY_DEST)
+	{
+		pre[preCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		pre[preCount].Transition = { copy.Get(), 0, XeFGInputState, D3D12_RESOURCE_STATE_COPY_DEST };
+		++preCount;
+	}
+	if (preCount)
+		cmdList->ResourceBarrier(preCount, pre);
+
+	D3D12_TEXTURE_COPY_LOCATION srcLoc{};
+	srcLoc.pResource = source;
+	srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	srcLoc.SubresourceIndex = 0;
+
+	D3D12_TEXTURE_COPY_LOCATION bufSrcLoc{};
+	bufSrcLoc.pResource = scratch.Get();
+	bufSrcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	bufSrcLoc.PlacedFootprint = srcFootprint;
+	cmdList->CopyTextureRegion(&bufSrcLoc, 0, 0, 0, &srcLoc, nullptr);
+
+	D3D12_RESOURCE_BARRIER mid{};
+	mid.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	mid.Transition = { scratch.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+		D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE };
+	cmdList->ResourceBarrier(1, &mid);
+
+	D3D12_TEXTURE_COPY_LOCATION dstLoc{};
+	dstLoc.pResource = copy.Get();
+	dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	dstLoc.SubresourceIndex = 0;
+
+	D3D12_TEXTURE_COPY_LOCATION bufDstLoc{};
+	bufDstLoc.pResource = scratch.Get();
+	bufDstLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	bufDstLoc.PlacedFootprint = dstFootprint;
+	cmdList->CopyTextureRegion(&dstLoc, 0, 0, 0, &bufDstLoc, nullptr);
+
+	D3D12_RESOURCE_BARRIER post[3]{};
+	UINT postCount = 0;
+	for (UINT i = 0; i < preCount; ++i)
+	{
+		post[postCount] = pre[i];
+		std::swap(post[postCount].Transition.StateBefore, post[postCount].Transition.StateAfter);
+		++postCount;
+	}
+	post[postCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	post[postCount].Transition = { scratch.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+		D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON };
+	++postCount;
+	cmdList->ResourceBarrier(postCount, post);
+	return true;
+}
+
 // Copies source into copy, (re)created when the source changes, the copy is left in XeFGInputState
 static bool Capture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* source,
-	D3D12_RESOURCE_STATES sourceState, ComPtr<ID3D12Resource>& copy, const char* purpose, bool isDepth = false)
+	D3D12_RESOURCE_STATES sourceState, ComPtr<ID3D12Resource>& copy, const char* purpose, bool isDepth = false,
+	ComPtr<ID3D12Resource>* depthScratch = nullptr)
 {
 	if (!source)
 	{
@@ -202,6 +336,16 @@ static bool Capture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, ID
 	}
 
 	auto desc = source->GetDesc();
+
+	// On Unreal Engine 5 / REDengine 4 DX12 games, depth is typically D32_FLOAT_S8X24 / R32G8X24_TYPELESS.
+	// Extract plane 0 into a shared R32_FLOAT texture so D3D12->Vulkan hardware WMMA bridge can import it.
+	if (isDepth && depthScratch && D3D12VulkanWmma::WantsSharedTextures() &&
+		desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.SampleDesc.Count == 1 &&
+		IsDepth32StencilFormat(desc.Format))
+	{
+		if (CaptureDepth32Plane0(device, cmdList, source, sourceState, copy, *depthScratch, purpose))
+			return true;
+	}
 
 	// The copy only ever rests in XeFGInputState and gets read through an SRV, so none of the source's flags are
 	// needed. Inheriting them can make CreateCommittedResource reject the desc: ALLOW_CROSS_ADAPTER needs a cross
@@ -683,21 +827,82 @@ bool FrameGenerator::CreateContext()
 
 	context = std::move(newContext);
 
-	// Pre-warm the Vulkan WMMA bridge context during CreateContext rather than lazily inside EvaluateFeature,
-	// so Vulkan pipeline compilation and weight upload never stall Streamline's 500ms waitCPUFence deadline
-	// (which caused freezes in The Witcher 3 and Cyberpunk 2077 when switching to WMMA).
+	// Warm up the Vulkan WMMA bridge context asynchronously on a background thread so CreateContext
+	// returns immediately after D3D12 XeFG::Init and never stalls Streamline's 500ms waitCPUFence deadline
+	// (first 1-2 frames run seamlessly on D3D12 cs_6_6 overrides until Vulkan context init completes).
 	if (UseWmma(settings.model) && D3D12VulkanWmma::Active())
 	{
 		const D3D12VulkanWmma::ContextSettings vkSettings{
 			settings.width, settings.height, settings.format, settings.initFlags, settings.uiMode, settings.model
 		};
-		D3D12VulkanWmma::EnsureContext(vkSettings);
+		D3D12VulkanWmma::WarmupContextAsync(vkSettings);
 	}
 
 	routeLaunches = UseWmma(settings.model) ? xefg_wmma::Snapshot().launches : xefg_cuda::Snapshot().launches;
 	routeFrames = 0;
 	routeReported = false;
 	return true;
+}
+
+bool FrameGenerator::PollVramGuard() noexcept
+{
+	if (!Plugin::options.vramGuard.load(std::memory_order_relaxed))
+	{
+		if (vramGuardActive)
+		{
+			vramGuardActive = false;
+			Log::Info("Adaptive VRAM guard disabled by user, restoring full MFG multiplier");
+		}
+		return false;
+	}
+
+	if (!vramAdapterChecked)
+	{
+		vramAdapterChecked = true;
+		ComPtr<IDXGIFactory4> factory;
+		if (device && SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
+		{
+			const LUID luid = device->GetAdapterLuid();
+			ComPtr<IDXGIAdapter1> adapter;
+			if (SUCCEEDED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter))) && adapter)
+				adapter.As(&vramAdapter);
+		}
+	}
+
+	if (!vramAdapter)
+		return false;
+
+	// Poll every 8 real frames to keep QueryVideoMemoryInfo overhead negligible
+	if ((vramPollCounter++ & 7u) != 0)
+		return vramGuardActive;
+
+	DXGI_QUERY_VIDEO_MEMORY_INFO memInfo{};
+	if (FAILED(vramAdapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memInfo)) || memInfo.Budget == 0)
+		return vramGuardActive;
+
+	constexpr uint64_t kSafetyMarginBytes = 200ull * 1024ull * 1024ull; // 200 MiB safety margin
+	constexpr uint64_t kReleaseMarginBytes = 400ull * 1024ull * 1024ull; // 400 MiB hysteresis to avoid oscillation
+
+	if (!vramGuardActive)
+	{
+		if (memInfo.Budget > kSafetyMarginBytes && memInfo.CurrentUsage + kSafetyMarginBytes >= memInfo.Budget)
+		{
+			vramGuardActive = true;
+			Log::Warn("Adaptive VRAM guard engaged ({} MiB / {} MiB budget): clamping MFG temporarily to 2x to prevent swap stutter",
+				memInfo.CurrentUsage / (1024ull * 1024ull), memInfo.Budget / (1024ull * 1024ull));
+		}
+	}
+	else
+	{
+		if (memInfo.Budget > kReleaseMarginBytes && memInfo.CurrentUsage + kReleaseMarginBytes < memInfo.Budget)
+		{
+			vramGuardActive = false;
+			Log::Info("Adaptive VRAM guard released ({} MiB / {} MiB budget): restoring full MFG multiplier",
+				memInfo.CurrentUsage / (1024ull * 1024ull), memInfo.Budget / (1024ull * 1024ull));
+		}
+	}
+
+	return vramGuardActive;
 }
 
 void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const NGXParameter& params)
@@ -849,7 +1054,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	auto& previous = context->frames[context->current ^ 1];
 
 	bool captured = Capture(device.Get(), cmdList, backbuffer, BackbufferState, frame.backbuffer, "Backbuffer");
-	captured &= Capture(device.Get(), cmdList, depth, InputState, frame.depth, "Depth copy", true);
+	captured &= Capture(device.Get(), cmdList, depth, InputState, frame.depth, "Depth copy", true, &frame.depthScratch);
 	captured &= Capture(device.Get(), cmdList, mvecs, InputState, frame.mvecs, "MVecs copy");
 	Capture(device.Get(), cmdList, hudless, InputState, frame.hudless, "HUDLess copy");
 
@@ -885,7 +1090,49 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	if (data.motionVectorScale[0] == 0.0f || data.motionVectorScale[1] == 0.0f)
 		data.motionVectorScale[0] = data.motionVectorScale[1] = 1.0f;
 
-	const bool reset = params.GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
+	bool reset = params.GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
+
+	// Camera Cut & Teleport Detector: force history reset on sudden position jumps or sharp orientation snaps
+	if (Plugin::options.cameraCutDetection.load(std::memory_order_relaxed))
+	{
+		const XMFLOAT3 curPos = GetVector(params, "DLSSG.CameraPosX", "DLSSG.CameraPosY", "DLSSG.CameraPosZ");
+		const XMFLOAT3 curFwd = GetVector(params, "DLSSG.CameraFwdX", "DLSSG.CameraFwdY", "DLSSG.CameraFwdZ");
+		const float fwdLenSq = curFwd.x * curFwd.x + curFwd.y * curFwd.y + curFwd.z * curFwd.z;
+		const bool hasCamera = fwdLenSq > 1e-6f;
+
+		if (hasCamera && context->hasPrevCamera && !reset)
+		{
+			const float dx = curPos.x - context->prevCameraPos[0];
+			const float dy = curPos.y - context->prevCameraPos[1];
+			const float dz = curPos.z - context->prevCameraPos[2];
+			const float distSq = dx * dx + dy * dy + dz * dz;
+			constexpr float kCutThresholdSq = 4.5f * 4.5f;
+
+			const float invCur = 1.0f / std::sqrt(fwdLenSq);
+			const float prevLenSq = context->prevCameraFwd[0] * context->prevCameraFwd[0] +
+				context->prevCameraFwd[1] * context->prevCameraFwd[1] +
+				context->prevCameraFwd[2] * context->prevCameraFwd[2];
+			const float fwdDot = (prevLenSq > 1e-6f)
+				? ((curFwd.x * context->prevCameraFwd[0] + curFwd.y * context->prevCameraFwd[1] +
+				    curFwd.z * context->prevCameraFwd[2]) * invCur / std::sqrt(prevLenSq))
+				: 1.0f;
+
+			if (distSq > kCutThresholdSq || fwdDot < -0.5f)
+				reset = true;
+		}
+
+		if (hasCamera)
+		{
+			context->prevCameraPos[0] = curPos.x;
+			context->prevCameraPos[1] = curPos.y;
+			context->prevCameraPos[2] = curPos.z;
+			context->prevCameraFwd[0] = curFwd.x;
+			context->prevCameraFwd[1] = curFwd.y;
+			context->prevCameraFwd[2] = curFwd.z;
+			context->hasPrevCamera = true;
+		}
+	}
+
 	data.resetHistory = reset;
 
 	// XeFG needs both frames to have hudless or neither
@@ -1053,18 +1300,28 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 	}
 
 	// 1 based index of the generated frame and the number of generated frames between two real frames
-	const uint32_t frameCount = std::clamp(params.GetOr<uint32_t>("DLSSG.MultiFrameCount", 1), 1u, MaxFrames);
-	const uint32_t frameIndex = std::clamp(params.GetOr<uint32_t>("DLSSG.MultiFrameIndex", 1), 1u, frameCount);
+	const uint32_t requestedCount = std::clamp(params.GetOr<uint32_t>("DLSSG.MultiFrameCount", 1), 1u, MaxFrames);
+	const uint32_t frameIndex = std::clamp(params.GetOr<uint32_t>("DLSSG.MultiFrameIndex", 1), 1u, requestedCount);
+
+	bool vramGuarded = vramGuardActive;
+	if (frameIndex == 1)
+	{
+		vramGuarded = PollVramGuard();
+		CaptureRealFrame(cmdList, params);
+	}
+
+	const uint32_t effectiveCount = (vramGuarded && requestedCount > 1u) ? 1u : requestedCount;
 
 	if (frameIndex == 1)
 	{
-		CaptureRealFrame(cmdList, params);
-
-		Plugin::Report({ settings.width, settings.height, frameCount, settings.uiMode != XEFGD_UI_MODE_AUTO,
+		Plugin::Report({ settings.width, settings.height, effectiveCount, settings.uiMode != XEFGD_UI_MODE_AUTO,
 			CurrentNetwork(settings.model), context == nullptr, settings.format == DXGI_FORMAT_R16G16B16A16_FLOAT });
 	}
 
-	const auto result = Interpolate(cmdList, output, output->GetDesc(), frameIndex, frameCount);
+	// When VRAM guard clamps 3x-6x down to 2x, skip extra generated frames gracefully by showing the real frame
+	const auto result = (frameIndex <= effectiveCount)
+		? Interpolate(cmdList, output, output->GetDesc(), frameIndex, effectiveCount)
+		: InterpolateResult::Skipped;
 
 	// A few frames after the path or context changed, say whether the hardware matrix route is actually the one running
 	if (result == InterpolateResult::Interpolated && !routeReported && ++routeFrames >= 8)

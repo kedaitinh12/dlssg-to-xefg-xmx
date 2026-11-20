@@ -462,6 +462,39 @@ namespace
 						 "interpolating the UI with the scene. It doesn't highlight the HUD.\n"
 						 "Turn off if the game's HUDless image is broken.");
 
+		bool cameraCut = Plugin::options.cameraCutDetection;
+
+		if (api->Checkbox("Camera cut detection", &cameraCut))
+		{
+			Plugin::options.cameraCutDetection = cameraCut;
+			api->SetBool(self, "CameraCutDetection", cameraCut);
+		}
+
+		api->ItemTooltip("Automatically resets XeFG frame history on sudden camera teleports or cutscene cuts\n"
+						 "to prevent jelly/smearing artifacts. Saved as CameraCutDetection in OptiScaler.ini.");
+
+		bool vramGuard = Plugin::options.vramGuard;
+
+		if (api->Checkbox("Adaptive VRAM guard", &vramGuard))
+		{
+			Plugin::options.vramGuard = vramGuard;
+			api->SetBool(self, "VramGuard", vramGuard);
+		}
+
+		api->ItemTooltip("Monitors local GPU VRAM via IDXGIAdapter3 and temporarily clamps 3x-6x MFG down to 2x\n"
+						 "when within 200 MiB of budget to prevent system-RAM swap stutters. Saved as VramGuard.");
+
+		bool autoVrr = Plugin::options.autoVrrPacing;
+
+		if (api->Checkbox("Auto VRR pacing (Hz - 3)", &autoVrr))
+		{
+			Plugin::options.autoVrrPacing = autoVrr;
+			api->SetBool(self, "AutoVrrPacing", autoVrr);
+		}
+
+		api->ItemTooltip("Limits the Vulkan present pacer cadence to (Monitor Hz - 3) to stay inside the VRR\n"
+						 "(G-Sync / FreeSync) window and avoid V-Sync latency spikes. Saved as AutoVrrPacing.");
+
 		bool debugLines = Plugin::options.debugLines;
 
 		if (api->Checkbox("Debug lines", &debugLines))
@@ -642,6 +675,9 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* optiAp
 		Plugin::options.path = (Plugin::Path)path;
 
 	Plugin::options.hudlessUi = api->GetBool(self, "HudlessUi", Plugin::options.hudlessUi);
+	Plugin::options.cameraCutDetection = api->GetBool(self, "CameraCutDetection", Plugin::options.cameraCutDetection);
+	Plugin::options.vramGuard = api->GetBool(self, "VramGuard", Plugin::options.vramGuard);
+	Plugin::options.autoVrrPacing = api->GetBool(self, "AutoVrrPacing", Plugin::options.autoVrrPacing);
 
 	// Off in OptiScaler.ini, the Vulkan hooks aren't installed. Said before they are, and a copy started by
 	// InitializeASI that has installed them already only passes the game's calls on from here

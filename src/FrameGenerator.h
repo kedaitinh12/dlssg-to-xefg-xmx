@@ -3,6 +3,7 @@
 #include "NGX.h"
 #include "XeFG.h"
 
+#include <dxgi1_4.h>
 #include <wrl/client.h>
 
 #include <memory>
@@ -46,6 +47,7 @@ private:
 		ComPtr<ID3D12Resource> backbuffer;
 		ComPtr<ID3D12Resource> hudless;
 		ComPtr<ID3D12Resource> depth;
+		ComPtr<ID3D12Resource> depthScratch;
 		ComPtr<ID3D12Resource> mvecs;
 		xefgd_frame_t data{};
 		bool valid = false;
@@ -66,6 +68,11 @@ private:
 		uint32_t batchGeneratedThrough = 0;
 		bool directOutput = false;
 
+		// Camera Cut & Teleport Detector state (prevents smearing on sudden cuts/teleports)
+		float prevCameraPos[3]{};
+		float prevCameraFwd[3]{};
+		bool hasPrevCamera = false;
+
 		~Context();
 	};
 
@@ -77,6 +84,7 @@ private:
 	};
 
 	bool CreateContext();
+	bool PollVramGuard() noexcept;
 	void CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const NGXParameter& params);
 	InterpolateResult Interpolate(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* output,
 		D3D12_RESOURCE_DESC outputDesc, uint32_t frameIndex, uint32_t frameCount);
@@ -92,4 +100,10 @@ private:
 	uint64_t routeLaunches = 0;
 	uint32_t routeFrames = 0;
 	bool routeReported = false;
+
+	// Adaptive VRAM Guard: cached IDXGIAdapter3 + hysteresis state (zero per-frame factory overhead)
+	ComPtr<IDXGIAdapter3> vramAdapter;
+	bool vramAdapterChecked = false;
+	bool vramGuardActive = false;
+	uint32_t vramPollCounter = 0;
 };

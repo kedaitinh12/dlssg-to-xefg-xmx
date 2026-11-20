@@ -27,6 +27,12 @@ namespace Plugin
 		std::atomic<Path> path = Path::XmxNative;
 		// Lets XeFG composite the UI from the game's HUDless color instead of interpolating it with the scene
 		std::atomic_bool hudlessUi = true;
+		// Detects sudden camera teleports / cutscene cuts and forces XeFG history reset to prevent smearing
+		std::atomic_bool cameraCutDetection = true;
+		// Monitors local VRAM via IDXGIAdapter3 and temporarily clamps high MFG multipliers to 2x near budget
+		std::atomic_bool vramGuard = true;
+		// Caps Vulkan present pacer cadence to (DisplayHz - 3) to stay inside the VRR/G-Sync/FreeSync window
+		std::atomic_bool autoVrrPacing = false;
 		// Not saved
 		std::atomic_bool debugLines = false;
 	};

@@ -72,6 +72,10 @@ namespace D3D12VulkanWmma
 	// Ensures the Vulkan-side XeFG context matches `settings` (recreates on resolution/format/flag change).
 	bool EnsureContext(const ContextSettings& settings) noexcept;
 
+	// Starts EnsureContext() asynchronously on a background thread so FrameGenerator::CreateContext()
+	// never stalls Streamline's 500ms waitCPUFence deadline while Vulkan compiles/uploads weights.
+	void WarmupContextAsync(const ContextSettings& settings) noexcept;
+
 	// Destroys the Vulkan-side XeFG context (e.g. when FrameGenerator recreates its context).
 	void ResetContext() noexcept;
 

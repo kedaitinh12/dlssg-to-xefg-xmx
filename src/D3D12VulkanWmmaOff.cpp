@@ -13,6 +13,7 @@ namespace D3D12VulkanWmma
 	bool WantsSharedTextures() noexcept { return false; }
 	bool CanShareTexture(const D3D12_RESOURCE_DESC&) noexcept { return false; }
 	bool EnsureContext(const ContextSettings&) noexcept { return false; }
+	void WarmupContextAsync(const ContextSettings&) noexcept {}
 	void ResetContext() noexcept {}
 
 	bool ScheduleBatch(ID3D12GraphicsCommandList*, const ContextSettings&, const FrameInputs&, const FrameInputs&,
