@@ -1,0 +1,44 @@
+From ed14f5ca8dfd534a6c59479e51b9a9e0c22b6beb Mon Sep 17 00:00:00 2001
+From: dlssg-to-xefg <dev@local>
+Date: Fri, 20 Nov 2026 15:10:48 +0000
+Subject: [PATCH] Fix Linux CI stubs: add dxgi1_4.h and
+ EnumDisplaySettingsW/DEVMODEW
+
+---
+ tests/vulkan_runtime/stubs/Windows.h | 7 +++++++
+ tests/vulkan_runtime/stubs/dxgi1_4.h | 5 +++++
+ 2 files changed, 12 insertions(+)
+ create mode 100644 tests/vulkan_runtime/stubs/dxgi1_4.h
+
+diff --git a/tests/vulkan_runtime/stubs/Windows.h b/tests/vulkan_runtime/stubs/Windows.h
+index c8b5cf8..98654fb 100644
+--- a/tests/vulkan_runtime/stubs/Windows.h
++++ b/tests/vulkan_runtime/stubs/Windows.h
+@@ -96,6 +96,13 @@ extern "C++"
+ 	ULONGLONG GetTickCount64();
+ 	int WideCharToMultiByte(UINT codePage, DWORD flags, const wchar_t* wide, int wideCount, char* narrow, int narrowCount,
+ 		const char* defaultChar, BOOL* usedDefault);
++	#define ENUM_CURRENT_SETTINGS ((DWORD)-1)
++	struct DEVMODEW
++	{
++		WORD dmSize;
++		DWORD dmDisplayFrequency;
++	};
++	BOOL EnumDisplaySettingsW(LPCWSTR lpszDeviceName, DWORD iModeNum, DEVMODEW* lpDevMode);
+ 	int _wcsicmp(const wchar_t* a, const wchar_t* b);
+ 
+ 	// std::filesystem::path::c_str() is wchar_t on Windows and char on the Linux this is checked on, these two let the
+diff --git a/tests/vulkan_runtime/stubs/dxgi1_4.h b/tests/vulkan_runtime/stubs/dxgi1_4.h
+new file mode 100644
+index 0000000..4abe65b
+--- /dev/null
++++ b/tests/vulkan_runtime/stubs/dxgi1_4.h
+@@ -0,0 +1,5 @@
++// Minimal DXGI 1.4 stub for Linux syntax/regression checks (FrameGenerator.h uses ComPtr<IDXGIAdapter3>).
++#pragma once
++#include "d3d12.h"
++
++struct IDXGIAdapter3 : IUnknown {};
+-- 
+2.39.5
+
