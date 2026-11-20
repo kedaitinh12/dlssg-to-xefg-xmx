@@ -489,7 +489,7 @@ struct PersistentHeapCache
 {
     ID3D12DescriptorHeap* heap{};
     std::array<DescCacheEntry, kDescCacheSlots> descCache{};
-    std::array<LayerReplayEntry, kLayerCount> layerCache{};
+    std::array<LayerReplayEntry, std::size(kLayers)> layerCache{};
 
     void BindHeap(ID3D12DescriptorHeap* nextHeap) noexcept
     {
