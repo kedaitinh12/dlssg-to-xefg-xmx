@@ -683,6 +683,17 @@ bool FrameGenerator::CreateContext()
 
 	context = std::move(newContext);
 
+	// Pre-warm the Vulkan WMMA bridge context during CreateContext rather than lazily inside EvaluateFeature,
+	// so Vulkan pipeline compilation and weight upload never stall Streamline's 500ms waitCPUFence deadline
+	// (which caused freezes in The Witcher 3 and Cyberpunk 2077 when switching to WMMA).
+	if (UseWmma(settings.model) && D3D12VulkanWmma::Active())
+	{
+		const D3D12VulkanWmma::ContextSettings vkSettings{
+			settings.width, settings.height, settings.format, settings.initFlags, settings.uiMode, settings.model
+		};
+		D3D12VulkanWmma::EnsureContext(vkSettings);
+	}
+
 	routeLaunches = UseWmma(settings.model) ? xefg_wmma::Snapshot().launches : xefg_cuda::Snapshot().launches;
 	routeFrames = 0;
 	routeReported = false;
