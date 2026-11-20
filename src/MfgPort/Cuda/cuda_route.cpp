@@ -483,19 +483,31 @@ struct LayerReplayEntry
     XefgCudaParams params{};
 };
 
-// Persists across HookReset on the same thread as long as the shader-visible CBV/SRV/UAV heap is unchanged,
-// mirroring CUDA Graph parameter-update replay (avoiding ~100 NvAPI descriptor lookups per frame).
+std::atomic<uint64_t> gCacheEpoch{ 1 };
+
+// Persists across HookReset on the same thread as long as the shader-visible CBV/SRV/UAV heap and context
+// epoch are unchanged, mirroring CUDA Graph parameter-update replay (avoiding ~100 NvAPI descriptor lookups per frame).
 struct PersistentHeapCache
 {
     ID3D12DescriptorHeap* heap{};
+    uint64_t epoch{};
+    UINT64 heapGpuStart{};
+    SIZE_T heapCpuStart{};
+    UINT heapNumDescriptors{};
     std::array<DescCacheEntry, kDescCacheSlots> descCache{};
     std::array<LayerReplayEntry, std::size(kLayers)> layerCache{};
 
-    void BindHeap(ID3D12DescriptorHeap* nextHeap) noexcept
+    void BindHeap(ID3D12DescriptorHeap* nextHeap, UINT64 gpuStart, SIZE_T cpuStart, UINT numDescriptors) noexcept
     {
-        if (heap != nextHeap)
+        const uint64_t curEpoch = gCacheEpoch.load(std::memory_order_acquire);
+        if (heap != nextHeap || epoch != curEpoch ||
+            heapGpuStart != gpuStart || heapCpuStart != cpuStart || heapNumDescriptors != numDescriptors)
         {
             heap = nextHeap;
+            epoch = curEpoch;
+            heapGpuStart = gpuStart;
+            heapCpuStart = cpuStart;
+            heapNumDescriptors = numDescriptors;
             descCache = {};
             layerCache = {};
         }
@@ -588,7 +600,6 @@ void STDMETHODCALLTYPE HookSetPipelineState(ID3D12GraphicsCommandList* self, ID3
 void STDMETHODCALLTYPE HookSetDescriptorHeaps(ID3D12GraphicsCommandList* self, UINT count, ID3D12DescriptorHeap* const* heaps)
 {
     auto& r = Track(self);
-    ID3D12DescriptorHeap* prevHeap = r.heap;
     r.heap = nullptr;
     r.heapNumDescriptors = 0;
     if (heaps)
@@ -609,7 +620,7 @@ void STDMETHODCALLTYPE HookSetDescriptorHeaps(ID3D12GraphicsCommandList* self, U
             }
         }
     }
-    if (r.heap) tHeapCache.BindHeap(r.heap);
+    if (r.heap) tHeapCache.BindHeap(r.heap, r.heapGpuStart.ptr, r.heapCpuStart.ptr, r.heapNumDescriptors);
     ListOriginal<SetDescriptorHeapsFn>(self, kSetDescriptorHeaps)(self, count, heaps);
 }
 void STDMETHODCALLTYPE HookSetComputeRootSignature(ID3D12GraphicsCommandList* self, ID3D12RootSignature* signature)
@@ -677,7 +688,7 @@ bool Launch(ID3D12GraphicsCommandList* list, Recording& r, UINT x, UINT y, UINT 
     if ((r.tableMask & 3u) != 3u || !r.heap) { Fallback(kBindings, "bindings_incomplete", layer); return false; }
     if ((r.constantMask & layer.constants) != layer.constants) { Fallback(kConstants, "constants_incomplete", layer); return false; }
     if (!r.heapNumDescriptors) { Fallback(kHeap, "heap_type", layer); return false; }
-    tHeapCache.BindHeap(r.heap);
+    tHeapCache.BindHeap(r.heap, r.heapGpuStart.ptr, r.heapCpuStart.ptr, r.heapNumDescriptors);
     auto& replay = tHeapCache.layerCache[r.layer - 1];
     if (replay.heap == r.heap && replay.table0 == r.tables[0].ptr && replay.table1 == r.tables[1].ptr &&
         replay.x == x && replay.y == y)
@@ -1200,6 +1211,7 @@ void Recognize(ID3D12Device* device, const D3D12_COMPUTE_PIPELINE_STATE_DESC& de
             gAnyLayer.store(true, std::memory_order_release);
             gLayerCount.store(uint32_t(gHeld.size()), std::memory_order_relaxed);
             if (!gLayerSeen[i].exchange(true) && gActive.load(std::memory_order_relaxed))
+                gCacheEpoch.fetch_add(1, std::memory_order_release);
                 Log("cuda_layer", std::string("\"program\":\"") + kLayers[i].info.program + "\",\"kernel\":\"" +
                     kLayers[i].info.kernel + "\"" + (own ? ",\"source\":\"rtxmfg\"" : "") + stack);
             return;
@@ -1496,7 +1508,10 @@ void SetEnabled(bool enabled) noexcept
         return;
     std::lock_guard lock(gMutex);
     if (gState.load(std::memory_order_acquire) == State::Active)
+    {
         gActive.store(enabled, std::memory_order_release);
+        gCacheEpoch.fetch_add(1, std::memory_order_release);
+    }
 }
 
 // The caller's list is where Execute records the provider's dispatches, and it may have been created before the
