@@ -471,6 +471,37 @@ struct DescCacheEntry
 };
 constexpr size_t kDescCacheSlots = 64;
 
+struct LayerReplayEntry
+{
+    ID3D12DescriptorHeap* heap{};
+    UINT64 table0{};
+    UINT64 table1{};
+    UINT x{};
+    UINT y{};
+    uint32_t gridX{};
+    uint32_t gridY{};
+    XefgCudaParams params{};
+};
+
+// Persists across HookReset on the same thread as long as the shader-visible CBV/SRV/UAV heap is unchanged,
+// mirroring CUDA Graph parameter-update replay (avoiding ~100 NvAPI descriptor lookups per frame).
+struct PersistentHeapCache
+{
+    ID3D12DescriptorHeap* heap{};
+    std::array<DescCacheEntry, kDescCacheSlots> descCache{};
+    std::array<LayerReplayEntry, kLayerCount> layerCache{};
+
+    void BindHeap(ID3D12DescriptorHeap* nextHeap) noexcept
+    {
+        if (heap != nextHeap)
+        {
+            heap = nextHeap;
+            descCache = {};
+            layerCache = {};
+        }
+    }
+};
+
 struct Recording
 {
     void* list{};
@@ -487,9 +518,9 @@ struct Recording
     uint32_t tableMask{};
     uint32_t constants[12]{};
     uint32_t constantMask{};
-    std::array<DescCacheEntry, kDescCacheSlots> descCache{};
 };
 thread_local Recording tRecording;
+thread_local PersistentHeapCache tHeapCache;
 
 void InitRecording(Recording& r, void* list) noexcept
 {
@@ -578,7 +609,7 @@ void STDMETHODCALLTYPE HookSetDescriptorHeaps(ID3D12GraphicsCommandList* self, U
             }
         }
     }
-    if (r.heap != prevHeap) r.descCache = {};
+    if (r.heap) tHeapCache.BindHeap(r.heap);
     ListOriginal<SetDescriptorHeapsFn>(self, kSetDescriptorHeaps)(self, count, heaps);
 }
 void STDMETHODCALLTYPE HookSetComputeRootSignature(ID3D12GraphicsCommandList* self, ID3D12RootSignature* signature)
@@ -646,6 +677,20 @@ bool Launch(ID3D12GraphicsCommandList* list, Recording& r, UINT x, UINT y, UINT 
     if ((r.tableMask & 3u) != 3u || !r.heap) { Fallback(kBindings, "bindings_incomplete", layer); return false; }
     if ((r.constantMask & layer.constants) != layer.constants) { Fallback(kConstants, "constants_incomplete", layer); return false; }
     if (!r.heapNumDescriptors) { Fallback(kHeap, "heap_type", layer); return false; }
+    tHeapCache.BindHeap(r.heap);
+    auto& replay = tHeapCache.layerCache[r.layer - 1];
+    if (replay.heap == r.heap && replay.table0 == r.tables[0].ptr && replay.table1 == r.tables[1].ptr &&
+        replay.x == x && replay.y == y)
+    {
+        // Fast replay path: reuse resolved texture/surface handles and grid dimensions, updating only dynamic root constants.
+        std::memcpy(replay.params.constants, r.constants, sizeof(replay.params.constants));
+        const int launched = GuardedLaunch(gNvapi.launch, list, gKernels[layer.kernel],
+            replay.gridX, replay.gridY, layer.gridZ, &replay.params, sizeof(replay.params));
+        if (launched == kNvFault) RuntimeFault("launch");
+        if (launched != 0) { Fallback(kLaunch, "launch", layer); return false; }
+        gLaunches.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
     const auto gpuStart = r.heapGpuStart;
     const auto cpuStart = r.heapCpuStart;
     auto object = [&](D3D12_GPU_DESCRIPTOR_HANDLE table, uint32_t offset, int type, uint64_t& handle) {
@@ -653,7 +698,7 @@ bool Launch(ID3D12GraphicsCommandList* list, Recording& r, UINT x, UINT y, UINT 
         const uint64_t index = (table.ptr - gpuStart.ptr)/gIncrement + offset;
         if (index >= r.heapNumDescriptors) return false;
         const uint64_t cacheKey = ((index + 1ull) << 1) | uint64_t(type & 1);
-        auto& slot = r.descCache[size_t((cacheKey * 0x9E3779B97F4A7C15ull) >> 58) & (kDescCacheSlots - 1)];
+        auto& slot = tHeapCache.descCache[size_t((cacheKey * 0x9E3779B97F4A7C15ull) >> 58) & (kDescCacheSlots - 1)];
         if (slot.key == cacheKey && slot.handle)
         {
             handle = slot.handle;
@@ -680,6 +725,7 @@ bool Launch(ID3D12GraphicsCommandList* list, Recording& r, UINT x, UINT y, UINT 
     params.limitH = y*layer.intelH;
     std::memcpy(params.constants, r.constants, sizeof(params.constants));
     const uint32_t gridX = (params.limitW + layer.tileW - 1)/layer.tileW, gridY = (params.limitH + layer.tileH - 1)/layer.tileH;
+    replay = {r.heap, r.tables[0].ptr, r.tables[1].ptr, x, y, gridX, gridY, params};
     const int launched = GuardedLaunch(gNvapi.launch, list, gKernels[layer.kernel], gridX, gridY, layer.gridZ, &params, sizeof(params));
     if (launched == kNvFault) RuntimeFault("launch");
     if (launched != 0) { Fallback(kLaunch, "launch", layer); return false; }
