@@ -38,26 +38,38 @@ jobs:
         shell: pwsh
         run: ./tools/GenerateXeFgPrograms.ps1 -Output bin\Release\xefg_mfg_programs -Cache obj\Release\packages
 
-      - name: Setup CUDA Toolkit (12.8.1 minimal nvcc)
+      - name: Setup CUDA Toolkit (13.4 minimal nvcc for MSVC 14.52)
         id: cuda_setup
         continue-on-error: true
         shell: pwsh
         run: |
-          $cudaDir = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+          $cudaDir = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
           if (-not (Test-Path (Join-Path $cudaDir "bin\nvcc.exe"))) {
-            $installer = Join-Path $env:RUNNER_TEMP "cuda_12.8.1_windows_network.exe"
-            Write-Host "Downloading official NVIDIA CUDA 12.8.1 Windows network installer..."
-            Invoke-WebRequest -Uri "https://developer.download.nvidia.com/compute/cuda/12.8.1/network_installers/cuda_12.8.1_windows_network.exe" -OutFile $installer
-            Write-Host "Installing minimal CUDA 12.8.1 components (nvcc_12.8, cudart_12.8)..."
-            $proc = Start-Process -FilePath $installer -ArgumentList "-s", "nvcc_12.8", "cudart_12.8" -Wait -PassThru
-            if ($proc.ExitCode -ne 0) {
-              Write-Warning "CUDA network installer exited with code $($proc.ExitCode)"
+            $installer = $null
+            foreach ($ver in @("13.4.3", "13.4.2", "13.4.1")) {
+              $url = "https://developer.download.nvidia.com/compute/cuda/$ver/network_installers/cuda_${ver}_windows_network.exe"
+              $cand = Join-Path $env:RUNNER_TEMP "cuda_${ver}_windows_network.exe"
+              try {
+                Write-Host "Trying official NVIDIA CUDA $ver Windows network installer..."
+                Invoke-WebRequest -Uri $url -OutFile $cand -ErrorAction Stop
+                $installer = $cand
+                break
+              } catch {
+                Write-Warning "CUDA $ver download unavailable: $($_.Exception.Message)"
+              }
+            }
+            if ($installer) {
+              Write-Host "Installing minimal CUDA 13.4 components (nvcc_13.4, cudart_13.4)..."
+              $proc = Start-Process -FilePath $installer -ArgumentList "-s", "nvcc_13.4", "cudart_13.4" -Wait -PassThru
+              if ($proc.ExitCode -ne 0) {
+                Write-Warning "CUDA network installer exited with code $($proc.ExitCode)"
+              }
             }
           }
           if (Test-Path (Join-Path $cudaDir "bin\nvcc.exe")) {
             "CUDA_PATH=$cudaDir" >> $env:GITHUB_OUTPUT
             "CUDA_PATH=$cudaDir" >> $env:GITHUB_ENV
-            Write-Host "CUDA Toolkit 12.8.1 ready at $cudaDir"
+            Write-Host "CUDA Toolkit 13.4 ready at $cudaDir"
           } else {
             Write-Warning "nvcc.exe not found at $cudaDir; build will keep the extracted fatbin."
           }
