@@ -437,6 +437,64 @@ int main()
 		pacer.OnBatchStart(200 * ms, 1);
 		pacer.OnBatchStart(220 * ms, 1);
 		CHECK(pacer.ComputePresentWaitNs(500 * ms, false) == 0);
+
+		// Adaptive GPU-Bound Burst Release hysteresis (f5low-kit DriverPacing=2 / FlipBurst=1):
+		// Sustained queue pressure for >= 2s engages gpuBoundBurst; smooth cadence for >= 2s releases it.
+		VulkanPolicy::PresentPacer burst{};
+		uint64_t bt = 1'000'000'000ull;
+		for (int i = 0; i < 4; ++i)
+		{
+			burst.OnBatchStart(bt, 2);
+			burst.ComputePresentWaitNs(bt, false);
+			burst.ComputePresentWaitNs(bt + 6 * ms, false);
+			burst.ComputePresentWaitNs(bt + 12 * ms, false);
+			bt += 20 * ms;
+		}
+		CHECK(!burst.gpuBoundBurst);
+
+		// Sustain incomplete batches (queue pressure) for > 2 seconds (110 batches * 20 ms = 2.2 s)
+		for (int i = 0; i < 110; ++i)
+		{
+			burst.OnBatchStart(bt, 2);
+			burst.ComputePresentWaitNs(bt, false); // only 1 of 3 presents completed -> prevIncomplete
+			bt += 20 * ms;
+		}
+		CHECK(burst.gpuBoundBurst);
+		CHECK(burst.ComputePresentWaitNs(bt + 100'000ull, false) == 0);
+
+		// Restore smooth complete batches for > 2 seconds (110 batches * 20 ms = 2.2 s) -> burst releases
+		for (int i = 0; i < 110; ++i)
+		{
+			burst.OnBatchStart(bt, 2);
+			burst.ComputePresentWaitNs(bt, false);
+			burst.ComputePresentWaitNs(bt + 6 * ms, false);
+			burst.ComputePresentWaitNs(bt + 12 * ms, false);
+			bt += 20 * ms;
+		}
+		CHECK(!burst.gpuBoundBurst);
+
+		// RDR2 Vulkan 6x MFG (5 generated + 1 real = 6 frames) pipelined pacing regression:
+		// Render thread starts the next batch while 1 present of the previous batch is still in flight (5/6 done)
+		// and G1 arrives 6 ms after OnBatchStart. Pacer must NOT falsely trip gpuBoundBurst and must space G2..G5 evenly.
+		VulkanPolicy::PresentPacer mfg6{};
+		uint64_t mt = 2'000'000'000ull;
+		for (int i = 0; i < 120; ++i)
+		{
+			mfg6.OnBatchStart(mt, 5);
+			uint64_t p0 = mt + 6 * ms; // G1 arrives 6 ms after render-thread OnBatchStart
+			(void)mfg6.ComputePresentWaitNs(p0, false);
+			uint64_t cur = p0;
+			for (int g = 1; g < 5; ++g) // 5 of 6 presents complete before next OnBatchStart (normal pipelining)
+			{
+				const uint64_t w = mfg6.ComputePresentWaitNs(cur + 200'000ull, false);
+				if (i >= 5)
+					CHECK(w > 2'000'000ull); // must pace smoothly (~3.5-4.3 ms), never burst at 0
+				cur += 200'000ull + w;
+			}
+			mt += 26 * ms; // ~38.5 base FPS -> ~230 FPS at 6x MFG
+		}
+		CHECK(!mfg6.gpuBoundBurst);
+		CHECK(!mfg6.skipBatch);
 	}
 
 	std::printf("%d checks, %d failed\n", checks, failures);

@@ -38,6 +38,7 @@ sources=(
 	src/VulkanProvider.cpp
 	src/ExportsVulkan.cpp
 	src/Plugin.cpp
+	src/loader/EarlyLoader.cpp
 )
 
 # xvk.h includes <windows.h> in lower case, and a stubs folder can't have that next to Windows.h: a checkout on Windows, or an
