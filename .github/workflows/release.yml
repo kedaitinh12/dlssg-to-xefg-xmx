@@ -46,16 +46,27 @@ jobs:
           $cudaDir = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
           if (-not (Test-Path (Join-Path $cudaDir "bin\nvcc.exe"))) {
             $installer = $null
-            foreach ($ver in @("13.4.3", "13.4.2", "13.4.1")) {
-              $url = "https://developer.download.nvidia.com/compute/cuda/$ver/network_installers/cuda_${ver}_windows_network.exe"
-              $cand = Join-Path $env:RUNNER_TEMP "cuda_${ver}_windows_network.exe"
+            # CUDA 13.4 introduced Windows on Arm and renamed x86_64 installers to include _x86_64.
+            $candidates = @(
+              @{ Ver = "13.4.3"; Path = "network_installers/cuda_13.4.3_windows_x86_64_network.exe" },
+              @{ Ver = "13.4.2"; Path = "network_installers/cuda_13.4.2_windows_x86_64_network.exe" },
+              @{ Ver = "13.4.1"; Path = "network_installers/cuda_13.4.1_windows_x86_64_network.exe" },
+              @{ Ver = "13.4.3"; Path = "network_installers/cuda_13.4.3_windows_network_x86_64.exe" },
+              @{ Ver = "13.4.2"; Path = "network_installers/cuda_13.4.2_windows_network_x86_64.exe" },
+              @{ Ver = "13.4.3"; Path = "local_installers/cuda_13.4.3_windows_x86_64.exe" },
+              @{ Ver = "13.4.2"; Path = "local_installers/cuda_13.4.2_windows_x86_64.exe" }
+            )
+            foreach ($c in $candidates) {
+              $url = "https://developer.download.nvidia.com/compute/cuda/$($c.Ver)/$($c.Path)"
+              $leaf = Split-Path $c.Path -Leaf
+              $cand = Join-Path $env:RUNNER_TEMP $leaf
               try {
-                Write-Host "Trying official NVIDIA CUDA $ver Windows network installer..."
+                Write-Host "Trying NVIDIA CUDA $($c.Ver): $leaf..."
                 Invoke-WebRequest -Uri $url -OutFile $cand -ErrorAction Stop
                 $installer = $cand
                 break
               } catch {
-                Write-Warning "CUDA $ver download unavailable: $($_.Exception.Message)"
+                Write-Host "  Not at $leaf ($($_.Exception.Message))"
               }
             }
             if ($installer) {
