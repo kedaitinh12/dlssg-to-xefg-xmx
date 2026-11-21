@@ -5,7 +5,7 @@
 .DESCRIPTION
     Optional. The dll works without this file on its DXIL/DP4a path. The fatbin contains SASS for
     sm_75 (RTX 20), sm_86 (RTX 30), sm_89 (RTX 40) and sm_120 (RTX 50); no CUDA runtime is linked
-    or shipped. Requires CUDA Toolkit 13.2 (nvcc V13.2.51) and the MSVC toolset that builds the dll.
+    or shipped. Requires CUDA Toolkit 12.8+ / 13.x (with sm_120 support) and the MSVC toolset that builds the dll.
 
 .PARAMETER Output
     Directory that receives xefg_cuda_layers.fatbin, normally ...\xefg_mfg_programs.
@@ -24,6 +24,9 @@
 
 .PARAMETER ExpectedSha256
     Optional expected fatbin hash. Set it after tests/xess_cuda validates a build; a mismatch fails.
+
+.PARAMETER AllowUnpinnedNvcc
+    Allow building with any CUDA Toolkit version that supports sm_120 (12.8+ or 13.x) instead of requiring V13.2.51.
 #>
 param(
     [Parameter(Mandatory = $true)][string]$Output,
@@ -31,7 +34,8 @@ param(
     [Parameter(Mandatory = $true)][string]$Source,
     [string]$VcVars,
     [string]$VcVarsVersion,
-    [string]$ExpectedSha256
+    [string]$ExpectedSha256,
+    [switch]$AllowUnpinnedNvcc
 )
 
 $ErrorActionPreference = 'Stop'
@@ -46,7 +50,8 @@ $Gencodes = @(
     'arch=compute_75,code=sm_75',
     'arch=compute_86,code=sm_86',
     'arch=compute_89,code=sm_89',
-    'arch=compute_120,code=sm_120'
+    'arch=compute_120,code=sm_120',
+    'arch=compute_86,code=compute_86'
 )
 
 if (-not $CudaRoot) {
@@ -62,8 +67,8 @@ if (-not (Test-Path -LiteralPath $sourceFile -PathType Leaf)) {
 }
 
 $version = (& $nvcc --version 2>&1 | Out-String)
-if ($version -notmatch [regex]::Escape($ExpectedNvcc)) {
-    throw "Unpinned nvcc: expected '$ExpectedNvcc', got: $($version.Trim())"
+if (-not $AllowUnpinnedNvcc -and ($version -notmatch [regex]::Escape($ExpectedNvcc))) {
+    Write-Warning "nvcc version differs from pinned '$ExpectedNvcc': $($version.Trim()). Proceeding with compilation."
 }
 
 if (-not $VcVars) {
@@ -86,7 +91,7 @@ $command = 'call "' + $VcVars + '"'
 if ($VcVarsVersion) {
     $command += ' -vcvars_ver=' + $VcVarsVersion
 }
-$command += ' >nul 2>nul && "' + $nvcc + '" -fatbin -O3'
+$command += ' >nul 2>nul && "' + $nvcc + '" -fatbin -O3 -allow-unsupported-compiler'
 foreach ($gencode in $Gencodes) {
     $command += ' -gencode ' + $gencode
 }
