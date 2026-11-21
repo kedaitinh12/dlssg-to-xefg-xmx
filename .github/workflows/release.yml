@@ -44,7 +44,10 @@ jobs:
         continue-on-error: true
         with:
           cuda: '12.8.1'
+          method: 'network'
           sub-packages: '["nvcc_12.8", "cudart_12.8"]'
+          use-github-cache: false
+          use-local-cache: false
 
       - name: Rebuild CUDA tensor-core fatbin
         id: cuda_rebuild

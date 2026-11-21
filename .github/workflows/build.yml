@@ -74,7 +74,10 @@ jobs:
         continue-on-error: true
         with:
           cuda: '12.8.1'
+          method: 'network'
           sub-packages: '["nvcc_12.8", "cudart_12.8"]'
+          use-github-cache: false
+          use-local-cache: false
 
       # Rebuild xefg_cuda_layers.fatbin from the optimized src/MfgPort/Cuda/xefg_cuda_layers.cu AFTER
       # GenerateXeFgPrograms.ps1 so the extracted fatbin does not overwrite the newly built sm_120/PTX fatbin.
