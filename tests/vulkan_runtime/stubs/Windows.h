@@ -82,8 +82,25 @@ extern "C++"
 	HMODULE LoadLibraryExW(LPCWSTR name, HANDLE file, DWORD flags);
 	DWORD GetModuleFileNameW(HMODULE module, wchar_t* path, DWORD size);
 	DWORD GetEnvironmentVariableW(LPCWSTR name, LPWSTR value, DWORD size);
+	#define ERROR_ALREADY_EXISTS 183L
+	struct SYSTEMTIME
+	{
+		WORD wYear;
+		WORD wMonth;
+		WORD wDayOfWeek;
+		WORD wDay;
+		WORD wHour;
+		WORD wMinute;
+		WORD wSecond;
+		WORD wMilliseconds;
+	};
+	void GetLocalTime(SYSTEMTIME* lpSystemTime);
+	BOOL IsDebuggerPresent();
+	void OutputDebugStringA(const char* lpOutputString);
 	DWORD GetLastError();
+	DWORD GetCurrentProcessId();
 	HANDLE GetCurrentProcess();
+	HANDLE CreateMutexW(void* lpMutexAttributes, BOOL bInitialOwner, LPCWSTR lpName);
 	union LARGE_INTEGER { int64_t QuadPart; };
 	BOOL QueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCount);
 	BOOL QueryPerformanceFrequency(LARGE_INTEGER* lpFrequency);
