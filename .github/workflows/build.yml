@@ -68,23 +68,34 @@ jobs:
 
       # Install minimal CUDA Toolkit 13.4 (nvcc + nvvm + cudart + crt + cccl) so CI always builds xefg_cuda_layers.fatbin
       # from the optimized src/MfgPort/Cuda/xefg_cuda_layers.cu (sm_75/86/89/120 + compute_86 PTX).
-      - name: Setup CUDA Toolkit (13.4 minimal nvcc for MSVC 14.52)
+      - name: Setup CUDA Toolkit (13.5/13.4 minimal nvcc for MSVC 14.52)
         id: cuda_setup
         continue-on-error: true
         shell: pwsh
         run: |
-          $cudaDir = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
-          if (-not (Test-Path (Join-Path $cudaDir "bin\nvcc.exe")) -or -not (Test-Path (Join-Path $cudaDir "include\crt\host_config.h")) -or -not (Test-Path (Join-Path $cudaDir "nvvm\bin\cicc.exe"))) {
+          function Test-CudaToolchain([string]$dir) {
+            return (Test-Path (Join-Path $dir "bin\nvcc.exe")) -and
+                   (Test-Path (Join-Path $dir "include\crt\host_config.h")) -and
+                   (Test-Path (Join-Path $dir "nvvm\bin\cicc.exe"))
+          }
+          $cudaDir = $null
+          foreach ($v in @("13.5", "13.4")) {
+            $d = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$v"
+            if (Test-CudaToolchain $d) {
+              $cudaDir = $d
+              break
+            }
+          }
+          if (-not $cudaDir) {
             $installer = $null
-            # CUDA 13.4 introduced Windows on Arm and renamed x86_64 installers to include _x86_64.
+            $selectedMinor = $null
+            # CUDA 13.4+ uses _x86_64 installer filenames and no longer bundles GPU drivers (since 13.1).
             $candidates = @(
-              @{ Ver = "13.4.3"; Path = "network_installers/cuda_13.4.3_windows_x86_64_network.exe" },
-              @{ Ver = "13.4.2"; Path = "network_installers/cuda_13.4.2_windows_x86_64_network.exe" },
-              @{ Ver = "13.4.1"; Path = "network_installers/cuda_13.4.1_windows_x86_64_network.exe" },
-              @{ Ver = "13.4.3"; Path = "network_installers/cuda_13.4.3_windows_network_x86_64.exe" },
-              @{ Ver = "13.4.2"; Path = "network_installers/cuda_13.4.2_windows_network_x86_64.exe" },
-              @{ Ver = "13.4.3"; Path = "local_installers/cuda_13.4.3_windows_x86_64.exe" },
-              @{ Ver = "13.4.2"; Path = "local_installers/cuda_13.4.2_windows_x86_64.exe" }
+              @{ Ver = "13.5.0"; Minor = "13.5"; Path = "network_installers/cuda_13.5.0_windows_x86_64_network.exe" },
+              @{ Ver = "13.4.3"; Minor = "13.4"; Path = "network_installers/cuda_13.4.3_windows_x86_64_network.exe" },
+              @{ Ver = "13.4.2"; Minor = "13.4"; Path = "network_installers/cuda_13.4.2_windows_x86_64_network.exe" },
+              @{ Ver = "13.5.0"; Minor = "13.5"; Path = "local_installers/cuda_13.5.0_windows_x86_64.exe" },
+              @{ Ver = "13.4.3"; Minor = "13.4"; Path = "local_installers/cuda_13.4.3_windows_x86_64.exe" }
             )
             foreach ($c in $candidates) {
               $url = "https://developer.download.nvidia.com/compute/cuda/$($c.Ver)/$($c.Path)"
@@ -94,25 +105,32 @@ jobs:
                 Write-Host "Trying NVIDIA CUDA $($c.Ver): $leaf..."
                 Invoke-WebRequest -Uri $url -OutFile $cand -ErrorAction Stop
                 $installer = $cand
+                $selectedMinor = $c.Minor
                 break
               } catch {
                 Write-Host "  Not at $leaf ($($_.Exception.Message))"
               }
             }
             if ($installer) {
-              Write-Host "Installing minimal CUDA 13.4 components (nvcc_13.4, nvvm_13.4, cudart_13.4, crt_13.4, cccl_13.4, nvfatbin_13.4, nvptxcompiler_13.4)..."
-              $proc = Start-Process -FilePath $installer -ArgumentList "-s", "nvcc_13.4", "nvvm_13.4", "cudart_13.4", "crt_13.4", "cccl_13.4", "nvfatbin_13.4", "nvptxcompiler_13.4" -Wait -PassThru
-              if ($proc.ExitCode -ne 0) {
-                Write-Warning "CUDA network installer exited with code $($proc.ExitCode)"
+              $cudaDir = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$selectedMinor"
+              $minimalPkgs = @("nvcc_$selectedMinor", "nvvm_$selectedMinor", "cudart_$selectedMinor", "crt_$selectedMinor", "cccl_$selectedMinor")
+              Write-Host "Installing minimal CUDA $selectedMinor components ($($minimalPkgs -join ', '))..."
+              $proc = Start-Process -FilePath $installer -ArgumentList (@("-s") + $minimalPkgs) -Wait -PassThru
+              if ($proc.ExitCode -ne 0 -or -not (Test-CudaToolchain $cudaDir)) {
+                Write-Warning "Minimal CUDA $selectedMinor install exited with code $($proc.ExitCode) or missed compiler components; retrying full silent toolkit install (-s)..."
+                $proc2 = Start-Process -FilePath $installer -ArgumentList "-s" -Wait -PassThru
+                if ($proc2.ExitCode -ne 0) {
+                  Write-Warning "Full silent CUDA $selectedMinor install exited with code $($proc2.ExitCode)"
+                }
               }
             }
           }
-          if ((Test-Path (Join-Path $cudaDir "bin\nvcc.exe")) -and (Test-Path (Join-Path $cudaDir "include\crt\host_config.h")) -and (Test-Path (Join-Path $cudaDir "nvvm\bin\cicc.exe"))) {
+          if ($cudaDir -and (Test-CudaToolchain $cudaDir)) {
             "CUDA_PATH=$cudaDir" >> $env:GITHUB_OUTPUT
             "CUDA_PATH=$cudaDir" >> $env:GITHUB_ENV
-            Write-Host "CUDA Toolkit 13.4 ready at $cudaDir"
+            Write-Host "CUDA Toolkit ready at $cudaDir"
           } else {
-            Write-Warning "CUDA 13.4 toolchain incomplete at $cudaDir (expected bin\nvcc.exe, include\crt\host_config.h, nvvm\bin\cicc.exe); build will keep the extracted fatbin."
+            Write-Warning "CUDA toolchain incomplete at $cudaDir (expected bin\nvcc.exe, include\crt\host_config.h, nvvm\bin\cicc.exe); build will keep the extracted fatbin."
           }
 
       # Rebuild xefg_cuda_layers.fatbin from the optimized src/MfgPort/Cuda/xefg_cuda_layers.cu AFTER
@@ -122,7 +140,7 @@ jobs:
         shell: pwsh
         run: |
           $cudaRoot = if ($env:CUDA_PATH) { $env:CUDA_PATH } else { "${{ steps.cuda_setup.outputs.CUDA_PATH }}" }
-          if ($cudaRoot -and (Test-Path (Join-Path $cudaRoot "bin\nvcc.exe"))) {
+          if ($cudaRoot -and (Test-Path (Join-Path $cudaRoot "bin\nvcc.exe")) -and (Test-Path (Join-Path $cudaRoot "nvvm\bin\cicc.exe"))) {
             Write-Host "CUDA Toolkit found at $cudaRoot, rebuilding xefg_cuda_layers.fatbin from xefg_cuda_layers.cu..."
             ./tools/GenerateXeFgCuda.ps1 -Output bin\Release\xefg_mfg_programs -CudaRoot $cudaRoot -Source src\MfgPort\Cuda -AllowUnpinnedNvcc
             "rebuilt=true" >> $env:GITHUB_OUTPUT
