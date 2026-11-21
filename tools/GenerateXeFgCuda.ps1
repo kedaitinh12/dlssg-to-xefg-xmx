@@ -100,6 +100,12 @@ $command += ' -I "' + $Source + '" -o "' + $target + '" "' + $sourceFile + '"'
 $compiled = & cmd.exe /d /s /c $command 2>&1
 $compiled | ForEach-Object { Write-Host $_ }
 if ($LASTEXITCODE -ne 0) {
+    foreach ($rel in @('bin\nvcc.exe', 'bin\cudafe++.exe', 'bin\ptxas.exe', 'bin\fatbinary.exe', 'nvvm\bin\cicc.exe', 'include\crt\host_config.h')) {
+        $p = Join-Path $CudaRoot $rel
+        if (-not (Test-Path -LiteralPath $p -PathType Leaf)) {
+            Write-Warning "Missing expected CUDA toolchain file: $p"
+        }
+    }
     throw "nvcc failed with exit $LASTEXITCODE"
 }
 if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
