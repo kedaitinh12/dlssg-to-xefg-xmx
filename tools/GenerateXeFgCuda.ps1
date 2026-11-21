@@ -50,7 +50,8 @@ $Gencodes = @(
     'arch=compute_75,code=sm_75',
     'arch=compute_86,code=sm_86',
     'arch=compute_89,code=sm_89',
-    'arch=compute_120,code=sm_120'
+    'arch=compute_120,code=sm_120',
+    'arch=compute_86,code=compute_86'
 )
 
 if (-not $CudaRoot) {
