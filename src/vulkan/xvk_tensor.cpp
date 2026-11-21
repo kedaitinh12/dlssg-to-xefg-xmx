@@ -131,9 +131,10 @@ bool TensorRoute::Launch(VkCommandBuffer buffer, uint8_t kernel, uint32_t x, uin
     if (options_.fullBarriers)
     {
         VkMemoryBarrier2 memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-        memory.srcStageMask = memory.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-        memory.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
-        memory.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        memory.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        memory.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        memory.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        memory.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
         VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
         dependency.memoryBarrierCount = 1; dependency.pMemoryBarriers = &memory;
         barrier_(buffer, &dependency);
@@ -195,13 +196,14 @@ bool TensorRoute::TryLaunch(Device& device, VkCommandBuffer buffer, uint8_t id, 
         if (decoder) params.skip = t0[1].resource->CudaHandle(cudaView(t0[1]), false, *this);
         if (!params.input || !params.output || (decoder && !params.skip)) return fallback("image_handle");
         uint64_t* handles[] = {&params.weights, &params.scale, &params.bias};
+        std::string reason;
         for (size_t i = 0; i < 3; ++i)
         {
             const auto& d = t1[i];
             if (d.kind != DescriptorKind::SrvBuffer || !d.resource || d.stride != 16 || !d.buffer.range
                 || d.buffer.range % 16 || d.buffer.range / 16 > device.properties().limits.maxImageDimension1D)
                 return fallback("shadow_shape");
-            std::string reason;
+            reason.clear();
             *handles[i] = d.resource->TensorShadow(buffer, d.buffer.offset, d.buffer.range, *this, reason);
             if (!*handles[i]) return fallback(reason.c_str());
         }

@@ -4,6 +4,7 @@
 
 #include "../FrameGenerator.h"
 #include "../Log.h"
+#include "../Plugin.h"
 #include "../MfgPort/Cuda/cuda_route.h"
 #include "../VulkanPrograms.h"
 #include "../XeFG.h"
@@ -166,6 +167,9 @@ struct PostCopyRing
 	X(vkDestroySemaphore)                        \
 	X(vkImportSemaphoreWin32HandleKHR)           \
 	X(vkWaitSemaphores)                          \
+	X(vkCreateFence)                             \
+	X(vkDestroyFence)                            \
+	X(vkWaitForFences)                           \
 	X(vkCmdCopyImage)                            \
 	X(vkCmdPipelineBarrier)
 
@@ -935,8 +939,11 @@ bool Install(ID3D12Device* d3dDevice, std::string& reason) noexcept
 		return false;
 	};
 
-	if (VulkanPolicy::IsOffWord(EnvString(L"XEFG_D3D12_VULKAN_WMMA")))
+	const std::wstring envBridge = EnvString(L"XEFG_D3D12_VULKAN_WMMA");
+	if (VulkanPolicy::IsOffWord(envBridge))
 		return fail("environment_off");
+	if (!VulkanPolicy::IsOnWord(envBridge) && !Plugin::options.d3d12VulkanWmmaBridge.load(std::memory_order_acquire))
+		return fail("disabled_by_default");
 
 	if (!d3dDevice)
 		return fail("no_d3d12_device");
@@ -1051,7 +1058,9 @@ bool Install(ID3D12Device* d3dDevice, std::string& reason) noexcept
 		return fail("missing_vulkan13_features");
 	}
 
-	// Pick a compute + transfer queue family (prefer family 0 / graphics+compute on AMD).
+	// Pick a compute + transfer queue family. Prefer a dedicated Async Compute family (COMPUTE|TRANSFER without
+	// GRAPHICS) so Vulkan XeFG init/compute does not collide with the D3D12 game's GFX ring on AMD RDNA 3/4,
+	// unless XEFG_D3D12_VULKAN_WMMA_GFX_QUEUE=1 explicitly requests the graphics queue family.
 	uint32_t famCount = 0;
 	getQueueFams(matchedPhys, &famCount, nullptr);
 	if (!famCount)
@@ -1059,14 +1068,17 @@ bool Install(ID3D12Device* d3dDevice, std::string& reason) noexcept
 	std::vector<VkQueueFamilyProperties> fams(famCount);
 	getQueueFams(matchedPhys, &famCount, fams.data());
 
+	const bool preferGfxQueue = VulkanPolicy::IsOnWord(EnvString(L"XEFG_D3D12_VULKAN_WMMA_GFX_QUEUE"));
 	uint32_t chosenFamily = UINT32_MAX;
 	for (uint32_t i = 0; i < famCount; ++i)
 	{
 		if ((fams[i].queueFlags & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT)) ==
 			(VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT))
 		{
-			chosenFamily = i;
-			if (fams[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)
+			const bool hasGraphics = (fams[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
+			if (chosenFamily == UINT32_MAX || (preferGfxQueue ? hasGraphics : !hasGraphics))
+				chosenFamily = i;
+			if (preferGfxQueue ? hasGraphics : !hasGraphics)
 				break;
 		}
 	}
@@ -1359,47 +1371,46 @@ bool EnsureContext(const ContextSettings& settings) noexcept
 	}
 
 	// Submit XeFG::Init weight uploads via Vulkan 1.3 vkQueueSubmit2 (bypassing OptiScaler's
-	// Vulkan_wDx12::hk_vkQueueSubmit hook) and wait on a timeline semaphore with a bounded timeout
-	// instead of infinite vkQueueWaitIdle so a driver/interop stall can never freeze the game.
-	const uint64_t initDoneVal = gBridge.fenceValue.fetch_add(1, std::memory_order_acq_rel) + 1;
+	// Vulkan_wDx12::hk_vkQueueSubmit hook) with a private local VkFence instead of the imported
+	// D3D12 WDDM sharedSemaphore, so init never touches cross-API D3D12/Vulkan sync while the game renders.
+	VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+	VkFence initFence = VK_NULL_HANDLE;
+	if (gBridge.vkCreateFence(gBridge.device, &fenceInfo, nullptr, &initFence) != VK_SUCCESS || !initFence)
+	{
+		XeFG::Destroy(ctx);
+		Log::Warn("D3D12->Vulkan WMMA bridge: vkCreateFence failed for XeFG::Init, falling back to D3D12");
+		return markFailed();
+	}
+
 	VkCommandBufferSubmitInfo cmdInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
 	cmdInfo.commandBuffer = initCmd;
-
-	VkSemaphoreSubmitInfo signalInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
-	signalInfo.semaphore = gBridge.sharedSemaphore;
-	signalInfo.value = initDoneVal;
-	signalInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 
 	VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
 	submitInfo.commandBufferInfoCount = 1;
 	submitInfo.pCommandBufferInfos = &cmdInfo;
-	submitInfo.signalSemaphoreInfoCount = 1;
-	submitInfo.pSignalSemaphoreInfos = &signalInfo;
 
-	const VkResult subRes = gBridge.vkQueueSubmit2(gBridge.queue, 1, &submitInfo, VK_NULL_HANDLE);
+	Log::Info("D3D12->Vulkan WMMA bridge: submitting XeFG::Init weight upload on queue family {}", gBridge.queueFamily);
+	const VkResult subRes = gBridge.vkQueueSubmit2(gBridge.queue, 1, &submitInfo, initFence);
 	if (subRes != VK_SUCCESS)
 	{
+		gBridge.vkDestroyFence(gBridge.device, initFence, nullptr);
 		XeFG::Destroy(ctx);
 		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init vkQueueSubmit2 failed (result {}), falling back to D3D12",
 			static_cast<int>(subRes));
 		return markFailed();
 	}
-	gBridge.lastSubmittedVkFence = initDoneVal;
-	gBridge.vkSlotDoneFence[0] = initDoneVal;
 
-	VkSemaphoreWaitInfo waitInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
-	waitInfo.semaphoreCount = 1;
-	waitInfo.pSemaphores = &gBridge.sharedSemaphore;
-	waitInfo.pValues = &initDoneVal;
-	const VkResult waitRes = gBridge.vkWaitSemaphores(gBridge.device, &waitInfo, 2'000'000'000ull);
+	const VkResult waitRes = gBridge.vkWaitForFences(gBridge.device, 1, &initFence, VK_TRUE, 2'000'000'000ull);
 	if (waitRes != VK_SUCCESS)
 	{
-		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init vkWaitSemaphores timed out/failed (result {}), disabling bridge and falling back to D3D12",
+		// Do not destroy initFence while the GPU submission may still be in flight.
+		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init vkWaitForFences timed out/failed (result {}), disabling bridge and falling back to D3D12",
 			static_cast<int>(waitRes));
 		gBridge.active.store(false, std::memory_order_release);
 		gBridge.contextReady.store(false, std::memory_order_release);
 		return markFailed();
 	}
+	gBridge.vkDestroyFence(gBridge.device, initFence, nullptr);
 
 	if (gBridge.resetRequested.exchange(false, std::memory_order_acq_rel))
 	{

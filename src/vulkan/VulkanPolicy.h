@@ -464,6 +464,7 @@ namespace VulkanPolicy
 
 		uint64_t lastBatchNs = 0;
 		uint64_t batchStartNs = 0;
+		uint64_t batchPresentOriginNs = 0;
 		uint64_t emaBatchNs = 0;
 		uint64_t targetStepNs = 0;
 		uint64_t lastPresentNs = 0;
@@ -474,10 +475,18 @@ namespace VulkanPolicy
 		uint32_t generatedCount = 0;
 		uint32_t presentsInBatch = 0;
 		bool skipBatch = false;
+		// Adaptive GPU-Bound Burst Release hysteresis (f5low-kit DriverPacing=2 / FlipBurst=1):
+		// When sustained queue pressure lasts >= 2s, bypass CPU pacing completely until smooth headroom holds for >= 2s.
+		static constexpr uint64_t BurstEngageNs = 2'000'000'000ull;
+		static constexpr uint64_t BurstReleaseNs = 2'000'000'000ull;
+
 		// Auto VRR (Hz - 3) cap & Queue-Pressure Guard state
 		uint32_t displayRefreshHz = 0;
 		bool autoVrrEnabled = false;
 		uint32_t pressureStreak = 0;
+		bool gpuBoundBurst = false;
+		uint64_t burstEngageSinceNs = 0;
+		uint64_t burstReleaseSinceNs = 0;
 
 		void SetDisplayRefreshHz(uint32_t hz) noexcept
 		{
@@ -493,6 +502,7 @@ namespace VulkanPolicy
 		{
 			lastBatchNs = 0;
 			batchStartNs = 0;
+			batchPresentOriginNs = 0;
 			emaBatchNs = 0;
 			targetStepNs = 0;
 			lastPresentNs = 0;
@@ -504,29 +514,38 @@ namespace VulkanPolicy
 			presentsInBatch = 0;
 			skipBatch = false;
 			pressureStreak = 0;
+			gpuBoundBurst = false;
+			burstEngageSinceNs = 0;
+			burstReleaseSinceNs = 0;
 		}
 
 		void OnPaused() noexcept
 		{
 			lastBatchNs = 0;
 			batchStartNs = 0;
+			batchPresentOriginNs = 0;
 			targetStepNs = 0;
 			activeUntilNs = 0;
 			generatedCount = 0;
 			presentsInBatch = 0;
 			skipBatch = false;
 			pressureStreak = 0;
+			gpuBoundBurst = false;
+			burstEngageSinceNs = 0;
+			burstReleaseSinceNs = 0;
 		}
 
 		void OnBatchStart(uint64_t nowNs, uint32_t count) noexcept
 		{
 			count = ClampCount(count);
 			const uint32_t prevTotal = generatedCount ? (generatedCount + 1u) : 0u;
-			const bool prevIncomplete = lastBatchNs != 0 && targetStepNs != 0 && prevTotal != 0 && presentsInBatch < prevTotal;
+			const uint32_t prevPresents = presentsInBatch;
+			const bool prevIncomplete = lastBatchNs != 0 && targetStepNs != 0 && prevTotal != 0 && prevPresents < prevTotal;
 
 			generatedCount = count;
 			presentsInBatch = 0;
 			batchStartNs = nowNs;
+			batchPresentOriginNs = 0;
 			activeUntilNs = nowNs + ActiveWindowNs;
 			skipBatch = false;
 
@@ -578,25 +597,48 @@ namespace VulkanPolicy
 							targetStepNs = std::min(vrrMinStepNs, MaxWaitNs);
 					}
 
-					// Queue-Pressure Guard: detect sustained GPU/render-queue saturation and drop artificial CPU sleep
-					const bool queuePressure = prevIncomplete || (emaBatchNs != 0 && delta * 100ull > emaBatchNs * 135ull);
+					// Queue-Pressure Guard + Adaptive GPU-Bound Burst Release hysteresis (2s engage / 2s release):
+					// At 4x-6x MFG (prevTotal = 4..6), the render thread routinely pipelines 1-2 frames ahead of the
+					// present thread; only treat incomplete batches as queue pressure when <50% of presents completed.
+					const bool prevSevereIncomplete = prevIncomplete && (prevPresents * 2u < prevTotal);
+					const bool queuePressure = prevSevereIncomplete || (emaBatchNs != 0 && delta * 100ull > emaBatchNs * 135ull);
 					if (queuePressure)
 					{
 						if (pressureStreak < 8u)
 							++pressureStreak;
+						burstReleaseSinceNs = 0;
+						if (!gpuBoundBurst)
+						{
+							if (burstEngageSinceNs == 0)
+								burstEngageSinceNs = nowNs;
+							else if (nowNs >= burstEngageSinceNs + BurstEngageNs)
+								gpuBoundBurst = true;
+						}
 					}
-					else if (pressureStreak > 0u)
+					else
 					{
-						--pressureStreak;
+						if (pressureStreak > 0u)
+							--pressureStreak;
+						burstEngageSinceNs = 0;
+						if (gpuBoundBurst)
+						{
+							if (burstReleaseSinceNs == 0)
+								burstReleaseSinceNs = nowNs;
+							else if (nowNs >= burstReleaseSinceNs + BurstReleaseNs)
+							{
+								gpuBoundBurst = false;
+								burstReleaseSinceNs = 0;
+							}
+						}
 					}
 
-					// On a hitch spike or sustained queue pressure, clear stale present debt and let this batch drain
-					if (isHitch || pressureStreak >= 2u)
+					// On a hitch spike, sustained queue pressure, or active GPU-bound burst release, drain without CPU sleep
+					if (isHitch || pressureStreak >= 2u || gpuBoundBurst)
 					{
 						lastPresentNs = 0;
 						skipBatch = true;
 					}
-					else if (prevIncomplete)
+					else if (prevSevereIncomplete)
 					{
 						lastPresentNs = 0;
 					}
@@ -629,6 +671,8 @@ namespace VulkanPolicy
 
 			if (skipBatch || generatedCount == 0 || targetStepNs == 0 || nowNs > activeUntilNs)
 			{
+				if (skipBatch && generatedCount > 0 && nowNs <= activeUntilNs)
+					++presentsInBatch;
 				lastPresentNs = nowNs;
 				return 0;
 			}
@@ -641,6 +685,8 @@ namespace VulkanPolicy
 			}
 
 			const uint32_t slotIndex = presentsInBatch++;
+			if (slotIndex == 0)
+				batchPresentOriginNs = nowNs;
 
 			if (lastPresentNs == 0 || nowNs <= lastPresentNs)
 			{
@@ -648,11 +694,13 @@ namespace VulkanPolicy
 				return 0;
 			}
 
-			// Bound every present by its batch-relative slot deadline so presents never spill into the next real frame
+			// Anchor slot deadlines to when the batch's first present actually starts (batchPresentOriginNs) rather than
+			// render-thread batchStartNs, preventing 4x-6x bursts when GPU work delays G1 relative to OnBatchStart.
 			uint64_t desiredNs = lastPresentNs + targetStepNs;
-			if (batchStartNs != 0)
+			const uint64_t originNs = batchPresentOriginNs ? batchPresentOriginNs : batchStartNs;
+			if (originNs != 0 && slotIndex > 0)
 			{
-				const uint64_t slotDeadlineNs = batchStartNs + (static_cast<uint64_t>(slotIndex) + 1ull) * targetStepNs;
+				const uint64_t slotDeadlineNs = originNs + static_cast<uint64_t>(slotIndex) * targetStepNs;
 				if (desiredNs > slotDeadlineNs)
 					desiredNs = slotDeadlineNs;
 			}

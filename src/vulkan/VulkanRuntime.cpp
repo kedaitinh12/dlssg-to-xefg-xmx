@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <atomic>
 #include <cstddef>
 #include <cstring>
@@ -161,7 +162,12 @@ namespace
 		bool hasHudless = false;
 		bool hasUi = false;
 		bool reset = false;
+		float view[16]{};
 		float projection[16]{};
+		xefgd_2d_t bbBase{}, bbSize{};
+		xefgd_2d_t depthBase{}, depthSize{};
+		xefgd_2d_t motionBase{}, motionSize{};
+		xefgd_2d_t hudlessBase{}, hudlessSize{};
 		float jitterX = 0, jitterY = 0, motionScaleX = 0, motionScaleY = 0;
 	};
 
@@ -196,6 +202,17 @@ namespace
 		uint64_t batches = 0, failures = 0, evaluations = 0, realCopies = 0, paused = 0;
 		std::string fault;
 		std::string initFault; // permanent missing-program failure for the current input configuration
+
+		// Reference-mod stability guards: camera cut/teleport detector, DRS/subrect shift detector,
+		// HUD-less mismatch one-shot warning, and consecutive execute-failure stall circuit breaker.
+		float prevCameraPos[3]{};
+		float prevCameraFwd[3]{};
+		bool hasPrevCamera = false;
+		std::array<uint32_t, 12> prevSubrects{};
+		bool hasPrevSubrects = false;
+		bool hudlessMismatchLogged = false;
+		uint32_t consecutiveFailures = 0;
+		uint32_t stallCooldownBatches = 0;
 
 		// The batch's XeFG call, kept for its later evaluations, which each record their own output. XeFG takes the same
 		// output array for every call of a pair
@@ -876,32 +893,122 @@ namespace
 		return true;
 	}
 
-	xefgd_resource_t Region(ID3D12Resource* resource, uint32_t width, uint32_t height)
+	xefgd_resource_t Region(ID3D12Resource* resource, uint32_t width, uint32_t height,
+		xefgd_2d_t base = {}, xefgd_2d_t size = {})
 	{
 		xefgd_resource_t out{};
 		out.pResource = resource;
-		out.size = { width, height };
+		out.base = base;
+		out.size = (size.x > 0 && size.y > 0) ? size : xefgd_2d_t{ width, height };
 
 		return out;
+	}
+
+	void BuildViewMatrix(const NGXParameter& params, float out[16]) noexcept
+	{
+		auto finite = [](float v) noexcept { return std::isfinite(v) ? v : 0.0f; };
+		const float px = finite(params.GetOr<float>("DLSSG.CameraPosX", 0.0f));
+		const float py = finite(params.GetOr<float>("DLSSG.CameraPosY", 0.0f));
+		const float pz = finite(params.GetOr<float>("DLSSG.CameraPosZ", 0.0f));
+		const float rx = finite(params.GetOr<float>("DLSSG.CameraRightX", 0.0f));
+		const float ry = finite(params.GetOr<float>("DLSSG.CameraRightY", 0.0f));
+		const float rz = finite(params.GetOr<float>("DLSSG.CameraRightZ", 0.0f));
+		const float ux = finite(params.GetOr<float>("DLSSG.CameraUpX", 0.0f));
+		const float uy = finite(params.GetOr<float>("DLSSG.CameraUpY", 0.0f));
+		const float uz = finite(params.GetOr<float>("DLSSG.CameraUpZ", 0.0f));
+		const float fx = finite(params.GetOr<float>("DLSSG.CameraFwdX", 0.0f));
+		const float fy = finite(params.GetOr<float>("DLSSG.CameraFwdY", 0.0f));
+		const float fz = finite(params.GetOr<float>("DLSSG.CameraFwdZ", 0.0f));
+
+		// Match D3D12 FrameGenerator::GetViewMatrix so XeFG receives real 3D camera motion for disocclusion/reprojection;
+		// fall back to identity only when camera vectors are absent.
+		if (fx == 0.0f && fy == 0.0f && fz == 0.0f)
+		{
+			for (int i = 0; i < 16; ++i)
+				out[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+			return;
+		}
+
+		const float view[16] = {
+			rx, ux, fx, 0.0f,
+			ry, uy, fy, 0.0f,
+			rz, uz, fz, 0.0f,
+			-(px * rx + py * ry + pz * rz),
+			-(px * ux + py * uy + pz * uz),
+			-(px * fx + py * fy + pz * fz),
+			1.0f
+		};
+		std::memcpy(out, view, sizeof(view));
+	}
+
+	bool CameraFromViewToClip(const NGXParameter& params, float& cameraNear, float& cameraFar, float& fov) noexcept
+	{
+		float(*viewToClip)[4] = nullptr;
+		params.Get("DLSSG.CameraViewToClip", reinterpret_cast<void**>(&viewToClip));
+		if (params.GetOr<uint32_t>("DLSSG.OrthoProjection", 0) || !viewToClip)
+			return false;
+
+		float m[4][4] = {};
+		if (std::memcmp(viewToClip, m, sizeof(m)) == 0)
+			return false;
+		m[0][0] = m[1][1] = m[2][2] = m[3][3] = 1.0f;
+		if (std::memcmp(viewToClip, m, sizeof(m)) == 0)
+			return false;
+
+		const double b = viewToClip[1][1];
+		const double c = viewToClip[2][2];
+		const double d = viewToClip[3][2];
+		const double e = viewToClip[2][3];
+		if (!std::isfinite(b) || !std::isfinite(c) || !std::isfinite(d) || !std::isfinite(e) || b == 0.0)
+			return false;
+
+		const double sign = (e < 0.0) ? -1.0 : 1.0;
+		const double nearDist = (c != 0.0) ? (-d / c) : 0.0;
+		const double farDist = ((c - sign) != 0.0) ? (-d / (c - sign)) : 0.0;
+		const double computedFov = 2.0 * std::atan(1.0 / std::abs(b));
+		if (!std::isfinite(computedFov) || computedFov <= 0.0001 || computedFov >= 3.13)
+			return false;
+
+		const float n = static_cast<float>(std::abs(nearDist));
+		const float f = static_cast<float>(std::abs(farDist));
+		if (!std::isfinite(n) || n <= 0.0f)
+			return false;
+		cameraNear = n;
+		cameraFar = (std::isfinite(f) && f > 0.0f) ? f : 10000.0f;
+		fov = static_cast<float>(computedFov);
+		return true;
+	}
+
+	void ReadClampedSubrect(const NGXParameter& params, const char* baseXKey, const char* baseYKey,
+		const char* widthKey, const char* heightKey, uint32_t maxW, uint32_t maxH,
+		xefgd_2d_t& outBase, xefgd_2d_t& outSize) noexcept
+	{
+		uint32_t bx = params.GetOr<uint32_t>(baseXKey, 0u);
+		uint32_t by = params.GetOr<uint32_t>(baseYKey, 0u);
+		uint32_t w = params.GetOr<uint32_t>(widthKey, 0u);
+		uint32_t h = params.GetOr<uint32_t>(heightKey, 0u);
+		if (bx >= maxW) bx = 0;
+		if (by >= maxH) by = 0;
+		if (w == 0 || bx + w > maxW) w = maxW - bx;
+		if (h == 0 || by + h > maxH) h = maxH - by;
+		outBase = { bx, by };
+		outSize = { w, h };
 	}
 
 	void DescribeFrame(const Feature& f, const Slot& slot, xefgd_frame_t& frame)
 	{
 		frame = {};
-		frame.backBuffer = Region(slot.backbuffer.Get(), f.width, f.height);
-		frame.depth = Region(slot.depth.Get(), f.depthWidth, f.depthHeight);
-		frame.motionVectors = Region(slot.motion.Get(), f.depthWidth, f.depthHeight);
+		frame.backBuffer = Region(slot.backbuffer.Get(), f.width, f.height, slot.bbBase, slot.bbSize);
+		frame.depth = Region(slot.depth.Get(), f.depthWidth, f.depthHeight, slot.depthBase, slot.depthSize);
+		frame.motionVectors = Region(slot.motion.Get(), f.depthWidth, f.depthHeight, slot.motionBase, slot.motionSize);
 
 		if (slot.hasHudless)
-			frame.hudlessColor = Region(slot.hudless.Get(), f.width, f.height);
+			frame.hudlessColor = Region(slot.hudless.Get(), f.width, f.height, slot.hudlessBase, slot.hudlessSize);
 
 		if (slot.hasUi)
 			frame.uiTexture = Region(slot.ui.Get(), f.width, f.height);
 
-		// Identity: no camera matrices are given, which also keeps XeFG's scene change detection on
-		for (int i = 0; i < 16; ++i)
-			frame.viewMatrix[i] = (i % 5 == 0) ? 1.0f : 0.0f;
-
+		std::memcpy(frame.viewMatrix, slot.view, sizeof(frame.viewMatrix));
 		std::memcpy(frame.projectionMatrix, slot.projection, sizeof(frame.projectionMatrix));
 
 		frame.outputResolution[0] = static_cast<float>(f.width);
@@ -985,14 +1092,31 @@ namespace
 			return false;
 		}
 
-		// XeFG's UI inputs cover the output extent. A differently sized optional
-		// image cannot be described as the full backbuffer: ignore it this batch.
-		auto usableUi = [&](const NgxResource* image) {
-			return image && image->width == in.backbuffer->width && image->height == in.backbuffer->height &&
-				image->range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT;
+		// XeFG's UI inputs must cover the output extent and use a supported color format (dlssg-0.4.2 C86/C139).
+		// If HUD-less is mismatched in size or format, fall back cleanly to UI Auto with a one-shot warning.
+		const DXGI_FORMAT bbFormat = ColorFormat(in.backbuffer);
+		auto usableUi = [&](const NgxResource* image, bool requireBbFormatMatch) {
+			if (!image)
+				return false;
+			const DXGI_FORMAT fmt = ColorFormat(image);
+			return image->width == in.backbuffer->width && image->height == in.backbuffer->height &&
+				image->range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT &&
+				fmt != DXGI_FORMAT_UNKNOWN &&
+				(!requireBbFormatMatch || fmt == bbFormat);
 		};
-		if (!usableUi(in.hudless)) in.hudless = nullptr;
-		if (!usableUi(in.ui)) in.ui = nullptr;
+		if (in.hudless && !usableUi(in.hudless, true))
+		{
+			if (!f.hudlessMismatchLogged)
+			{
+				f.hudlessMismatchLogged = true;
+				Log::Warn("Vulkan: HUD-less input ({}x{}, VkFormat {}) does not match backbuffer ({}x{}, VkFormat {}); "
+					"falling back to UI Auto", in.hudless->width, in.hudless->height,
+					static_cast<int>(in.hudless->format), in.backbuffer->width, in.backbuffer->height,
+					static_cast<int>(in.backbuffer->format));
+			}
+			in.hudless = nullptr;
+		}
+		if (!usableUi(in.ui, false)) in.ui = nullptr;
 
 		const bool inverted = parameters.GetOr<uint32_t>("DLSSG.DepthInverted", 0) != 0;
 		const bool jittered = parameters.GetOr<uint32_t>("DLSSG.MvecJittered", 0) != 0;
@@ -1006,7 +1130,74 @@ namespace
 		if (sLastDebugLines.exchange(debugLines ? 1 : 0, std::memory_order_relaxed) != (debugLines ? 1 : 0))
 			XeFG::SetDebugLines(debugLines);
 
-		const bool reset = parameters.GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
+		bool reset = parameters.GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
+
+		// DRS / Subrect Change Detector (dlssg-0.4.2 M3): force history reset if any active subrect changes
+		// between consecutive batches even when the game omits DLSSG.Reset.
+		const std::array<uint32_t, 12> curSubrects = {
+			parameters.GetOr<uint32_t>("DLSSG.BackbufferSubrectBaseX", 0u),
+			parameters.GetOr<uint32_t>("DLSSG.BackbufferSubrectBaseY", 0u),
+			parameters.GetOr<uint32_t>("DLSSG.BackbufferSubrectWidth", in.backbuffer->width),
+			parameters.GetOr<uint32_t>("DLSSG.BackbufferSubrectHeight", in.backbuffer->height),
+			parameters.GetOr<uint32_t>("DLSSG.DepthSubrectBaseX", 0u),
+			parameters.GetOr<uint32_t>("DLSSG.DepthSubrectBaseY", 0u),
+			parameters.GetOr<uint32_t>("DLSSG.DepthSubrectWidth", in.depth->width),
+			parameters.GetOr<uint32_t>("DLSSG.DepthSubrectHeight", in.depth->height),
+			parameters.GetOr<uint32_t>("DLSSG.MVecsSubrectBaseX", 0u),
+			parameters.GetOr<uint32_t>("DLSSG.MVecsSubrectBaseY", 0u),
+			parameters.GetOr<uint32_t>("DLSSG.MVecsSubrectWidth", in.motion->width),
+			parameters.GetOr<uint32_t>("DLSSG.MVecsSubrectHeight", in.motion->height),
+		};
+		if (f.hasPrevSubrects && curSubrects != f.prevSubrects)
+			reset = true;
+		f.prevSubrects = curSubrects;
+		f.hasPrevSubrects = true;
+
+		// Camera Cut & Teleport Detector (DLSSG-MFG v3.0.1): force history reset on sudden cuts/teleports on Vulkan too.
+		if (Plugin::options.cameraCutDetection.load(std::memory_order_relaxed))
+		{
+			auto finiteOr = [](float v, float fallback) noexcept { return std::isfinite(v) ? v : fallback; };
+			const float px = finiteOr(parameters.GetOr<float>("DLSSG.CameraPosX", 0.0f), 0.0f);
+			const float py = finiteOr(parameters.GetOr<float>("DLSSG.CameraPosY", 0.0f), 0.0f);
+			const float pz = finiteOr(parameters.GetOr<float>("DLSSG.CameraPosZ", 0.0f), 0.0f);
+			const float fx = finiteOr(parameters.GetOr<float>("DLSSG.CameraFwdX", 0.0f), 0.0f);
+			const float fy = finiteOr(parameters.GetOr<float>("DLSSG.CameraFwdY", 0.0f), 0.0f);
+			const float fz = finiteOr(parameters.GetOr<float>("DLSSG.CameraFwdZ", 0.0f), 0.0f);
+			const float fwdLenSq = fx * fx + fy * fy + fz * fz;
+			const bool hasCamera = fwdLenSq > 1e-6f;
+
+			if (hasCamera && f.hasPrevCamera && !reset)
+			{
+				const float dx = px - f.prevCameraPos[0];
+				const float dy = py - f.prevCameraPos[1];
+				const float dz = pz - f.prevCameraPos[2];
+				const float distSq = dx * dx + dy * dy + dz * dz;
+				constexpr float kCutThresholdSq = 4.5f * 4.5f;
+
+				const float prevLenSq = f.prevCameraFwd[0] * f.prevCameraFwd[0] +
+					f.prevCameraFwd[1] * f.prevCameraFwd[1] +
+					f.prevCameraFwd[2] * f.prevCameraFwd[2];
+				const float fwdDot = (prevLenSq > 1e-6f)
+					? ((fx * f.prevCameraFwd[0] + fy * f.prevCameraFwd[1] + fz * f.prevCameraFwd[2]) /
+					   std::sqrt(fwdLenSq * prevLenSq))
+					: 1.0f;
+
+				if (distSq > kCutThresholdSq || fwdDot < -0.5f)
+					reset = true;
+			}
+
+			if (hasCamera)
+			{
+				f.prevCameraPos[0] = px;
+				f.prevCameraPos[1] = py;
+				f.prevCameraPos[2] = pz;
+				f.prevCameraFwd[0] = fx;
+				f.prevCameraFwd[1] = fy;
+				f.prevCameraFwd[2] = fz;
+				f.hasPrevCamera = true;
+			}
+		}
+
 		Slot& slot = f.slots[f.current];
 
 		// The frame's inputs: wait for the game's prior writes before transfer/compute reads
@@ -1047,22 +1238,53 @@ namespace
 		// Streamline's normalized one), carried to the depth size they are resampled to. XeFG's left handed projection is
 		// built from DLSS-G's near, far and field of view; DLSSG.CameraViewToClip is OptiScaler's right handed one, with
 		// which XeFG reconstructs depth the wrong way round
-		const float mvecX = parameters.GetOr<float>("DLSSG.MvecScaleX", 1.0f);
-		const float mvecY = parameters.GetOr<float>("DLSSG.MvecScaleY", 1.0f);
+		auto sanitizeFinite = [](float v, float fallback) noexcept { return std::isfinite(v) ? v : fallback; };
+		const float rawMvecX = sanitizeFinite(parameters.GetOr<float>("DLSSG.MvecScaleX", 1.0f), 1.0f);
+		const float rawMvecY = sanitizeFinite(parameters.GetOr<float>("DLSSG.MvecScaleY", 1.0f), 1.0f);
+		const float mvecX = (rawMvecX != 0.0f) ? rawMvecX : 1.0f;
+		const float mvecY = (rawMvecY != 0.0f) ? rawMvecY : 1.0f;
 		const auto [scaleX, scaleY] =
 			VulkanPolicy::MotionScale(mvecX, mvecY, motion.width, motion.height, f.depthWidth, f.depthHeight);
 
-		slot.motionScaleX = scaleX;
-		slot.motionScaleY = scaleY;
-		slot.jitterX = parameters.GetOr<float>("DLSSG.JitterOffsetX", 0.0f);
-		slot.jitterY = parameters.GetOr<float>("DLSSG.JitterOffsetY", 0.0f);
+		slot.motionScaleX = sanitizeFinite(scaleX, 1.0f);
+		slot.motionScaleY = sanitizeFinite(scaleY, 1.0f);
+		slot.jitterX = sanitizeFinite(parameters.GetOr<float>("DLSSG.JitterOffsetX", 0.0f), 0.0f);
+		slot.jitterY = sanitizeFinite(parameters.GetOr<float>("DLSSG.JitterOffsetY", 0.0f), 0.0f);
 		slot.reset = reset;
 
-		const float aspect = parameters.GetOr<float>("DLSSG.CameraAspectRatio",
-			static_cast<float>(f.width) / static_cast<float>(f.height));
-		const float cameraNear = parameters.GetOr<float>("DLSSG.CameraNear", 0.0f);
-		const float cameraFar = parameters.GetOr<float>("DLSSG.CameraFar", 0.0f);
-		const float fov = parameters.GetOr<float>("DLSSG.CameraFOV", 0.0f);
+		BuildViewMatrix(parameters, slot.view);
+		ReadClampedSubrect(parameters, "DLSSG.BackbufferSubrectBaseX", "DLSSG.BackbufferSubrectBaseY",
+			"DLSSG.BackbufferSubrectWidth", "DLSSG.BackbufferSubrectHeight", f.width, f.height, slot.bbBase, slot.bbSize);
+		ReadClampedSubrect(parameters, "DLSSG.DepthSubrectBaseX", "DLSSG.DepthSubrectBaseY",
+			"DLSSG.DepthSubrectWidth", "DLSSG.DepthSubrectHeight", f.depthWidth, f.depthHeight, slot.depthBase, slot.depthSize);
+		// Motion vectors are resampled into f.depthWidth x f.depthHeight; scale motion subrect proportionally if present.
+		ReadClampedSubrect(parameters, "DLSSG.MVecsSubrectBaseX", "DLSSG.MVecsSubrectBaseY",
+			"DLSSG.MVecsSubrectWidth", "DLSSG.MVecsSubrectHeight", motion.width, motion.height, slot.motionBase, slot.motionSize);
+		if (motion.width != f.depthWidth || motion.height != f.depthHeight)
+		{
+			slot.motionBase = { static_cast<uint32_t>((uint64_t(slot.motionBase.x) * f.depthWidth) / std::max(motion.width, 1u)),
+				static_cast<uint32_t>((uint64_t(slot.motionBase.y) * f.depthHeight) / std::max(motion.height, 1u)) };
+			slot.motionSize = { static_cast<uint32_t>((uint64_t(slot.motionSize.x) * f.depthWidth) / std::max(motion.width, 1u)),
+				static_cast<uint32_t>((uint64_t(slot.motionSize.y) * f.depthHeight) / std::max(motion.height, 1u)) };
+			if (slot.motionBase.x >= f.depthWidth) slot.motionBase.x = 0;
+			if (slot.motionBase.y >= f.depthHeight) slot.motionBase.y = 0;
+			if (slot.motionSize.x == 0 || slot.motionBase.x + slot.motionSize.x > f.depthWidth) slot.motionSize.x = f.depthWidth - slot.motionBase.x;
+			if (slot.motionSize.y == 0 || slot.motionBase.y + slot.motionSize.y > f.depthHeight) slot.motionSize.y = f.depthHeight - slot.motionBase.y;
+		}
+		if (slot.hasHudless)
+		{
+			ReadClampedSubrect(parameters, "DLSSG.HUDLessSubrectBaseX", "DLSSG.HUDLessSubrectBaseY",
+				"DLSSG.HUDLessSubrectWidth", "DLSSG.HUDLessSubrectHeight", f.width, f.height, slot.hudlessBase, slot.hudlessSize);
+		}
+
+		const float defaultAspect = static_cast<float>(f.width) / static_cast<float>(f.height);
+		const float rawAspect = sanitizeFinite(parameters.GetOr<float>("DLSSG.CameraAspectRatio", defaultAspect), defaultAspect);
+		const float aspect = (rawAspect > 0.0f) ? rawAspect : defaultAspect;
+		float cameraNear = sanitizeFinite(parameters.GetOr<float>("DLSSG.CameraNear", 0.0f), 0.0f);
+		float cameraFar = sanitizeFinite(parameters.GetOr<float>("DLSSG.CameraFar", 0.0f), 0.0f);
+		float fov = sanitizeFinite(parameters.GetOr<float>("DLSSG.CameraFOV", 0.0f), 0.0f);
+		if (cameraNear <= 0.0f || cameraFar <= 0.0f || fov <= 0.0001f)
+			CameraFromViewToClip(parameters, cameraNear, cameraFar, fov);
 
 		VulkanPolicy::Projection(aspect, cameraNear, cameraFar, fov, inverted, slot.projection);
 
@@ -1089,7 +1311,10 @@ namespace
 		f.execBases = {};
 
 		for (uint32_t i = 0; i < count; ++i)
+		{
 			f.execOutputs[i] = f.outputs[i].Get();
+			f.execBases[i] = slot.bbBase;
+		}
 
 		f.exec.ppOutputs = f.execOutputs.data();
 		f.exec.pOutputBases = f.execBases.data();
@@ -1244,9 +1469,11 @@ namespace
 			recording = true;
 			f.evaluations++;
 
-			// DLSSG.EnableInterp 0 pauses generation for this frame (a menu, a loading screen): no XeFG work and the next
-			// batch starts without a previous frame
-			const bool interpolate = parameters->GetOr<uint32_t>("DLSSG.EnableInterp", 1) != 0;
+			// DLSSG.EnableInterp 0 or DLSSG.OutputDisableInterpolation 1 pauses generation for this frame
+			// (menu, cutscene, loading screen): copy the real frame cleanly without invoking XeFG (dlssg-0.4.2 M1).
+			const bool disableInterp = parameters->GetOr<uint32_t>("DLSSG.OutputDisableInterpolation", 0) != 0;
+			const bool resetRequested = parameters->GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
+			const bool interpolate = parameters->GetOr<uint32_t>("DLSSG.EnableInterp", 1) != 0 && !disableInterp;
 			bool didExecute = false;
 
 			if (!interpolate)
@@ -1254,16 +1481,38 @@ namespace
 				f.batchReady = false;
 				f.havePrevious = false;
 				f.generatedThrough = 0;
+				f.consecutiveFailures = 0;
+				f.stallCooldownBatches = 0;
 				f.paused++;
 				VulkanHost::NotifyPaused();
 			}
 			else if (VulkanPolicy::NewBatch(index, f.lastIndex, count, f.batchCount, f.batches))
 			{
+				if (resetRequested)
+				{
+					f.consecutiveFailures = 0;
+					f.stallCooldownBatches = 0;
+				}
+
 				f.batchCount = count;
 				f.fault.clear();
 				f.generatedThrough = 0;
-				f.batchReady = GenerateBatch(d, f, command, *parameters, count,
-					VulkanPolicy::ExecuteRange(true, index, count, false));
+
+				// Stall circuit breaker (dlssg-0.4.2): after 3 consecutive Execute failures, bypass XeFG for 60 batches
+				// and copy the real frame cleanly so the game never freezes or flickers.
+				if (f.stallCooldownBatches > 0)
+				{
+					--f.stallCooldownBatches;
+					f.batchReady = false;
+					f.havePrevious = false;
+					f.fault = "stall_cooldown";
+					VulkanHost::NotifyPaused();
+				}
+				else
+				{
+					f.batchReady = GenerateBatch(d, f, command, *parameters, count,
+						VulkanPolicy::ExecuteRange(true, index, count, false));
+				}
 				didExecute = f.batchReady;
 				f.batches++;
 
@@ -1274,11 +1523,21 @@ namespace
 				{
 					f.havePrevious = false;
 					VulkanHost::NotifyPaused();
-					if (++f.failures <= 16)
-						Log::Error("Vulkan: batch failed ({}), index {}, count {}", f.fault, index, count);
+					if (f.fault != "stall_cooldown")
+					{
+						if (++f.failures <= 16)
+							Log::Error("Vulkan: batch failed ({}), index {}, count {}", f.fault, index, count);
+						if (++f.consecutiveFailures >= 3u)
+						{
+							f.stallCooldownBatches = 60u;
+							f.consecutiveFailures = 0;
+							Log::Warn("Vulkan: XeFG stalled after 3 consecutive batch failures ({}); pausing FG for 60 batches", f.fault);
+						}
+					}
 				}
 				else
 				{
+					f.consecutiveFailures = 0;
 					VulkanHost::NotifyBatchStart(count);
 					if (f.batches == 1 || f.batches % 6000 == 0)
 					{

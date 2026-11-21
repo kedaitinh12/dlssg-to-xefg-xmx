@@ -1531,6 +1531,19 @@ void VulkanHost::Start(const char* caller)
 	if (s.started)
 		return;
 
+	// Process-wide guard: even if two copies of this DLL are ever loaded from different folders in the same
+	// process, only the first one may install MinHook detours on vulkan-1.dll.
+	const std::wstring guardName = L"Local\\XeFgVulkanHostHookGuard_" + std::to_wstring(GetCurrentProcessId());
+	HANDLE guardMutex = CreateMutexW(nullptr, FALSE, guardName.c_str());
+	if (guardMutex && GetLastError() == ERROR_ALREADY_EXISTS)
+	{
+		CloseHandle(guardMutex);
+		s.started = true;
+		Log::Info("Vulkan hooks are already owned by another instance in this process ({}); skipping duplicate install", caller);
+		return;
+	}
+	// Intentionally kept open for the lifetime of the process when this instance owns the hooks.
+
 	s.started = true;
 
 	if (const HMODULE loader = GetModuleHandleW(LoaderName))
