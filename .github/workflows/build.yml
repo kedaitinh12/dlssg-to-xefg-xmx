@@ -66,19 +66,29 @@ jobs:
         shell: pwsh
         run: ./tools/GenerateXeFgPrograms.ps1 -Output bin\Release\xefg_mfg_programs -Cache obj\Release\packages
 
-      # Optional: if a CUDA Toolkit (12.8+ / 13.x with sm_120 support) is installed on the runner, rebuild
-      # xefg_cuda_layers.fatbin from the optimized src/MfgPort/Cuda/xefg_cuda_layers.cu AFTER GenerateXeFgPrograms.ps1
-      # so the extracted v1.7.0 fatbin does not overwrite the newly built sm_120 fatbin.
-      - name: Rebuild CUDA tensor-core fatbin (when CUDA Toolkit is present)
+      # Install minimal CUDA Toolkit 12.8.1 (nvcc + cudart only) so CI always builds xefg_cuda_layers.fatbin
+      # from the optimized src/MfgPort/Cuda/xefg_cuda_layers.cu (sm_75/86/89/120 + compute_86 PTX).
+      - name: Setup CUDA Toolkit (12.8.1 minimal nvcc)
+        id: cuda_setup
+        uses: Jimver/cuda-toolkit@v0.2.28
+        continue-on-error: true
+        with:
+          cuda: '12.8.1'
+          sub-packages: '["nvcc_12.8", "cudart_12.8"]'
+
+      # Rebuild xefg_cuda_layers.fatbin from the optimized src/MfgPort/Cuda/xefg_cuda_layers.cu AFTER
+      # GenerateXeFgPrograms.ps1 so the extracted fatbin does not overwrite the newly built sm_120/PTX fatbin.
+      - name: Rebuild CUDA tensor-core fatbin
         id: cuda_rebuild
         shell: pwsh
         run: |
-          if ($env:CUDA_PATH -and (Test-Path (Join-Path $env:CUDA_PATH "bin\nvcc.exe"))) {
-            Write-Host "CUDA Toolkit found at $env:CUDA_PATH, rebuilding xefg_cuda_layers.fatbin from xefg_cuda_layers.cu..."
-            ./tools/GenerateXeFgCuda.ps1 -Output bin\Release\xefg_mfg_programs -CudaRoot $env:CUDA_PATH -Source src\MfgPort\Cuda -AllowUnpinnedNvcc
+          $cudaRoot = if ($env:CUDA_PATH) { $env:CUDA_PATH } else { "${{ steps.cuda_setup.outputs.CUDA_PATH }}" }
+          if ($cudaRoot -and (Test-Path (Join-Path $cudaRoot "bin\nvcc.exe"))) {
+            Write-Host "CUDA Toolkit found at $cudaRoot, rebuilding xefg_cuda_layers.fatbin from xefg_cuda_layers.cu..."
+            ./tools/GenerateXeFgCuda.ps1 -Output bin\Release\xefg_mfg_programs -CudaRoot $cudaRoot -Source src\MfgPort\Cuda -AllowUnpinnedNvcc
             "rebuilt=true" >> $env:GITHUB_OUTPUT
           } else {
-            Write-Host "No CUDA Toolkit on runner; keeping the extracted xefg_cuda_layers.fatbin."
+            Write-Host "CUDA Toolkit unavailable on runner; keeping the extracted xefg_cuda_layers.fatbin."
             "rebuilt=false" >> $env:GITHUB_OUTPUT
           }
 
@@ -150,7 +160,9 @@ jobs:
       # Every function the sources mark as exported has to be in the dll's export table, the NGX D3D12 and Vulkan
       # entry points and the OptiScaler plugin entries (OptiPluginInit, InitializeASI) among them.
       - name: Check the exports
-        run: python tools/CheckExports.py bin/Release/dlssg_to_xefg_intel_is_better.dll src/Exports.cpp src/ExportsVulkan.cpp src/Plugin.cpp
+        run: |
+          python tools/CheckExports.py bin/Release/dlssg_to_xefg_intel_is_better.dll src/Exports.cpp src/ExportsVulkan.cpp src/Plugin.cpp
+          python tools/CheckExports.py bin/Release/dlssg_to_xefg_loader.asi src/loader/EarlyLoader.cpp
 
       - name: Load DLL and resolve exports (no GPU)
         run: python tests/windows/load_plugin.py bin/Release/dlssg_to_xefg_intel_is_better.dll
@@ -163,9 +175,9 @@ jobs:
           New-Item -ItemType Directory -Path $programs -Force | Out-Null
 
           Copy-Item bin\Release\dlssg_to_xefg_intel_is_better.dll $dlssg
-          # Same basename as the main DLL: Plugin.cpp::FindMainDll depends on it.
+          # Dedicated lightweight early loader for Vulkan games (supports renamed custom folders & DLLs).
           New-Item -ItemType Directory -Path staging\plugins -Force | Out-Null
-          Copy-Item bin\Release\dlssg_to_xefg_intel_is_better.dll staging\plugins\dlssg_to_xefg_intel_is_better.asi
+          Copy-Item bin\Release\dlssg_to_xefg_loader.asi staging\plugins\dlssg_to_xefg_loader.asi
           Copy-Item docs\OPTISCALER_BUILD_VI.md staging\README-VI.md
           if (Test-Path third_party\libxess_fg.dll) {
             Copy-Item third_party\libxess_fg.dll staging\libxess_fg.dll
@@ -200,7 +212,7 @@ jobs:
             "",
             "- Vulkan runtime: built in, Vulkan headers VK_HEADER_VERSION ${{ steps.vulkan.outputs.version }}",
             "- Vulkan models: $models",
-            "- Routes built in: XMX (native), XMX Port (DP4a INT8), CUDA Tensor Cores (sm_75/86/89/120), AMD WMMA INT8 (D3D12 cs_6_6 & Vulkan VK_KHR_cooperative_matrix)",
+            "- Routes built in: XMX (native), XMX Port (DP4a INT8), CUDA Tensor Cores (sm_75/86/89/120 + compute_86 PTX, rebuilt=${{ steps.cuda_rebuild.outputs.rebuilt }}), AMD WMMA INT8 (D3D12 cs_6_6 & Vulkan VK_KHR_cooperative_matrix)",
             "- Artifact: ``custom\XeMFG XMX\dlssg\dlssg_to_xefg_intel_is_better.dll`` with ``xefg_mfg_programs`` beside it"
           ) -join "`n" >> $env:GITHUB_STEP_SUMMARY
 
@@ -280,6 +292,13 @@ jobs:
 
       - name: Vulkan regression tests
         run: bash tests/vulkan_runtime/check_regressions.sh
+
+      - name: Early loader test
+        working-directory: tests/vulkan_runtime
+        run: |
+          g++ -std=c++20 -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -g \
+            -I ../../src early_loader_test.cpp -o early_loader_test
+          ./early_loader_test
 
       - name: OptiScaler plugin ABI prefix
         run: python tools/CheckOptiScalerAbi.py

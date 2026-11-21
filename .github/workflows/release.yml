@@ -38,14 +38,35 @@ jobs:
         shell: pwsh
         run: ./tools/GenerateXeFgPrograms.ps1 -Output bin\Release\xefg_mfg_programs -Cache obj\Release\packages
 
-      - name: Rebuild CUDA tensor-core fatbin (when CUDA Toolkit is present)
+      - name: Setup CUDA Toolkit (12.8.1 minimal nvcc)
+        id: cuda_setup
+        uses: Jimver/cuda-toolkit@v0.2.28
+        continue-on-error: true
+        with:
+          cuda: '12.8.1'
+          sub-packages: '["nvcc_12.8", "cudart_12.8"]'
+
+      - name: Rebuild CUDA tensor-core fatbin
+        id: cuda_rebuild
         shell: pwsh
         run: |
-          if ($env:CUDA_PATH -and (Test-Path (Join-Path $env:CUDA_PATH "bin\nvcc.exe"))) {
-            Write-Host "CUDA Toolkit found at $env:CUDA_PATH, rebuilding xefg_cuda_layers.fatbin from xefg_cuda_layers.cu..."
-            ./tools/GenerateXeFgCuda.ps1 -Output bin\Release\xefg_mfg_programs -CudaRoot $env:CUDA_PATH -Source src\MfgPort\Cuda -AllowUnpinnedNvcc
+          $cudaRoot = if ($env:CUDA_PATH) { $env:CUDA_PATH } else { "${{ steps.cuda_setup.outputs.CUDA_PATH }}" }
+          if ($cudaRoot -and (Test-Path (Join-Path $cudaRoot "bin\nvcc.exe"))) {
+            Write-Host "CUDA Toolkit found at $cudaRoot, rebuilding xefg_cuda_layers.fatbin from xefg_cuda_layers.cu..."
+            ./tools/GenerateXeFgCuda.ps1 -Output bin\Release\xefg_mfg_programs -CudaRoot $cudaRoot -Source src\MfgPort\Cuda -AllowUnpinnedNvcc
+            "rebuilt=true" >> $env:GITHUB_OUTPUT
           } else {
-            Write-Host "No CUDA Toolkit on runner; keeping the extracted xefg_cuda_layers.fatbin."
+            Write-Host "CUDA Toolkit unavailable on runner; keeping the extracted xefg_cuda_layers.fatbin."
+            "rebuilt=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Validate CUDA tensor-core fatbin
+        shell: pwsh
+        run: |
+          if ("${{ steps.cuda_rebuild.outputs.rebuilt }}" -eq "true") {
+            python tests/vulkan_runtime/check_layer_tables.py --fatbin bin/Release/xefg_mfg_programs/xefg_cuda_layers.fatbin --no-pin
+          } else {
+            python tests/vulkan_runtime/check_layer_tables.py --fatbin bin/Release/xefg_mfg_programs/xefg_cuda_layers.fatbin
           }
 
       - name: Build D3D12 WMMA compute shaders (DXC cs_6_6)
@@ -94,6 +115,8 @@ jobs:
           New-Item -ItemType Directory -Path $programs -Force | Out-Null
 
           Copy-Item bin\Release\dlssg_to_xefg_intel_is_better.dll $dlssg
+          New-Item -ItemType Directory -Path (Join-Path $stage "plugins") -Force | Out-Null
+          Copy-Item bin\Release\dlssg_to_xefg_loader.asi (Join-Path $stage "plugins\dlssg_to_xefg_loader.asi")
           Copy-Item bin\Release\xefg_mfg_programs\* $programs -Recurse
 
           # The licenses a binary distribution has to carry: this project's, MFG-Unlocker's (its code is in the dll), MinHook's
@@ -115,10 +138,12 @@ jobs:
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $archive = [System.IO.Compression.ZipFile]::Open($zip, [System.IO.Compression.ZipArchiveMode]::Create)
           try {
-            Get-ChildItem -Path (Join-Path $stage "XeMFG XMX") -Recurse -File | ForEach-Object {
-              # Use forward slashes so the zip extracts correctly on all platforms.
-              $entryName = $_.FullName.Substring($stage.Length + 1).Replace("\", "/")
-              [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $_.FullName, $entryName) | Out-Null
+            foreach ($folder in "XeMFG XMX", "plugins") {
+              Get-ChildItem -Path (Join-Path $stage $folder) -Recurse -File | ForEach-Object {
+                # Use forward slashes so the zip extracts correctly on all platforms.
+                $entryName = $_.FullName.Substring($stage.Length + 1).Replace("\", "/")
+                [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $_.FullName, $entryName) | Out-Null
+              }
             }
           } finally {
             $archive.Dispose()
