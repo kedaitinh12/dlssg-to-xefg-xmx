@@ -44,7 +44,7 @@ jobs:
         shell: pwsh
         run: |
           $cudaDir = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
-          if (-not (Test-Path (Join-Path $cudaDir "bin\nvcc.exe"))) {
+          if (-not (Test-Path (Join-Path $cudaDir "bin\nvcc.exe")) -or -not (Test-Path (Join-Path $cudaDir "include\crt\host_config.h"))) {
             $installer = $null
             # CUDA 13.4 introduced Windows on Arm and renamed x86_64 installers to include _x86_64.
             $candidates = @(
@@ -70,8 +70,8 @@ jobs:
               }
             }
             if ($installer) {
-              Write-Host "Installing minimal CUDA 13.4 components (nvcc_13.4, cudart_13.4)..."
-              $proc = Start-Process -FilePath $installer -ArgumentList "-s", "nvcc_13.4", "cudart_13.4" -Wait -PassThru
+              Write-Host "Installing minimal CUDA 13.4 components (nvcc_13.4, cudart_13.4, crt_13.4)..."
+              $proc = Start-Process -FilePath $installer -ArgumentList "-s", "nvcc_13.4", "cudart_13.4", "crt_13.4" -Wait -PassThru
               if ($proc.ExitCode -ne 0) {
                 Write-Warning "CUDA network installer exited with code $($proc.ExitCode)"
               }
