@@ -66,7 +66,7 @@ jobs:
         shell: pwsh
         run: ./tools/GenerateXeFgPrograms.ps1 -Output bin\Release\xefg_mfg_programs -Cache obj\Release\packages
 
-      # Install minimal CUDA Toolkit 12.8.1 (nvcc + cudart only) so CI always builds xefg_cuda_layers.fatbin
+      # Install minimal CUDA Toolkit 13.4 (nvcc + nvvm + cudart + crt + cccl) so CI always builds xefg_cuda_layers.fatbin
       # from the optimized src/MfgPort/Cuda/xefg_cuda_layers.cu (sm_75/86/89/120 + compute_86 PTX).
       - name: Setup CUDA Toolkit (13.4 minimal nvcc for MSVC 14.52)
         id: cuda_setup
@@ -74,7 +74,7 @@ jobs:
         shell: pwsh
         run: |
           $cudaDir = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
-          if (-not (Test-Path (Join-Path $cudaDir "bin\nvcc.exe")) -or -not (Test-Path (Join-Path $cudaDir "include\crt\host_config.h"))) {
+          if (-not (Test-Path (Join-Path $cudaDir "bin\nvcc.exe")) -or -not (Test-Path (Join-Path $cudaDir "include\crt\host_config.h")) -or -not (Test-Path (Join-Path $cudaDir "nvvm\bin\cicc.exe"))) {
             $installer = $null
             # CUDA 13.4 introduced Windows on Arm and renamed x86_64 installers to include _x86_64.
             $candidates = @(
@@ -100,19 +100,19 @@ jobs:
               }
             }
             if ($installer) {
-              Write-Host "Installing minimal CUDA 13.4 components (nvcc_13.4, cudart_13.4, crt_13.4)..."
-              $proc = Start-Process -FilePath $installer -ArgumentList "-s", "nvcc_13.4", "cudart_13.4", "crt_13.4" -Wait -PassThru
+              Write-Host "Installing minimal CUDA 13.4 components (nvcc_13.4, nvvm_13.4, cudart_13.4, crt_13.4, cccl_13.4, nvfatbin_13.4, nvptxcompiler_13.4)..."
+              $proc = Start-Process -FilePath $installer -ArgumentList "-s", "nvcc_13.4", "nvvm_13.4", "cudart_13.4", "crt_13.4", "cccl_13.4", "nvfatbin_13.4", "nvptxcompiler_13.4" -Wait -PassThru
               if ($proc.ExitCode -ne 0) {
                 Write-Warning "CUDA network installer exited with code $($proc.ExitCode)"
               }
             }
           }
-          if (Test-Path (Join-Path $cudaDir "bin\nvcc.exe")) {
+          if ((Test-Path (Join-Path $cudaDir "bin\nvcc.exe")) -and (Test-Path (Join-Path $cudaDir "include\crt\host_config.h")) -and (Test-Path (Join-Path $cudaDir "nvvm\bin\cicc.exe"))) {
             "CUDA_PATH=$cudaDir" >> $env:GITHUB_OUTPUT
             "CUDA_PATH=$cudaDir" >> $env:GITHUB_ENV
             Write-Host "CUDA Toolkit 13.4 ready at $cudaDir"
           } else {
-            Write-Warning "nvcc.exe not found at $cudaDir; build will keep the extracted fatbin."
+            Write-Warning "CUDA 13.4 toolchain incomplete at $cudaDir (expected bin\nvcc.exe, include\crt\host_config.h, nvvm\bin\cicc.exe); build will keep the extracted fatbin."
           }
 
       # Rebuild xefg_cuda_layers.fatbin from the optimized src/MfgPort/Cuda/xefg_cuda_layers.cu AFTER
