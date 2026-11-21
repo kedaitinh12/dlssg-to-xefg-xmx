@@ -1,0 +1,88 @@
+From 4dea45dcd12c73c3698d465af8736203bc9c2940 Mon Sep 17 00:00:00 2001
+From: dlssg-to-xefg <dev@local>
+Date: Sat, 21 Nov 2026 16:00:05 +0000
+Subject: [PATCH] Fix CUDA 13.4 Windows x86_64 installer filename in CI
+ workflows
+
+---
+ .github/workflows/build.yml   | 21 ++++++++++++++++-----
+ .github/workflows/release.yml | 21 ++++++++++++++++-----
+ 2 files changed, 32 insertions(+), 10 deletions(-)
+
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index 0a01002..5e9aa45 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -76,16 +76,27 @@ jobs:
+           $cudaDir = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
+           if (-not (Test-Path (Join-Path $cudaDir "bin\nvcc.exe"))) {
+             $installer = $null
+-            foreach ($ver in @("13.4.3", "13.4.2", "13.4.1")) {
+-              $url = "https://developer.download.nvidia.com/compute/cuda/$ver/network_installers/cuda_${ver}_windows_network.exe"
+-              $cand = Join-Path $env:RUNNER_TEMP "cuda_${ver}_windows_network.exe"
++            # CUDA 13.4 introduced Windows on Arm and renamed x86_64 installers to include _x86_64.
++            $candidates = @(
++              @{ Ver = "13.4.3"; Path = "network_installers/cuda_13.4.3_windows_x86_64_network.exe" },
++              @{ Ver = "13.4.2"; Path = "network_installers/cuda_13.4.2_windows_x86_64_network.exe" },
++              @{ Ver = "13.4.1"; Path = "network_installers/cuda_13.4.1_windows_x86_64_network.exe" },
++              @{ Ver = "13.4.3"; Path = "network_installers/cuda_13.4.3_windows_network_x86_64.exe" },
++              @{ Ver = "13.4.2"; Path = "network_installers/cuda_13.4.2_windows_network_x86_64.exe" },
++              @{ Ver = "13.4.3"; Path = "local_installers/cuda_13.4.3_windows_x86_64.exe" },
++              @{ Ver = "13.4.2"; Path = "local_installers/cuda_13.4.2_windows_x86_64.exe" }
++            )
++            foreach ($c in $candidates) {
++              $url = "https://developer.download.nvidia.com/compute/cuda/$($c.Ver)/$($c.Path)"
++              $leaf = Split-Path $c.Path -Leaf
++              $cand = Join-Path $env:RUNNER_TEMP $leaf
+               try {
+-                Write-Host "Trying official NVIDIA CUDA $ver Windows network installer..."
++                Write-Host "Trying NVIDIA CUDA $($c.Ver): $leaf..."
+                 Invoke-WebRequest -Uri $url -OutFile $cand -ErrorAction Stop
+                 $installer = $cand
+                 break
+               } catch {
+-                Write-Warning "CUDA $ver download unavailable: $($_.Exception.Message)"
++                Write-Host "  Not at $leaf ($($_.Exception.Message))"
+               }
+             }
+             if ($installer) {
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+index 2be8c02..ac02768 100644
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -46,16 +46,27 @@ jobs:
+           $cudaDir = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
+           if (-not (Test-Path (Join-Path $cudaDir "bin\nvcc.exe"))) {
+             $installer = $null
+-            foreach ($ver in @("13.4.3", "13.4.2", "13.4.1")) {
+-              $url = "https://developer.download.nvidia.com/compute/cuda/$ver/network_installers/cuda_${ver}_windows_network.exe"
+-              $cand = Join-Path $env:RUNNER_TEMP "cuda_${ver}_windows_network.exe"
++            # CUDA 13.4 introduced Windows on Arm and renamed x86_64 installers to include _x86_64.
++            $candidates = @(
++              @{ Ver = "13.4.3"; Path = "network_installers/cuda_13.4.3_windows_x86_64_network.exe" },
++              @{ Ver = "13.4.2"; Path = "network_installers/cuda_13.4.2_windows_x86_64_network.exe" },
++              @{ Ver = "13.4.1"; Path = "network_installers/cuda_13.4.1_windows_x86_64_network.exe" },
++              @{ Ver = "13.4.3"; Path = "network_installers/cuda_13.4.3_windows_network_x86_64.exe" },
++              @{ Ver = "13.4.2"; Path = "network_installers/cuda_13.4.2_windows_network_x86_64.exe" },
++              @{ Ver = "13.4.3"; Path = "local_installers/cuda_13.4.3_windows_x86_64.exe" },
++              @{ Ver = "13.4.2"; Path = "local_installers/cuda_13.4.2_windows_x86_64.exe" }
++            )
++            foreach ($c in $candidates) {
++              $url = "https://developer.download.nvidia.com/compute/cuda/$($c.Ver)/$($c.Path)"
++              $leaf = Split-Path $c.Path -Leaf
++              $cand = Join-Path $env:RUNNER_TEMP $leaf
+               try {
+-                Write-Host "Trying official NVIDIA CUDA $ver Windows network installer..."
++                Write-Host "Trying NVIDIA CUDA $($c.Ver): $leaf..."
+                 Invoke-WebRequest -Uri $url -OutFile $cand -ErrorAction Stop
+                 $installer = $cand
+                 break
+               } catch {
+-                Write-Warning "CUDA $ver download unavailable: $($_.Exception.Message)"
++                Write-Host "  Not at $leaf ($($_.Exception.Message))"
+               }
+             }
+             if ($installer) {
+-- 
+2.39.5
+
