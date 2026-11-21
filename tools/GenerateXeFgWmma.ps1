@@ -10,12 +10,16 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Output,
 
-    [string]$Source = (Join-Path $PSScriptRoot "..\src\MfgPort\Wmma\xefg_wmma_layers.hlsl"),
+    [string]$Source = "",
 
     [string]$DxcPath = ""
 )
 
 $ErrorActionPreference = "Stop"
+
+if (-not $Source) {
+    $Source = Join-Path $PSScriptRoot "..\src\MfgPort\Wmma\xefg_wmma_layers.hlsl"
+}
 
 if (-not (Test-Path $Source)) {
     throw "WMMA HLSL shader source not found: $Source"
