@@ -448,28 +448,40 @@ using CreateList1Fn = HRESULT (STDMETHODCALLTYPE*)(ID3D12Device4*, UINT, D3D12_C
 HRESULT STDMETHODCALLTYPE HookReset(ID3D12GraphicsCommandList* self, ID3D12CommandAllocator* allocator, ID3D12PipelineState* initial)
 {
     const HRESULT result = ListOriginal<ResetFn>(self, kReset)(self, allocator, initial);
-    auto& r = tRecording;
-    InitRecording(r, self);
-    if (SUCCEEDED(result))
+    if (gActive.load(std::memory_order_relaxed))
     {
-        r.lastState = initial;
-        r.layer = Lookup(initial, r.wmmaPso);
-        if (r.layer)
-            gBinds.fetch_add(1, std::memory_order_relaxed);
+        auto& r = tRecording;
+        InitRecording(r, self);
+        if (SUCCEEDED(result))
+        {
+            r.lastState = initial;
+            r.layer = Lookup(initial, r.wmmaPso);
+            if (r.layer)
+                gBinds.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    else if (tRecording.list == self)
+    {
+        tRecording.layer = 0;
+        tRecording.wmmaPso = nullptr;
+        tRecording.lastState = nullptr;
     }
     return result;
 }
 
 void STDMETHODCALLTYPE HookSetPipelineState(ID3D12GraphicsCommandList* self, ID3D12PipelineState* state)
 {
-    auto& r = Track(self);
-    if (r.lastState != state || !state)
+    if (gActive.load(std::memory_order_relaxed))
     {
-        r.lastState = state;
-        r.layer = Lookup(state, r.wmmaPso);
+        auto& r = Track(self);
+        if (r.lastState != state || !state)
+        {
+            r.lastState = state;
+            r.layer = Lookup(state, r.wmmaPso);
+        }
+        if (r.layer)
+            gBinds.fetch_add(1, std::memory_order_relaxed);
     }
-    if (r.layer)
-        gBinds.fetch_add(1, std::memory_order_relaxed);
     ListOriginal<SetPipelineStateFn>(self, kSetPipelineState)(self, state);
 }
 
@@ -494,8 +506,10 @@ void Fallback(Reason reason, const char* text, const xefg_cuda::Layer& layer) no
 
 void STDMETHODCALLTYPE HookDispatch(ID3D12GraphicsCommandList* self, UINT x, UINT y, UINT z)
 {
+    if (gActive.load(std::memory_order_acquire))
+    {
     auto& r = tRecording;
-    if (r.list == self && r.layer && r.table == *reinterpret_cast<void***>(self) && gActive.load(std::memory_order_acquire))
+    if (r.list == self && r.layer && r.table == *reinterpret_cast<void***>(self))
     {
         if ((r.tableRecord && r.tableRecord->complete.load(std::memory_order_acquire)) || (!r.tableRecord && r.tableHooked))
         {
@@ -523,6 +537,7 @@ void STDMETHODCALLTYPE HookDispatch(ID3D12GraphicsCommandList* self, UINT x, UIN
                 return;
             }
         }
+    }
     }
     ListOriginal<DispatchFn>(self, kDispatch)(self, x, y, z);
 }
