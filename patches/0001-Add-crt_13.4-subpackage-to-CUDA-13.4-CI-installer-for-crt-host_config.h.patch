@@ -1,0 +1,62 @@
+From f0cd3a53b69faca7ec3a2e815257c7b1c47f41e0 Mon Sep 17 00:00:00 2001
+From: dlssg-to-xefg <dev@local>
+Date: Sat, 21 Nov 2026 16:15:17 +0000
+Subject: [PATCH] Add crt_13.4 subpackage to CUDA 13.4 CI installer for
+ crt/host_config.h
+
+---
+ .github/workflows/build.yml   | 6 +++---
+ .github/workflows/release.yml | 6 +++---
+ 2 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index 5e9aa45..5b5576c 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -74,7 +74,7 @@ jobs:
+         shell: pwsh
+         run: |
+           $cudaDir = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
+-          if (-not (Test-Path (Join-Path $cudaDir "bin\nvcc.exe"))) {
++          if (-not (Test-Path (Join-Path $cudaDir "bin\nvcc.exe")) -or -not (Test-Path (Join-Path $cudaDir "include\crt\host_config.h"))) {
+             $installer = $null
+             # CUDA 13.4 introduced Windows on Arm and renamed x86_64 installers to include _x86_64.
+             $candidates = @(
+@@ -100,8 +100,8 @@ jobs:
+               }
+             }
+             if ($installer) {
+-              Write-Host "Installing minimal CUDA 13.4 components (nvcc_13.4, cudart_13.4)..."
+-              $proc = Start-Process -FilePath $installer -ArgumentList "-s", "nvcc_13.4", "cudart_13.4" -Wait -PassThru
++              Write-Host "Installing minimal CUDA 13.4 components (nvcc_13.4, cudart_13.4, crt_13.4)..."
++              $proc = Start-Process -FilePath $installer -ArgumentList "-s", "nvcc_13.4", "cudart_13.4", "crt_13.4" -Wait -PassThru
+               if ($proc.ExitCode -ne 0) {
+                 Write-Warning "CUDA network installer exited with code $($proc.ExitCode)"
+               }
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+index ac02768..e178d39 100644
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -44,7 +44,7 @@ jobs:
+         shell: pwsh
+         run: |
+           $cudaDir = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
+-          if (-not (Test-Path (Join-Path $cudaDir "bin\nvcc.exe"))) {
++          if (-not (Test-Path (Join-Path $cudaDir "bin\nvcc.exe")) -or -not (Test-Path (Join-Path $cudaDir "include\crt\host_config.h"))) {
+             $installer = $null
+             # CUDA 13.4 introduced Windows on Arm and renamed x86_64 installers to include _x86_64.
+             $candidates = @(
+@@ -70,8 +70,8 @@ jobs:
+               }
+             }
+             if ($installer) {
+-              Write-Host "Installing minimal CUDA 13.4 components (nvcc_13.4, cudart_13.4)..."
+-              $proc = Start-Process -FilePath $installer -ArgumentList "-s", "nvcc_13.4", "cudart_13.4" -Wait -PassThru
++              Write-Host "Installing minimal CUDA 13.4 components (nvcc_13.4, cudart_13.4, crt_13.4)..."
++              $proc = Start-Process -FilePath $installer -ArgumentList "-s", "nvcc_13.4", "cudart_13.4", "crt_13.4" -Wait -PassThru
+               if ($proc.ExitCode -ne 0) {
+                 Write-Warning "CUDA network installer exited with code $($proc.ExitCode)"
+               }
+-- 
+2.39.5
+
