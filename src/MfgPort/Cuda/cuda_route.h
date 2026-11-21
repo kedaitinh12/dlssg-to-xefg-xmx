@@ -65,6 +65,8 @@ void SetStackRecognition(bool enabled) noexcept;
 // tables their originals back and release those lists. The device hooks (and a shared table of a
 // system runtime) stay installed and pass every call through until new layers appear.
 void ForgetLayers() noexcept;
+// Invalidate thread-local descriptor/replay caches on context teardown or recreation.
+void InvalidateCache() noexcept;
 
 struct Status
 {

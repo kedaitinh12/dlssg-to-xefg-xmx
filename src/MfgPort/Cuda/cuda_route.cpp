@@ -577,6 +577,11 @@ HRESULT STDMETHODCALLTYPE HookReset(ID3D12GraphicsCommandList* self, ID3D12Comma
 {
     const HRESULT result = ListOriginal<ResetFn>(self, kReset)(self, allocator, initial);
     auto& r = tRecording;
+    if (!gActive.load(std::memory_order_relaxed))
+    {
+        if (r.list == self) { r.lastState = nullptr; r.layer = 0; }
+        return result;
+    }
     InitRecording(r, self);
     if (SUCCEEDED(result))
     {
@@ -588,67 +593,96 @@ HRESULT STDMETHODCALLTYPE HookReset(ID3D12GraphicsCommandList* self, ID3D12Comma
 }
 void STDMETHODCALLTYPE HookSetPipelineState(ID3D12GraphicsCommandList* self, ID3D12PipelineState* state)
 {
-    auto& r = Track(self);
-    if (r.lastState != state || !state)
+    if (gActive.load(std::memory_order_relaxed))
     {
-        r.lastState = state;
-        r.layer = Lookup(state);
+        auto& r = Track(self);
+        if (r.lastState != state || !state)
+        {
+            r.lastState = state;
+            r.layer = Lookup(state);
+        }
+        if (r.layer) gLayerBinds.fetch_add(1, std::memory_order_relaxed);
     }
-    if (r.layer) gLayerBinds.fetch_add(1, std::memory_order_relaxed);
     ListOriginal<SetPipelineStateFn>(self, kSetPipelineState)(self, state);
 }
 void STDMETHODCALLTYPE HookSetDescriptorHeaps(ID3D12GraphicsCommandList* self, UINT count, ID3D12DescriptorHeap* const* heaps)
 {
-    auto& r = Track(self);
-    r.heap = nullptr;
-    r.heapNumDescriptors = 0;
-    if (heaps)
+    if (gActive.load(std::memory_order_relaxed))
     {
-        for (UINT i = 0; i < count && i < 2; ++i)
+        auto& r = Track(self);
+        r.heap = nullptr;
+        r.heapNumDescriptors = 0;
+        if (heaps)
         {
-            if (!heaps[i]) continue;
-            const D3D12_DESCRIPTOR_HEAP_DESC desc = heaps[i]->GetDesc();
-            if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+            const uint64_t curEpoch = gCacheEpoch.load(std::memory_order_acquire);
+            for (UINT i = 0; i < count && i < 2; ++i)
             {
-                r.heap = heaps[i];
-                if (desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
+                ID3D12DescriptorHeap* candidate = heaps[i];
+                if (!candidate) continue;
+                // Fast-path: a D3D12 descriptor heap's type, flags, start handles, and size are immutable for its lifetime.
+                if (candidate == tHeapCache.heap && tHeapCache.epoch == curEpoch && tHeapCache.heapNumDescriptors != 0)
                 {
-                    r.heapGpuStart = heaps[i]->GetGPUDescriptorHandleForHeapStart();
-                    r.heapCpuStart = heaps[i]->GetCPUDescriptorHandleForHeapStart();
-                    r.heapNumDescriptors = desc.NumDescriptors;
+                    r.heap = candidate;
+                    r.heapGpuStart.ptr = tHeapCache.heapGpuStart;
+                    r.heapCpuStart.ptr = tHeapCache.heapCpuStart;
+                    r.heapNumDescriptors = tHeapCache.heapNumDescriptors;
+                    continue;
+                }
+                const D3D12_DESCRIPTOR_HEAP_DESC desc = candidate->GetDesc();
+                if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                {
+                    r.heap = candidate;
+                    if (desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
+                    {
+                        r.heapGpuStart = candidate->GetGPUDescriptorHandleForHeapStart();
+                        r.heapCpuStart = candidate->GetCPUDescriptorHandleForHeapStart();
+                        r.heapNumDescriptors = desc.NumDescriptors;
+                    }
                 }
             }
         }
+        if (r.heap) tHeapCache.BindHeap(r.heap, r.heapGpuStart.ptr, r.heapCpuStart.ptr, r.heapNumDescriptors);
     }
-    if (r.heap) tHeapCache.BindHeap(r.heap, r.heapGpuStart.ptr, r.heapCpuStart.ptr, r.heapNumDescriptors);
     ListOriginal<SetDescriptorHeapsFn>(self, kSetDescriptorHeaps)(self, count, heaps);
 }
 void STDMETHODCALLTYPE HookSetComputeRootSignature(ID3D12GraphicsCommandList* self, ID3D12RootSignature* signature)
 {
-    auto& r = Track(self);
-    r.tableMask = 0;
-    r.constantMask = 0;
+    if (gActive.load(std::memory_order_relaxed))
+    {
+        auto& r = Track(self);
+        r.tableMask = 0;
+        r.constantMask = 0;
+    }
     ListOriginal<SetRootSignatureFn>(self, kSetComputeRootSignature)(self, signature);
 }
 void STDMETHODCALLTYPE HookSetComputeRootDescriptorTable(ID3D12GraphicsCommandList* self, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE table)
 {
-    auto& r = Track(self);
-    if (index < 2) { r.tables[index] = table; r.tableMask |= 1u << index; }
+    if (gActive.load(std::memory_order_relaxed))
+    {
+        auto& r = Track(self);
+        if (index < 2) { r.tables[index] = table; r.tableMask |= 1u << index; }
+    }
     ListOriginal<SetTableFn>(self, kSetComputeRootDescriptorTable)(self, index, table);
 }
 void STDMETHODCALLTYPE HookSetComputeRoot32BitConstant(ID3D12GraphicsCommandList* self, UINT index, UINT value, UINT offset)
 {
-    auto& r = Track(self);
-    if (index == 2 && offset < 12) { r.constants[offset] = value; r.constantMask |= 1u << offset; }
+    if (gActive.load(std::memory_order_relaxed))
+    {
+        auto& r = Track(self);
+        if (index == 2 && offset < 12) { r.constants[offset] = value; r.constantMask |= 1u << offset; }
+    }
     ListOriginal<SetConstantFn>(self, kSetComputeRoot32BitConstant)(self, index, value, offset);
 }
 void STDMETHODCALLTYPE HookSetComputeRoot32BitConstants(ID3D12GraphicsCommandList* self, UINT index, UINT count, const void* values, UINT offset)
 {
-    auto& r = Track(self);
-    if (index == 2 && values && count && offset < 12 && count <= 12 - offset)
+    if (gActive.load(std::memory_order_relaxed))
     {
-        std::memcpy(r.constants + offset, values, size_t(count)*4);
-        r.constantMask |= ((1u << count) - 1u) << offset;
+        auto& r = Track(self);
+        if (index == 2 && values && count && offset < 12 && count <= 12 - offset)
+        {
+            std::memcpy(r.constants + offset, values, size_t(count)*4);
+            r.constantMask |= ((1u << count) - 1u) << offset;
+        }
     }
     ListOriginal<SetConstantsFn>(self, kSetComputeRoot32BitConstants)(self, index, count, values, offset);
 }
@@ -1210,10 +1244,12 @@ void Recognize(ID3D12Device* device, const D3D12_COMPUTE_PIPELINE_STATE_DESC& de
             gHeld.push_back(state.Detach());
             gAnyLayer.store(true, std::memory_order_release);
             gLayerCount.store(uint32_t(gHeld.size()), std::memory_order_relaxed);
+            gCacheEpoch.fetch_add(1, std::memory_order_release);
             if (!gLayerSeen[i].exchange(true) && gActive.load(std::memory_order_relaxed))
-                gCacheEpoch.fetch_add(1, std::memory_order_release);
+            {
                 Log("cuda_layer", std::string("\"program\":\"") + kLayers[i].info.program + "\",\"kernel\":\"" +
                     kLayers[i].info.kernel + "\"" + (own ? ",\"source\":\"rtxmfg\"" : "") + stack);
+            }
             return;
         }
     }
@@ -1550,9 +1586,15 @@ bool Enabled() noexcept
     return gState.load(std::memory_order_acquire) == State::Active && gActive.load(std::memory_order_acquire);
 }
 
+void InvalidateCache() noexcept
+{
+    gCacheEpoch.fetch_add(1, std::memory_order_release);
+}
+
 void ForgetLayers() noexcept
 {
     std::lock_guard lock(gMutex);
+    gCacheEpoch.fetch_add(1, std::memory_order_release);
     gAnyLayer.store(false, std::memory_order_release);
     for (auto& key : gKeys) key.store(nullptr, std::memory_order_release);
     for (auto* state : gHeld) state->Release();

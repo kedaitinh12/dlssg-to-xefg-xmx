@@ -85,11 +85,21 @@ DEVI void Mma32(int (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
     asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
         : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+// Blackwell (sm_120): m16n8k16 wastes half of tensor-core throughput compared to native m16n8k32;
+// run tap 8 as m16n8k32 with zero-padded upper k16 operands (byte-identical output, learned from dlssg-0.4.2 C133).
+DEVI void Mma16(int (&c)[4], uint32_t a0, uint32_t a1, uint32_t b0)
+{
+    const uint32_t zero = 0u;
+    Mma32(c, a0, a1, zero, zero, b0, zero);
+}
+#else
 DEVI void Mma16(int (&c)[4], uint32_t a0, uint32_t a1, uint32_t b0)
 {
     asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
         : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(b0));
 }
+#endif
 #endif
 
 constexpr int WIN_W = 18;   // 16 positions + 2 halo texels
