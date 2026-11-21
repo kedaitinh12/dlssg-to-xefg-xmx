@@ -107,6 +107,22 @@ static const char* HdrDescription(DXGI_FORMAT format)
 	}
 }
 
+// XeFG only accepts 8-bit UNORM/sRGB and HDR10 R10G10B10A2_UNORM; scRGB FP16 (R16G16B16A16_FLOAT) is rejected by libxess_fg.
+static bool IsSupportedXeFGColorFormat(DXGI_FORMAT format) noexcept
+{
+	switch (format)
+	{
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+	case DXGI_FORMAT_R10G10B10A2_UNORM:
+		return true;
+	default:
+		return false;
+	}
+}
+
 // XeFG stock network. libxess_fg.dll does not ship its multi frame variant (16), which Init would switch to for
 // more than one generated frame, so it gets forced. The XMX port publishes 16, and then Init loads the cheaper MFG
 // model: one optical flow field for the whole batch instead of one per generated frame
@@ -123,6 +139,7 @@ FrameGenerator::Context::~Context()
 		D3D12VulkanWmma::ForgetResource(f.mvecs.Get());
 	}
 	D3D12VulkanWmma::ResetContext();
+	xefg_cuda::InvalidateCache();
 
 	if (handle)
 	{
@@ -148,16 +165,20 @@ static void XeFGLogCallback(const char* message, xefgd_logging_level_t level, vo
 }
 
 static ComPtr<ID3D12Resource> CreateTexture(ID3D12Device* device, D3D12_RESOURCE_DESC desc,
-	D3D12_RESOURCE_STATES state, const wchar_t* name, const char* purpose)
+	D3D12_RESOURCE_STATES state, const wchar_t* name, const char* purpose, bool wantShared = false)
 {
 	ComPtr<ID3D12Resource> texture;
 	D3D12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
 
-	const bool tryShared = D3D12VulkanWmma::WantsSharedTextures() && D3D12VulkanWmma::CanShareTexture(desc);
+	const bool tryShared = wantShared && D3D12VulkanWmma::CanShareTexture(desc);
 	HRESULT hr = E_FAIL;
 	if (tryShared)
-		hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc, state, nullptr,
+	{
+		D3D12_RESOURCE_DESC sharedDesc = desc;
+		sharedDesc.Alignment = 0;
+		hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &sharedDesc, state, nullptr,
 			IID_PPV_ARGS(&texture));
+	}
 	if (FAILED(hr))
 		hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
 			IID_PPV_ARGS(&texture));
@@ -205,13 +226,16 @@ static bool IsDepth32StencilFormat(DXGI_FORMAT fmt) noexcept
 static bool CaptureDepth32Plane0(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* source,
 	D3D12_RESOURCE_STATES sourceState, ComPtr<ID3D12Resource>& copy, ComPtr<ID3D12Resource>& scratch, const char* purpose)
 {
-	const D3D12_RESOURCE_DESC srcDesc = source->GetDesc();
+	const D3D12_RESOURCE_DESC rawSrcDesc = source->GetDesc();
+	D3D12_RESOURCE_DESC srcDesc = rawSrcDesc;
+	srcDesc.Alignment = 0;
+	srcDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+	srcDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+	srcDesc.MipLevels = 1;
+	srcDesc.DepthOrArraySize = 1;
+
 	D3D12_RESOURCE_DESC dstDesc = srcDesc;
 	dstDesc.Format = DXGI_FORMAT_R32_FLOAT;
-	dstDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
-	dstDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-	dstDesc.MipLevels = 1;
-	dstDesc.DepthOrArraySize = 1;
 
 	D3D12_PLACED_SUBRESOURCE_FOOTPRINT srcFootprint{};
 	UINT64 srcBytes = 0;
@@ -221,8 +245,17 @@ static bool CaptureDepth32Plane0(ID3D12Device* device, ID3D12GraphicsCommandList
 	UINT64 dstBytes = 0;
 	device->GetCopyableFootprints(&dstDesc, 0, 1, 0, &dstFootprint, nullptr, nullptr, &dstBytes);
 
-	if (!srcBytes || !dstBytes || srcFootprint.Footprint.RowPitch != dstFootprint.Footprint.RowPitch)
+	if (srcBytes == 0 || srcBytes == UINT64_MAX || dstBytes == 0 || dstBytes == UINT64_MAX ||
+		srcFootprint.Footprint.RowPitch != dstFootprint.Footprint.RowPitch)
+	{
+		static std::atomic<bool> logged{ false };
+		if (!logged.exchange(true, std::memory_order_relaxed))
+			Log::Warn("CaptureDepth32Plane0 skipped (srcFmt={}, srcFpFmt={}, srcPitch={}, dstPitch={}, srcBytes={}, dstBytes={}, {}x{})",
+				static_cast<uint32_t>(rawSrcDesc.Format), static_cast<uint32_t>(srcFootprint.Footprint.Format),
+				srcFootprint.Footprint.RowPitch, dstFootprint.Footprint.RowPitch, srcBytes, dstBytes,
+				static_cast<uint64_t>(rawSrcDesc.Width), rawSrcDesc.Height);
 		return false;
+	}
 
 	const UINT64 bufBytes = std::max(srcBytes, dstBytes);
 	if (scratch && scratch->GetDesc().Width < bufBytes)
@@ -260,7 +293,7 @@ static bool CaptureDepth32Plane0(ID3D12Device* device, ID3D12GraphicsCommandList
 		}
 	}
 	if (!copy)
-		copy = CreateTexture(device, dstDesc, XeFGInputState, L"dlssg-to-xefg depth plane0 copy", purpose);
+		copy = CreateTexture(device, dstDesc, XeFGInputState, L"dlssg-to-xefg depth plane0 copy", purpose, true);
 	if (!copy)
 		return false;
 
@@ -325,10 +358,19 @@ static bool CaptureDepth32Plane0(ID3D12Device* device, ID3D12GraphicsCommandList
 	return true;
 }
 
-// Copies source into copy, (re)created when the source changes, the copy is left in XeFGInputState
-static bool Capture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* source,
-	D3D12_RESOURCE_STATES sourceState, ComPtr<ID3D12Resource>& copy, const char* purpose, bool isDepth = false,
-	ComPtr<ID3D12Resource>* depthScratch = nullptr)
+struct PendingCaptureCopy
+{
+	ID3D12Resource* destination{};
+	ID3D12Resource* source{};
+	D3D12_RESOURCE_STATES sourceState{};
+};
+
+// Prepares copy texture for source (recreated on desc change) and queues a batched CopyResource instead of
+// issuing per-texture ResourceBarrier flushes (cuts 8 barriers down to 2 per real frame across CUDA/XMX/DP4a).
+static bool PrepareCapture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* source,
+	D3D12_RESOURCE_STATES sourceState, ComPtr<ID3D12Resource>& copy, const char* purpose,
+	PendingCaptureCopy* pending, UINT& pendingCount, bool wantShared = false,
+	bool isDepth = false, ComPtr<ID3D12Resource>* depthScratch = nullptr)
 {
 	if (!source)
 	{
@@ -339,8 +381,8 @@ static bool Capture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, ID
 	auto desc = source->GetDesc();
 
 	// On Unreal Engine 5 / REDengine 4 DX12 games, depth is typically D32_FLOAT_S8X24 / R32G8X24_TYPELESS.
-	// Extract plane 0 into a shared R32_FLOAT texture so D3D12->Vulkan hardware WMMA bridge can import it.
-	if (isDepth && depthScratch && D3D12VulkanWmma::WantsSharedTextures() &&
+	// Extract plane 0 into a shared R32_FLOAT texture only when the D3D12->Vulkan hardware WMMA bridge is active.
+	if (wantShared && isDepth && depthScratch &&
 		desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.SampleDesc.Count == 1 &&
 		IsDepth32StencilFormat(desc.Format))
 	{
@@ -375,13 +417,60 @@ static bool Capture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, ID
 	}
 
 	if (!copy)
-		copy = CreateTexture(device, desc, XeFGInputState, L"dlssg-to-xefg input copy", purpose);
+		copy = CreateTexture(device, desc, XeFGInputState, L"dlssg-to-xefg input copy", purpose, wantShared);
 
 	if (!copy)
 		return false;
 
-	Copy(cmdList, copy.Get(), XeFGInputState, source, sourceState);
+	pending[pendingCount++] = { copy.Get(), source, sourceState };
 	return true;
+}
+
+static void FlushCaptureCopies(ID3D12GraphicsCommandList* cmdList, const PendingCaptureCopy* pending, UINT count)
+{
+	if (!count)
+		return;
+
+	D3D12_RESOURCE_BARRIER before[8]{};
+	UINT beforeCount = 0;
+	for (UINT i = 0; i < count; ++i)
+	{
+		if (XeFGInputState != D3D12_RESOURCE_STATE_COPY_DEST)
+		{
+			before[beforeCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			before[beforeCount].Transition = { pending[i].destination, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+				XeFGInputState, D3D12_RESOURCE_STATE_COPY_DEST };
+			++beforeCount;
+		}
+		if (pending[i].sourceState != D3D12_RESOURCE_STATE_COPY_SOURCE)
+		{
+			// Deduplicate if the game aliases two inputs to the same resource
+			bool seen = false;
+			for (UINT j = 0; j < i; ++j)
+			{
+				if (pending[j].source == pending[i].source) { seen = true; break; }
+			}
+			if (!seen)
+			{
+				before[beforeCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+				before[beforeCount].Transition = { pending[i].source, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+					pending[i].sourceState, D3D12_RESOURCE_STATE_COPY_SOURCE };
+				++beforeCount;
+			}
+		}
+	}
+	if (beforeCount)
+		cmdList->ResourceBarrier(beforeCount, before);
+
+	for (UINT i = 0; i < count; ++i)
+		cmdList->CopyResource(pending[i].destination, pending[i].source);
+
+	if (beforeCount)
+	{
+		for (UINT i = 0; i < beforeCount; ++i)
+			std::swap(before[i].Transition.StateBefore, before[i].Transition.StateAfter);
+		cmdList->ResourceBarrier(beforeCount, before);
+	}
 }
 
 struct SubrectKeys
@@ -412,22 +501,35 @@ constexpr SubrectKeys kHudlessSubrect{
 static xefgd_resource_t Subrect(const NGXParameter& params, const SubrectKeys& keys, ID3D12Resource* resource)
 {
 	xefgd_resource_t subrect{};
+	const auto desc = resource->GetDesc();
+	const uint32_t resW = static_cast<uint32_t>(desc.Width);
+	const uint32_t resH = desc.Height;
 	subrect.base = { params.GetOr<uint32_t>(keys.baseX, 0), params.GetOr<uint32_t>(keys.baseY, 0) };
 	subrect.size = { params.GetOr<uint32_t>(keys.width, 0), params.GetOr<uint32_t>(keys.height, 0) };
 
-	if (subrect.size.x == 0 || subrect.size.y == 0)
+	if (subrect.size.x == 0 || subrect.size.y == 0 || subrect.base.x >= resW || subrect.base.y >= resH)
 	{
-		auto desc = resource->GetDesc();
 		subrect.base = {};
-		subrect.size = { (uint32_t)desc.Width, desc.Height };
+		subrect.size = { resW, resH };
+	}
+	else
+	{
+		subrect.size.x = std::min(subrect.size.x, resW - subrect.base.x);
+		subrect.size.y = std::min(subrect.size.y, resH - subrect.base.y);
 	}
 
 	return subrect;
 }
 
+static bool IsFiniteVec3(const XMFLOAT3& v) noexcept
+{
+	return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+}
+
 static XMFLOAT3 GetVector(const NGXParameter& params, const char* keyX, const char* keyY, const char* keyZ)
 {
-	return { params.GetOr(keyX, 0.0f), params.GetOr(keyY, 0.0f), params.GetOr(keyZ, 0.0f) };
+	const XMFLOAT3 v{ params.GetOr(keyX, 0.0f), params.GetOr(keyY, 0.0f), params.GetOr(keyZ, 0.0f) };
+	return IsFiniteVec3(v) ? v : XMFLOAT3{ 0.0f, 0.0f, 0.0f };
 }
 
 // XeFG's scene change detection uses the forward axis
@@ -438,7 +540,7 @@ static void GetViewMatrix(const NGXParameter& params, float* out)
 	const XMFLOAT3 up = GetVector(params, "DLSSG.CameraUpX", "DLSSG.CameraUpY", "DLSSG.CameraUpZ");
 	const XMFLOAT3 forward = GetVector(params, "DLSSG.CameraFwdX", "DLSSG.CameraFwdY", "DLSSG.CameraFwdZ");
 
-	// All zero disables XeFG's scene change detection
+	// All zero (or sanitized non-finite) disables XeFG's scene change detection
 	if (forward.x == 0.0f && forward.y == 0.0f && forward.z == 0.0f)
 		return;
 
@@ -489,7 +591,7 @@ static bool CameraFromViewToClip(const NGXParameter& params, float& cameraNear, 
 
 	fov = (float)(2.0 * std::atan(1.0 / b));
 
-	return cameraNear >= 0.0f && cameraFar >= 0.0f;
+	return std::isfinite(cameraNear) && std::isfinite(cameraFar) && std::isfinite(fov) && cameraNear >= 0.0f && cameraFar >= 0.0f && fov > 0.0f;
 }
 
 // Unreal's executables live in Binaries\<platform> and end with -Shipping
@@ -826,6 +928,7 @@ bool FrameGenerator::CreateContext()
 		return false;
 	}
 
+	newContext->sharedTexturesMode = UseWmma(settings.model) && D3D12VulkanWmma::WantsSharedTextures();
 	context = std::move(newContext);
 
 	// Warm up the Vulkan WMMA bridge context asynchronously on a background thread so CreateContext
@@ -920,8 +1023,26 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 
 	const bool depthInverted = params.GetOr<uint32_t>("DLSSG.DepthInverted", 0) != 0;
 
-	const auto backbufferFormat = TypedFormat(backbuffer->GetDesc().Format);
-	const auto hudlessFormat = hudless ? TypedFormat(hudless->GetDesc().Format) : DXGI_FORMAT_UNKNOWN;
+	const auto bbDesc = backbuffer->GetDesc();
+	const auto backbufferFormat = TypedFormat(bbDesc.Format);
+	auto hudlessFormat = hudless ? TypedFormat(hudless->GetDesc().Format) : DXGI_FORMAT_UNKNOWN;
+
+	// Guard against mismatched HUD-less textures (different size, format, or MSAA) which cause XeFG errors or HDR glitches.
+	if (hudless)
+	{
+		const auto hlDesc = hudless->GetDesc();
+		if (hlDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || hlDesc.SampleDesc.Count > 1 ||
+			hlDesc.Width != bbDesc.Width || hlDesc.Height != bbDesc.Height || hudlessFormat != backbufferFormat)
+		{
+			static bool warnedHudlessMismatch = false;
+			if (!std::exchange(warnedHudlessMismatch, true))
+				Log::Warn("Ignoring HUD-less input due to mismatch with back buffer (HUD-less {}x{} {}, back buffer {}x{} {}); falling back to UI Auto",
+					static_cast<uint64_t>(hlDesc.Width), hlDesc.Height, FormatName(hudlessFormat),
+					static_cast<uint64_t>(bbDesc.Width), bbDesc.Height, FormatName(backbufferFormat));
+			hudless = nullptr;
+			hudlessFormat = DXGI_FORMAT_UNKNOWN;
+		}
+	}
 
 	Settings wanted;
 	auto outputDesc = output->GetDesc();
@@ -974,6 +1095,13 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 
 		if (context)
 			DeferredDestroy::Add(std::move(context));
+	}
+
+	if (!IsSupportedXeFGColorFormat(settings.format) || !IsSupportedXeFGColorFormat(backbufferFormat) ||
+		settings.width == 0 || settings.height == 0)
+	{
+		createFailed = true;
+		return;
 	}
 
 	if (!context && !createFailed)
@@ -1050,14 +1178,43 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 		routeReported = false;
 	}
 
+	const bool wantShared = UseWmma(settings.model) && D3D12VulkanWmma::WantsSharedTextures();
+	if (context->sharedTexturesMode != wantShared)
+	{
+		auto releaseTex = [](ComPtr<ID3D12Resource>& res) {
+			if (res)
+			{
+				D3D12VulkanWmma::ForgetResource(res.Get());
+				DeferredDestroy::Add(std::make_shared<ComPtr<ID3D12Resource>>(std::move(res)));
+			}
+		};
+		for (auto& out : context->outputs)
+			releaseTex(out);
+		for (auto& f : context->frames)
+		{
+			releaseTex(f.backbuffer);
+			releaseTex(f.hudless);
+			releaseTex(f.depth);
+			releaseTex(f.depthScratch);
+			releaseTex(f.mvecs);
+			f.valid = false;
+		}
+		context->pairValid = false;
+		context->batchGeneratedThrough = 0;
+		context->sharedTexturesMode = wantShared;
+	}
+
 	context->current ^= 1;
 	auto& frame = context->frames[context->current];
 	auto& previous = context->frames[context->current ^ 1];
 
-	bool captured = Capture(device.Get(), cmdList, backbuffer, BackbufferState, frame.backbuffer, "Backbuffer");
-	captured &= Capture(device.Get(), cmdList, depth, InputState, frame.depth, "Depth copy", true, &frame.depthScratch);
-	captured &= Capture(device.Get(), cmdList, mvecs, InputState, frame.mvecs, "MVecs copy");
-	Capture(device.Get(), cmdList, hudless, InputState, frame.hudless, "HUDLess copy");
+	PendingCaptureCopy pendingCopies[4]{};
+	UINT pendingCopyCount = 0;
+	bool captured = PrepareCapture(device.Get(), cmdList, backbuffer, BackbufferState, frame.backbuffer, "Backbuffer", pendingCopies, pendingCopyCount, wantShared);
+	captured &= PrepareCapture(device.Get(), cmdList, depth, InputState, frame.depth, "Depth copy", pendingCopies, pendingCopyCount, wantShared, true, &frame.depthScratch);
+	captured &= PrepareCapture(device.Get(), cmdList, mvecs, InputState, frame.mvecs, "MVecs copy", pendingCopies, pendingCopyCount, wantShared);
+	PrepareCapture(device.Get(), cmdList, hudless, InputState, frame.hudless, "HUDLess copy", pendingCopies, pendingCopyCount, wantShared);
+	FlushCaptureCopies(cmdList, pendingCopies, pendingCopyCount);
 
 	auto& data = frame.data;
 	data = {};
@@ -1081,17 +1238,33 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 
 	data.outputResolution[0] = (float)settings.width;
 	data.outputResolution[1] = (float)settings.height;
-	data.jitterOffset[0] = params.GetOr("DLSSG.JitterOffsetX", 0.0f);
-	data.jitterOffset[1] = params.GetOr("DLSSG.JitterOffsetY", 0.0f);
+	const float jx = params.GetOr("DLSSG.JitterOffsetX", 0.0f);
+	const float jy = params.GetOr("DLSSG.JitterOffsetY", 0.0f);
+	data.jitterOffset[0] = std::isfinite(jx) ? jx : 0.0f;
+	data.jitterOffset[1] = std::isfinite(jy) ? jy : 0.0f;
 
 	// Unlike Streamline's constant, the NGX parameter already converts to pixels
-	data.motionVectorScale[0] = params.GetOr("DLSSG.MvecScaleX", 1.0f);
-	data.motionVectorScale[1] = params.GetOr("DLSSG.MvecScaleY", 1.0f);
-
-	if (data.motionVectorScale[0] == 0.0f || data.motionVectorScale[1] == 0.0f)
-		data.motionVectorScale[0] = data.motionVectorScale[1] = 1.0f;
+	const float mvsx = params.GetOr("DLSSG.MvecScaleX", 1.0f);
+	const float mvsy = params.GetOr("DLSSG.MvecScaleY", 1.0f);
+	data.motionVectorScale[0] = (std::isfinite(mvsx) && mvsx != 0.0f) ? mvsx : 1.0f;
+	data.motionVectorScale[1] = (std::isfinite(mvsy) && mvsy != 0.0f) ? mvsy : 1.0f;
 
 	bool reset = params.GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
+
+	// Dynamic Resolution / Subrect Change Detector: reset XeFG history if active render/viewport rect changed
+	if (captured && previous.valid && !reset)
+	{
+		const auto same2d = [](const xefgd_2d_t& a, const xefgd_2d_t& b) noexcept {
+			return a.x == b.x && a.y == b.y;
+		};
+		if (!same2d(data.backBuffer.base, previous.data.backBuffer.base) ||
+			!same2d(data.backBuffer.size, previous.data.backBuffer.size) ||
+			!same2d(data.depth.size, previous.data.depth.size) ||
+			!same2d(data.motionVectors.size, previous.data.motionVectors.size))
+		{
+			reset = true;
+		}
+	}
 
 	// Camera Cut & Teleport Detector: force history reset on sudden position jumps or sharp orientation snaps
 	if (Plugin::options.cameraCutDetection.load(std::memory_order_relaxed))
@@ -1134,6 +1307,16 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 		}
 	}
 
+	// Force history reset if HUD-less presence toggles between frames (network source switch, dlssg-0.4.2 M3)
+	if (captured && previous.valid && (frame.hudless != nullptr) != (previous.hudless != nullptr))
+		reset = true;
+
+	if (reset)
+	{
+		context->consecutiveExecuteFailures = 0;
+		context->stallCooldownEvaluations = 0;
+	}
+
 	data.resetHistory = reset;
 
 	// XeFG needs both frames to have hudless or neither
@@ -1144,12 +1327,21 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 }
 
 FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* output,
-	D3D12_RESOURCE_DESC outputDesc, uint32_t frameIndex, uint32_t frameCount)
+	D3D12_RESOURCE_DESC outputDesc, uint32_t frameIndex, uint32_t frameCount, float interpolationTime)
 {
 	if (!context || !context->pairValid)
 		return InterpolateResult::Skipped;
 
-	const bool useVulkanWmma = UseWmma(settings.model) && D3D12VulkanWmma::Active();
+	if (context->stallCooldownEvaluations > 0)
+	{
+		--context->stallCooldownEvaluations;
+		return InterpolateResult::Skipped;
+	}
+
+	const bool customInterpTime = interpolationTime > 0.0f && interpolationTime < 1.0f;
+	// Fractional FlipMeter TargetFps timestamps (DLSSG.InterpolationTime) evaluate one custom-t frame per call
+	// through the patched XeFG::Execute step rather than the fixed-step multi-frame Vulkan batch path.
+	const bool useVulkanWmma = !customInterpTime && UseWmma(settings.model) && D3D12VulkanWmma::Active();
 
 	// Multi-frame batch reuse (D3D12->Vulkan WMMA bridge only): when ScheduleBatch already generated 1..frameCount
 	// at frameIndex == 1 to keep a single D3D12<->Vulkan fence bounce, subsequent calls copy the pre-generated output.
@@ -1189,7 +1381,7 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 		{
 			if (!context->outputs[i])
 				context->outputs[i] = CreateTexture(device.Get(), outputDesc, OutputState, L"dlssg-to-xefg output",
-					"XeFG output");
+					"XeFG output", useVulkanWmma);
 
 			if (!context->outputs[i])
 				return InterpolateResult::Failed;
@@ -1253,10 +1445,13 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 	else if (UseWmma(settings.model))
 		xefg_wmma::Adopt(cmdList);
 
-	auto result = XeFG::Execute(context->handle, cmdList, params);
+	auto result = XeFG::Execute(context->handle, cmdList, params, interpolationTime);
 
 	if (result == XEFGD_RESULT_SUCCESS)
+	{
+		context->consecutiveExecuteFailures = 0;
 		return InterpolateResult::Interpolated;
+	}
 
 	if (result > 0)
 	{
@@ -1267,6 +1462,12 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 
 	Log::Error("XeFG Execute error: {}, frame {}/{}", result, frameIndex, frameCount);
 	context->pairValid = false;
+	if (++context->consecutiveExecuteFailures >= 3u)
+	{
+		context->stallCooldownEvaluations = 60u;
+		context->consecutiveExecuteFailures = 0;
+		Log::Warn("XeFG stalled after 3 consecutive Execute errors; bypassing interpolation for 60 evaluations");
+	}
 	return InterpolateResult::Failed;
 }
 
@@ -1276,7 +1477,11 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 	auto output = params.GetOr<ID3D12Resource*>("DLSSG.OutputInterpolated", nullptr);
 	auto outputReal = params.GetOr<ID3D12Resource*>("DLSSG.OutputReal", nullptr);
 
-	if (!backbuffer || !output)
+	float interpolationTime = params.GetOr<float>("DLSSG.InterpolationTime", 0.0f);
+	if (!(interpolationTime > 0.0f && interpolationTime < 1.0f) || !XeFG::SupportsInterpolationTime())
+		interpolationTime = 0.0f;
+
+	if (!backbuffer || (!output && interpolationTime == 0.0f))
 	{
 		Log::Error("Missing backbuffer or output");
 		return NGX_FAIL_INVALID_PARAMETER;
@@ -1285,11 +1490,18 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 	if (outputReal)
 		Copy(cmdList, outputReal, OutputState, backbuffer, BackbufferState);
 
-	if (!params.GetOr<uint32_t>("DLSSG.EnableInterp", 1))
+	if (!params.GetOr<uint32_t>("DLSSG.EnableInterp", 1) ||
+		params.GetOr<uint32_t>("DLSSG.OutputDisableInterpolation", 0) != 0)
 	{
 		if (context)
+		{
 			context->pairValid = false;
+			context->consecutiveExecuteFailures = 0;
+			context->stallCooldownEvaluations = 0;
+		}
 
+		if (output)
+			Copy(cmdList, output, OutputState, backbuffer, BackbufferState);
 		return NGX_SUCCESS;
 	}
 
@@ -1319,9 +1531,11 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 			CurrentNetwork(settings.model), context == nullptr, settings.format == DXGI_FORMAT_R16G16B16A16_FLOAT });
 	}
 
+	const auto targetDesc = (output ? output : backbuffer)->GetDesc();
+
 	// When VRAM guard clamps 3x-6x down to 2x, skip extra generated frames gracefully by showing the real frame
 	const auto result = (frameIndex <= effectiveCount)
-		? Interpolate(cmdList, output, output->GetDesc(), frameIndex, effectiveCount)
+		? Interpolate(cmdList, output, targetDesc, frameIndex, effectiveCount, interpolationTime)
 		: InterpolateResult::Skipped;
 
 	// A few frames after the path or context changed, say whether the hardware matrix route is actually the one running
@@ -1355,14 +1569,17 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 	}
 
 	// Without a usable pair (first frame, reset) the real frame is shown again, that's not an error
-	if (result == InterpolateResult::Interpolated)
+	if (output)
 	{
-		if (!context->directOutput)
-			Copy(cmdList, output, OutputState, context->outputs[frameIndex - 1].Get(), OutputState);
-	}
-	else
-	{
-		Copy(cmdList, output, OutputState, backbuffer, BackbufferState);
+		if (result == InterpolateResult::Interpolated)
+		{
+			if (!context->directOutput)
+				Copy(cmdList, output, OutputState, context->outputs[frameIndex - 1].Get(), OutputState);
+		}
+		else
+		{
+			Copy(cmdList, output, OutputState, backbuffer, BackbufferState);
+		}
 	}
 
 	return result == InterpolateResult::Failed ? NGX_FAIL : NGX_SUCCESS;

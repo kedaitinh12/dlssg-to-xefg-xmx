@@ -5,12 +5,14 @@
 #include "VulkanProvider.h"
 #include "VulkanRuntime.h"
 #include "XeFG.h"
+#include "loader/EarlyLoaderCore.h"
 #include "optiscaler_plugin.h"
 #include "vulkan/VulkanPolicy.h"
 
 #include <filesystem>
 #include <format>
 #include <mutex>
+#include <thread>
 #include <string>
 #include <system_error>
 
@@ -495,6 +497,19 @@ namespace
 		api->ItemTooltip("Limits the Vulkan present pacer cadence to (Monitor Hz - 3) to stay inside the VRR\n"
 						 "(G-Sync / FreeSync) window and avoid V-Sync latency spikes. Saved as AutoVrrPacing.");
 
+		bool vkWmmaBridge = Plugin::options.d3d12VulkanWmmaBridge;
+
+		if (api->Checkbox("D3D12->Vulkan WMMA bridge (experimental)", &vkWmmaBridge))
+		{
+			Plugin::options.d3d12VulkanWmmaBridge = vkWmmaBridge;
+			api->SetBool(self, "D3D12VulkanWmmaBridge", vkWmmaBridge);
+		}
+
+		api->ItemTooltip("Routes D3D12 WMMA batches through a private Vulkan VK_KHR_cooperative_matrix device\n"
+						 "(takes effect on next game launch, or set XEFG_D3D12_VULKAN_WMMA=1).\n"
+						 "Off by default to use freeze-free D3D12 cs_6_6 WMMA overrides without duplicate VRAM\n"
+						 "or OptiScaler Vulkan_wDx12 hook interference. Saved as D3D12VulkanWmmaBridge.");
+
 		bool debugLines = Plugin::options.debugLines;
 
 		if (api->Checkbox("Debug lines", &debugLines))
@@ -517,25 +532,50 @@ namespace
 		return _wcsicmp(ThisModulePath().extension().c_str(), L".asi") == 0;
 	}
 
-	// The dll OptiScaler uses, <OptiScaler folder>\custom\<name>\dlssg\<this file's name>.dll, for the copy that is
-	// <OptiScaler folder>\plugins\<this file's name>.asi. Empty when there is none
+	// Pre-read and validate xefg_mfg_programs\vulkan on a background thread during early bootstrap so
+	// OptiPluginInit doesn't stall the main thread for disk I/O when the game initializes.
+	std::once_flag preloadModelsOnce;
+
+	void StartAsyncModelPreload()
+	{
+		std::call_once(preloadModelsOnce,
+			[]
+			{
+				try
+				{
+					std::thread(
+						[]
+						{
+							try
+							{
+								VulkanPrograms::Installed();
+							}
+							catch (const std::exception& error)
+							{
+								Log::Warn("Vulkan models (early preload): {}", error.what());
+							}
+							catch (...)
+							{
+							}
+						}).detach();
+				}
+				catch (...)
+				{
+				}
+			});
+	}
+
+	// Legacy fallback when a user manually copies the main DLL as .asi into plugins\.
+	// Uses EarlyLoaderCore so OptiScaler.ini FGNvngxReplacement and PE export verification apply here too.
 	std::filesystem::path FindMainDll()
 	{
 		try
 		{
 			const auto self = ThisModulePath();
-			const auto name = self.stem().wstring() + L".dll";
-			const auto custom = self.parent_path().parent_path() / L"custom";
-
-			std::error_code error;
-
-			for (const auto& entry : std::filesystem::directory_iterator(custom, error))
-			{
-				const auto candidate = entry.path() / L"dlssg" / name;
-
-				if (std::filesystem::is_regular_file(candidate, error))
-					return candidate;
-			}
+			const auto optiRoot = self.parent_path().parent_path();
+			const auto ini = EarlyLoader::ParseOptiScalerIni(optiRoot / L"OptiScaler.ini");
+			const auto selected = EarlyLoader::SelectMainDll(optiRoot, ini, self.stem().string());
+			return selected.path;
 		}
 		catch (...)
 		{
@@ -551,10 +591,11 @@ namespace
 		const auto self = ThisModulePath();
 		Log::Info("InitializeASI, {}", self.string());
 
-		// The dll itself, started by OptiScaler as a plugin or by its early copy
+		// The dll itself, started by OptiScaler as a plugin or by its early loader
 		if (!IsEarlyCopy())
 		{
 			VulkanRuntime::Start("InitializeASI");
+			StartAsyncModelPreload();
 			return;
 		}
 
@@ -564,8 +605,8 @@ namespace
 
 		if (main.empty())
 		{
-			Log::Warn("This copy of the dll is a plugin, but there is no {}.dll in custom\\<name>\\dlssg next to the plugins "
-				"folder to start", self.stem().string());
+			Log::Warn("This copy of the dll is a plugin, but there is no matching main dll in custom\\<name>\\dlssg next to the plugins "
+				"folder to start");
 			return;
 		}
 
@@ -574,6 +615,14 @@ namespace
 		if (!module)
 		{
 			Log::Error("Can't load {} ({})", main.string(), GetLastError());
+			return;
+		}
+
+		using BootstrapFn = void (*)(const char*);
+		if (const auto bootstrap = reinterpret_cast<BootstrapFn>(GetProcAddress(module, EarlyLoader::kBootstrapExportName)))
+		{
+			Log::Info("Starting {} via {}", main.string(), EarlyLoader::kBootstrapExportName);
+			bootstrap("InitializeASI (early copy)");
 			return;
 		}
 
@@ -626,6 +675,27 @@ void Plugin::Report(const Status& reported)
 // later, when the game asks for DLSS Frame Generation, which for a Vulkan game is after the device exists and too late
 // for the Vulkan hooks. So for Vulkan games this dll is also copied to OptiScaler's plugins folder renamed to .asi: that
 // copy loads the real one from custom\<name>\dlssg here, and the real one installs the hooks.
+// Dedicated handshake entry point called by dlssg_to_xefg_loader.asi before the game creates its Vulkan device.
+// Exporting this unique symbol also lets the loader identify this mod's DLL via its PE export table without running DllMain.
+extern "C" __declspec(dllexport) void XeFgEarlyBootstrap(const char* caller)
+{
+	try
+	{
+		const char* tag = (caller && *caller) ? caller : "XeFgEarlyBootstrap";
+		Log::Info("XeFgEarlyBootstrap ({}), {}", tag, ThisModulePath().string());
+		VulkanRuntime::Start(tag);
+		StartAsyncModelPreload();
+	}
+	catch (const std::exception& error)
+	{
+		Log::Error("XeFgEarlyBootstrap: {}", error.what());
+	}
+	catch (...)
+	{
+		Log::Error("XeFgEarlyBootstrap failed");
+	}
+}
+
 extern "C" __declspec(dllexport) void InitializeASI()
 {
 	try
@@ -678,6 +748,7 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* optiAp
 	Plugin::options.cameraCutDetection = api->GetBool(self, "CameraCutDetection", Plugin::options.cameraCutDetection);
 	Plugin::options.vramGuard = api->GetBool(self, "VramGuard", Plugin::options.vramGuard);
 	Plugin::options.autoVrrPacing = api->GetBool(self, "AutoVrrPacing", Plugin::options.autoVrrPacing);
+	Plugin::options.d3d12VulkanWmmaBridge = api->GetBool(self, "D3D12VulkanWmmaBridge", Plugin::options.d3d12VulkanWmmaBridge);
 
 	// Off in OptiScaler.ini, the Vulkan hooks aren't installed. Said before they are, and a copy started by
 	// InitializeASI that has installed them already only passes the game's calls on from here

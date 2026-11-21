@@ -67,11 +67,17 @@ private:
 		bool pairValid = false;
 		uint32_t batchGeneratedThrough = 0;
 		bool directOutput = false;
+		// Tracks whether cached frame/output copies were allocated with D3D12_HEAP_FLAG_SHARED for Vulkan WMMA
+		bool sharedTexturesMode = false;
 
 		// Camera Cut & Teleport Detector state (prevents smearing on sudden cuts/teleports)
 		float prevCameraPos[3]{};
 		float prevCameraFwd[3]{};
 		bool hasPrevCamera = false;
+
+		// Stall circuit breaker (dlssg-0.4.2): bypass XeFG temporarily after 3 consecutive Execute failures
+		uint32_t consecutiveExecuteFailures = 0;
+		uint32_t stallCooldownEvaluations = 0;
 
 		~Context();
 	};
@@ -87,7 +93,7 @@ private:
 	bool PollVramGuard() noexcept;
 	void CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const NGXParameter& params);
 	InterpolateResult Interpolate(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* output,
-		D3D12_RESOURCE_DESC outputDesc, uint32_t frameIndex, uint32_t frameCount);
+		D3D12_RESOURCE_DESC outputDesc, uint32_t frameIndex, uint32_t frameCount, float interpolationTime = 0.0f);
 
 	ComPtr<ID3D12Device> device;
 	Settings settings;

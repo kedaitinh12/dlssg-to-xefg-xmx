@@ -161,6 +161,7 @@ NGX_EXPORT NGXResult NVSDK_NGX_D3D12_PopulateParameters_Impl(NGXParameter* param
 	params->Set("DLSSG.GetCurrentSettingsCallback", reinterpret_cast<void*>(&GetCurrentSettingsCallback));
 	params->Set("DLSSG.EstimateVRAMCallback", reinterpret_cast<void*>(&EstimateVRAMCallback));
 	params->Set("DLSSG.MultiFrameCountMax", (int)FrameGenerator::MaxFrames);
+	params->Set("DLSSG.SupportsInterpolationTime", XeFG::SupportsInterpolationTime() ? 1 : 0);
 
 	return NGX_SUCCESS;
 }

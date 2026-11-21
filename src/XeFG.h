@@ -128,6 +128,7 @@ static_assert(offsetof(xefgd_frame_t, viewMatrix) == 120);
 static_assert(offsetof(xefgd_frame_t, jitterOffset) == 256);
 static_assert(offsetof(xefgd_frame_t, motionVectorScale) == 264);
 static_assert(offsetof(xefgd_exec_params_t, ppOutputs) == 560);
+static_assert(offsetof(xefgd_exec_params_t, pOutputBases) == 568);
 static_assert(offsetof(xefgd_exec_params_t, numInterpolatedFrames) == 576);
 static_assert(offsetof(xefgd_exec_params_t, networkScales) == 580);
 static_assert(offsetof(xefgd_exec_params_t, pDescriptorHeap) == 584);
@@ -178,8 +179,14 @@ namespace XeFG
 
 	xefgd_result_t CreateContext(ID3D12Device* device, xefgd_handle_t* context);
 	void SetLoggingCallback(xefgd_handle_t context, xefgd_logging_level_t level, xefgd_log_callback_t callback);
+	// True when libxess_fg.dll's fixed interpolation-step calculation was located and can be patched for
+	// arbitrary fractional timestamps (DLSSG.InterpolationTime / OptiScaler FlipMeter TargetFps + VRR)
+	bool SupportsInterpolationTime();
+
 	xefgd_result_t Init(xefgd_handle_t context, const xefgd_init_params_t& params);
-	// Leaves XeFG's descriptor heap bound
-	xefgd_result_t Execute(xefgd_handle_t context, ID3D12GraphicsCommandList* cmdList, const xefgd_exec_params_t& params);
+	// Leaves XeFG's descriptor heap bound. When interpolationTime is in (0, 1), overrides XeFG's fixed step
+	// so the generated frame lands at exactly t = interpolationTime between prev and next.
+	xefgd_result_t Execute(xefgd_handle_t context, ID3D12GraphicsCommandList* cmdList, const xefgd_exec_params_t& params,
+		float interpolationTime = 0.0f);
 	xefgd_result_t Destroy(xefgd_handle_t context);
 } // namespace XeFG

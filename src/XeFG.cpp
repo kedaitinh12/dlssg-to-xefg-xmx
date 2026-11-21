@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 namespace
@@ -32,7 +33,85 @@ namespace
 		// XefgSettings singleton
 		uint8_t* settings = nullptr;
 		const SettingsLayout* layout = nullptr;
+
+		// 22-byte interpolation step calculation inside XeFG::Execute (for DLSSG.InterpolationTime)
+		uint8_t* interpolationTimeSite = nullptr;
+		bool interpolationTimePatched = false;
 	} api;
+
+	struct InterpolationTimeOverride
+	{
+		const void* outputBasesKey = nullptr; // matches [r14 + 0x238] (xefgd_exec_params_t::pOutputBases)
+		float step = 0.0f;                    // interpolationTime / (firstFrameIndex + 1)
+	};
+	static_assert(offsetof(InterpolationTimeOverride, outputBasesKey) == 0);
+	static_assert(offsetof(InterpolationTimeOverride, step) == 8);
+
+	InterpolationTimeOverride gInterpTimeOverride{};
+	std::mutex gInterpTimePatchMutex;
+
+	bool PatchInterpolationTime()
+	{
+		if (api.interpolationTimePatched)
+			return true;
+
+		std::lock_guard lock(gInterpTimePatchMutex);
+		if (api.interpolationTimePatched)
+			return true;
+		if (!api.interpolationTimeSite)
+			return false;
+
+		constexpr size_t kSiteBytes = 0x16; // 22 bytes
+
+		// Trampoline replays the original 1.0f / (numInterpolatedFrames + 1) computation using an immediate 1.0f
+		// (avoiding RIP-relative displacement), then overrides xmm7 if [r14 + 0x238] matches outputBasesKey.
+		std::vector<uint8_t> tramp = {
+			0xFF, 0xC1,                         // inc ecx
+			0x0F, 0x57, 0xC0,                   // xorps xmm0, xmm0
+			0xF3, 0x48, 0x0F, 0x2A, 0xC1,       // cvtsi2ss xmm0, rcx
+			0xB8, 0x00, 0x00, 0x80, 0x3F,       // mov eax, 0x3f800000 (1.0f)
+			0x66, 0x0F, 0x6E, 0xF8,             // movd xmm7, eax
+			0xF3, 0x0F, 0x5E, 0xF8,             // divss xmm7, xmm0
+			0x48, 0xB8,                         // movabs rax, &gInterpTimeOverride
+		};
+		const auto appendU64 = [](std::vector<uint8_t>& buf, uint64_t val) {
+			const auto* bytes = reinterpret_cast<const uint8_t*>(&val);
+			buf.insert(buf.end(), bytes, bytes + sizeof(val));
+		};
+		appendU64(tramp, reinterpret_cast<uint64_t>(&gInterpTimeOverride));
+		const uint8_t tail[] = {
+			0x49, 0x8B, 0x8E, 0x38, 0x02, 0x00, 0x00, // mov rcx, [r14 + 0x238] (params.pOutputBases)
+			0x48, 0x3B, 0x08,                         // cmp rcx, [rax]
+			0x75, 0x05,                               // jne +5
+			0xF3, 0x0F, 0x10, 0x78, 0x08,             // movss xmm7, [rax + 8]
+			0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,       // jmp qword ptr [rip + 0]
+		};
+		tramp.insert(tramp.end(), std::begin(tail), std::end(tail));
+		appendU64(tramp, reinterpret_cast<uint64_t>(api.interpolationTimeSite + kSiteBytes));
+
+		void* mem = VirtualAlloc(nullptr, tramp.size(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+		if (!mem)
+			return false;
+		memcpy(mem, tramp.data(), tramp.size());
+
+		std::vector<uint8_t> detour = { 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00 };
+		appendU64(detour, reinterpret_cast<uint64_t>(mem));
+		detour.resize(kSiteBytes, 0x90);
+
+		DWORD oldProtect = 0;
+		if (!VirtualProtect(api.interpolationTimeSite, kSiteBytes, PAGE_EXECUTE_READWRITE, &oldProtect))
+		{
+			VirtualFree(mem, 0, MEM_RELEASE);
+			return false;
+		}
+		memcpy(api.interpolationTimeSite, detour.data(), detour.size());
+		VirtualProtect(api.interpolationTimeSite, kSiteBytes, oldProtect, &oldProtect);
+		FlushInstructionCache(GetCurrentProcess(), api.interpolationTimeSite, kSiteBytes);
+
+		api.interpolationTimePatched = true;
+		Log::Info("Patched XeFG's interpolation time");
+		return true;
+	}
 
 	// Offsets into the XefgSettings singleton
 	struct SettingsLayout
@@ -374,12 +453,23 @@ bool XeFG::Resolve(HMODULE module)
 		}
 	}
 
+	// Locate the 22-byte interpolation step calculation inside XeFG::Execute for DLSSG.InterpolationTime
+	// (OptiScaler FlipMeter TargetFps + VRR fractional timestamps).
+	if (auto timeHits = FindPattern(image.text,
+			"41 8B 8E 40 02 00 00 44 8B C1 89 4C 24 ?? 41 8B 86 64 02 00 00 85 C0 74 ?? "
+			"41 8B 96 60 02 00 00 89 54 24 ?? 44 8D 04 10 44 89 44 24 ?? "
+			"FF C1 0F 57 C0 F3 48 0F 2A C1 F3 0F 10 3D ?? ?? ?? ?? F3 0F 5E F8");
+		timeHits.size() == 1)
+	{
+		api.interpolationTimeSite = const_cast<uint8_t*>(timeHits[0] + 0x2d);
+	}
+
 	auto rva = [&image](const void* function)
 		{ return function ? static_cast<uint32_t>(static_cast<const uint8_t*>(function) - image.base) : 0; };
 
-	Log::Info("XeFG API ({}): create {:X}, init {:X}, execute {:X}, destroy {:X}, logging {:X}, settings {:X}",
+	Log::Info("XeFG API ({}): create {:X}, init {:X}, execute {:X}, destroy {:X}, logging {:X}, settings {:X}, time {:X}",
 		known ? "known build" : "scanned", rva(api.createContext), rva(api.init), rva(api.execute),
-		rva(api.destroy), rva(api.setLoggingCallback), rva(api.settingsInstance));
+		rva(api.destroy), rva(api.setLoggingCallback), rva(api.settingsInstance), rva(api.interpolationTimeSite));
 
 	return api.createContext && api.init && api.execute && api.destroy && api.settings;
 }
@@ -441,9 +531,19 @@ xefgd_result_t XeFG::Init(xefgd_handle_t context, const xefgd_init_params_t& par
 	return api.init(context, &params);
 }
 
+bool XeFG::SupportsInterpolationTime() { return api.interpolationTimeSite != nullptr; }
+
 xefgd_result_t XeFG::Execute(xefgd_handle_t context, ID3D12GraphicsCommandList* cmdList,
-	const xefgd_exec_params_t& params)
+	const xefgd_exec_params_t& params, float interpolationTime)
 {
+	if (interpolationTime > 0.0f && interpolationTime < 1.0f && PatchInterpolationTime())
+	{
+		gInterpTimeOverride.outputBasesKey = params.pOutputBases;
+		gInterpTimeOverride.step = interpolationTime / static_cast<float>(params.firstFrameIndex + 1);
+		const auto result = api.execute(context, cmdList, &params);
+		gInterpTimeOverride.outputBasesKey = nullptr;
+		return result;
+	}
 	return api.execute(context, cmdList, &params);
 }
 
