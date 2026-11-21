@@ -1,0 +1,74 @@
+From e2a43ce2c9a7504efa1113814def7b9009dc9846 Mon Sep 17 00:00:00 2001
+From: dlssg-to-xefg <dev@local>
+Date: Sat, 21 Nov 2026 10:51:37 +0000
+Subject: [PATCH 07/10] Harden CUDA replay cache epoch invalidation and fix
+ cuda_layer log guard
+
+---
+ src/FrameGenerator.cpp          |  1 +
+ src/MfgPort/Cuda/cuda_route.cpp | 10 +++++++++-
+ src/MfgPort/Cuda/cuda_route.h   |  2 ++
+ 3 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/src/FrameGenerator.cpp b/src/FrameGenerator.cpp
+index 6a4f974..481a9ff 100644
+--- a/src/FrameGenerator.cpp
++++ b/src/FrameGenerator.cpp
+@@ -139,6 +139,7 @@ FrameGenerator::Context::~Context()
+ 		D3D12VulkanWmma::ForgetResource(f.mvecs.Get());
+ 	}
+ 	D3D12VulkanWmma::ResetContext();
++	xefg_cuda::InvalidateCache();
+ 
+ 	if (handle)
+ 	{
+diff --git a/src/MfgPort/Cuda/cuda_route.cpp b/src/MfgPort/Cuda/cuda_route.cpp
+index 10ea6f9..4d33dd1 100644
+--- a/src/MfgPort/Cuda/cuda_route.cpp
++++ b/src/MfgPort/Cuda/cuda_route.cpp
+@@ -1210,10 +1210,12 @@ void Recognize(ID3D12Device* device, const D3D12_COMPUTE_PIPELINE_STATE_DESC& de
+             gHeld.push_back(state.Detach());
+             gAnyLayer.store(true, std::memory_order_release);
+             gLayerCount.store(uint32_t(gHeld.size()), std::memory_order_relaxed);
++            gCacheEpoch.fetch_add(1, std::memory_order_release);
+             if (!gLayerSeen[i].exchange(true) && gActive.load(std::memory_order_relaxed))
+-                gCacheEpoch.fetch_add(1, std::memory_order_release);
++            {
+                 Log("cuda_layer", std::string("\"program\":\"") + kLayers[i].info.program + "\",\"kernel\":\"" +
+                     kLayers[i].info.kernel + "\"" + (own ? ",\"source\":\"rtxmfg\"" : "") + stack);
++            }
+             return;
+         }
+     }
+@@ -1550,9 +1552,15 @@ bool Enabled() noexcept
+     return gState.load(std::memory_order_acquire) == State::Active && gActive.load(std::memory_order_acquire);
+ }
+ 
++void InvalidateCache() noexcept
++{
++    gCacheEpoch.fetch_add(1, std::memory_order_release);
++}
++
+ void ForgetLayers() noexcept
+ {
+     std::lock_guard lock(gMutex);
++    gCacheEpoch.fetch_add(1, std::memory_order_release);
+     gAnyLayer.store(false, std::memory_order_release);
+     for (auto& key : gKeys) key.store(nullptr, std::memory_order_release);
+     for (auto* state : gHeld) state->Release();
+diff --git a/src/MfgPort/Cuda/cuda_route.h b/src/MfgPort/Cuda/cuda_route.h
+index 150f3ba..e346982 100644
+--- a/src/MfgPort/Cuda/cuda_route.h
++++ b/src/MfgPort/Cuda/cuda_route.h
+@@ -65,6 +65,8 @@ void SetStackRecognition(bool enabled) noexcept;
+ // tables their originals back and release those lists. The device hooks (and a shared table of a
+ // system runtime) stay installed and pass every call through until new layers appear.
+ void ForgetLayers() noexcept;
++// Invalidate thread-local descriptor/replay caches on context teardown or recreation.
++void InvalidateCache() noexcept;
+ 
+ struct Status
+ {
+-- 
+2.39.5
+

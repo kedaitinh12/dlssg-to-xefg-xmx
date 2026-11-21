@@ -1,0 +1,262 @@
+From e85545b542dcb7445cbb7556c4b89417b5418cd3 Mon Sep 17 00:00:00 2001
+From: dlssg-to-xefg <dev@local>
+Date: Sat, 21 Nov 2026 12:23:50 +0000
+Subject: [PATCH 09/10] CI: build optimized CUDA fatbin in workflows; optimize
+ DX12 capture barriers & Vulkan/XMX compute barriers
+
+---
+ .github/workflows/build.yml   | 28 ++++++++-----
+ .github/workflows/release.yml | 31 ++++++++++++---
+ src/FrameGenerator.cpp        | 75 +++++++++++++++++++++++++++++++----
+ src/vulkan/xvk_coopmat.cpp    | 10 +++--
+ src/vulkan/xvk_tensor.cpp     |  7 ++--
+ 5 files changed, 122 insertions(+), 29 deletions(-)
+
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index d102c70..3c3e97e 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -66,19 +66,29 @@ jobs:
+         shell: pwsh
+         run: ./tools/GenerateXeFgPrograms.ps1 -Output bin\Release\xefg_mfg_programs -Cache obj\Release\packages
+ 
+-      # Optional: if a CUDA Toolkit (12.8+ / 13.x with sm_120 support) is installed on the runner, rebuild
+-      # xefg_cuda_layers.fatbin from the optimized src/MfgPort/Cuda/xefg_cuda_layers.cu AFTER GenerateXeFgPrograms.ps1
+-      # so the extracted v1.7.0 fatbin does not overwrite the newly built sm_120 fatbin.
+-      - name: Rebuild CUDA tensor-core fatbin (when CUDA Toolkit is present)
++      # Install minimal CUDA Toolkit 12.8.1 (nvcc + cudart only) so CI always builds xefg_cuda_layers.fatbin
++      # from the optimized src/MfgPort/Cuda/xefg_cuda_layers.cu (sm_75/86/89/120 + compute_86 PTX).
++      - name: Setup CUDA Toolkit (12.8.1 minimal nvcc)
++        id: cuda_setup
++        uses: Jimver/cuda-toolkit@v0.2.28
++        continue-on-error: true
++        with:
++          cuda: '12.8.1'
++          sub-packages: '["nvcc_12.8", "cudart_12.8"]'
++
++      # Rebuild xefg_cuda_layers.fatbin from the optimized src/MfgPort/Cuda/xefg_cuda_layers.cu AFTER
++      # GenerateXeFgPrograms.ps1 so the extracted fatbin does not overwrite the newly built sm_120/PTX fatbin.
++      - name: Rebuild CUDA tensor-core fatbin
+         id: cuda_rebuild
+         shell: pwsh
+         run: |
+-          if ($env:CUDA_PATH -and (Test-Path (Join-Path $env:CUDA_PATH "bin\nvcc.exe"))) {
+-            Write-Host "CUDA Toolkit found at $env:CUDA_PATH, rebuilding xefg_cuda_layers.fatbin from xefg_cuda_layers.cu..."
+-            ./tools/GenerateXeFgCuda.ps1 -Output bin\Release\xefg_mfg_programs -CudaRoot $env:CUDA_PATH -Source src\MfgPort\Cuda -AllowUnpinnedNvcc
++          $cudaRoot = if ($env:CUDA_PATH) { $env:CUDA_PATH } else { "${{ steps.cuda_setup.outputs.CUDA_PATH }}" }
++          if ($cudaRoot -and (Test-Path (Join-Path $cudaRoot "bin\nvcc.exe"))) {
++            Write-Host "CUDA Toolkit found at $cudaRoot, rebuilding xefg_cuda_layers.fatbin from xefg_cuda_layers.cu..."
++            ./tools/GenerateXeFgCuda.ps1 -Output bin\Release\xefg_mfg_programs -CudaRoot $cudaRoot -Source src\MfgPort\Cuda -AllowUnpinnedNvcc
+             "rebuilt=true" >> $env:GITHUB_OUTPUT
+           } else {
+-            Write-Host "No CUDA Toolkit on runner; keeping the extracted xefg_cuda_layers.fatbin."
++            Write-Host "CUDA Toolkit unavailable on runner; keeping the extracted xefg_cuda_layers.fatbin."
+             "rebuilt=false" >> $env:GITHUB_OUTPUT
+           }
+ 
+@@ -202,7 +212,7 @@ jobs:
+             "",
+             "- Vulkan runtime: built in, Vulkan headers VK_HEADER_VERSION ${{ steps.vulkan.outputs.version }}",
+             "- Vulkan models: $models",
+-            "- Routes built in: XMX (native), XMX Port (DP4a INT8), CUDA Tensor Cores (sm_75/86/89/120), AMD WMMA INT8 (D3D12 cs_6_6 & Vulkan VK_KHR_cooperative_matrix)",
++            "- Routes built in: XMX (native), XMX Port (DP4a INT8), CUDA Tensor Cores (sm_75/86/89/120 + compute_86 PTX, rebuilt=${{ steps.cuda_rebuild.outputs.rebuilt }}), AMD WMMA INT8 (D3D12 cs_6_6 & Vulkan VK_KHR_cooperative_matrix)",
+             "- Artifact: ``custom\XeMFG XMX\dlssg\dlssg_to_xefg_intel_is_better.dll`` with ``xefg_mfg_programs`` beside it"
+           ) -join "`n" >> $env:GITHUB_STEP_SUMMARY
+ 
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+index 77682ff..0bb1126 100644
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -38,14 +38,35 @@ jobs:
+         shell: pwsh
+         run: ./tools/GenerateXeFgPrograms.ps1 -Output bin\Release\xefg_mfg_programs -Cache obj\Release\packages
+ 
+-      - name: Rebuild CUDA tensor-core fatbin (when CUDA Toolkit is present)
++      - name: Setup CUDA Toolkit (12.8.1 minimal nvcc)
++        id: cuda_setup
++        uses: Jimver/cuda-toolkit@v0.2.28
++        continue-on-error: true
++        with:
++          cuda: '12.8.1'
++          sub-packages: '["nvcc_12.8", "cudart_12.8"]'
++
++      - name: Rebuild CUDA tensor-core fatbin
++        id: cuda_rebuild
+         shell: pwsh
+         run: |
+-          if ($env:CUDA_PATH -and (Test-Path (Join-Path $env:CUDA_PATH "bin\nvcc.exe"))) {
+-            Write-Host "CUDA Toolkit found at $env:CUDA_PATH, rebuilding xefg_cuda_layers.fatbin from xefg_cuda_layers.cu..."
+-            ./tools/GenerateXeFgCuda.ps1 -Output bin\Release\xefg_mfg_programs -CudaRoot $env:CUDA_PATH -Source src\MfgPort\Cuda -AllowUnpinnedNvcc
++          $cudaRoot = if ($env:CUDA_PATH) { $env:CUDA_PATH } else { "${{ steps.cuda_setup.outputs.CUDA_PATH }}" }
++          if ($cudaRoot -and (Test-Path (Join-Path $cudaRoot "bin\nvcc.exe"))) {
++            Write-Host "CUDA Toolkit found at $cudaRoot, rebuilding xefg_cuda_layers.fatbin from xefg_cuda_layers.cu..."
++            ./tools/GenerateXeFgCuda.ps1 -Output bin\Release\xefg_mfg_programs -CudaRoot $cudaRoot -Source src\MfgPort\Cuda -AllowUnpinnedNvcc
++            "rebuilt=true" >> $env:GITHUB_OUTPUT
+           } else {
+-            Write-Host "No CUDA Toolkit on runner; keeping the extracted xefg_cuda_layers.fatbin."
++            Write-Host "CUDA Toolkit unavailable on runner; keeping the extracted xefg_cuda_layers.fatbin."
++            "rebuilt=false" >> $env:GITHUB_OUTPUT
++          }
++
++      - name: Validate CUDA tensor-core fatbin
++        shell: pwsh
++        run: |
++          if ("${{ steps.cuda_rebuild.outputs.rebuilt }}" -eq "true") {
++            python tests/vulkan_runtime/check_layer_tables.py --fatbin bin/Release/xefg_mfg_programs/xefg_cuda_layers.fatbin --no-pin
++          } else {
++            python tests/vulkan_runtime/check_layer_tables.py --fatbin bin/Release/xefg_mfg_programs/xefg_cuda_layers.fatbin
+           }
+ 
+       - name: Build D3D12 WMMA compute shaders (DXC cs_6_6)
+diff --git a/src/FrameGenerator.cpp b/src/FrameGenerator.cpp
+index 481a9ff..035ba29 100644
+--- a/src/FrameGenerator.cpp
++++ b/src/FrameGenerator.cpp
+@@ -358,9 +358,18 @@ static bool CaptureDepth32Plane0(ID3D12Device* device, ID3D12GraphicsCommandList
+ 	return true;
+ }
+ 
+-// Copies source into copy, (re)created when the source changes, the copy is left in XeFGInputState
+-static bool Capture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* source,
+-	D3D12_RESOURCE_STATES sourceState, ComPtr<ID3D12Resource>& copy, const char* purpose, bool wantShared = false,
++struct PendingCaptureCopy
++{
++	ID3D12Resource* destination{};
++	ID3D12Resource* source{};
++	D3D12_RESOURCE_STATES sourceState{};
++};
++
++// Prepares copy texture for source (recreated on desc change) and queues a batched CopyResource instead of
++// issuing per-texture ResourceBarrier flushes (cuts 8 barriers down to 2 per real frame across CUDA/XMX/DP4a).
++static bool PrepareCapture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* source,
++	D3D12_RESOURCE_STATES sourceState, ComPtr<ID3D12Resource>& copy, const char* purpose,
++	PendingCaptureCopy* pending, UINT& pendingCount, bool wantShared = false,
+ 	bool isDepth = false, ComPtr<ID3D12Resource>* depthScratch = nullptr)
+ {
+ 	if (!source)
+@@ -413,10 +422,57 @@ static bool Capture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, ID
+ 	if (!copy)
+ 		return false;
+ 
+-	Copy(cmdList, copy.Get(), XeFGInputState, source, sourceState);
++	pending[pendingCount++] = { copy.Get(), source, sourceState };
+ 	return true;
+ }
+ 
++static void FlushCaptureCopies(ID3D12GraphicsCommandList* cmdList, const PendingCaptureCopy* pending, UINT count)
++{
++	if (!count)
++		return;
++
++	D3D12_RESOURCE_BARRIER before[8]{};
++	UINT beforeCount = 0;
++	for (UINT i = 0; i < count; ++i)
++	{
++		if (XeFGInputState != D3D12_RESOURCE_STATE_COPY_DEST)
++		{
++			before[beforeCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++			before[beforeCount].Transition = { pending[i].destination, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
++				XeFGInputState, D3D12_RESOURCE_STATE_COPY_DEST };
++			++beforeCount;
++		}
++		if (pending[i].sourceState != D3D12_RESOURCE_STATE_COPY_SOURCE)
++		{
++			// Deduplicate if the game aliases two inputs to the same resource
++			bool seen = false;
++			for (UINT j = 0; j < i; ++j)
++			{
++				if (pending[j].source == pending[i].source) { seen = true; break; }
++			}
++			if (!seen)
++			{
++				before[beforeCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++				before[beforeCount].Transition = { pending[i].source, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
++					pending[i].sourceState, D3D12_RESOURCE_STATE_COPY_SOURCE };
++				++beforeCount;
++			}
++		}
++	}
++	if (beforeCount)
++		cmdList->ResourceBarrier(beforeCount, before);
++
++	for (UINT i = 0; i < count; ++i)
++		cmdList->CopyResource(pending[i].destination, pending[i].source);
++
++	if (beforeCount)
++	{
++		for (UINT i = 0; i < beforeCount; ++i)
++			std::swap(before[i].Transition.StateBefore, before[i].Transition.StateAfter);
++		cmdList->ResourceBarrier(beforeCount, before);
++	}
++}
++
+ struct SubrectKeys
+ {
+ 	const char* baseX;
+@@ -1152,10 +1208,13 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const
+ 	auto& frame = context->frames[context->current];
+ 	auto& previous = context->frames[context->current ^ 1];
+ 
+-	bool captured = Capture(device.Get(), cmdList, backbuffer, BackbufferState, frame.backbuffer, "Backbuffer", wantShared);
+-	captured &= Capture(device.Get(), cmdList, depth, InputState, frame.depth, "Depth copy", wantShared, true, &frame.depthScratch);
+-	captured &= Capture(device.Get(), cmdList, mvecs, InputState, frame.mvecs, "MVecs copy", wantShared);
+-	Capture(device.Get(), cmdList, hudless, InputState, frame.hudless, "HUDLess copy", wantShared);
++	PendingCaptureCopy pendingCopies[4]{};
++	UINT pendingCopyCount = 0;
++	bool captured = PrepareCapture(device.Get(), cmdList, backbuffer, BackbufferState, frame.backbuffer, "Backbuffer", pendingCopies, pendingCopyCount, wantShared);
++	captured &= PrepareCapture(device.Get(), cmdList, depth, InputState, frame.depth, "Depth copy", pendingCopies, pendingCopyCount, wantShared, true, &frame.depthScratch);
++	captured &= PrepareCapture(device.Get(), cmdList, mvecs, InputState, frame.mvecs, "MVecs copy", pendingCopies, pendingCopyCount, wantShared);
++	PrepareCapture(device.Get(), cmdList, hudless, InputState, frame.hudless, "HUDLess copy", pendingCopies, pendingCopyCount, wantShared);
++	FlushCaptureCopies(cmdList, pendingCopies, pendingCopyCount);
+ 
+ 	auto& data = frame.data;
+ 	data = {};
+diff --git a/src/vulkan/xvk_coopmat.cpp b/src/vulkan/xvk_coopmat.cpp
+index 912fccf..1f634f6 100644
+--- a/src/vulkan/xvk_coopmat.cpp
++++ b/src/vulkan/xvk_coopmat.cpp
+@@ -313,7 +313,8 @@ bool CoopMatrixRoute::EnsureLayerPipeline(Device& device, uint8_t layerIdx, Pipe
+     pipelineInfo.stage = {
+         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         requireSubgroupSize32_ ? &reqSubgroup : nullptr,
+-        requireSubgroupSize32_ ? VkPipelineShaderStageCreateFlags(VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT) : 0u,
++        (requireSubgroupSize32_ || subgroupSize_ == 16u || subgroupSize_ == 32u)
++            ? VkPipelineShaderStageCreateFlags(VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT) : 0u,
+         VK_SHADER_STAGE_COMPUTE_BIT,
+         shaderModule,
+         "main",
+@@ -463,9 +464,10 @@ bool CoopMatrixRoute::TryLaunch(Device& device, VkCommandBuffer buffer, uint8_t
+         if (options_.fullBarriers)
+         {
+             VkMemoryBarrier2 memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+-            memory.srcStageMask = memory.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+-            memory.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+-            memory.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
++            memory.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
++            memory.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
++            memory.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
++            memory.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+             VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+             dependency.memoryBarrierCount = 1;
+             dependency.pMemoryBarriers = &memory;
+diff --git a/src/vulkan/xvk_tensor.cpp b/src/vulkan/xvk_tensor.cpp
+index 59659b1..28a7d59 100644
+--- a/src/vulkan/xvk_tensor.cpp
++++ b/src/vulkan/xvk_tensor.cpp
+@@ -131,9 +131,10 @@ bool TensorRoute::Launch(VkCommandBuffer buffer, uint8_t kernel, uint32_t x, uin
+     if (options_.fullBarriers)
+     {
+         VkMemoryBarrier2 memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+-        memory.srcStageMask = memory.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+-        memory.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+-        memory.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
++        memory.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
++        memory.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
++        memory.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
++        memory.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+         VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+         dependency.memoryBarrierCount = 1; dependency.pMemoryBarriers = &memory;
+         barrier_(buffer, &dependency);
+-- 
+2.39.5
+

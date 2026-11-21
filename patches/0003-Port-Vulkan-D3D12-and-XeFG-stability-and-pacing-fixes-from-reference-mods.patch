@@ -1,0 +1,509 @@
+From 3e7b15dde1a3ea253bcf81e5657a5e8afb97c006 Mon Sep 17 00:00:00 2001
+From: dlssg-to-xefg <dev@local>
+Date: Fri, 20 Nov 2026 23:10:07 +0000
+Subject: [PATCH 03/10] Port Vulkan, D3D12, and XeFG stability and pacing fixes
+ from reference mods
+
+---
+ src/FrameGenerator.cpp               |  29 +++++
+ src/FrameGenerator.h                 |   4 +
+ src/vulkan/VulkanPolicy.h            |  46 ++++++-
+ src/vulkan/VulkanRuntime.cpp         | 186 +++++++++++++++++++++++----
+ tests/vulkan_runtime/policy_test.cpp |  35 +++++
+ 5 files changed, 269 insertions(+), 31 deletions(-)
+
+diff --git a/src/FrameGenerator.cpp b/src/FrameGenerator.cpp
+index 79a03c2..c37bae6 100644
+--- a/src/FrameGenerator.cpp
++++ b/src/FrameGenerator.cpp
+@@ -1204,6 +1204,16 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const
+ 		}
+ 	}
+ 
++	// Force history reset if HUD-less presence toggles between frames (network source switch, dlssg-0.4.2 M3)
++	if (captured && previous.valid && (frame.hudless != nullptr) != (previous.hudless != nullptr))
++		reset = true;
++
++	if (reset)
++	{
++		context->consecutiveExecuteFailures = 0;
++		context->stallCooldownEvaluations = 0;
++	}
++
+ 	data.resetHistory = reset;
+ 
+ 	// XeFG needs both frames to have hudless or neither
+@@ -1219,6 +1229,12 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
+ 	if (!context || !context->pairValid)
+ 		return InterpolateResult::Skipped;
+ 
++	if (context->stallCooldownEvaluations > 0)
++	{
++		--context->stallCooldownEvaluations;
++		return InterpolateResult::Skipped;
++	}
++
+ 	const bool useVulkanWmma = UseWmma(settings.model) && D3D12VulkanWmma::Active();
+ 
+ 	// Multi-frame batch reuse (D3D12->Vulkan WMMA bridge only): when ScheduleBatch already generated 1..frameCount
+@@ -1326,7 +1342,10 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
+ 	auto result = XeFG::Execute(context->handle, cmdList, params);
+ 
+ 	if (result == XEFGD_RESULT_SUCCESS)
++	{
++		context->consecutiveExecuteFailures = 0;
+ 		return InterpolateResult::Interpolated;
++	}
+ 
+ 	if (result > 0)
+ 	{
+@@ -1337,6 +1356,12 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
+ 
+ 	Log::Error("XeFG Execute error: {}, frame {}/{}", result, frameIndex, frameCount);
+ 	context->pairValid = false;
++	if (++context->consecutiveExecuteFailures >= 3u)
++	{
++		context->stallCooldownEvaluations = 60u;
++		context->consecutiveExecuteFailures = 0;
++		Log::Warn("XeFG stalled after 3 consecutive Execute errors; bypassing interpolation for 60 evaluations");
++	}
+ 	return InterpolateResult::Failed;
+ }
+ 
+@@ -1359,7 +1384,11 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
+ 		params.GetOr<uint32_t>("DLSSG.OutputDisableInterpolation", 0) != 0)
+ 	{
+ 		if (context)
++		{
+ 			context->pairValid = false;
++			context->consecutiveExecuteFailures = 0;
++			context->stallCooldownEvaluations = 0;
++		}
+ 
+ 		Copy(cmdList, output, OutputState, backbuffer, BackbufferState);
+ 		return NGX_SUCCESS;
+diff --git a/src/FrameGenerator.h b/src/FrameGenerator.h
+index 815414d..4fa9673 100644
+--- a/src/FrameGenerator.h
++++ b/src/FrameGenerator.h
+@@ -73,6 +73,10 @@ private:
+ 		float prevCameraFwd[3]{};
+ 		bool hasPrevCamera = false;
+ 
++		// Stall circuit breaker (dlssg-0.4.2): bypass XeFG temporarily after 3 consecutive Execute failures
++		uint32_t consecutiveExecuteFailures = 0;
++		uint32_t stallCooldownEvaluations = 0;
++
+ 		~Context();
+ 	};
+ 
+diff --git a/src/vulkan/VulkanPolicy.h b/src/vulkan/VulkanPolicy.h
+index b6b9b7b..e2a290f 100644
+--- a/src/vulkan/VulkanPolicy.h
++++ b/src/vulkan/VulkanPolicy.h
+@@ -474,10 +474,18 @@ namespace VulkanPolicy
+ 		uint32_t generatedCount = 0;
+ 		uint32_t presentsInBatch = 0;
+ 		bool skipBatch = false;
++		// Adaptive GPU-Bound Burst Release hysteresis (f5low-kit DriverPacing=2 / FlipBurst=1):
++		// When sustained queue pressure lasts >= 2s, bypass CPU pacing completely until smooth headroom holds for >= 2s.
++		static constexpr uint64_t BurstEngageNs = 2'000'000'000ull;
++		static constexpr uint64_t BurstReleaseNs = 2'000'000'000ull;
++
+ 		// Auto VRR (Hz - 3) cap & Queue-Pressure Guard state
+ 		uint32_t displayRefreshHz = 0;
+ 		bool autoVrrEnabled = false;
+ 		uint32_t pressureStreak = 0;
++		bool gpuBoundBurst = false;
++		uint64_t burstEngageSinceNs = 0;
++		uint64_t burstReleaseSinceNs = 0;
+ 
+ 		void SetDisplayRefreshHz(uint32_t hz) noexcept
+ 		{
+@@ -504,6 +512,9 @@ namespace VulkanPolicy
+ 			presentsInBatch = 0;
+ 			skipBatch = false;
+ 			pressureStreak = 0;
++			gpuBoundBurst = false;
++			burstEngageSinceNs = 0;
++			burstReleaseSinceNs = 0;
+ 		}
+ 
+ 		void OnPaused() noexcept
+@@ -516,6 +527,9 @@ namespace VulkanPolicy
+ 			presentsInBatch = 0;
+ 			skipBatch = false;
+ 			pressureStreak = 0;
++			gpuBoundBurst = false;
++			burstEngageSinceNs = 0;
++			burstReleaseSinceNs = 0;
+ 		}
+ 
+ 		void OnBatchStart(uint64_t nowNs, uint32_t count) noexcept
+@@ -578,20 +592,40 @@ namespace VulkanPolicy
+ 							targetStepNs = std::min(vrrMinStepNs, MaxWaitNs);
+ 					}
+ 
+-					// Queue-Pressure Guard: detect sustained GPU/render-queue saturation and drop artificial CPU sleep
++					// Queue-Pressure Guard + Adaptive GPU-Bound Burst Release hysteresis (2s engage / 2s release)
+ 					const bool queuePressure = prevIncomplete || (emaBatchNs != 0 && delta * 100ull > emaBatchNs * 135ull);
+ 					if (queuePressure)
+ 					{
+ 						if (pressureStreak < 8u)
+ 							++pressureStreak;
++						burstReleaseSinceNs = 0;
++						if (!gpuBoundBurst)
++						{
++							if (burstEngageSinceNs == 0)
++								burstEngageSinceNs = nowNs;
++							else if (nowNs >= burstEngageSinceNs + BurstEngageNs)
++								gpuBoundBurst = true;
++						}
+ 					}
+-					else if (pressureStreak > 0u)
++					else
+ 					{
+-						--pressureStreak;
++						if (pressureStreak > 0u)
++							--pressureStreak;
++						burstEngageSinceNs = 0;
++						if (gpuBoundBurst)
++						{
++							if (burstReleaseSinceNs == 0)
++								burstReleaseSinceNs = nowNs;
++							else if (nowNs >= burstReleaseSinceNs + BurstReleaseNs)
++							{
++								gpuBoundBurst = false;
++								burstReleaseSinceNs = 0;
++							}
++						}
+ 					}
+ 
+-					// On a hitch spike or sustained queue pressure, clear stale present debt and let this batch drain
+-					if (isHitch || pressureStreak >= 2u)
++					// On a hitch spike, sustained queue pressure, or active GPU-bound burst release, drain without CPU sleep
++					if (isHitch || pressureStreak >= 2u || gpuBoundBurst)
+ 					{
+ 						lastPresentNs = 0;
+ 						skipBatch = true;
+@@ -629,6 +663,8 @@ namespace VulkanPolicy
+ 
+ 			if (skipBatch || generatedCount == 0 || targetStepNs == 0 || nowNs > activeUntilNs)
+ 			{
++				if (skipBatch && generatedCount > 0 && nowNs <= activeUntilNs)
++					++presentsInBatch;
+ 				lastPresentNs = nowNs;
+ 				return 0;
+ 			}
+diff --git a/src/vulkan/VulkanRuntime.cpp b/src/vulkan/VulkanRuntime.cpp
+index de4adde..2e0f935 100644
+--- a/src/vulkan/VulkanRuntime.cpp
++++ b/src/vulkan/VulkanRuntime.cpp
+@@ -32,6 +32,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <cmath>
+ #include <atomic>
+ #include <cstddef>
+ #include <cstring>
+@@ -197,6 +198,17 @@ namespace
+ 		std::string fault;
+ 		std::string initFault; // permanent missing-program failure for the current input configuration
+ 
++		// Reference-mod stability guards: camera cut/teleport detector, DRS/subrect shift detector,
++		// HUD-less mismatch one-shot warning, and consecutive execute-failure stall circuit breaker.
++		float prevCameraPos[3]{};
++		float prevCameraFwd[3]{};
++		bool hasPrevCamera = false;
++		std::array<uint32_t, 12> prevSubrects{};
++		bool hasPrevSubrects = false;
++		bool hudlessMismatchLogged = false;
++		uint32_t consecutiveFailures = 0;
++		uint32_t stallCooldownBatches = 0;
++
+ 		// The batch's XeFG call, kept for its later evaluations, which each record their own output. XeFG takes the same
+ 		// output array for every call of a pair
+ 		xefgd_exec_params_t exec{};
+@@ -985,14 +997,31 @@ namespace
+ 			return false;
+ 		}
+ 
+-		// XeFG's UI inputs cover the output extent. A differently sized optional
+-		// image cannot be described as the full backbuffer: ignore it this batch.
+-		auto usableUi = [&](const NgxResource* image) {
+-			return image && image->width == in.backbuffer->width && image->height == in.backbuffer->height &&
+-				image->range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT;
++		// XeFG's UI inputs must cover the output extent and use a supported color format (dlssg-0.4.2 C86/C139).
++		// If HUD-less is mismatched in size or format, fall back cleanly to UI Auto with a one-shot warning.
++		const DXGI_FORMAT bbFormat = ColorFormat(in.backbuffer);
++		auto usableUi = [&](const NgxResource* image, bool requireBbFormatMatch) {
++			if (!image)
++				return false;
++			const DXGI_FORMAT fmt = ColorFormat(image);
++			return image->width == in.backbuffer->width && image->height == in.backbuffer->height &&
++				image->range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT &&
++				fmt != DXGI_FORMAT_UNKNOWN &&
++				(!requireBbFormatMatch || fmt == bbFormat);
+ 		};
+-		if (!usableUi(in.hudless)) in.hudless = nullptr;
+-		if (!usableUi(in.ui)) in.ui = nullptr;
++		if (in.hudless && !usableUi(in.hudless, true))
++		{
++			if (!f.hudlessMismatchLogged)
++			{
++				f.hudlessMismatchLogged = true;
++				Log::Warn("Vulkan: HUD-less input ({}x{}, VkFormat {}) does not match backbuffer ({}x{}, VkFormat {}); "
++					"falling back to UI Auto", in.hudless->width, in.hudless->height,
++					static_cast<int>(in.hudless->format), in.backbuffer->width, in.backbuffer->height,
++					static_cast<int>(in.backbuffer->format));
++			}
++			in.hudless = nullptr;
++		}
++		if (!usableUi(in.ui, false)) in.ui = nullptr;
+ 
+ 		const bool inverted = parameters.GetOr<uint32_t>("DLSSG.DepthInverted", 0) != 0;
+ 		const bool jittered = parameters.GetOr<uint32_t>("DLSSG.MvecJittered", 0) != 0;
+@@ -1006,7 +1035,74 @@ namespace
+ 		if (sLastDebugLines.exchange(debugLines ? 1 : 0, std::memory_order_relaxed) != (debugLines ? 1 : 0))
+ 			XeFG::SetDebugLines(debugLines);
+ 
+-		const bool reset = parameters.GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
++		bool reset = parameters.GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
++
++		// DRS / Subrect Change Detector (dlssg-0.4.2 M3): force history reset if any active subrect changes
++		// between consecutive batches even when the game omits DLSSG.Reset.
++		const std::array<uint32_t, 12> curSubrects = {
++			parameters.GetOr<uint32_t>("DLSSG.BackbufferSubrectBaseX", 0u),
++			parameters.GetOr<uint32_t>("DLSSG.BackbufferSubrectBaseY", 0u),
++			parameters.GetOr<uint32_t>("DLSSG.BackbufferSubrectWidth", in.backbuffer->width),
++			parameters.GetOr<uint32_t>("DLSSG.BackbufferSubrectHeight", in.backbuffer->height),
++			parameters.GetOr<uint32_t>("DLSSG.DepthSubrectBaseX", 0u),
++			parameters.GetOr<uint32_t>("DLSSG.DepthSubrectBaseY", 0u),
++			parameters.GetOr<uint32_t>("DLSSG.DepthSubrectWidth", in.depth->width),
++			parameters.GetOr<uint32_t>("DLSSG.DepthSubrectHeight", in.depth->height),
++			parameters.GetOr<uint32_t>("DLSSG.MVecsSubrectBaseX", 0u),
++			parameters.GetOr<uint32_t>("DLSSG.MVecsSubrectBaseY", 0u),
++			parameters.GetOr<uint32_t>("DLSSG.MVecsSubrectWidth", in.motion->width),
++			parameters.GetOr<uint32_t>("DLSSG.MVecsSubrectHeight", in.motion->height),
++		};
++		if (f.hasPrevSubrects && curSubrects != f.prevSubrects)
++			reset = true;
++		f.prevSubrects = curSubrects;
++		f.hasPrevSubrects = true;
++
++		// Camera Cut & Teleport Detector (DLSSG-MFG v3.0.1): force history reset on sudden cuts/teleports on Vulkan too.
++		if (Plugin::options.cameraCutDetection.load(std::memory_order_relaxed))
++		{
++			auto finiteOr = [](float v, float fallback) noexcept { return std::isfinite(v) ? v : fallback; };
++			const float px = finiteOr(parameters.GetOr<float>("DLSSG.CameraPosX", 0.0f), 0.0f);
++			const float py = finiteOr(parameters.GetOr<float>("DLSSG.CameraPosY", 0.0f), 0.0f);
++			const float pz = finiteOr(parameters.GetOr<float>("DLSSG.CameraPosZ", 0.0f), 0.0f);
++			const float fx = finiteOr(parameters.GetOr<float>("DLSSG.CameraFwdX", 0.0f), 0.0f);
++			const float fy = finiteOr(parameters.GetOr<float>("DLSSG.CameraFwdY", 0.0f), 0.0f);
++			const float fz = finiteOr(parameters.GetOr<float>("DLSSG.CameraFwdZ", 0.0f), 0.0f);
++			const float fwdLenSq = fx * fx + fy * fy + fz * fz;
++			const bool hasCamera = fwdLenSq > 1e-6f;
++
++			if (hasCamera && f.hasPrevCamera && !reset)
++			{
++				const float dx = px - f.prevCameraPos[0];
++				const float dy = py - f.prevCameraPos[1];
++				const float dz = pz - f.prevCameraPos[2];
++				const float distSq = dx * dx + dy * dy + dz * dz;
++				constexpr float kCutThresholdSq = 4.5f * 4.5f;
++
++				const float prevLenSq = f.prevCameraFwd[0] * f.prevCameraFwd[0] +
++					f.prevCameraFwd[1] * f.prevCameraFwd[1] +
++					f.prevCameraFwd[2] * f.prevCameraFwd[2];
++				const float fwdDot = (prevLenSq > 1e-6f)
++					? ((fx * f.prevCameraFwd[0] + fy * f.prevCameraFwd[1] + fz * f.prevCameraFwd[2]) /
++					   std::sqrt(fwdLenSq * prevLenSq))
++					: 1.0f;
++
++				if (distSq > kCutThresholdSq || fwdDot < -0.5f)
++					reset = true;
++			}
++
++			if (hasCamera)
++			{
++				f.prevCameraPos[0] = px;
++				f.prevCameraPos[1] = py;
++				f.prevCameraPos[2] = pz;
++				f.prevCameraFwd[0] = fx;
++				f.prevCameraFwd[1] = fy;
++				f.prevCameraFwd[2] = fz;
++				f.hasPrevCamera = true;
++			}
++		}
++
+ 		Slot& slot = f.slots[f.current];
+ 
+ 		// The frame's inputs: wait for the game's prior writes before transfer/compute reads
+@@ -1047,22 +1143,26 @@ namespace
+ 		// Streamline's normalized one), carried to the depth size they are resampled to. XeFG's left handed projection is
+ 		// built from DLSS-G's near, far and field of view; DLSSG.CameraViewToClip is OptiScaler's right handed one, with
+ 		// which XeFG reconstructs depth the wrong way round
+-		const float mvecX = parameters.GetOr<float>("DLSSG.MvecScaleX", 1.0f);
+-		const float mvecY = parameters.GetOr<float>("DLSSG.MvecScaleY", 1.0f);
++		auto sanitizeFinite = [](float v, float fallback) noexcept { return std::isfinite(v) ? v : fallback; };
++		const float rawMvecX = sanitizeFinite(parameters.GetOr<float>("DLSSG.MvecScaleX", 1.0f), 1.0f);
++		const float rawMvecY = sanitizeFinite(parameters.GetOr<float>("DLSSG.MvecScaleY", 1.0f), 1.0f);
++		const float mvecX = (rawMvecX != 0.0f) ? rawMvecX : 1.0f;
++		const float mvecY = (rawMvecY != 0.0f) ? rawMvecY : 1.0f;
+ 		const auto [scaleX, scaleY] =
+ 			VulkanPolicy::MotionScale(mvecX, mvecY, motion.width, motion.height, f.depthWidth, f.depthHeight);
+ 
+-		slot.motionScaleX = scaleX;
+-		slot.motionScaleY = scaleY;
+-		slot.jitterX = parameters.GetOr<float>("DLSSG.JitterOffsetX", 0.0f);
+-		slot.jitterY = parameters.GetOr<float>("DLSSG.JitterOffsetY", 0.0f);
++		slot.motionScaleX = sanitizeFinite(scaleX, 1.0f);
++		slot.motionScaleY = sanitizeFinite(scaleY, 1.0f);
++		slot.jitterX = sanitizeFinite(parameters.GetOr<float>("DLSSG.JitterOffsetX", 0.0f), 0.0f);
++		slot.jitterY = sanitizeFinite(parameters.GetOr<float>("DLSSG.JitterOffsetY", 0.0f), 0.0f);
+ 		slot.reset = reset;
+ 
+-		const float aspect = parameters.GetOr<float>("DLSSG.CameraAspectRatio",
+-			static_cast<float>(f.width) / static_cast<float>(f.height));
+-		const float cameraNear = parameters.GetOr<float>("DLSSG.CameraNear", 0.0f);
+-		const float cameraFar = parameters.GetOr<float>("DLSSG.CameraFar", 0.0f);
+-		const float fov = parameters.GetOr<float>("DLSSG.CameraFOV", 0.0f);
++		const float defaultAspect = static_cast<float>(f.width) / static_cast<float>(f.height);
++		const float rawAspect = sanitizeFinite(parameters.GetOr<float>("DLSSG.CameraAspectRatio", defaultAspect), defaultAspect);
++		const float aspect = (rawAspect > 0.0f) ? rawAspect : defaultAspect;
++		const float cameraNear = sanitizeFinite(parameters.GetOr<float>("DLSSG.CameraNear", 0.0f), 0.0f);
++		const float cameraFar = sanitizeFinite(parameters.GetOr<float>("DLSSG.CameraFar", 0.0f), 0.0f);
++		const float fov = sanitizeFinite(parameters.GetOr<float>("DLSSG.CameraFOV", 0.0f), 0.0f);
+ 
+ 		VulkanPolicy::Projection(aspect, cameraNear, cameraFar, fov, inverted, slot.projection);
+ 
+@@ -1244,9 +1344,11 @@ namespace
+ 			recording = true;
+ 			f.evaluations++;
+ 
+-			// DLSSG.EnableInterp 0 pauses generation for this frame (a menu, a loading screen): no XeFG work and the next
+-			// batch starts without a previous frame
+-			const bool interpolate = parameters->GetOr<uint32_t>("DLSSG.EnableInterp", 1) != 0;
++			// DLSSG.EnableInterp 0 or DLSSG.OutputDisableInterpolation 1 pauses generation for this frame
++			// (menu, cutscene, loading screen): copy the real frame cleanly without invoking XeFG (dlssg-0.4.2 M1).
++			const bool disableInterp = parameters->GetOr<uint32_t>("DLSSG.OutputDisableInterpolation", 0) != 0;
++			const bool resetRequested = parameters->GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
++			const bool interpolate = parameters->GetOr<uint32_t>("DLSSG.EnableInterp", 1) != 0 && !disableInterp;
+ 			bool didExecute = false;
+ 
+ 			if (!interpolate)
+@@ -1254,16 +1356,38 @@ namespace
+ 				f.batchReady = false;
+ 				f.havePrevious = false;
+ 				f.generatedThrough = 0;
++				f.consecutiveFailures = 0;
++				f.stallCooldownBatches = 0;
+ 				f.paused++;
+ 				VulkanHost::NotifyPaused();
+ 			}
+ 			else if (VulkanPolicy::NewBatch(index, f.lastIndex, count, f.batchCount, f.batches))
+ 			{
++				if (resetRequested)
++				{
++					f.consecutiveFailures = 0;
++					f.stallCooldownBatches = 0;
++				}
++
+ 				f.batchCount = count;
+ 				f.fault.clear();
+ 				f.generatedThrough = 0;
+-				f.batchReady = GenerateBatch(d, f, command, *parameters, count,
+-					VulkanPolicy::ExecuteRange(true, index, count, false));
++
++				// Stall circuit breaker (dlssg-0.4.2): after 3 consecutive Execute failures, bypass XeFG for 60 batches
++				// and copy the real frame cleanly so the game never freezes or flickers.
++				if (f.stallCooldownBatches > 0)
++				{
++					--f.stallCooldownBatches;
++					f.batchReady = false;
++					f.havePrevious = false;
++					f.fault = "stall_cooldown";
++					VulkanHost::NotifyPaused();
++				}
++				else
++				{
++					f.batchReady = GenerateBatch(d, f, command, *parameters, count,
++						VulkanPolicy::ExecuteRange(true, index, count, false));
++				}
+ 				didExecute = f.batchReady;
+ 				f.batches++;
+ 
+@@ -1274,11 +1398,21 @@ namespace
+ 				{
+ 					f.havePrevious = false;
+ 					VulkanHost::NotifyPaused();
+-					if (++f.failures <= 16)
+-						Log::Error("Vulkan: batch failed ({}), index {}, count {}", f.fault, index, count);
++					if (f.fault != "stall_cooldown")
++					{
++						if (++f.failures <= 16)
++							Log::Error("Vulkan: batch failed ({}), index {}, count {}", f.fault, index, count);
++						if (++f.consecutiveFailures >= 3u)
++						{
++							f.stallCooldownBatches = 60u;
++							f.consecutiveFailures = 0;
++							Log::Warn("Vulkan: XeFG stalled after 3 consecutive batch failures ({}); pausing FG for 60 batches", f.fault);
++						}
++					}
+ 				}
+ 				else
+ 				{
++					f.consecutiveFailures = 0;
+ 					VulkanHost::NotifyBatchStart(count);
+ 					if (f.batches == 1 || f.batches % 6000 == 0)
+ 					{
+diff --git a/tests/vulkan_runtime/policy_test.cpp b/tests/vulkan_runtime/policy_test.cpp
+index d36f548..ca80873 100644
+--- a/tests/vulkan_runtime/policy_test.cpp
++++ b/tests/vulkan_runtime/policy_test.cpp
+@@ -437,6 +437,41 @@ int main()
+ 		pacer.OnBatchStart(200 * ms, 1);
+ 		pacer.OnBatchStart(220 * ms, 1);
+ 		CHECK(pacer.ComputePresentWaitNs(500 * ms, false) == 0);
++
++		// Adaptive GPU-Bound Burst Release hysteresis (f5low-kit DriverPacing=2 / FlipBurst=1):
++		// Sustained queue pressure for >= 2s engages gpuBoundBurst; smooth cadence for >= 2s releases it.
++		VulkanPolicy::PresentPacer burst{};
++		uint64_t bt = 1'000'000'000ull;
++		for (int i = 0; i < 4; ++i)
++		{
++			burst.OnBatchStart(bt, 2);
++			burst.ComputePresentWaitNs(bt, false);
++			burst.ComputePresentWaitNs(bt + 6 * ms, false);
++			burst.ComputePresentWaitNs(bt + 12 * ms, false);
++			bt += 20 * ms;
++		}
++		CHECK(!burst.gpuBoundBurst);
++
++		// Sustain incomplete batches (queue pressure) for > 2 seconds (110 batches * 20 ms = 2.2 s)
++		for (int i = 0; i < 110; ++i)
++		{
++			burst.OnBatchStart(bt, 2);
++			burst.ComputePresentWaitNs(bt, false); // only 1 of 3 presents completed -> prevIncomplete
++			bt += 20 * ms;
++		}
++		CHECK(burst.gpuBoundBurst);
++		CHECK(burst.ComputePresentWaitNs(bt + 100'000ull, false) == 0);
++
++		// Restore smooth complete batches for > 2 seconds (110 batches * 20 ms = 2.2 s) -> burst releases
++		for (int i = 0; i < 110; ++i)
++		{
++			burst.OnBatchStart(bt, 2);
++			burst.ComputePresentWaitNs(bt, false);
++			burst.ComputePresentWaitNs(bt + 6 * ms, false);
++			burst.ComputePresentWaitNs(bt + 12 * ms, false);
++			bt += 20 * ms;
++		}
++		CHECK(!burst.gpuBoundBurst);
+ 	}
+ 
+ 	std::printf("%d checks, %d failed\n", checks, failures);
+-- 
+2.39.5
+

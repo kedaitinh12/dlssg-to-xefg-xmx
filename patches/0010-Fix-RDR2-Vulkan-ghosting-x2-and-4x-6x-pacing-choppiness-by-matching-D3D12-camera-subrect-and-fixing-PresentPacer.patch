@@ -1,0 +1,345 @@
+From d3745443dee21c340b6a0bfda87d42f67c759e4f Mon Sep 17 00:00:00 2001
+From: dlssg-to-xefg <dev@local>
+Date: Sat, 21 Nov 2026 13:20:24 +0000
+Subject: [PATCH 10/10] Fix RDR2 Vulkan ghosting (x2+) and 4x-6x pacing
+ choppiness by matching D3D12 camera/subrect and fixing PresentPacer
+
+---
+ src/vulkan/VulkanPolicy.h            |  26 +++--
+ src/vulkan/VulkanRuntime.cpp         | 151 ++++++++++++++++++++++++---
+ tests/vulkan_runtime/policy_test.cpp |  23 ++++
+ 3 files changed, 180 insertions(+), 20 deletions(-)
+
+diff --git a/src/vulkan/VulkanPolicy.h b/src/vulkan/VulkanPolicy.h
+index e2a290f..71e7789 100644
+--- a/src/vulkan/VulkanPolicy.h
++++ b/src/vulkan/VulkanPolicy.h
+@@ -464,6 +464,7 @@ namespace VulkanPolicy
+ 
+ 		uint64_t lastBatchNs = 0;
+ 		uint64_t batchStartNs = 0;
++		uint64_t batchPresentOriginNs = 0;
+ 		uint64_t emaBatchNs = 0;
+ 		uint64_t targetStepNs = 0;
+ 		uint64_t lastPresentNs = 0;
+@@ -501,6 +502,7 @@ namespace VulkanPolicy
+ 		{
+ 			lastBatchNs = 0;
+ 			batchStartNs = 0;
++			batchPresentOriginNs = 0;
+ 			emaBatchNs = 0;
+ 			targetStepNs = 0;
+ 			lastPresentNs = 0;
+@@ -521,6 +523,7 @@ namespace VulkanPolicy
+ 		{
+ 			lastBatchNs = 0;
+ 			batchStartNs = 0;
++			batchPresentOriginNs = 0;
+ 			targetStepNs = 0;
+ 			activeUntilNs = 0;
+ 			generatedCount = 0;
+@@ -536,11 +539,13 @@ namespace VulkanPolicy
+ 		{
+ 			count = ClampCount(count);
+ 			const uint32_t prevTotal = generatedCount ? (generatedCount + 1u) : 0u;
+-			const bool prevIncomplete = lastBatchNs != 0 && targetStepNs != 0 && prevTotal != 0 && presentsInBatch < prevTotal;
++			const uint32_t prevPresents = presentsInBatch;
++			const bool prevIncomplete = lastBatchNs != 0 && targetStepNs != 0 && prevTotal != 0 && prevPresents < prevTotal;
+ 
+ 			generatedCount = count;
+ 			presentsInBatch = 0;
+ 			batchStartNs = nowNs;
++			batchPresentOriginNs = 0;
+ 			activeUntilNs = nowNs + ActiveWindowNs;
+ 			skipBatch = false;
+ 
+@@ -592,8 +597,11 @@ namespace VulkanPolicy
+ 							targetStepNs = std::min(vrrMinStepNs, MaxWaitNs);
+ 					}
+ 
+-					// Queue-Pressure Guard + Adaptive GPU-Bound Burst Release hysteresis (2s engage / 2s release)
+-					const bool queuePressure = prevIncomplete || (emaBatchNs != 0 && delta * 100ull > emaBatchNs * 135ull);
++					// Queue-Pressure Guard + Adaptive GPU-Bound Burst Release hysteresis (2s engage / 2s release):
++					// At 4x-6x MFG (prevTotal = 4..6), the render thread routinely pipelines 1-2 frames ahead of the
++					// present thread; only treat incomplete batches as queue pressure when <50% of presents completed.
++					const bool prevSevereIncomplete = prevIncomplete && (prevPresents * 2u < prevTotal);
++					const bool queuePressure = prevSevereIncomplete || (emaBatchNs != 0 && delta * 100ull > emaBatchNs * 135ull);
+ 					if (queuePressure)
+ 					{
+ 						if (pressureStreak < 8u)
+@@ -630,7 +638,7 @@ namespace VulkanPolicy
+ 						lastPresentNs = 0;
+ 						skipBatch = true;
+ 					}
+-					else if (prevIncomplete)
++					else if (prevSevereIncomplete)
+ 					{
+ 						lastPresentNs = 0;
+ 					}
+@@ -677,6 +685,8 @@ namespace VulkanPolicy
+ 			}
+ 
+ 			const uint32_t slotIndex = presentsInBatch++;
++			if (slotIndex == 0)
++				batchPresentOriginNs = nowNs;
+ 
+ 			if (lastPresentNs == 0 || nowNs <= lastPresentNs)
+ 			{
+@@ -684,11 +694,13 @@ namespace VulkanPolicy
+ 				return 0;
+ 			}
+ 
+-			// Bound every present by its batch-relative slot deadline so presents never spill into the next real frame
++			// Anchor slot deadlines to when the batch's first present actually starts (batchPresentOriginNs) rather than
++			// render-thread batchStartNs, preventing 4x-6x bursts when GPU work delays G1 relative to OnBatchStart.
+ 			uint64_t desiredNs = lastPresentNs + targetStepNs;
+-			if (batchStartNs != 0)
++			const uint64_t originNs = batchPresentOriginNs ? batchPresentOriginNs : batchStartNs;
++			if (originNs != 0 && slotIndex > 0)
+ 			{
+-				const uint64_t slotDeadlineNs = batchStartNs + (static_cast<uint64_t>(slotIndex) + 1ull) * targetStepNs;
++				const uint64_t slotDeadlineNs = originNs + static_cast<uint64_t>(slotIndex) * targetStepNs;
+ 				if (desiredNs > slotDeadlineNs)
+ 					desiredNs = slotDeadlineNs;
+ 			}
+diff --git a/src/vulkan/VulkanRuntime.cpp b/src/vulkan/VulkanRuntime.cpp
+index 2e0f935..d734b26 100644
+--- a/src/vulkan/VulkanRuntime.cpp
++++ b/src/vulkan/VulkanRuntime.cpp
+@@ -162,7 +162,12 @@ namespace
+ 		bool hasHudless = false;
+ 		bool hasUi = false;
+ 		bool reset = false;
++		float view[16]{};
+ 		float projection[16]{};
++		xefgd_2d_t bbBase{}, bbSize{};
++		xefgd_2d_t depthBase{}, depthSize{};
++		xefgd_2d_t motionBase{}, motionSize{};
++		xefgd_2d_t hudlessBase{}, hudlessSize{};
+ 		float jitterX = 0, jitterY = 0, motionScaleX = 0, motionScaleY = 0;
+ 	};
+ 
+@@ -888,32 +893,122 @@ namespace
+ 		return true;
+ 	}
+ 
+-	xefgd_resource_t Region(ID3D12Resource* resource, uint32_t width, uint32_t height)
++	xefgd_resource_t Region(ID3D12Resource* resource, uint32_t width, uint32_t height,
++		xefgd_2d_t base = {}, xefgd_2d_t size = {})
+ 	{
+ 		xefgd_resource_t out{};
+ 		out.pResource = resource;
+-		out.size = { width, height };
++		out.base = base;
++		out.size = (size.x > 0 && size.y > 0) ? size : xefgd_2d_t{ width, height };
+ 
+ 		return out;
+ 	}
+ 
++	void BuildViewMatrix(const NGXParameter& params, float out[16]) noexcept
++	{
++		auto finite = [](float v) noexcept { return std::isfinite(v) ? v : 0.0f; };
++		const float px = finite(params.GetOr<float>("DLSSG.CameraPosX", 0.0f));
++		const float py = finite(params.GetOr<float>("DLSSG.CameraPosY", 0.0f));
++		const float pz = finite(params.GetOr<float>("DLSSG.CameraPosZ", 0.0f));
++		const float rx = finite(params.GetOr<float>("DLSSG.CameraRightX", 0.0f));
++		const float ry = finite(params.GetOr<float>("DLSSG.CameraRightY", 0.0f));
++		const float rz = finite(params.GetOr<float>("DLSSG.CameraRightZ", 0.0f));
++		const float ux = finite(params.GetOr<float>("DLSSG.CameraUpX", 0.0f));
++		const float uy = finite(params.GetOr<float>("DLSSG.CameraUpY", 0.0f));
++		const float uz = finite(params.GetOr<float>("DLSSG.CameraUpZ", 0.0f));
++		const float fx = finite(params.GetOr<float>("DLSSG.CameraFwdX", 0.0f));
++		const float fy = finite(params.GetOr<float>("DLSSG.CameraFwdY", 0.0f));
++		const float fz = finite(params.GetOr<float>("DLSSG.CameraFwdZ", 0.0f));
++
++		// Match D3D12 FrameGenerator::GetViewMatrix so XeFG receives real 3D camera motion for disocclusion/reprojection;
++		// fall back to identity only when camera vectors are absent.
++		if (fx == 0.0f && fy == 0.0f && fz == 0.0f)
++		{
++			for (int i = 0; i < 16; ++i)
++				out[i] = (i % 5 == 0) ? 1.0f : 0.0f;
++			return;
++		}
++
++		const float view[16] = {
++			rx, ux, fx, 0.0f,
++			ry, uy, fy, 0.0f,
++			rz, uz, fz, 0.0f,
++			-(px * rx + py * ry + pz * rz),
++			-(px * ux + py * uy + pz * uz),
++			-(px * fx + py * fy + pz * fz),
++			1.0f
++		};
++		std::memcpy(out, view, sizeof(view));
++	}
++
++	bool CameraFromViewToClip(const NGXParameter& params, float& cameraNear, float& cameraFar, float& fov) noexcept
++	{
++		float(*viewToClip)[4] = nullptr;
++		params.Get("DLSSG.CameraViewToClip", reinterpret_cast<void**>(&viewToClip));
++		if (params.GetOr<uint32_t>("DLSSG.OrthoProjection", 0) || !viewToClip)
++			return false;
++
++		float m[4][4] = {};
++		if (std::memcmp(viewToClip, m, sizeof(m)) == 0)
++			return false;
++		m[0][0] = m[1][1] = m[2][2] = m[3][3] = 1.0f;
++		if (std::memcmp(viewToClip, m, sizeof(m)) == 0)
++			return false;
++
++		const double b = viewToClip[1][1];
++		const double c = viewToClip[2][2];
++		const double d = viewToClip[3][2];
++		const double e = viewToClip[2][3];
++		if (!std::isfinite(b) || !std::isfinite(c) || !std::isfinite(d) || !std::isfinite(e) || b == 0.0)
++			return false;
++
++		const double sign = (e < 0.0) ? -1.0 : 1.0;
++		const double nearDist = (c != 0.0) ? (-d / c) : 0.0;
++		const double farDist = ((c - sign) != 0.0) ? (-d / (c - sign)) : 0.0;
++		const double computedFov = 2.0 * std::atan(1.0 / std::abs(b));
++		if (!std::isfinite(computedFov) || computedFov <= 0.0001 || computedFov >= 3.13)
++			return false;
++
++		const float n = static_cast<float>(std::abs(nearDist));
++		const float f = static_cast<float>(std::abs(farDist));
++		if (!std::isfinite(n) || n <= 0.0f)
++			return false;
++		cameraNear = n;
++		cameraFar = (std::isfinite(f) && f > 0.0f) ? f : 10000.0f;
++		fov = static_cast<float>(computedFov);
++		return true;
++	}
++
++	void ReadClampedSubrect(const NGXParameter& params, const char* baseXKey, const char* baseYKey,
++		const char* widthKey, const char* heightKey, uint32_t maxW, uint32_t maxH,
++		xefgd_2d_t& outBase, xefgd_2d_t& outSize) noexcept
++	{
++		uint32_t bx = params.GetOr<uint32_t>(baseXKey, 0u);
++		uint32_t by = params.GetOr<uint32_t>(baseYKey, 0u);
++		uint32_t w = params.GetOr<uint32_t>(widthKey, 0u);
++		uint32_t h = params.GetOr<uint32_t>(heightKey, 0u);
++		if (bx >= maxW) bx = 0;
++		if (by >= maxH) by = 0;
++		if (w == 0 || bx + w > maxW) w = maxW - bx;
++		if (h == 0 || by + h > maxH) h = maxH - by;
++		outBase = { bx, by };
++		outSize = { w, h };
++	}
++
+ 	void DescribeFrame(const Feature& f, const Slot& slot, xefgd_frame_t& frame)
+ 	{
+ 		frame = {};
+-		frame.backBuffer = Region(slot.backbuffer.Get(), f.width, f.height);
+-		frame.depth = Region(slot.depth.Get(), f.depthWidth, f.depthHeight);
+-		frame.motionVectors = Region(slot.motion.Get(), f.depthWidth, f.depthHeight);
++		frame.backBuffer = Region(slot.backbuffer.Get(), f.width, f.height, slot.bbBase, slot.bbSize);
++		frame.depth = Region(slot.depth.Get(), f.depthWidth, f.depthHeight, slot.depthBase, slot.depthSize);
++		frame.motionVectors = Region(slot.motion.Get(), f.depthWidth, f.depthHeight, slot.motionBase, slot.motionSize);
+ 
+ 		if (slot.hasHudless)
+-			frame.hudlessColor = Region(slot.hudless.Get(), f.width, f.height);
++			frame.hudlessColor = Region(slot.hudless.Get(), f.width, f.height, slot.hudlessBase, slot.hudlessSize);
+ 
+ 		if (slot.hasUi)
+ 			frame.uiTexture = Region(slot.ui.Get(), f.width, f.height);
+ 
+-		// Identity: no camera matrices are given, which also keeps XeFG's scene change detection on
+-		for (int i = 0; i < 16; ++i)
+-			frame.viewMatrix[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+-
++		std::memcpy(frame.viewMatrix, slot.view, sizeof(frame.viewMatrix));
+ 		std::memcpy(frame.projectionMatrix, slot.projection, sizeof(frame.projectionMatrix));
+ 
+ 		frame.outputResolution[0] = static_cast<float>(f.width);
+@@ -1157,12 +1252,39 @@ namespace
+ 		slot.jitterY = sanitizeFinite(parameters.GetOr<float>("DLSSG.JitterOffsetY", 0.0f), 0.0f);
+ 		slot.reset = reset;
+ 
++		BuildViewMatrix(parameters, slot.view);
++		ReadClampedSubrect(parameters, "DLSSG.BackbufferSubrectBaseX", "DLSSG.BackbufferSubrectBaseY",
++			"DLSSG.BackbufferSubrectWidth", "DLSSG.BackbufferSubrectHeight", f.width, f.height, slot.bbBase, slot.bbSize);
++		ReadClampedSubrect(parameters, "DLSSG.DepthSubrectBaseX", "DLSSG.DepthSubrectBaseY",
++			"DLSSG.DepthSubrectWidth", "DLSSG.DepthSubrectHeight", f.depthWidth, f.depthHeight, slot.depthBase, slot.depthSize);
++		// Motion vectors are resampled into f.depthWidth x f.depthHeight; scale motion subrect proportionally if present.
++		ReadClampedSubrect(parameters, "DLSSG.MVecsSubrectBaseX", "DLSSG.MVecsSubrectBaseY",
++			"DLSSG.MVecsSubrectWidth", "DLSSG.MVecsSubrectHeight", motion.width, motion.height, slot.motionBase, slot.motionSize);
++		if (motion.width != f.depthWidth || motion.height != f.depthHeight)
++		{
++			slot.motionBase = { static_cast<uint32_t>((uint64_t(slot.motionBase.x) * f.depthWidth) / std::max(motion.width, 1u)),
++				static_cast<uint32_t>((uint64_t(slot.motionBase.y) * f.depthHeight) / std::max(motion.height, 1u)) };
++			slot.motionSize = { static_cast<uint32_t>((uint64_t(slot.motionSize.x) * f.depthWidth) / std::max(motion.width, 1u)),
++				static_cast<uint32_t>((uint64_t(slot.motionSize.y) * f.depthHeight) / std::max(motion.height, 1u)) };
++			if (slot.motionBase.x >= f.depthWidth) slot.motionBase.x = 0;
++			if (slot.motionBase.y >= f.depthHeight) slot.motionBase.y = 0;
++			if (slot.motionSize.x == 0 || slot.motionBase.x + slot.motionSize.x > f.depthWidth) slot.motionSize.x = f.depthWidth - slot.motionBase.x;
++			if (slot.motionSize.y == 0 || slot.motionBase.y + slot.motionSize.y > f.depthHeight) slot.motionSize.y = f.depthHeight - slot.motionBase.y;
++		}
++		if (slot.hasHudless)
++		{
++			ReadClampedSubrect(parameters, "DLSSG.HUDLessSubrectBaseX", "DLSSG.HUDLessSubrectBaseY",
++				"DLSSG.HUDLessSubrectWidth", "DLSSG.HUDLessSubrectHeight", f.width, f.height, slot.hudlessBase, slot.hudlessSize);
++		}
++
+ 		const float defaultAspect = static_cast<float>(f.width) / static_cast<float>(f.height);
+ 		const float rawAspect = sanitizeFinite(parameters.GetOr<float>("DLSSG.CameraAspectRatio", defaultAspect), defaultAspect);
+ 		const float aspect = (rawAspect > 0.0f) ? rawAspect : defaultAspect;
+-		const float cameraNear = sanitizeFinite(parameters.GetOr<float>("DLSSG.CameraNear", 0.0f), 0.0f);
+-		const float cameraFar = sanitizeFinite(parameters.GetOr<float>("DLSSG.CameraFar", 0.0f), 0.0f);
+-		const float fov = sanitizeFinite(parameters.GetOr<float>("DLSSG.CameraFOV", 0.0f), 0.0f);
++		float cameraNear = sanitizeFinite(parameters.GetOr<float>("DLSSG.CameraNear", 0.0f), 0.0f);
++		float cameraFar = sanitizeFinite(parameters.GetOr<float>("DLSSG.CameraFar", 0.0f), 0.0f);
++		float fov = sanitizeFinite(parameters.GetOr<float>("DLSSG.CameraFOV", 0.0f), 0.0f);
++		if (cameraNear <= 0.0f || cameraFar <= 0.0f || fov <= 0.0001f)
++			CameraFromViewToClip(parameters, cameraNear, cameraFar, fov);
+ 
+ 		VulkanPolicy::Projection(aspect, cameraNear, cameraFar, fov, inverted, slot.projection);
+ 
+@@ -1189,7 +1311,10 @@ namespace
+ 		f.execBases = {};
+ 
+ 		for (uint32_t i = 0; i < count; ++i)
++		{
+ 			f.execOutputs[i] = f.outputs[i].Get();
++			f.execBases[i] = slot.bbBase;
++		}
+ 
+ 		f.exec.ppOutputs = f.execOutputs.data();
+ 		f.exec.pOutputBases = f.execBases.data();
+diff --git a/tests/vulkan_runtime/policy_test.cpp b/tests/vulkan_runtime/policy_test.cpp
+index ca80873..14d87c9 100644
+--- a/tests/vulkan_runtime/policy_test.cpp
++++ b/tests/vulkan_runtime/policy_test.cpp
+@@ -472,6 +472,29 @@ int main()
+ 			bt += 20 * ms;
+ 		}
+ 		CHECK(!burst.gpuBoundBurst);
++
++		// RDR2 Vulkan 6x MFG (5 generated + 1 real = 6 frames) pipelined pacing regression:
++		// Render thread starts the next batch while 1 present of the previous batch is still in flight (5/6 done)
++		// and G1 arrives 6 ms after OnBatchStart. Pacer must NOT falsely trip gpuBoundBurst and must space G2..G5 evenly.
++		VulkanPolicy::PresentPacer mfg6{};
++		uint64_t mt = 2'000'000'000ull;
++		for (int i = 0; i < 120; ++i)
++		{
++			mfg6.OnBatchStart(mt, 5);
++			uint64_t p0 = mt + 6 * ms; // G1 arrives 6 ms after render-thread OnBatchStart
++			(void)mfg6.ComputePresentWaitNs(p0, false);
++			uint64_t cur = p0;
++			for (int g = 1; g < 5; ++g) // 5 of 6 presents complete before next OnBatchStart (normal pipelining)
++			{
++				const uint64_t w = mfg6.ComputePresentWaitNs(cur + 200'000ull, false);
++				if (i >= 5)
++					CHECK(w > 2'000'000ull); // must pace smoothly (~3.5-4.3 ms), never burst at 0
++				cur += 200'000ull + w;
++			}
++			mt += 26 * ms; // ~38.5 base FPS -> ~230 FPS at 6x MFG
++		}
++		CHECK(!mfg6.gpuBoundBurst);
++		CHECK(!mfg6.skipBatch);
+ 	}
+ 
+ 	std::printf("%d checks, %d failed\n", checks, failures);
+-- 
+2.39.5
+

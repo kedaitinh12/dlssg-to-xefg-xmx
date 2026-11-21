@@ -1,0 +1,282 @@
+From 1f1295c51bd6f2b11806aeaee3d8c5fd067c0aff Mon Sep 17 00:00:00 2001
+From: dlssg-to-xefg <dev@local>
+Date: Sat, 21 Nov 2026 09:54:44 +0000
+Subject: [PATCH 05/10] Restore XMX Port FPS and fix UE5 depth sharing for
+ Vulkan WMMA
+
+1. Scope D3D12_HEAP_FLAG_SHARED and CaptureDepth32Plane0 strictly to active WMMA mode (with clean texture reallocation on XMX<->WMMA switch) so XMX Port keeps full RDNA DCC compression and zero extra depth scratch copies.
+
+2. Early-out in wmma_route HookReset/HookSetPipelineState/HookDispatch when WMMA is inactive to eliminate per-PSO CPU lookup overhead during XMX Port.
+
+3. Sanitize srcDesc/dstDesc alignment and flags and check UINT64_MAX sentinel in CaptureDepth32Plane0 so UE5 R32G8X24_TYPELESS depth buffers share cleanly into Vulkan VK_KHR_cooperative_matrix.
+---
+ src/FrameGenerator.cpp          | 83 +++++++++++++++++++++++++--------
+ src/FrameGenerator.h            |  2 +
+ src/MfgPort/Wmma/wmma_route.cpp | 43 +++++++++++------
+ 3 files changed, 94 insertions(+), 34 deletions(-)
+
+diff --git a/src/FrameGenerator.cpp b/src/FrameGenerator.cpp
+index c37bae6..93c8d64 100644
+--- a/src/FrameGenerator.cpp
++++ b/src/FrameGenerator.cpp
+@@ -164,16 +164,20 @@ static void XeFGLogCallback(const char* message, xefgd_logging_level_t level, vo
+ }
+ 
+ static ComPtr<ID3D12Resource> CreateTexture(ID3D12Device* device, D3D12_RESOURCE_DESC desc,
+-	D3D12_RESOURCE_STATES state, const wchar_t* name, const char* purpose)
++	D3D12_RESOURCE_STATES state, const wchar_t* name, const char* purpose, bool wantShared = false)
+ {
+ 	ComPtr<ID3D12Resource> texture;
+ 	D3D12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
+ 
+-	const bool tryShared = D3D12VulkanWmma::WantsSharedTextures() && D3D12VulkanWmma::CanShareTexture(desc);
++	const bool tryShared = wantShared && D3D12VulkanWmma::CanShareTexture(desc);
+ 	HRESULT hr = E_FAIL;
+ 	if (tryShared)
+-		hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc, state, nullptr,
++	{
++		D3D12_RESOURCE_DESC sharedDesc = desc;
++		sharedDesc.Alignment = 0;
++		hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &sharedDesc, state, nullptr,
+ 			IID_PPV_ARGS(&texture));
++	}
+ 	if (FAILED(hr))
+ 		hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
+ 			IID_PPV_ARGS(&texture));
+@@ -221,13 +225,16 @@ static bool IsDepth32StencilFormat(DXGI_FORMAT fmt) noexcept
+ static bool CaptureDepth32Plane0(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* source,
+ 	D3D12_RESOURCE_STATES sourceState, ComPtr<ID3D12Resource>& copy, ComPtr<ID3D12Resource>& scratch, const char* purpose)
+ {
+-	const D3D12_RESOURCE_DESC srcDesc = source->GetDesc();
++	const D3D12_RESOURCE_DESC rawSrcDesc = source->GetDesc();
++	D3D12_RESOURCE_DESC srcDesc = rawSrcDesc;
++	srcDesc.Alignment = 0;
++	srcDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
++	srcDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++	srcDesc.MipLevels = 1;
++	srcDesc.DepthOrArraySize = 1;
++
+ 	D3D12_RESOURCE_DESC dstDesc = srcDesc;
+ 	dstDesc.Format = DXGI_FORMAT_R32_FLOAT;
+-	dstDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+-	dstDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+-	dstDesc.MipLevels = 1;
+-	dstDesc.DepthOrArraySize = 1;
+ 
+ 	D3D12_PLACED_SUBRESOURCE_FOOTPRINT srcFootprint{};
+ 	UINT64 srcBytes = 0;
+@@ -237,8 +244,17 @@ static bool CaptureDepth32Plane0(ID3D12Device* device, ID3D12GraphicsCommandList
+ 	UINT64 dstBytes = 0;
+ 	device->GetCopyableFootprints(&dstDesc, 0, 1, 0, &dstFootprint, nullptr, nullptr, &dstBytes);
+ 
+-	if (!srcBytes || !dstBytes || srcFootprint.Footprint.RowPitch != dstFootprint.Footprint.RowPitch)
++	if (srcBytes == 0 || srcBytes == UINT64_MAX || dstBytes == 0 || dstBytes == UINT64_MAX ||
++		srcFootprint.Footprint.RowPitch != dstFootprint.Footprint.RowPitch)
++	{
++		static std::atomic<bool> logged{ false };
++		if (!logged.exchange(true, std::memory_order_relaxed))
++			Log::Warn("CaptureDepth32Plane0 skipped (srcFmt={}, srcFpFmt={}, srcPitch={}, dstPitch={}, srcBytes={}, dstBytes={}, {}x{})",
++				static_cast<uint32_t>(rawSrcDesc.Format), static_cast<uint32_t>(srcFootprint.Footprint.Format),
++				srcFootprint.Footprint.RowPitch, dstFootprint.Footprint.RowPitch, srcBytes, dstBytes,
++				static_cast<uint64_t>(rawSrcDesc.Width), rawSrcDesc.Height);
+ 		return false;
++	}
+ 
+ 	const UINT64 bufBytes = std::max(srcBytes, dstBytes);
+ 	if (scratch && scratch->GetDesc().Width < bufBytes)
+@@ -276,7 +292,7 @@ static bool CaptureDepth32Plane0(ID3D12Device* device, ID3D12GraphicsCommandList
+ 		}
+ 	}
+ 	if (!copy)
+-		copy = CreateTexture(device, dstDesc, XeFGInputState, L"dlssg-to-xefg depth plane0 copy", purpose);
++		copy = CreateTexture(device, dstDesc, XeFGInputState, L"dlssg-to-xefg depth plane0 copy", purpose, true);
+ 	if (!copy)
+ 		return false;
+ 
+@@ -343,8 +359,8 @@ static bool CaptureDepth32Plane0(ID3D12Device* device, ID3D12GraphicsCommandList
+ 
+ // Copies source into copy, (re)created when the source changes, the copy is left in XeFGInputState
+ static bool Capture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* source,
+-	D3D12_RESOURCE_STATES sourceState, ComPtr<ID3D12Resource>& copy, const char* purpose, bool isDepth = false,
+-	ComPtr<ID3D12Resource>* depthScratch = nullptr)
++	D3D12_RESOURCE_STATES sourceState, ComPtr<ID3D12Resource>& copy, const char* purpose, bool wantShared = false,
++	bool isDepth = false, ComPtr<ID3D12Resource>* depthScratch = nullptr)
+ {
+ 	if (!source)
+ 	{
+@@ -355,8 +371,8 @@ static bool Capture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, ID
+ 	auto desc = source->GetDesc();
+ 
+ 	// On Unreal Engine 5 / REDengine 4 DX12 games, depth is typically D32_FLOAT_S8X24 / R32G8X24_TYPELESS.
+-	// Extract plane 0 into a shared R32_FLOAT texture so D3D12->Vulkan hardware WMMA bridge can import it.
+-	if (isDepth && depthScratch && D3D12VulkanWmma::WantsSharedTextures() &&
++	// Extract plane 0 into a shared R32_FLOAT texture only when the D3D12->Vulkan hardware WMMA bridge is active.
++	if (wantShared && isDepth && depthScratch &&
+ 		desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.SampleDesc.Count == 1 &&
+ 		IsDepth32StencilFormat(desc.Format))
+ 	{
+@@ -391,7 +407,7 @@ static bool Capture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, ID
+ 	}
+ 
+ 	if (!copy)
+-		copy = CreateTexture(device, desc, XeFGInputState, L"dlssg-to-xefg input copy", purpose);
++		copy = CreateTexture(device, desc, XeFGInputState, L"dlssg-to-xefg input copy", purpose, wantShared);
+ 
+ 	if (!copy)
+ 		return false;
+@@ -855,6 +871,7 @@ bool FrameGenerator::CreateContext()
+ 		return false;
+ 	}
+ 
++	newContext->sharedTexturesMode = UseWmma(settings.model) && D3D12VulkanWmma::WantsSharedTextures();
+ 	context = std::move(newContext);
+ 
+ 	// Warm up the Vulkan WMMA bridge context asynchronously on a background thread so CreateContext
+@@ -1104,14 +1121,40 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const
+ 		routeReported = false;
+ 	}
+ 
++	const bool wantShared = UseWmma(settings.model) && D3D12VulkanWmma::WantsSharedTextures();
++	if (context->sharedTexturesMode != wantShared)
++	{
++		auto releaseTex = [](ComPtr<ID3D12Resource>& res) {
++			if (res)
++			{
++				D3D12VulkanWmma::ForgetResource(res.Get());
++				DeferredDestroy::Add(std::make_shared<ComPtr<ID3D12Resource>>(std::move(res)));
++			}
++		};
++		for (auto& out : context->outputs)
++			releaseTex(out);
++		for (auto& f : context->frames)
++		{
++			releaseTex(f.backbuffer);
++			releaseTex(f.hudless);
++			releaseTex(f.depth);
++			releaseTex(f.depthScratch);
++			releaseTex(f.mvecs);
++			f.valid = false;
++		}
++		context->pairValid = false;
++		context->batchGeneratedThrough = 0;
++		context->sharedTexturesMode = wantShared;
++	}
++
+ 	context->current ^= 1;
+ 	auto& frame = context->frames[context->current];
+ 	auto& previous = context->frames[context->current ^ 1];
+ 
+-	bool captured = Capture(device.Get(), cmdList, backbuffer, BackbufferState, frame.backbuffer, "Backbuffer");
+-	captured &= Capture(device.Get(), cmdList, depth, InputState, frame.depth, "Depth copy", true, &frame.depthScratch);
+-	captured &= Capture(device.Get(), cmdList, mvecs, InputState, frame.mvecs, "MVecs copy");
+-	Capture(device.Get(), cmdList, hudless, InputState, frame.hudless, "HUDLess copy");
++	bool captured = Capture(device.Get(), cmdList, backbuffer, BackbufferState, frame.backbuffer, "Backbuffer", wantShared);
++	captured &= Capture(device.Get(), cmdList, depth, InputState, frame.depth, "Depth copy", wantShared, true, &frame.depthScratch);
++	captured &= Capture(device.Get(), cmdList, mvecs, InputState, frame.mvecs, "MVecs copy", wantShared);
++	Capture(device.Get(), cmdList, hudless, InputState, frame.hudless, "HUDLess copy", wantShared);
+ 
+ 	auto& data = frame.data;
+ 	data = {};
+@@ -1275,7 +1318,7 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
+ 		{
+ 			if (!context->outputs[i])
+ 				context->outputs[i] = CreateTexture(device.Get(), outputDesc, OutputState, L"dlssg-to-xefg output",
+-					"XeFG output");
++					"XeFG output", useVulkanWmma);
+ 
+ 			if (!context->outputs[i])
+ 				return InterpolateResult::Failed;
+diff --git a/src/FrameGenerator.h b/src/FrameGenerator.h
+index 4fa9673..335d777 100644
+--- a/src/FrameGenerator.h
++++ b/src/FrameGenerator.h
+@@ -67,6 +67,8 @@ private:
+ 		bool pairValid = false;
+ 		uint32_t batchGeneratedThrough = 0;
+ 		bool directOutput = false;
++		// Tracks whether cached frame/output copies were allocated with D3D12_HEAP_FLAG_SHARED for Vulkan WMMA
++		bool sharedTexturesMode = false;
+ 
+ 		// Camera Cut & Teleport Detector state (prevents smearing on sudden cuts/teleports)
+ 		float prevCameraPos[3]{};
+diff --git a/src/MfgPort/Wmma/wmma_route.cpp b/src/MfgPort/Wmma/wmma_route.cpp
+index 3d7ace4..53154b3 100644
+--- a/src/MfgPort/Wmma/wmma_route.cpp
++++ b/src/MfgPort/Wmma/wmma_route.cpp
+@@ -448,28 +448,40 @@ using CreateList1Fn = HRESULT (STDMETHODCALLTYPE*)(ID3D12Device4*, UINT, D3D12_C
+ HRESULT STDMETHODCALLTYPE HookReset(ID3D12GraphicsCommandList* self, ID3D12CommandAllocator* allocator, ID3D12PipelineState* initial)
+ {
+     const HRESULT result = ListOriginal<ResetFn>(self, kReset)(self, allocator, initial);
+-    auto& r = tRecording;
+-    InitRecording(r, self);
+-    if (SUCCEEDED(result))
++    if (gActive.load(std::memory_order_relaxed))
+     {
+-        r.lastState = initial;
+-        r.layer = Lookup(initial, r.wmmaPso);
+-        if (r.layer)
+-            gBinds.fetch_add(1, std::memory_order_relaxed);
++        auto& r = tRecording;
++        InitRecording(r, self);
++        if (SUCCEEDED(result))
++        {
++            r.lastState = initial;
++            r.layer = Lookup(initial, r.wmmaPso);
++            if (r.layer)
++                gBinds.fetch_add(1, std::memory_order_relaxed);
++        }
++    }
++    else if (tRecording.list == self)
++    {
++        tRecording.layer = 0;
++        tRecording.wmmaPso = nullptr;
++        tRecording.lastState = nullptr;
+     }
+     return result;
+ }
+ 
+ void STDMETHODCALLTYPE HookSetPipelineState(ID3D12GraphicsCommandList* self, ID3D12PipelineState* state)
+ {
+-    auto& r = Track(self);
+-    if (r.lastState != state || !state)
++    if (gActive.load(std::memory_order_relaxed))
+     {
+-        r.lastState = state;
+-        r.layer = Lookup(state, r.wmmaPso);
++        auto& r = Track(self);
++        if (r.lastState != state || !state)
++        {
++            r.lastState = state;
++            r.layer = Lookup(state, r.wmmaPso);
++        }
++        if (r.layer)
++            gBinds.fetch_add(1, std::memory_order_relaxed);
+     }
+-    if (r.layer)
+-        gBinds.fetch_add(1, std::memory_order_relaxed);
+     ListOriginal<SetPipelineStateFn>(self, kSetPipelineState)(self, state);
+ }
+ 
+@@ -494,8 +506,10 @@ void Fallback(Reason reason, const char* text, const xefg_cuda::Layer& layer) no
+ 
+ void STDMETHODCALLTYPE HookDispatch(ID3D12GraphicsCommandList* self, UINT x, UINT y, UINT z)
+ {
++    if (gActive.load(std::memory_order_acquire))
++    {
+     auto& r = tRecording;
+-    if (r.list == self && r.layer && r.table == *reinterpret_cast<void***>(self) && gActive.load(std::memory_order_acquire))
++    if (r.list == self && r.layer && r.table == *reinterpret_cast<void***>(self))
+     {
+         if ((r.tableRecord && r.tableRecord->complete.load(std::memory_order_acquire)) || (!r.tableRecord && r.tableHooked))
+         {
+@@ -524,6 +538,7 @@ void STDMETHODCALLTYPE HookDispatch(ID3D12GraphicsCommandList* self, UINT x, UIN
+             }
+         }
+     }
++    }
+     ListOriginal<DispatchFn>(self, kDispatch)(self, x, y, z);
+ }
+ 
+-- 
+2.39.5
+
