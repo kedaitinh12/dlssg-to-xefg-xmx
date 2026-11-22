@@ -495,6 +495,49 @@ int main()
 		}
 		CHECK(!mfg6.gpuBoundBurst);
 		CHECK(!mfg6.skipBatch);
+
+		// Post-Hitch Median Window Protection: back-to-back hitch spikes must not pollute recentDeltas or inflate emaBatchNs
+		VulkanPolicy::PresentPacer hp{};
+		uint64_t ht = 3'000'000'000ull;
+		for (int i = 0; i < 6; ++i)
+		{
+			hp.OnBatchStart(ht, 2);
+			ht += 16 * ms;
+		}
+		const uint64_t steadyEma = hp.emaBatchNs;
+		// Two consecutive 45 ms hitches (> 130% of 16 ms)
+		hp.OnBatchStart(ht + 29 * ms, 2); ht += 45 * ms;
+		CHECK(hp.skipBatch);
+		hp.OnBatchStart(ht, 2); ht += 45 * ms;
+		CHECK(hp.skipBatch);
+		// Returning to steady 16 ms must stay at steadyEma (not dragged upward by hitch spikes)
+		hp.OnBatchStart(ht, 2); ht += 16 * ms;
+		hp.OnBatchStart(ht, 2); ht += 16 * ms;
+		CHECK(hp.emaBatchNs == steadyEma);
+
+		// Selective X3+ Source Cadence Alternation Smoothing: stays off on steady X3+ and on X2,
+		// engages on persistent short/long alternation at X3+ (<= +4% budget), and relaxes when steady.
+		VulkanPolicy::PresentPacer alt{};
+		uint64_t at = 4'000'000'000ull;
+		for (int i = 0; i < 6; ++i) { alt.OnBatchStart(at, 2); at += 16 * ms; }
+		CHECK(!alt.alternationActive);
+		// Persistent 14 ms / 19 ms alternation (> 15% swing, < 30% hitch threshold)
+		for (int i = 0; i < 8; ++i)
+		{
+			alt.OnBatchStart(at, 2);
+			at += (i % 2 == 0 ? 14 : 19) * ms;
+		}
+		CHECK(alt.alternationActive);
+		const uint64_t maxAllowedStep = ((alt.emaBatchNs * 104ull / 100ull) * 92ull) / (3ull * 100ull);
+		CHECK(alt.targetStepNs <= maxAllowedStep);
+		// Steady frames disengage alternation automatically
+		for (int i = 0; i < 10; ++i) { alt.OnBatchStart(at, 2); at += 16 * ms; }
+		CHECK(!alt.alternationActive);
+		// X2 (count == 1) must never engage alternation smoothing
+		VulkanPolicy::PresentPacer alt2{};
+		uint64_t a2 = 5'000'000'000ull;
+		for (int i = 0; i < 10; ++i) { alt2.OnBatchStart(a2, 1); a2 += (i % 2 == 0 ? 13 : 20) * ms; }
+		CHECK(!alt2.alternationActive);
 	}
 
 	// ---- Vulkan MFG swapchain image count policy (6 -> 8 double-buffered 4x MFG)
