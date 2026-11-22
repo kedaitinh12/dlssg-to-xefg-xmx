@@ -245,8 +245,21 @@ static bool CaptureDepth32Plane0(ID3D12Device* device, ID3D12GraphicsCommandList
 	UINT64 dstBytes = 0;
 	device->GetCopyableFootprints(&dstDesc, 0, 1, 0, &dstFootprint, nullptr, nullptr, &dstBytes);
 
+	const bool validPlane0Fmt =
+		srcFootprint.Footprint.Format == DXGI_FORMAT_R32_TYPELESS ||
+		srcFootprint.Footprint.Format == DXGI_FORMAT_R32_FLOAT ||
+		srcFootprint.Footprint.Format == DXGI_FORMAT_D32_FLOAT;
+	const bool sameDims =
+		srcFootprint.Footprint.Width == dstFootprint.Footprint.Width &&
+		srcFootprint.Footprint.Height == dstFootprint.Footprint.Height &&
+		srcFootprint.Footprint.Depth == dstFootprint.Footprint.Depth &&
+		dstFootprint.Footprint.Width > 0u && dstFootprint.Footprint.Height > 0u;
+	const UINT commonPitch = std::max(srcFootprint.Footprint.RowPitch, dstFootprint.Footprint.RowPitch);
+	const UINT64 rowBytes = static_cast<UINT64>(dstFootprint.Footprint.Width) * 4u;
+
 	if (srcBytes == 0 || srcBytes == UINT64_MAX || dstBytes == 0 || dstBytes == UINT64_MAX ||
-		srcFootprint.Footprint.RowPitch != dstFootprint.Footprint.RowPitch)
+		!validPlane0Fmt || !sameDims || commonPitch < rowBytes ||
+		(commonPitch % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) != 0)
 	{
 		static std::atomic<bool> logged{ false };
 		if (!logged.exchange(true, std::memory_order_relaxed))
@@ -257,7 +270,15 @@ static bool CaptureDepth32Plane0(ID3D12Device* device, ID3D12GraphicsCommandList
 		return false;
 	}
 
-	const UINT64 bufBytes = std::max(srcBytes, dstBytes);
+	// AMD RDNA drivers can report a wider RowPitch for R32G8X24 plane 0 than for plain R32_FLOAT
+	// (e.g., 7168 vs 6912 for 1708x960). D3D12 CopyTextureRegion allows any RowPitch >= minimum
+	// that stays aligned to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (256), so share the larger pitch.
+	srcFootprint.Footprint.RowPitch = commonPitch;
+	dstFootprint.Footprint.RowPitch = commonPitch;
+
+	const UINT64 requiredBytes =
+		static_cast<UINT64>(commonPitch) * (dstFootprint.Footprint.Height - 1u) + rowBytes;
+	const UINT64 bufBytes = std::max(std::max(srcBytes, dstBytes), requiredBytes);
 	if (scratch && scratch->GetDesc().Width < bufBytes)
 	{
 		DeferredDestroy::Add(std::make_shared<ComPtr<ID3D12Resource>>(std::move(scratch)));
