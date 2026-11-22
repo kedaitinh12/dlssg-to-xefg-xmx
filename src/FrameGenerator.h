@@ -3,6 +3,8 @@
 #include "NGX.h"
 #include "XeFgEnabler.h"
 #include "XeFG.h"
+#include "HudTierPolicy.h"
+#include "HudTierPass.h"
 
 #include <dxgi1_4.h>
 #include <wrl/client.h>
@@ -47,9 +49,12 @@ private:
 	{
 		ComPtr<ID3D12Resource> backbuffer;
 		ComPtr<ID3D12Resource> hudless;
+		ID3D12Resource* matchedHudless = nullptr; // non-owning ping-pong texture owned by HudTierPass (Tier 4 only)
 		ComPtr<ID3D12Resource> depth;
+		ComPtr<ID3D12Resource> spareDepth;  // provkey.1: alternating depth format cache (Dying Light 2 / The Beast)
 		ComPtr<ID3D12Resource> depthScratch;
 		ComPtr<ID3D12Resource> mvecs;
+		ComPtr<ID3D12Resource> spareMotion; // provkey.1: alternating motion format cache
 		xefgd_frame_t data{};
 		bool valid = false;
 	};
@@ -118,4 +123,13 @@ private:
 	bool vramAdapterChecked = false;
 	bool vramGuardActive = false;
 	uint32_t vramPollCounter = 0;
+
+	// 3-Tier Adaptive HUD Protection (persists across XeFG context recreations when tier changes)
+	HudTier::StateMachine hudTierState;
+	HudTierPass hudTierPass;
+	HudTier::Decision hudDecision{};
+	HudTier::ActiveTier loggedHudTier = HudTier::ActiveTier::Interpolated;
+	bool hasLoggedHudTier = false;
+	uint32_t vramUsageMiB = 0;
+	uint32_t vramBudgetMiB = 0;
 };

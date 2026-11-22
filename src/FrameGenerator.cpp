@@ -136,7 +136,9 @@ FrameGenerator::Context::~Context()
 		D3D12VulkanWmma::ForgetResource(f.backbuffer.Get());
 		D3D12VulkanWmma::ForgetResource(f.hudless.Get());
 		D3D12VulkanWmma::ForgetResource(f.depth.Get());
+		D3D12VulkanWmma::ForgetResource(f.spareDepth.Get());
 		D3D12VulkanWmma::ForgetResource(f.mvecs.Get());
+		D3D12VulkanWmma::ForgetResource(f.spareMotion.Get());
 	}
 	D3D12VulkanWmma::ResetContext();
 	xefg_cuda::InvalidateCache();
@@ -146,6 +148,8 @@ FrameGenerator::Context::~Context()
 		if (auto result = XeFG::Destroy(handle); result != XEFGD_RESULT_SUCCESS)
 			Log::Warn("XeFG Destroy error: {}", result);
 	}
+	// cudaheld.1: prune now-unreferenced provider PSOs so repeated FG restarts never exhaust gHeld (256-slot cap).
+	xefg_cuda::ContextRetired();
 }
 
 static void XeFGLogCallback(const char* message, xefgd_logging_level_t level, void*)
@@ -206,6 +210,12 @@ static void MakeReadableDepth(D3D12_RESOURCE_DESC& desc)
 	case DXGI_FORMAT_R16_TYPELESS:
 	case DXGI_FORMAT_D16_UNORM:
 		desc.Format = TypedFormat(desc.Format);
+		desc.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+		break;
+	case DXGI_FORMAT_R32_FLOAT:
+	case DXGI_FORMAT_R16_FLOAT:
+		// Alan Wake 2 (Northlight) and other engines submitting R16_FLOAT / R32_FLOAT depth:
+		// strip ALLOW_DEPTH_STENCIL so the copy is SRV-readable and shareable with Vulkan WMMA.
 		desc.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
 		break;
 	default:
@@ -388,10 +398,20 @@ struct PendingCaptureCopy
 
 // Prepares copy texture for source (recreated on desc change) and queues a batched CopyResource instead of
 // issuing per-texture ResourceBarrier flushes (cuts 8 barriers down to 2 per real frame across CUDA/XMX/DP4a).
+static bool SameTextureDesc(const D3D12_RESOURCE_DESC& a, const D3D12_RESOURCE_DESC& b) noexcept
+{
+	return a.Dimension == b.Dimension && a.Width == b.Width && a.Height == b.Height &&
+		a.DepthOrArraySize == b.DepthOrArraySize && a.MipLevels == b.MipLevels &&
+		a.Format == b.Format && a.SampleDesc.Count == b.SampleDesc.Count &&
+		a.SampleDesc.Quality == b.SampleDesc.Quality && a.Layout == b.Layout &&
+		a.Flags == b.Flags;
+}
+
 static bool PrepareCapture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* source,
 	D3D12_RESOURCE_STATES sourceState, ComPtr<ID3D12Resource>& copy, const char* purpose,
 	PendingCaptureCopy* pending, UINT& pendingCount, bool wantShared = false,
-	bool isDepth = false, ComPtr<ID3D12Resource>* depthScratch = nullptr)
+	bool isDepth = false, ComPtr<ID3D12Resource>* depthScratch = nullptr,
+	ComPtr<ID3D12Resource>* spare = nullptr)
 {
 	if (!source)
 	{
@@ -423,17 +443,29 @@ static bool PrepareCapture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdL
 
 	if (copy)
 	{
-		auto copyDesc = copy->GetDesc();
-
-		// The old one can still be in use by the GPU
-		if (copyDesc.Dimension != desc.Dimension || copyDesc.Width != desc.Width || copyDesc.Height != desc.Height ||
-			copyDesc.DepthOrArraySize != desc.DepthOrArraySize || copyDesc.MipLevels != desc.MipLevels ||
-			copyDesc.Format != desc.Format || copyDesc.SampleDesc.Count != desc.SampleDesc.Count ||
-			copyDesc.SampleDesc.Quality != desc.SampleDesc.Quality || copyDesc.Layout != desc.Layout ||
-			copyDesc.Flags != desc.Flags)
+		const auto copyDesc = copy->GetDesc();
+		if (!SameTextureDesc(copyDesc, desc))
 		{
-			D3D12VulkanWmma::ForgetResource(copy.Get());
-			DeferredDestroy::Add(std::make_shared<ComPtr<ID3D12Resource>>(std::move(copy)));
+			// provkey.1: Dying Light 2 & The Beast alternate depth/motion formats every frame; keep one spare copy
+			// per slot so alternating formats swap in place with zero VRAM reallocation or context recreation.
+			if (spare && *spare && SameTextureDesc((*spare)->GetDesc(), desc))
+			{
+				copy.Swap(*spare);
+			}
+			else if (spare)
+			{
+				if (*spare)
+				{
+					D3D12VulkanWmma::ForgetResource((*spare).Get());
+					DeferredDestroy::Add(std::make_shared<ComPtr<ID3D12Resource>>(std::move(*spare)));
+				}
+				*spare = std::move(copy);
+			}
+			else
+			{
+				D3D12VulkanWmma::ForgetResource(copy.Get());
+				DeferredDestroy::Add(std::make_shared<ComPtr<ID3D12Resource>>(std::move(copy)));
+			}
 		}
 	}
 
@@ -927,7 +959,11 @@ bool FrameGenerator::CreateContext()
 
 	if (auto result = XeFG::CreateContext(device.Get(), &newContext->handle); result != XEFGD_RESULT_SUCCESS)
 	{
-		Log::Error("XeFG CreateContext error: {}", result);
+		const HRESULT removed = device ? device->GetDeviceRemovedReason() : S_OK;
+		if (FAILED(removed))
+			Log::Error("XeFG CreateContext error: {} (D3D12 device removed: {:#010x})", result, static_cast<uint32_t>(removed));
+		else
+			Log::Error("XeFG CreateContext error: {}", result);
 		return false;
 	}
 
@@ -945,7 +981,11 @@ bool FrameGenerator::CreateContext()
 
 	if (auto result = XeFG::Init(newContext->handle, initParams); result != XEFGD_RESULT_SUCCESS)
 	{
-		Log::Error("XeFG Init error: {}", result);
+		const HRESULT removed = device ? device->GetDeviceRemovedReason() : S_OK;
+		if (FAILED(removed))
+			Log::Error("XeFG Init error: {} (D3D12 device removed: {:#010x})", result, static_cast<uint32_t>(removed));
+		else
+			Log::Error("XeFG Init error: {}", result);
 		return false;
 	}
 
@@ -1005,6 +1045,9 @@ bool FrameGenerator::PollVramGuard() noexcept
 	if (FAILED(vramAdapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memInfo)) || memInfo.Budget == 0)
 		return vramGuardActive;
 
+	vramUsageMiB = static_cast<uint32_t>(memInfo.CurrentUsage / (1024ull * 1024ull));
+	vramBudgetMiB = static_cast<uint32_t>(memInfo.Budget / (1024ull * 1024ull));
+
 	constexpr uint64_t kSafetyMarginBytes = 200ull * 1024ull * 1024ull; // 200 MiB safety margin
 	constexpr uint64_t kReleaseMarginBytes = 400ull * 1024ull * 1024ull; // 400 MiB hysteresis to avoid oscillation
 
@@ -1036,8 +1079,11 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	if (params.GetOr<uint32_t>("DLSSG.CameraMotionIncluded", 1) == 0 && !std::exchange(warnedCameraMotion, true))
 		Log::Warn("DLSSG.CameraMotionIncluded is 0, the camera's motion is missing from the motion vectors");
 
+	Plugin::ApplyBrokenHudlessQuirkOnce();
+
 	auto backbuffer = params.GetOr<ID3D12Resource*>("DLSSG.Backbuffer", nullptr);
-	auto hudless = Plugin::options.hudlessUi ? params.GetOr<ID3D12Resource*>("DLSSG.HUDLess", nullptr) : nullptr;
+	auto rawHudless = params.GetOr<ID3D12Resource*>("DLSSG.HUDLess", nullptr);
+	auto hudless = Plugin::options.hudlessUi ? rawHudless : nullptr;
 	auto depth = params.GetOr<ID3D12Resource*>("DLSSG.Depth", nullptr);
 	auto mvecs = params.GetOr<ID3D12Resource*>("DLSSG.MVecs", nullptr);
 	auto output = params.GetOr<ID3D12Resource*>("DLSSG.OutputInterpolated", nullptr);
@@ -1053,20 +1099,55 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	const auto backbufferFormat = TypedFormat(bbDesc.Format);
 	auto hudlessFormat = hudless ? TypedFormat(hudless->GetDesc().Format) : DXGI_FORMAT_UNKNOWN;
 
-	// Guard against mismatched HUD-less textures (different size, format, or MSAA) which cause XeFG errors or HDR glitches.
+	// Guard against aliased or mismatched HUD-less textures (size, format, MSAA, or subrect) which break XeFG UI extraction.
+	bool hudlessFormatMismatch = false;
 	if (hudless)
 	{
 		const auto hlDesc = hudless->GetDesc();
-		if (hlDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || hlDesc.SampleDesc.Count > 1 ||
-			hlDesc.Width != bbDesc.Width || hlDesc.Height != bbDesc.Height || hudlessFormat != backbufferFormat)
+		const auto bbSubrect = Subrect(params, kBackbufferSubrect, backbuffer);
+		const auto hlSubrect = Subrect(params, kHudlessSubrect, hudless);
+		const bool subrectMismatch =
+			hlSubrect.base.x != bbSubrect.base.x || hlSubrect.base.y != bbSubrect.base.y ||
+			hlSubrect.size.x != bbSubrect.size.x || hlSubrect.size.y != bbSubrect.size.y;
+		const bool geometryBad =
+			hlDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || hlDesc.SampleDesc.Count > 1 ||
+			hlDesc.Width != bbDesc.Width || hlDesc.Height != bbDesc.Height || subrectMismatch;
+
+		if (hudless == backbuffer)
+		{
+			static bool warnedHudlessAlias = false;
+			if (!std::exchange(warnedHudlessAlias, true))
+				Log::Warn("Ignoring HUD-less input because it aliases back buffer; falling back to UI Auto");
+			hudless = nullptr;
+			hudlessFormat = DXGI_FORMAT_UNKNOWN;
+		}
+		else if (geometryBad)
 		{
 			static bool warnedHudlessMismatch = false;
 			if (!std::exchange(warnedHudlessMismatch, true))
-				Log::Warn("Ignoring HUD-less input due to mismatch with back buffer (HUD-less {}x{} {}, back buffer {}x{} {}); falling back to UI Auto",
+				Log::Warn("Ignoring HUD-less input due to geometry/subrect mismatch with back buffer (HUD-less {}x{} {} rect [{},{}+{}x{}], back buffer {}x{} {} rect [{},{}+{}x{}]); falling back to UI Auto",
 					static_cast<uint64_t>(hlDesc.Width), hlDesc.Height, FormatName(hudlessFormat),
-					static_cast<uint64_t>(bbDesc.Width), bbDesc.Height, FormatName(backbufferFormat));
+					hlSubrect.base.x, hlSubrect.base.y, hlSubrect.size.x, hlSubrect.size.y,
+					static_cast<uint64_t>(bbDesc.Width), bbDesc.Height, FormatName(backbufferFormat),
+					bbSubrect.base.x, bbSubrect.base.y, bbSubrect.size.x, bbSubrect.size.y);
 			hudless = nullptr;
 			hudlessFormat = DXGI_FORMAT_UNKNOWN;
+		}
+		else if (hudlessFormat != backbufferFormat)
+		{
+			if (HudTierPass::IsToneMapMatchSupported(backbufferFormat))
+			{
+				hudlessFormatMismatch = true;
+			}
+			else
+			{
+				static bool warnedHudlessFmtMismatch = false;
+				if (!std::exchange(warnedHudlessFmtMismatch, true))
+					Log::Warn("Ignoring HUD-less input due to format mismatch with back buffer (HUD-less {}, back buffer {}); falling back to UI Auto",
+						FormatName(hudlessFormat), FormatName(backbufferFormat));
+				hudless = nullptr;
+				hudlessFormat = DXGI_FORMAT_UNKNOWN;
+			}
 		}
 	}
 
@@ -1077,7 +1158,47 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	wanted.format = TypedFormat(outputDesc.Format);
 	wanted.initFlags = (depthInverted ? XEFGD_INIT_FLAG_INVERTED_DEPTH : 0) |
 		(mvecJittered ? XEFGD_INIT_FLAG_JITTERED_MV : 0);
-	wanted.uiMode = hudless ? XEFGD_UI_MODE_BACKBUFFER_HUDLESS : XEFGD_UI_MODE_AUTO;
+	// 4-Tier Adaptive HUD Protection: poll non-blocking GPU readbacks from 2 frames ago and evaluate active tier.
+	const bool hudComputeReady = hudTierPass.EnsureInitialized(device.Get(), wanted.width, wanted.height);
+	if (hudComputeReady)
+	{
+		float diffFrac = 0.0f;
+		bool fromToneMatched = false;
+		if (hudTierPass.PollDiffFraction(diffFrac, fromToneMatched))
+			hudTierState.FeedHudDiffFraction(diffFrac, fromToneMatched);
+		float staticFrac = 0.0f;
+		if (hudTierPass.PollStaticFraction(staticFrac))
+			hudTierState.FeedStaticHudFraction(staticFrac);
+	}
+
+	HudTier::Inputs hudInputs{};
+	hudInputs.mode = static_cast<HudTier::Mode>(std::clamp(Plugin::options.hudTierMode.load(std::memory_order_relaxed), 0, 4));
+	hudInputs.hudlessUiEnabled = Plugin::options.hudlessUi.load(std::memory_order_relaxed);
+	hudInputs.hasGameHudless = rawHudless != nullptr;
+	hudInputs.hudlessStructurallyValid = hudless != nullptr && !hudlessFormatMismatch;
+	hudInputs.hudlessFormatMismatch = hudless != nullptr && hudlessFormatMismatch;
+	hudInputs.hasSeparateUiPlane = false;
+	hudInputs.gpuComputeAvailable = hudComputeReady;
+	hudInputs.toneMapMatchAvailable = hudComputeReady && HudTierPass::IsToneMapMatchSupported(backbufferFormat);
+	hudDecision = hudTierState.Evaluate(hudInputs);
+
+	if (!hasLoggedHudTier || hudDecision.activeTier != loggedHudTier)
+	{
+		hasLoggedHudTier = true;
+		loggedHudTier = hudDecision.activeTier;
+		Log::Info("HUD protection tier: {} (reason: {}, diff={:.2f}%, static={:.2f}%)",
+			HudTier::ActiveTierShortName(hudDecision.activeTier), hudDecision.reason,
+			hudTierState.LastDiffFraction() * 100.0f, hudTierState.LastStaticFraction() * 100.0f);
+	}
+
+	// Only keep HUD-less capture when Tier 1 Native, Tier 2 Diff-Composite, Tier 4 Tone-Map Match, or diff-guard needs it.
+	if (!hudDecision.useXeFgNativeUi && !hudDecision.useHudlessAsSceneSource && !hudDecision.runHudDiffGuard && !hudDecision.runToneMapMatch)
+	{
+		hudless = nullptr;
+		hudlessFormat = DXGI_FORMAT_UNKNOWN;
+	}
+
+	wanted.uiMode = hudDecision.useXeFgNativeUi ? XEFGD_UI_MODE_BACKBUFFER_HUDLESS : XEFGD_UI_MODE_AUTO;
 	wanted.model = PickModel(device.Get());
 
 	// The menu path can change without a context change: XMX Port, CUDA, and WMMA all run the ported model (16), only the
@@ -1220,9 +1341,12 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 		{
 			releaseTex(f.backbuffer);
 			releaseTex(f.hudless);
+			f.matchedHudless = nullptr;
 			releaseTex(f.depth);
+			releaseTex(f.spareDepth);
 			releaseTex(f.depthScratch);
 			releaseTex(f.mvecs);
+			releaseTex(f.spareMotion);
 			f.valid = false;
 		}
 		context->pairValid = false;
@@ -1237,10 +1361,38 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	PendingCaptureCopy pendingCopies[4]{};
 	UINT pendingCopyCount = 0;
 	bool captured = PrepareCapture(device.Get(), cmdList, backbuffer, BackbufferState, frame.backbuffer, "Backbuffer", pendingCopies, pendingCopyCount, wantShared);
-	captured &= PrepareCapture(device.Get(), cmdList, depth, InputState, frame.depth, "Depth copy", pendingCopies, pendingCopyCount, wantShared, true, &frame.depthScratch);
-	captured &= PrepareCapture(device.Get(), cmdList, mvecs, InputState, frame.mvecs, "MVecs copy", pendingCopies, pendingCopyCount, wantShared);
-	PrepareCapture(device.Get(), cmdList, hudless, InputState, frame.hudless, "HUDLess copy", pendingCopies, pendingCopyCount, wantShared);
+	captured &= PrepareCapture(device.Get(), cmdList, depth, InputState, frame.depth, "Depth copy", pendingCopies, pendingCopyCount, wantShared, true, &frame.depthScratch, &frame.spareDepth);
+	captured &= PrepareCapture(device.Get(), cmdList, mvecs, InputState, frame.mvecs, "MVecs copy", pendingCopies, pendingCopyCount, wantShared, false, nullptr, &frame.spareMotion);
+	const bool hudlessCaptured = hudless &&
+		PrepareCapture(device.Get(), cmdList, hudless, InputState, frame.hudless, "HUDLess copy", pendingCopies, pendingCopyCount, wantShared);
+	if (!hudlessCaptured && frame.hudless)
+		frame.hudless.Reset();
 	FlushCaptureCopies(cmdList, pendingCopies, pendingCopyCount);
+
+	frame.matchedHudless = nullptr;
+	if (hudComputeReady && captured)
+	{
+		hudTierPass.BeginRealFrame();
+		// Tier 4 Tone-Map Match (conditional inline): runs ONLY when HUDLess color/format mismatches Backbuffer.
+		if (hudDecision.runToneMapMatch && hudlessCaptured && frame.hudless)
+		{
+			frame.matchedHudless = hudTierPass.RecordToneMapMatch(cmdList, context->current, wantShared,
+				frame.backbuffer.Get(), BackbufferState, frame.hudless.Get(), InputState, InputState);
+		}
+		// Tier 1 Native (or Tier 3 recovery monitoring): analyze-only 1/16-pixel Real vs Hudless diff guard.
+		if (hudDecision.runHudDiffGuard && !hudDecision.runHudDiffComposite && hudlessCaptured && frame.hudless)
+		{
+			hudTierPass.RecordHudDiffGuard(cmdList, frame.backbuffer.Get(), BackbufferState,
+				frame.hudless.Get(), InputState);
+		}
+		// Tier 3 Static HUD Mask: update per-pixel temporal stability map across consecutive real frames.
+		if (hudDecision.runStaticHudUpdate)
+		{
+			const bool staticReset = !previous.valid || !previous.backbuffer;
+			hudTierPass.RecordStaticHudUpdate(cmdList, frame.backbuffer.Get(), BackbufferState,
+				previous.valid ? previous.backbuffer.Get() : nullptr, BackbufferState, staticReset);
+		}
+	}
 
 	auto& data = frame.data;
 	data = {};
@@ -1251,7 +1403,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 		data.depth = Subrect(params, kDepthSubrect, depth);
 		data.motionVectors = Subrect(params, kMVecsSubrect, mvecs);
 
-		if (hudless)
+		if (hudlessCaptured && frame.hudless)
 			data.hudlessColor = Subrect(params, kHudlessSubrect, hudless);
 	}
 
@@ -1431,9 +1583,12 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 	}
 
 	// Zero-copy in-place UAV fast-path for 2x FG (frameCount == 1) when the game's output texture is directly UAV-compatible
+	const bool needsPostHudComposite = hudTierPass.Available() &&
+		(hudDecision.runHudDiffComposite || hudDecision.runStaticHudComposite);
 	const bool canWriteDirect = !useVulkanWmma && frameCount == 1 && frameIndex == 1 && output != nullptr &&
 		outputDesc.Format == settings.format &&
 		(outputDesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0 &&
+		(!needsPostHudComposite || HudTierPass::IsUavCompatibleFormat(outputDesc.Format)) &&
 		outputDesc.SampleDesc.Count == 1 &&
 		outputDesc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN;
 	context->directOutput = canWriteDirect;
@@ -1459,10 +1614,15 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 	auto fill = [this](const Frame& frame, xefgd_frame_t& out)
 		{
 			out = frame.data;
-			out.backBuffer.pResource = frame.backbuffer.Get();
+			// Tier 2 / Tier 4: interpolate the clean (or tone-matched) HUD-less scene in UI_MODE_AUTO, then composite HUD on top.
+			ID3D12Resource* effectiveHudless = (hudDecision.runToneMapMatch && frame.matchedHudless)
+				? frame.matchedHudless
+				: frame.hudless.Get();
+			const bool useHudlessScene = hudDecision.useHudlessAsSceneSource && effectiveHudless != nullptr;
+			out.backBuffer.pResource = useHudlessScene ? effectiveHudless : frame.backbuffer.Get();
 			out.depth.pResource = frame.depth.Get();
 			out.motionVectors.pResource = frame.mvecs.Get();
-			out.hudlessColor.pResource = frame.hudless.Get();
+			out.hudlessColor.pResource = hudDecision.useXeFgNativeUi ? effectiveHudless : nullptr;
 		};
 
 	xefgd_exec_params_t params{};
@@ -1491,11 +1651,20 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 		D3D12VulkanWmma::ContextSettings vkSettings{
 			settings.width, settings.height, settings.format, settings.initFlags, settings.uiMode, settings.model
 		};
+		ID3D12Resource* prevEffectiveHudless = (hudDecision.runToneMapMatch && prevFrame.matchedHudless)
+			? prevFrame.matchedHudless : prevFrame.hudless.Get();
+		ID3D12Resource* nextEffectiveHudless = (hudDecision.runToneMapMatch && nextFrame.matchedHudless)
+			? nextFrame.matchedHudless : nextFrame.hudless.Get();
+		const bool useHudlessScene = hudDecision.useHudlessAsSceneSource && prevEffectiveHudless != nullptr && nextEffectiveHudless != nullptr;
 		D3D12VulkanWmma::FrameInputs vkPrev{
-			prevFrame.backbuffer.Get(), prevFrame.hudless.Get(), prevFrame.depth.Get(), prevFrame.mvecs.Get(), prevFrame.data
+			useHudlessScene ? prevEffectiveHudless : prevFrame.backbuffer.Get(),
+			hudDecision.useXeFgNativeUi ? prevEffectiveHudless : nullptr,
+			prevFrame.depth.Get(), prevFrame.mvecs.Get(), prevFrame.data
 		};
 		D3D12VulkanWmma::FrameInputs vkNext{
-			nextFrame.backbuffer.Get(), nextFrame.hudless.Get(), nextFrame.depth.Get(), nextFrame.mvecs.Get(), nextFrame.data
+			useHudlessScene ? nextEffectiveHudless : nextFrame.backbuffer.Get(),
+			hudDecision.useXeFgNativeUi ? nextEffectiveHudless : nullptr,
+			nextFrame.depth.Get(), nextFrame.mvecs.Get(), nextFrame.data
 		};
 		if (D3D12VulkanWmma::ScheduleBatch(cmdList, vkSettings, vkPrev, vkNext,
 			reinterpret_cast<ID3D12Resource* const*>(context->outputs), context->outputBases, frameCount,
@@ -1528,7 +1697,11 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 		return InterpolateResult::Skipped;
 	}
 
-	Log::Error("XeFG Execute error: {}, frame {}/{}", result, frameIndex, frameCount);
+	const HRESULT removed = device ? device->GetDeviceRemovedReason() : S_OK;
+	if (FAILED(removed))
+		Log::Error("XeFG Execute error: {}, frame {}/{} (D3D12 device removed: {:#010x})", result, frameIndex, frameCount, static_cast<uint32_t>(removed));
+	else
+		Log::Error("XeFG Execute error: {}, frame {}/{}", result, frameIndex, frameCount);
 	context->pairValid = false;
 	if (++context->consecutiveExecuteFailures >= 3u)
 	{
@@ -1592,12 +1765,16 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 		CaptureRealFrame(cmdList, params);
 	}
 
-	const uint32_t effectiveCount = (vramGuarded && requestedCount > 1u) ? 1u : requestedCount;
+	const bool vramClamped = vramGuarded && requestedCount > 1u;
+	const uint32_t effectiveCount = vramClamped ? 1u : requestedCount;
 
 	if (frameIndex == 1)
 	{
-		Plugin::Report({ settings.width, settings.height, effectiveCount, settings.uiMode != XEFGD_UI_MODE_AUTO,
-			CurrentNetwork(settings.model), context == nullptr, settings.format == DXGI_FORMAT_R16G16B16A16_FLOAT });
+		Plugin::Report({ settings.width, settings.height, effectiveCount,
+			hudDecision.activeTier != HudTier::ActiveTier::Interpolated,
+			static_cast<int32_t>(hudDecision.activeTier),
+			CurrentNetwork(settings.model), context == nullptr, settings.format == DXGI_FORMAT_R16G16B16A16_FLOAT,
+			requestedCount, vramClamped, vramUsageMiB, vramBudgetMiB });
 	}
 
 	const auto targetDesc = (output ? output : backbuffer)->GetDesc();
@@ -1642,6 +1819,37 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 	{
 		if (result == InterpolateResult::Interpolated)
 		{
+			// Tier 2 (HUD-Diff Composite) or Tier 3 (Temporal Static-HUD Mask) post-interpolation composite pass.
+			const bool runTier2 = hudTierPass.Available() && hudDecision.runHudDiffComposite;
+			const bool runTier3 = hudTierPass.Available() && hudDecision.runStaticHudComposite;
+			if (runTier2 || runTier3)
+			{
+				const Frame& curFrame = context->frames[context->current];
+				const bool debugMagenta = Plugin::options.hudDebugMagenta.load(std::memory_order_relaxed);
+				// Prefer our UAV-guaranteed internal output buffer when present (covers both native DX12 and Vulkan WMMA bridge).
+				ID3D12Resource* compositeTarget = (context->outputs[frameIndex - 1] != nullptr)
+					? context->outputs[frameIndex - 1].Get()
+					: (HudTierPass::IsUavCompatibleFormat(output->GetDesc().Format) ? output : nullptr);
+				if (compositeTarget && curFrame.backbuffer)
+				{
+					ID3D12Resource* compositeHudless = (hudDecision.runToneMapMatch && curFrame.matchedHudless)
+						? curFrame.matchedHudless : curFrame.hudless.Get();
+					if (runTier2 && compositeHudless)
+					{
+						hudTierPass.RecordHudDiffComposite(cmdList, curFrame.backbuffer.Get(), BackbufferState,
+							compositeHudless, InputState, compositeTarget, OutputState,
+							frameIndex == 1, debugMagenta, hudDecision.runToneMapMatch && curFrame.matchedHudless != nullptr);
+					}
+					else if (runTier3)
+					{
+						hudTierPass.RecordStaticHudComposite(cmdList, curFrame.backbuffer.Get(), BackbufferState,
+							compositeTarget, OutputState, debugMagenta);
+					}
+					if (compositeTarget != output)
+						context->directOutput = false;
+				}
+			}
+
 			if (!context->directOutput)
 				Copy(cmdList, output, OutputState, context->outputs[frameIndex - 1].Get(), OutputState);
 		}

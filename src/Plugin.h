@@ -46,6 +46,12 @@ namespace Plugin
 		// Extended XeFG flag overrides: 0 = Auto (game), 1 = Force Off, 2 = Force On
 		std::atomic<int32_t> depthInvertedOverride = 0;
 		std::atomic<int32_t> jitteredMvOverride = 0;
+		// UI alpha mode for Vulkan separate UI texture: 0 = Auto, 1 = Straight, 2 = Premultiplied (RTX-Encore xefgUiAlpha)
+		std::atomic<int32_t> uiAlphaMode = 0;
+		// 3-Tier Adaptive HUD Protection mode: 0 = Auto (3-Tier), 1 = Tier 1 Native Only, 2 = Tier 2 HUD-Diff Composite, 3 = Tier 3 Static HUD Mask
+		std::atomic<int32_t> hudTierMode = 0;
+		// Debug overlay (not saved): paints detected Tier 2 / Tier 3 HUD mask pixels magenta
+		std::atomic_bool hudDebugMagenta = false;
 		// Ignores game-supplied DLSSG.Reset (fixes games that spam Reset=1 every frame; internal safety resets still apply)
 		std::atomic_bool ignoreGameReset = false;
 		// Not saved
@@ -99,10 +105,20 @@ namespace Plugin
 		uint32_t height = 0;
 		uint32_t generatedFrames = 0; // between two real frames
 		bool hudless = false;
+		int32_t hudTier = 0; // HudTier::ActiveTier (0=Interpolated, 1=Native, 2=Diff-Comp, 3=Static Mask)
 		Network network = Network::Unknown;
 		bool failed = false; // no XeFG context
 		bool fp16 = false;   // 16-bit float (scRGB) back buffer, XeFG only takes 8-bit and HDR10
+		uint32_t requestedFrames = 0; // requested by game/Streamline before Adaptive VRAM guard clamp
+		bool vramGuarded = false;     // Adaptive VRAM guard actively clamping MFG multiplier to 2x
+		uint32_t vramUsageMiB = 0;    // local VRAM usage sampled by Adaptive VRAM guard
+		uint32_t vramBudgetMiB = 0;   // local VRAM budget sampled by Adaptive VRAM guard
 	};
 
 	void Report(const Status& status);
+
+	// Games whose Streamline HUDLess buffer differs from Backbuffer across the 3D scene (post-process/tone-map mismatch),
+	// causing XeFG's XEFGD_UI_MODE_BACKBUFFER_HUDLESS UI extractor to overwrite interpolated frames with the real backbuffer.
+	bool IsKnownBrokenHudlessGame() noexcept;
+	void ApplyBrokenHudlessQuirkOnce() noexcept;
 } // namespace Plugin

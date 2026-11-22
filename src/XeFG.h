@@ -28,6 +28,8 @@ constexpr uint32_t XEFGD_INIT_FLAG_JITTERED_MV = 1u << 4;
 
 // Same as xefg_swapchain_ui_mode_t
 constexpr uint32_t XEFGD_UI_MODE_AUTO = 0;
+constexpr uint32_t XEFGD_UI_MODE_UI_TEXTURE = 2;
+constexpr uint32_t XEFGD_UI_MODE_UI_TEXTURE_PREMULTIPLIED = 3;
 constexpr uint32_t XEFGD_UI_MODE_BACKBUFFER_HUDLESS = 4;
 
 enum xefgd_logging_level_t : int32_t
