@@ -96,11 +96,13 @@ static const int ROWS   = LAYER_TILE_H / 4;
 groupshared uint4 win[2][WIN];
 groupshared uint4 wsm[2][LAYER_NT * 72];
 #else
-#define LAYER_ZPER  (LAYER_OUT / LAYER_ZSPLIT)
-#define LAYER_WBUFS (((LAYER_ZPER) * (LAYER_IN) > 1) ? 2 : 1)
+#define LAYER_ZPER       (LAYER_OUT / LAYER_ZSPLIT)
+#define LAYER_WBUFS      (((LAYER_ZPER) * (LAYER_IN) > 1) ? 2 : 1)
+#define LAYER_STREAM_WIN ((LAYER_ZPER == 1) && (LAYER_IN > 2))
+#define LAYER_WIN_SLOTS  (LAYER_STREAM_WIN ? 2 : LAYER_IN)
 static const int ZPER  = LAYER_ZPER;
 static const int WBUFS = LAYER_WBUFS;
-groupshared uint4 win[LAYER_IN * WIN];
+groupshared uint4 win[LAYER_WIN_SLOTS * WIN];
 groupshared uint4 wsm[LAYER_WBUFS][144];
 #endif
 
@@ -204,6 +206,16 @@ void main(uint3 groupID : SV_GroupID, uint tid : SV_GroupIndex)
 #if LAYER_FAMILY == 0
     const int cx0 = (LAYER_POOL != 0) ? (2 * X0) : X0;
     const int cy0 = (LAYER_POOL != 0) ? (2 * Y0) : Y0;
+#if LAYER_STREAM_WIN
+    for (uint r = tid; r < uint(WIN); r += 128u)
+    {
+        uint4 v = FetchInputDim(cx0 - 1 + (int(r) % WIN_W), cy0 - 1 + (int(r) / WIN_W), 0, inW, inH, inD);
+#if LAYER_BIAS != 0
+        v += uint4(0x80808080u, 0x80808080u, 0x80808080u, 0x80808080u);
+#endif
+        win[r] = v;
+    }
+#else
     for (uint i = tid; i < uint(LAYER_IN * WIN); i += 128u)
     {
         int slice = int(i) / WIN;
@@ -214,6 +226,7 @@ void main(uint3 groupID : SV_GroupID, uint tid : SV_GroupIndex)
 #endif
         win[i] = v;
     }
+#endif
 #else
     uint skipW, skipH, skipD;
     tSkip.GetDimensions(skipW, skipH, skipD);
@@ -277,12 +290,22 @@ void main(uint3 groupID : SV_GroupID, uint tid : SV_GroupIndex)
                 const int nxt = cur ^ 1;
                 for (uint wIdx = tid; wIdx < 144u; wIdx += 128u)
                     wsm[nxt][SwizzleWeightIdx(wIdx)] = tWeights[(st + 1) * 144 + int(wIdx)];
+#if LAYER_STREAM_WIN && (LAYER_FAMILY == 0)
+                for (uint r = tid; r < uint(WIN); r += 128u)
+                {
+                    uint4 v = FetchInputDim(cx0 - 1 + (int(r) % WIN_W), cy0 - 1 + (int(r) / WIN_W), slice + 1, inW, inH, inD);
+#if LAYER_BIAS != 0
+                    v += uint4(0x80808080u, 0x80808080u, 0x80808080u, 0x80808080u);
+#endif
+                    win[nxt * WIN + int(r)] = v;
+                }
+#endif
             }
 #else
             const int cur = 0;
 #endif
 
-            const int sliceBase = slice * WIN;
+            const int sliceBase = (LAYER_STREAM_WIN ? cur : slice) * WIN;
             [unroll]
             for (int tap = 0; tap < 9; ++tap)
             {
