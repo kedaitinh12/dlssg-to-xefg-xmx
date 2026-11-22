@@ -497,6 +497,40 @@ int main()
 		CHECK(!mfg6.skipBatch);
 	}
 
+	// ---- Vulkan MFG swapchain image count policy (6 -> 8 double-buffered 4x MFG)
+	{
+		using VulkanPolicy::ParseSwapchainBufferTarget;
+		using VulkanPolicy::RecommendSwapchainImageCount;
+
+		CHECK(ParseSwapchainBufferTarget(L"") == 8u);
+		CHECK(ParseSwapchainBufferTarget(L"  ") == 8u);
+		CHECK(ParseSwapchainBufferTarget(L"0") == 0u);
+		CHECK(ParseSwapchainBufferTarget(L"off") == 0u);
+		CHECK(ParseSwapchainBufferTarget(L"FALSE") == 0u);
+		CHECK(ParseSwapchainBufferTarget(L"6") == 6u);
+		CHECK(ParseSwapchainBufferTarget(L"8") == 8u);
+		CHECK(ParseSwapchainBufferTarget(L"10") == 10u);
+		CHECK(ParseSwapchainBufferTarget(L"12") == 12u);
+		CHECK(ParseSwapchainBufferTarget(L"5") == 8u);
+		CHECK(ParseSwapchainBufferTarget(L"16") == 8u);
+		CHECK(ParseSwapchainBufferTarget(L"abc") == 8u);
+
+		// Standard Streamline 6-buffer swapchain boosted to 8 when driver allows (capMax == 0 unbounded or >= 8)
+		CHECK(RecommendSwapchainImageCount(6u, 2u, 0u, 8u) == 8u);
+		CHECK(RecommendSwapchainImageCount(6u, 2u, 8u, 8u) == 8u);
+		CHECK(RecommendSwapchainImageCount(6u, 2u, 16u, 8u) == 8u);
+		// Clamped to driver maxImageCount
+		CHECK(RecommendSwapchainImageCount(6u, 2u, 7u, 8u) == 7u);
+		CHECK(RecommendSwapchainImageCount(6u, 2u, 6u, 8u) == 6u);
+		// Non-MFG game swapchains (< 6 buffers) are never touched
+		CHECK(RecommendSwapchainImageCount(3u, 2u, 8u, 8u) == 3u);
+		CHECK(RecommendSwapchainImageCount(4u, 2u, 8u, 8u) == 4u);
+		// Disabled or already >= target
+		CHECK(RecommendSwapchainImageCount(6u, 2u, 8u, 0u) == 6u);
+		CHECK(RecommendSwapchainImageCount(8u, 2u, 16u, 8u) == 8u);
+		CHECK(RecommendSwapchainImageCount(10u, 2u, 16u, 8u) == 10u);
+	}
+
 	std::printf("%d checks, %d failed\n", checks, failures);
 	return failures ? 1 : 0;
 }
