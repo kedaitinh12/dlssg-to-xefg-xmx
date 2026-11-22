@@ -60,6 +60,7 @@ typedef VkFlags VkSamplerCreateFlags;
 typedef VkFlags VkShaderModuleCreateFlags;
 typedef VkFlags VkPipelineShaderStageCreateFlags;
 typedef VkFlags VkPipelineCreateFlags;
+typedef VkFlags VkPipelineCacheCreateFlags;
 typedef VkFlags64 VkPipelineStageFlags2;
 typedef VkFlags64 VkAccessFlags2;
 
@@ -112,6 +113,7 @@ typedef enum VkStructureType
 	VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO = 2,
 	VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO = 3,
 	VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO = 16,
+	VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO = 17,
 	VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO = 18,
 	VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO = 29,
 	VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO = 30,
@@ -168,6 +170,7 @@ typedef enum VkScopeKHR
 typedef enum VkFormat
 {
 	VK_FORMAT_UNDEFINED = 0,
+	VK_FORMAT_R8_UINT = 13,
 	VK_FORMAT_R8G8B8A8_UNORM = 37,
 	VK_FORMAT_R8G8B8A8_SRGB = 43,
 	VK_FORMAT_B8G8R8A8_UNORM = 44,
@@ -708,6 +711,13 @@ typedef struct VkImageSubresourceRange
 	uint32_t layerCount;
 } VkImageSubresourceRange;
 
+typedef struct VkBufferCopy
+{
+	VkDeviceSize srcOffset;
+	VkDeviceSize dstOffset;
+	VkDeviceSize size;
+} VkBufferCopy;
+
 typedef struct VkImageCopy
 {
 	VkImageSubresourceLayers srcSubresource;
@@ -926,6 +936,15 @@ typedef struct VkPipelineShaderStageCreateInfo
 	const VkSpecializationInfo* pSpecializationInfo;
 } VkPipelineShaderStageCreateInfo;
 
+typedef struct VkPipelineCacheCreateInfo
+{
+	VkStructureType sType;
+	const void* pNext;
+	VkPipelineCacheCreateFlags flags;
+	size_t initialDataSize;
+	const void* pInitialData;
+} VkPipelineCacheCreateInfo;
+
 typedef struct VkComputePipelineCreateInfo
 {
 	VkStructureType sType;
@@ -957,6 +976,10 @@ typedef void(VKAPI_PTR* PFN_vkGetPhysicalDeviceProperties2)(
 typedef void(VKAPI_PTR* PFN_vkGetPhysicalDeviceQueueFamilyProperties)(
 	VkPhysicalDevice physicalDevice, uint32_t* pQueueFamilyPropertyCount, VkQueueFamilyProperties* pQueueFamilyProperties);
 
+typedef void(VKAPI_PTR* PFN_vkCmdCopyBuffer)(VkCommandBuffer commandBuffer, VkBuffer srcBuffer,
+	VkBuffer dstBuffer, uint32_t regionCount, const VkBufferCopy* pRegions);
+typedef void(VKAPI_PTR* PFN_vkCmdFillBuffer)(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
+	VkDeviceSize dstOffset, VkDeviceSize size, uint32_t data);
 typedef void(VKAPI_PTR* PFN_vkCmdCopyImage)(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout,
 	VkImage dstImage, VkImageLayout dstImageLayout, uint32_t regionCount, const VkImageCopy* pRegions);
 typedef void(VKAPI_PTR* PFN_vkCmdPipelineBarrier)(VkCommandBuffer commandBuffer, VkPipelineStageFlags srcStageMask,
@@ -989,6 +1012,12 @@ typedef VkResult(VKAPI_PTR* PFN_vkCreateShaderModule)(VkDevice device, const VkS
 	const VkAllocationCallbacks* pAllocator, VkShaderModule* pShaderModule);
 typedef void(VKAPI_PTR* PFN_vkDestroyShaderModule)(
 	VkDevice device, VkShaderModule shaderModule, const VkAllocationCallbacks* pAllocator);
+typedef VkResult(VKAPI_PTR* PFN_vkCreatePipelineCache)(VkDevice device, const VkPipelineCacheCreateInfo* pCreateInfo,
+	const VkAllocationCallbacks* pAllocator, VkPipelineCache* pPipelineCache);
+typedef void(VKAPI_PTR* PFN_vkDestroyPipelineCache)(
+	VkDevice device, VkPipelineCache pipelineCache, const VkAllocationCallbacks* pAllocator);
+typedef VkResult(VKAPI_PTR* PFN_vkGetPipelineCacheData)(
+	VkDevice device, VkPipelineCache pipelineCache, size_t* pDataSize, void* pData);
 typedef VkResult(VKAPI_PTR* PFN_vkCreateComputePipelines)(VkDevice device, VkPipelineCache pipelineCache,
 	uint32_t createInfoCount, const VkComputePipelineCreateInfo* pCreateInfos, const VkAllocationCallbacks* pAllocator,
 	VkPipeline* pPipelines);
