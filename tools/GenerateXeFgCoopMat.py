@@ -176,7 +176,7 @@ def main() -> int:
         for fname, mode, fmt in hud_variants:
             out_spv = hud_dir / fname
             cmd = [
-                str(glslang),
+                str(args.glslang),
                 "-V",
                 "--target-env",
                 "vulkan1.3",
@@ -214,7 +214,7 @@ def main() -> int:
         for fname, tm_pass, fmt in tm_variants:
             out_spv = hud_dir / fname
             cmd = [
-                str(glslang),
+                str(args.glslang),
                 "-V",
                 "--target-env",
                 "vulkan1.3",
