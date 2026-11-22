@@ -676,7 +676,7 @@ namespace
 				const LUID luid = d.d3d->GetAdapterLuid();
 				ComPtr<IDXGIAdapter1> adapter;
 				if (SUCCEEDED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter))) && adapter)
-					adapter.As(&f.vramAdapter);
+					adapter->QueryInterface(IID_PPV_ARGS(&f.vramAdapter));
 			}
 		}
 
@@ -1095,7 +1095,7 @@ namespace
 		// Clean resume after a successful resize/settings change following any prior stall or failure (RTX-Encore)
 		f.havePrevious = false;
 		f.createFailed = false;
-		f.consecutiveExecuteFailures = 0;
+		f.consecutiveFailures = 0;
 		f.stallCooldownBatches = 0;
 		f.uiMode = wantedUiMode;
 		f.width = bb.width;
