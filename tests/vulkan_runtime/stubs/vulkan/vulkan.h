@@ -23,6 +23,7 @@
 
 #define VK_DEFINE_HANDLE(object) typedef struct object##_T* object;
 #define VK_DEFINE_NON_DISPATCHABLE_HANDLE(object) typedef struct object##_T* object;
+#define VK_WHOLE_SIZE (~0ULL)
 #define VK_NULL_HANDLE nullptr
 
 #define VK_TRUE 1
