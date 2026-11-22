@@ -1010,11 +1010,21 @@ typedef VkResult(VKAPI_PTR* PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKH
 	uint32_t* pPropertyCount, VkCooperativeMatrixPropertiesKHR* pProperties);
 typedef void(VKAPI_PTR* PFN_vkCmdPipelineBarrier2)(VkCommandBuffer commandBuffer, const VkDependencyInfo* pDependencyInfo);
 typedef struct VkQueue_T* VkQueue;
+typedef struct VkSurfaceKHR_T* VkSurfaceKHR;
 typedef struct VkSwapchainKHR_T* VkSwapchainKHR;
+typedef struct VkSurfaceCapabilitiesKHR
+{
+	uint32_t minImageCount;
+	uint32_t maxImageCount;
+} VkSurfaceCapabilitiesKHR;
+typedef VkResult(VKAPI_PTR* PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)(VkPhysicalDevice physicalDevice,
+	VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR* pSurfaceCapabilities);
 typedef struct VkSwapchainCreateInfoKHR
 {
 	VkStructureType sType;
 	const void* pNext;
+	VkSurfaceKHR surface;
+	uint32_t minImageCount;
 	VkPresentModeKHR presentMode;
 } VkSwapchainCreateInfoKHR;
 typedef struct VkPresentInfoKHR
