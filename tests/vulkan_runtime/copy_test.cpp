@@ -29,6 +29,7 @@ namespace xvk
     {
         return reinterpret_cast<VkImageView>(0x100);
     }
+    VkBuffer BufferOf(ID3D12Resource*) noexcept { return VK_NULL_HANDLE; }
 }
 
 static int gCreateContextCalls = 0;
