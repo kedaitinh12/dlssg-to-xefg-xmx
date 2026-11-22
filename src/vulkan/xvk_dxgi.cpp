@@ -941,11 +941,17 @@ HRESULT STDMETHODCALLTYPE SwapChain::ResizeBuffers(UINT count, UINT width, UINT 
     WaitIdle();
     if (count) desc_.BufferCount = count;
     if (format != DXGI_FORMAT_UNKNOWN) desc_.Format = format;
-    desc_.Flags = flags;
+    // Preserve immutable waitable-object and tearing flags across ResizeBuffers (DLSS Enabler / DXGI contract)
+    constexpr UINT kPreserveFlags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT | DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    desc_.Flags = flags | (desc_.Flags & kPreserveFlags);
     RECT rect{};
     GetClientRect(window_, &rect);
-    desc_.Width = width ? width : UINT(std::max<LONG>(1, rect.right - rect.left));
-    desc_.Height = height ? height : UINT(std::max<LONG>(1, rect.bottom - rect.top));
+    const LONG clientW = rect.right - rect.left;
+    const LONG clientH = rect.bottom - rect.top;
+    const UINT fallbackW = desc_.Width ? desc_.Width : 1u;
+    const UINT fallbackH = desc_.Height ? desc_.Height : 1u;
+    desc_.Width = width ? width : (clientW > 0 ? UINT(clientW) : fallbackW);
+    desc_.Height = height ? height : (clientH > 0 ? UINT(clientH) : fallbackH);
     // Before the first present the new size waits for CreateFirstSwapchain.
     HRESULT hr = swapchain_ ? CreateSwapchain(swapchain_) : S_OK;
     if (FAILED(hr)) return hr;

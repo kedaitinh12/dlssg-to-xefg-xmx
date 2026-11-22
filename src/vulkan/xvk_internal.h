@@ -276,6 +276,7 @@ public:
     Resource(Device* device, const D3D12_RESOURCE_DESC& desc, const D3D12_HEAP_PROPERTIES& heap, D3D12_HEAP_FLAGS flags);
     ~Resource() override;
     HRESULT Init(Heap* placedHeap, UINT64 placedOffset);
+    HRESULT InitExternalImage(VkImage image, VkFormat imageFormat);
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override;
     HRESULT STDMETHODCALLTYPE Map(UINT subresource, const D3D12_RANGE* readRange, void** data) override;
@@ -309,6 +310,7 @@ private:
     VkDeviceMemory ownMemory_ = VK_NULL_HANDLE;
     VkBuffer buffer_ = VK_NULL_HANDLE;
     VkImage image_ = VK_NULL_HANDLE;
+    bool ownsImage_ = true;
     VkFormat imageFormat_ = VK_FORMAT_UNDEFINED;
     uint64_t size_ = 0;
     D3D12_GPU_VIRTUAL_ADDRESS va_ = 0;

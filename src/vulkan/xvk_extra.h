@@ -9,4 +9,6 @@ namespace xvk
 	// A 2D storage image view of an xvk texture, null for any other resource or when the view can't be made. The layer
 	// caches it on the texture and destroys it with it
 	VkImageView StorageImageView(ID3D12Resource* resource, VkFormat format) noexcept;
+	// The VkBuffer behind an xvk buffer resource (null for images or foreign objects).
+	VkBuffer BufferOf(ID3D12Resource* resource) noexcept;
 } // namespace xvk

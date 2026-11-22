@@ -75,6 +75,7 @@ void SetTensorCoresEnabled(ID3D12Device*, bool enabled) noexcept;
 
 bool InstallCoopMatrix(ID3D12Device*, const wchar_t* moduleDir, const CoopMatrixOptions&, std::string& reason) noexcept;
 void SetCoopMatrixEnabled(ID3D12Device*, bool enabled) noexcept;
+void FlushCoopMatrixCache(ID3D12Device*) noexcept;
 
 // What the device needs. The SPIR-V is version 1.6, so the device must run at Vulkan 1.3 or later.
 constexpr uint32_t kRequiredApiVersion = VK_API_VERSION_1_3;
@@ -131,4 +132,8 @@ void EndRecording(ID3D12Device* device) noexcept;
 bool WaitRecordedIdle(ID3D12Device* device, uint64_t timeoutNs) noexcept;
 // The VkImage behind an xvk texture (null for buffers and foreign objects). Its layout is GENERAL.
 VkImage ImageOf(ID3D12Resource* resource) noexcept;
+// Wraps an externally-owned VkImage (for example an imported D3D12 shared texture) as an xvk ID3D12Resource
+// with zero copy. The caller retains ownership of the VkImage and manages its layout transitions.
+HRESULT WrapExternalImage(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc, VkImage image,
+                          VkFormat imageFormat, REFIID riid, void** resource) noexcept;
 }

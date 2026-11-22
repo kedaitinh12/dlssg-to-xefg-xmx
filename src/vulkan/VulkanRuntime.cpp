@@ -26,12 +26,15 @@
 #include "VulkanHost.h"
 #include "VulkanInputCopy.h"
 #include "VulkanPolicy.h"
+#include "../HudTierPolicy.h"
 #include "VulkanTensor.h"
 #include "xvk_extra.h"
 
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <array>
 #include <cmath>
 #include <atomic>
@@ -102,7 +105,7 @@ namespace
 	X(vkCmdCopyImage) X(vkCmdPipelineBarrier) X(vkCmdBindPipeline) X(vkCmdPushDescriptorSetKHR) X(vkCmdPushConstants) \
 	X(vkCmdDispatch) X(vkCreateSampler) X(vkDestroySampler) X(vkCreateDescriptorSetLayout)                            \
 	X(vkDestroyDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateShaderModule)      \
-	X(vkDestroyShaderModule) X(vkCreateComputePipelines) X(vkDestroyPipeline)
+	X(vkDestroyShaderModule) X(vkCreateComputePipelines) X(vkDestroyPipeline) X(vkCmdCopyBuffer) X(vkCmdFillBuffer)
 
 	struct Device
 	{
@@ -137,6 +140,12 @@ namespace
 		VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
 		VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
 		VkPipeline pipelines[VulkanInputCopy::Count] = {}; // 0 r32f (depth), 1 rg16f, 2 rg32f (motion vectors)
+
+		// 3-Tier Adaptive HUD Protection compute pipelines (4 modes x 2 color formats: 0=rgba8/bgra8, 1=rgb10a2)
+		VkDescriptorSetLayout hudSetLayout = VK_NULL_HANDLE;
+		VkPipelineLayout hudPipelineLayout = VK_NULL_HANDLE;
+		VkPipeline hudPipelines[4][2] = {};
+		bool hudPipelinesReady = false;
 	};
 
 	// The game owns the VkDevice and destroys it before the CRT is torn down. The layer's device is kept for the life of
@@ -158,6 +167,8 @@ namespace
 	struct Slot
 	{
 		ComPtr<ID3D12Resource> backbuffer, hudless, ui, depth, motion;
+		VkImageView bbView = VK_NULL_HANDLE;
+		VkImageView hudlessView = VK_NULL_HANDLE;
 		VkImageView depthView = VK_NULL_HANDLE;
 		VkImageView motionView = VK_NULL_HANDLE;
 		bool hasHudless = false;
@@ -185,6 +196,7 @@ namespace
 		DXGI_FORMAT motionFormat = DXGI_FORMAT_UNKNOWN;
 		DXGI_FORMAT hudlessFormat = DXGI_FORMAT_UNKNOWN;
 		DXGI_FORMAT uiFormat = DXGI_FORMAT_UNKNOWN;
+		uint32_t uiMode = XEFGD_UI_MODE_AUTO;
 		bool inverted = false;
 		bool jittered = false;
 		int32_t model = 0;
@@ -195,6 +207,26 @@ namespace
 		uint32_t current = 0;
 		bool havePrevious = false;
 		std::array<ComPtr<ID3D12Resource>, MaxGenerated> outputs;
+		std::array<VkImageView, MaxGenerated> outputViews{};
+
+		// 3-Tier Adaptive HUD Protection (zero-PCL-overhead inline compute + 2-slot non-blocking readback)
+		HudTier::StateMachine hudTierState;
+		HudTier::Decision hudDecision{};
+		HudTier::ActiveTier loggedHudTier = HudTier::ActiveTier::Interpolated;
+		bool hasLoggedHudTier = false;
+		ComPtr<ID3D12Resource> staticCountTex;
+		VkImageView staticCountView = VK_NULL_HANDLE;
+		ComPtr<ID3D12Resource> hudCounterGpu;
+		VkBuffer hudCounterGpuBuf = VK_NULL_HANDLE;
+		ComPtr<ID3D12Resource> hudCounterReadback[2];
+		VkBuffer hudCounterReadbackBuf[2]{};
+		const uint32_t* hudMappedReadback[2]{};
+		bool hudReadbackHasDiff[2]{};
+		bool hudReadbackHasStatic[2]{};
+		uint64_t hudRealFrameCount = 0;
+		uint32_t hudReadbackSlot = 0;
+		bool hudResourcesReady = false;
+		uint32_t activeBatchSlot = 0;
 
 		uint32_t lastIndex = 0; // the previous evaluation's DLSSG.MultiFrameIndex
 		uint32_t batchCount = 0;
@@ -409,6 +441,136 @@ namespace
 		d.vkCmdDispatch(command, (width + 7) / 8, (height + 7) / 8, 1);
 	}
 
+	struct VkHudPushConstants
+	{
+		uint32_t width;
+		uint32_t height;
+		float tolerance;
+		uint32_t flags;
+	};
+
+	void RecordHudDispatch(const Device& d, VkCommandBuffer command, VkPipeline pipeline,
+		VkImageView view0, VkImageView view1, VkImageView view2, VkBuffer counterBuf,
+		uint32_t width, uint32_t height, float tolerance, uint32_t flags) noexcept
+	{
+		if (!pipeline || !view0 || !view1 || !view2 || !counterBuf)
+			return;
+
+		d.vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+
+		VkDescriptorImageInfo img0{ VK_NULL_HANDLE, view0, VK_IMAGE_LAYOUT_GENERAL };
+		VkDescriptorImageInfo img1{ VK_NULL_HANDLE, view1, VK_IMAGE_LAYOUT_GENERAL };
+		VkDescriptorImageInfo img2{ VK_NULL_HANDLE, view2, VK_IMAGE_LAYOUT_GENERAL };
+		VkDescriptorBufferInfo buf3{ counterBuf, 0, 16 };
+
+		VkWriteDescriptorSet writes[4] = {
+			{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1,
+				VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &img0, nullptr, nullptr },
+			{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1,
+				VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &img1, nullptr, nullptr },
+			{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 2, 0, 1,
+				VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &img2, nullptr, nullptr },
+			{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 3, 0, 1,
+				VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &buf3, nullptr },
+		};
+
+		d.vkCmdPushDescriptorSetKHR(command, VK_PIPELINE_BIND_POINT_COMPUTE, d.hudPipelineLayout, 0, 4, writes);
+		const VkHudPushConstants pc{ width, height, tolerance, flags };
+		d.vkCmdPushConstants(command, d.hudPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+		d.vkCmdDispatch(command, (width + 7u) / 8u, (height + 7u) / 8u, 1u);
+	}
+
+	bool LoadSpirvFileBytes(const std::filesystem::path& path, std::vector<uint32_t>& outWords) noexcept
+	{
+		try
+		{
+			std::error_code ec;
+			const auto bytes = std::filesystem::file_size(path, ec);
+			if (ec || bytes < 20 || bytes > (1024u * 1024u) || (bytes % 4u) != 0)
+				return false;
+			std::ifstream file(path, std::ios::binary);
+			if (!file)
+				return false;
+			outWords.resize(static_cast<size_t>(bytes / 4u));
+			file.read(reinterpret_cast<char*>(outWords.data()), static_cast<std::streamsize>(bytes));
+			return file.good() && outWords[0] == 0x07230203u;
+		}
+		catch (...)
+		{
+			return false;
+		}
+	}
+
+	void CreateHudPipelines(Device& d) noexcept
+	{
+		d.hudPipelinesReady = false;
+		if (!d.vkCmdFillBuffer || !d.vkCmdCopyBuffer)
+			return;
+
+		wchar_t modPath[MAX_PATH]{};
+		if (!GetModuleFileNameW(SelfModule(), modPath, MAX_PATH))
+			return;
+		const std::filesystem::path baseDir = std::filesystem::path(modPath).parent_path();
+		std::filesystem::path hudDir = baseDir / L"xefg_mfg_programs" / L"vulkan" / L"coopmat" / L"hud";
+		std::error_code ec;
+		if (!std::filesystem::is_directory(hudDir, ec))
+			hudDir = baseDir / L"coopmat" / L"hud";
+		if (!std::filesystem::is_directory(hudDir, ec))
+			return;
+
+		VkDescriptorSetLayoutBinding bindings[4] = {
+			{ 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+			{ 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+			{ 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+			{ 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+		};
+		VkDescriptorSetLayoutCreateInfo setInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr,
+			VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, 4, bindings };
+		VkPushConstantRange push{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(VkHudPushConstants) };
+
+		if (d.vkCreateDescriptorSetLayout(d.device, &setInfo, nullptr, &d.hudSetLayout) != VK_SUCCESS)
+			return;
+
+		VkPipelineLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1,
+			&d.hudSetLayout, 1, &push };
+		if (d.vkCreatePipelineLayout(d.device, &layoutInfo, nullptr, &d.hudPipelineLayout) != VK_SUCCESS)
+			return;
+
+		static constexpr const char* kNames[4][2] = {
+			{ "hud_diff_guard_rgba8.spv", "hud_diff_guard_rgb10a2.spv" },
+			{ "hud_diff_composite_rgba8.spv", "hud_diff_composite_rgb10a2.spv" },
+			{ "hud_static_update_rgba8.spv", "hud_static_update_rgb10a2.spv" },
+			{ "hud_static_composite_rgba8.spv", "hud_static_composite_rgb10a2.spv" },
+		};
+
+		std::vector<uint32_t> words;
+		for (int m = 0; m < 4; ++m)
+		{
+			for (int f = 0; f < 2; ++f)
+			{
+				if (!LoadSpirvFileBytes(hudDir / kNames[m][f], words))
+					return;
+				VkShaderModuleCreateInfo modInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0,
+					words.size() * sizeof(uint32_t), words.data() };
+				VkShaderModule mod = VK_NULL_HANDLE;
+				if (d.vkCreateShaderModule(d.device, &modInfo, nullptr, &mod) != VK_SUCCESS)
+					return;
+				VkComputePipelineCreateInfo pipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+				pipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+					VK_SHADER_STAGE_COMPUTE_BIT, mod, "main", nullptr };
+				pipeInfo.layout = d.hudPipelineLayout;
+				const VkResult res = d.vkCreateComputePipelines(d.device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr,
+					&d.hudPipelines[m][f]);
+				d.vkDestroyShaderModule(d.device, mod, nullptr);
+				if (res != VK_SUCCESS)
+					return;
+			}
+		}
+
+		d.hudPipelinesReady = true;
+		Log::Info("Vulkan 3-tier HUD compute pipelines ready (8/8 SPIR-V from {})", hudDir.string());
+	}
+
 	// ------------------------------------------------------------------------------------------ the device
 
 	bool CreatePipelines(Device& d)
@@ -458,6 +620,7 @@ namespace
 				return false;
 		}
 
+		CreateHudPipelines(d);
 		return true;
 	}
 
@@ -738,6 +901,15 @@ namespace
 		const auto motionFormat = static_cast<DXGI_FORMAT>(VulkanPolicy::MotionFormat(static_cast<uint32_t>(motion.format)));
 		const DXGI_FORMAT hudlessFormat = ColorFormat(in.hudless);
 		const DXGI_FORMAT uiFormat = ColorFormat(in.ui);
+		const int32_t uiAlpha = Plugin::options.uiAlphaMode.load(std::memory_order_relaxed);
+		uint32_t wantedUiMode = XEFGD_UI_MODE_AUTO;
+		if (uiFormat != DXGI_FORMAT_UNKNOWN)
+		{
+			if (uiAlpha == 1)
+				wantedUiMode = XEFGD_UI_MODE_UI_TEXTURE;
+			else if (uiAlpha == 2)
+				wantedUiMode = XEFGD_UI_MODE_UI_TEXTURE_PREMULTIPLIED;
+		}
 		const int32_t model = WantedModel(d);
 
 		ApplyTensorGate(d, model);
@@ -751,8 +923,8 @@ namespace
 
 		const bool sameSettings = f.width == bb.width && f.height == bb.height && f.format == format &&
 			f.depthWidth == depth.width && f.depthHeight == depth.height && f.motionFormat == motionFormat &&
-			f.hudlessFormat == hudlessFormat && f.uiFormat == uiFormat && f.inverted == inverted &&
-			f.jittered == jittered && f.model == model;
+			f.hudlessFormat == hudlessFormat && f.uiFormat == uiFormat && f.uiMode == wantedUiMode &&
+			f.inverted == inverted && f.jittered == jittered && f.model == model;
 
 		if (sameSettings)
 		{
@@ -774,8 +946,12 @@ namespace
 			f.context = nullptr;
 		}
 
+		// Clean resume after a successful resize/settings change following any prior stall or failure (RTX-Encore)
 		f.havePrevious = false;
 		f.createFailed = false;
+		f.consecutiveExecuteFailures = 0;
+		f.stallCooldownBatches = 0;
+		f.uiMode = wantedUiMode;
 		f.width = bb.width;
 		f.height = bb.height;
 		f.format = format;
@@ -809,6 +985,11 @@ namespace
 				return false;
 			}
 
+			const VkFormat vkColorView = (format == DXGI_FORMAT_R10G10B10A2_UNORM)
+				? VK_FORMAT_A2B10G10R10_UNORM_PACK32
+				: (format == DXGI_FORMAT_B8G8R8A8_UNORM ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM);
+			slot.bbView = xvk::StorageImageView(slot.backbuffer.Get(), vkColorView);
+			slot.hudlessView = slot.hudless ? xvk::StorageImageView(slot.hudless.Get(), vkColorView) : VK_NULL_HANDLE;
 			slot.depthView = xvk::StorageImageView(slot.depth.Get(), VK_FORMAT_R32_SFLOAT);
 			slot.motionView = xvk::StorageImageView(slot.motion.Get(), motionView);
 
@@ -820,14 +1001,77 @@ namespace
 			}
 		}
 
-		for (auto& output : f.outputs)
+		const VkFormat vkOutColorView = (format == DXGI_FORMAT_R10G10B10A2_UNORM)
+			? VK_FORMAT_A2B10G10R10_UNORM_PACK32
+			: (format == DXGI_FORMAT_B8G8R8A8_UNORM ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM);
+		for (size_t i = 0; i < f.outputs.size(); ++i)
 		{
-			if (FAILED(CreateTexture(d3d, f.width, f.height, format, output)))
+			if (FAILED(CreateTexture(d3d, f.width, f.height, format, f.outputs[i])))
 			{
 				f.fault = "output_images";
 				f.createFailed = true;
 				return false;
 			}
+			f.outputViews[i] = xvk::StorageImageView(f.outputs[i].Get(), vkOutColorView);
+		}
+
+		// Allocate 3-tier HUD compute resources (R8_UINT static map + 16-byte GPU counter + 2-slot mapped readback)
+		f.hudResourcesReady = false;
+		f.staticCountTex.Reset();
+		f.staticCountView = VK_NULL_HANDLE;
+		f.hudCounterGpu.Reset();
+		f.hudCounterGpuBuf = VK_NULL_HANDLE;
+		for (int i = 0; i < 2; ++i)
+		{
+			f.hudCounterReadback[i].Reset();
+			f.hudCounterReadbackBuf[i] = VK_NULL_HANDLE;
+			f.hudMappedReadback[i] = nullptr;
+			f.hudReadbackHasDiff[i] = false;
+			f.hudReadbackHasStatic[i] = false;
+		}
+		f.hudRealFrameCount = 0;
+		f.hudReadbackSlot = 0;
+
+		if (d.hudPipelinesReady && SUCCEEDED(CreateTexture(d3d, f.width, f.height, DXGI_FORMAT_R8_UINT, f.staticCountTex)))
+		{
+			f.staticCountView = xvk::StorageImageView(f.staticCountTex.Get(), VK_FORMAT_R8_UINT);
+			D3D12_RESOURCE_DESC bufDesc{};
+			bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+			bufDesc.Width = 16;
+			bufDesc.Height = 1;
+			bufDesc.DepthOrArraySize = 1;
+			bufDesc.MipLevels = 1;
+			bufDesc.SampleDesc.Count = 1;
+			bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+			D3D12_RESOURCE_DESC gpuBufDesc = bufDesc;
+			gpuBufDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+			D3D12_HEAP_PROPERTIES defaultHeap{ D3D12_HEAP_TYPE_DEFAULT };
+			D3D12_HEAP_PROPERTIES readbackHeap{ D3D12_HEAP_TYPE_READBACK };
+
+			bool ok = (f.staticCountView != VK_NULL_HANDLE) &&
+				SUCCEEDED(d3d->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &gpuBufDesc,
+					D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&f.hudCounterGpu)));
+			if (ok)
+				f.hudCounterGpuBuf = xvk::BufferOf(f.hudCounterGpu.Get());
+			ok = ok && (f.hudCounterGpuBuf != VK_NULL_HANDLE);
+
+			for (int i = 0; ok && i < 2; ++i)
+			{
+				ok = SUCCEEDED(d3d->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
+					D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&f.hudCounterReadback[i])));
+				if (ok)
+				{
+					f.hudCounterReadbackBuf[i] = xvk::BufferOf(f.hudCounterReadback[i].Get());
+					void* mapped = nullptr;
+					const D3D12_RANGE range{ 0, 16 };
+					ok = (f.hudCounterReadbackBuf[i] != VK_NULL_HANDLE) &&
+						SUCCEEDED(f.hudCounterReadback[i]->Map(0, &range, &mapped)) && mapped != nullptr;
+					if (ok)
+						f.hudMappedReadback[i] = static_cast<const uint32_t*>(mapped);
+				}
+			}
+			f.hudResourcesReady = ok;
 		}
 
 		if (!f.allocator && FAILED(d3d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&f.allocator))))
@@ -861,7 +1105,7 @@ namespace
 		init.maxInterpolatedFrames = MaxGenerated;
 		init.creationNodeMask = init.visibleNodeMask = 1;
 		// Automatic: from the inputs given, the HUDless color and the UI texture
-		init.uiMode = XEFGD_UI_MODE_AUTO;
+		init.uiMode = wantedUiMode;
 
 		result = CallXeFG("Init", [&] { return XeFG::Init(context, init); });
 
@@ -998,11 +1242,13 @@ namespace
 	void DescribeFrame(const Feature& f, const Slot& slot, xefgd_frame_t& frame)
 	{
 		frame = {};
-		frame.backBuffer = Region(slot.backbuffer.Get(), f.width, f.height, slot.bbBase, slot.bbSize);
+		const bool useHudlessScene = f.hudDecision.useHudlessAsSceneSource && slot.hasHudless && slot.hudless;
+		frame.backBuffer = Region(useHudlessScene ? slot.hudless.Get() : slot.backbuffer.Get(),
+			f.width, f.height, slot.bbBase, slot.bbSize);
 		frame.depth = Region(slot.depth.Get(), f.depthWidth, f.depthHeight, slot.depthBase, slot.depthSize);
 		frame.motionVectors = Region(slot.motion.Get(), f.depthWidth, f.depthHeight, slot.motionBase, slot.motionSize);
 
-		if (slot.hasHudless)
+		if (slot.hasHudless && f.hudDecision.useXeFgNativeUi)
 			frame.hudlessColor = Region(slot.hudless.Get(), f.width, f.height, slot.hudlessBase, slot.hudlessSize);
 
 		if (slot.hasUi)
@@ -1056,6 +1302,62 @@ namespace
 			return false;
 		}
 
+		// Inline Tier 2 (HUD-Diff Composite) or Tier 3 (Static HUD Mask) on generated outputs in-place (zero extra submit / PCL).
+		if (d.hudPipelinesReady && f.hudResourcesReady &&
+			(f.hudDecision.runHudDiffComposite || f.hudDecision.runStaticHudComposite))
+		{
+			const int fmtIdx = (f.format == DXGI_FORMAT_R10G10B10A2_UNORM) ? 1 : 0;
+			const Slot& curSlot = f.slots[f.activeBatchSlot];
+			const bool debugMagenta = Plugin::options.hudDebugMagenta.load(std::memory_order_relaxed);
+			bool dispatched = false;
+
+			for (uint32_t k = 0; k < range.count; ++k)
+			{
+				const uint32_t outIdx = range.first + k;
+				if (outIdx >= f.outputViews.size() || !f.outputViews[outIdx])
+					continue;
+
+				if (f.hudDecision.runHudDiffComposite && curSlot.bbView && curSlot.hudlessView)
+				{
+					const bool updateCounter = (outIdx == 0);
+					if (updateCounter)
+					{
+						d.vkCmdFillBuffer(command, f.hudCounterGpuBuf, 0, 4, 0u);
+						StageBarrier(d, command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+							VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+					}
+					const uint32_t flags = (updateCounter ? 1u : 0u) | (debugMagenta ? 2u : 0u);
+					RecordHudDispatch(d, command, d.hudPipelines[1][fmtIdx],
+						curSlot.bbView, curSlot.hudlessView, f.outputViews[outIdx], f.hudCounterGpuBuf,
+						f.width, f.height, 0.02f, flags);
+					dispatched = true;
+					if (updateCounter)
+					{
+						StageBarrier(d, command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+							VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+						const VkBufferCopy copy{ 0, 0, 4 };
+						d.vkCmdCopyBuffer(command, f.hudCounterGpuBuf, f.hudCounterReadbackBuf[f.hudReadbackSlot], 1, &copy);
+						f.hudReadbackHasDiff[f.hudReadbackSlot] = true;
+					}
+				}
+				else if (f.hudDecision.runStaticHudComposite && curSlot.bbView && f.staticCountView)
+				{
+					const uint32_t flags = debugMagenta ? 2u : 0u;
+					RecordHudDispatch(d, command, d.hudPipelines[3][fmtIdx],
+						curSlot.bbView, f.staticCountView, f.outputViews[outIdx], f.hudCounterGpuBuf,
+						f.width, f.height, 0.008f, flags);
+					dispatched = true;
+				}
+			}
+
+			if (dispatched)
+			{
+				StageBarrier(d, command,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+					VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+			}
+		}
+
 		f.generatedThrough = range.through;
 		return true;
 	}
@@ -1070,10 +1372,12 @@ namespace
 		in.depth = ImageParameter(parameters, "DLSSG.Depth");
 		in.motion = ImageParameter(parameters, "DLSSG.MVecs");
 
-		// The menu's HUDless UI switch is for both: off, the UI is interpolated with the scene
+		const NgxResource* rawGameHudless = ImageParameter(parameters, "DLSSG.HUDLess");
+		const auto vkHudMode = static_cast<HudTier::Mode>(
+			std::clamp(Plugin::options.hudTierMode.load(std::memory_order_relaxed), 0, 3));
 		if (Plugin::options.hudlessUi)
 		{
-			in.hudless = ImageParameter(parameters, "DLSSG.HUDLess");
+			in.hudless = rawGameHudless;
 			in.ui = ImageParameter(parameters, "DLSSG.UI");
 		}
 
@@ -1104,19 +1408,100 @@ namespace
 				fmt != DXGI_FORMAT_UNKNOWN &&
 				(!requireBbFormatMatch || fmt == bbFormat);
 		};
-		if (in.hudless && !usableUi(in.hudless, true))
+		static const bool isNoMansSky = []() noexcept {
+			wchar_t exePath[MAX_PATH]{};
+			const DWORD len = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+			if (!len || len >= MAX_PATH)
+				return false;
+			const wchar_t* leaf = exePath;
+			for (const wchar_t* p = exePath; *p; ++p)
+				if (*p == L'\\' || *p == L'/')
+					leaf = p + 1;
+			return _wcsicmp(leaf, L"NMS.exe") == 0;
+		}();
+		if (in.hudless && isNoMansSky)
 		{
 			if (!f.hudlessMismatchLogged)
 			{
 				f.hudlessMismatchLogged = true;
-				Log::Warn("Vulkan: HUD-less input ({}x{}, VkFormat {}) does not match backbuffer ({}x{}, VkFormat {}); "
-					"falling back to UI Auto", in.hudless->width, in.hudless->height,
-					static_cast<int>(in.hudless->format), in.backbuffer->width, in.backbuffer->height,
-					static_cast<int>(in.backbuffer->format));
+				Log::Info("Vulkan: disabling HUD-less UI on No Man's Sky (NMS.exe) to prevent doubled outlines "
+					"during camera motion (using UI Auto)");
 			}
 			in.hudless = nullptr;
 		}
+		if (in.hudless)
+		{
+			const bool sameAsBackbuffer = (in.hudless->image == in.backbuffer->image);
+			const uint32_t bbSubX = parameters.GetOr<uint32_t>("DLSSG.BackbufferSubrectBaseX", 0u);
+			const uint32_t bbSubY = parameters.GetOr<uint32_t>("DLSSG.BackbufferSubrectBaseY", 0u);
+			const uint32_t bbSubW = parameters.GetOr<uint32_t>("DLSSG.BackbufferSubrectWidth", in.backbuffer->width);
+			const uint32_t bbSubH = parameters.GetOr<uint32_t>("DLSSG.BackbufferSubrectHeight", in.backbuffer->height);
+			const uint32_t hlSubX = parameters.GetOr<uint32_t>("DLSSG.HUDLessSubrectBaseX", 0u);
+			const uint32_t hlSubY = parameters.GetOr<uint32_t>("DLSSG.HUDLessSubrectBaseY", 0u);
+			const uint32_t hlSubW = parameters.GetOr<uint32_t>("DLSSG.HUDLessSubrectWidth", in.hudless->width);
+			const uint32_t hlSubH = parameters.GetOr<uint32_t>("DLSSG.HUDLessSubrectHeight", in.hudless->height);
+			const bool subrectMismatch = (hlSubX != bbSubX || hlSubY != bbSubY || hlSubW != bbSubW || hlSubH != bbSubH);
+			if (sameAsBackbuffer || subrectMismatch || !usableUi(in.hudless, true))
+			{
+				if (!f.hudlessMismatchLogged)
+				{
+					f.hudlessMismatchLogged = true;
+					Log::Warn("Vulkan: HUD-less input ({}x{}, VkFormat {}, subrect {},{} {}x{}) rejected against backbuffer "
+						"({}x{}, VkFormat {}, subrect {},{} {}x{}); falling back to UI Auto",
+						in.hudless->width, in.hudless->height, static_cast<int>(in.hudless->format),
+						hlSubX, hlSubY, hlSubW, hlSubH,
+						in.backbuffer->width, in.backbuffer->height, static_cast<int>(in.backbuffer->format),
+						bbSubX, bbSubY, bbSubW, bbSubH);
+				}
+				in.hudless = nullptr;
+			}
+		}
 		if (!usableUi(in.ui, false)) in.ui = nullptr;
+
+		// 3-Tier Adaptive HUD Protection: poll non-blocking 2-frame-old readback (0 GPU stall / 0 PCL overhead)
+		if (f.hudResourcesReady && f.hudRealFrameCount >= 2u && f.width > 0 && f.height > 0)
+		{
+			const uint32_t rslot = f.hudReadbackSlot;
+			const uint64_t sampledTotal = static_cast<uint64_t>((f.width + 3u) / 4u) * static_cast<uint64_t>((f.height + 3u) / 4u);
+			if (sampledTotal > 0 && f.hudMappedReadback[rslot])
+			{
+				if (f.hudReadbackHasDiff[rslot])
+				{
+					const float frac = std::clamp(static_cast<float>(f.hudMappedReadback[rslot][0]) / static_cast<float>(sampledTotal), 0.0f, 1.0f);
+					f.hudTierState.FeedHudDiffFraction(frac);
+					f.hudReadbackHasDiff[rslot] = false;
+				}
+				if (f.hudReadbackHasStatic[rslot])
+				{
+					const float frac = std::clamp(static_cast<float>(f.hudMappedReadback[rslot][1]) / static_cast<float>(sampledTotal), 0.0f, 1.0f);
+					f.hudTierState.FeedStaticHudFraction(frac);
+					f.hudReadbackHasStatic[rslot] = false;
+				}
+			}
+		}
+
+		HudTier::Inputs vkHudInputs{};
+		vkHudInputs.mode = vkHudMode;
+		vkHudInputs.hudlessUiEnabled = Plugin::options.hudlessUi.load(std::memory_order_relaxed);
+		vkHudInputs.hasGameHudless = rawGameHudless != nullptr;
+		vkHudInputs.hudlessStructurallyValid = in.hudless != nullptr;
+		vkHudInputs.hasSeparateUiPlane = in.ui != nullptr;
+		vkHudInputs.gpuComputeAvailable = d.hudPipelinesReady;
+		f.hudDecision = f.hudTierState.Evaluate(vkHudInputs);
+
+		if (!f.hasLoggedHudTier || f.hudDecision.activeTier != f.loggedHudTier)
+		{
+			f.hasLoggedHudTier = true;
+			f.loggedHudTier = f.hudDecision.activeTier;
+			Log::Info("Vulkan HUD protection tier: {} (reason: {}, diff={:.2f}%, static={:.2f}%)",
+				HudTier::ActiveTierShortName(f.hudDecision.activeTier), f.hudDecision.reason,
+				f.hudTierState.LastDiffFraction() * 100.0f, f.hudTierState.LastStaticFraction() * 100.0f);
+		}
+
+		if (!f.hudDecision.useXeFgNativeUi && !f.hudDecision.useHudlessAsSceneSource && !f.hudDecision.runHudDiffGuard)
+			in.hudless = nullptr;
+		if (!f.hudDecision.useXeFgNativeUi)
+			in.ui = nullptr;
 
 		const bool inverted = XeFgEnabler::ApplyTriStateOverride(
 			Plugin::options.depthInvertedOverride.load(std::memory_order_relaxed),
@@ -1281,6 +1666,48 @@ namespace
 			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 
+		// Record inline Tier 1 Pixel-Diff Guard and/or Tier 3 Static-HUD temporal update (0 extra submits / 0 PCL)
+		f.activeBatchSlot = f.current;
+		if (d.hudPipelinesReady && f.hudResourcesReady)
+		{
+			++f.hudRealFrameCount;
+			f.hudReadbackSlot = static_cast<uint32_t>(f.hudRealFrameCount & 1u);
+			const int fmtIdx = (f.format == DXGI_FORMAT_R10G10B10A2_UNORM) ? 1 : 0;
+
+			if (f.hudDecision.runHudDiffGuard && !f.hudDecision.runHudDiffComposite && slot.hasHudless && slot.bbView && slot.hudlessView)
+			{
+				d.vkCmdFillBuffer(command, f.hudCounterGpuBuf, 0, 4, 0u);
+				StageBarrier(d, command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+				RecordHudDispatch(d, command, d.hudPipelines[0][fmtIdx],
+					slot.bbView, slot.hudlessView, slot.bbView, f.hudCounterGpuBuf,
+					f.width, f.height, 0.02f, 1u);
+				StageBarrier(d, command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+					VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+				const VkBufferCopy copy{ 0, 0, 4 };
+				d.vkCmdCopyBuffer(command, f.hudCounterGpuBuf, f.hudCounterReadbackBuf[f.hudReadbackSlot], 1, &copy);
+				f.hudReadbackHasDiff[f.hudReadbackSlot] = true;
+			}
+
+			if (f.hudDecision.runStaticHudUpdate && slot.bbView && f.staticCountView)
+			{
+				const Slot& prevSlot = f.slots[f.current ^ 1];
+				const bool staticReset = !f.havePrevious || reset || !prevSlot.bbView;
+				d.vkCmdFillBuffer(command, f.hudCounterGpuBuf, 4, 4, 0u);
+				StageBarrier(d, command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+				RecordHudDispatch(d, command, d.hudPipelines[2][fmtIdx],
+					slot.bbView, staticReset ? slot.bbView : prevSlot.bbView, f.staticCountView, f.hudCounterGpuBuf,
+					f.width, f.height, 0.008f, staticReset ? 1u : 0u);
+				StageBarrier(d, command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+					VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+					VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+				const VkBufferCopy copy{ 4, 4, 4 };
+				d.vkCmdCopyBuffer(command, f.hudCounterGpuBuf, f.hudCounterReadbackBuf[f.hudReadbackSlot], 1, &copy);
+				f.hudReadbackHasStatic[f.hudReadbackSlot] = true;
+			}
+		}
+
 		// The frame's constants. DLSSG.MvecScale is already a pixel scale of the motion vectors' extent (not
 		// Streamline's normalized one), carried to the depth size they are resampled to. XeFG's left handed projection is
 		// built from DLSS-G's near, far and field of view; DLSSG.CameraViewToClip is OptiScaler's right handed one, with
@@ -1366,7 +1793,7 @@ namespace
 		f.exec.ppOutputs = f.execOutputs.data();
 		f.exec.pOutputBases = f.execBases.data();
 		f.exec.numInterpolatedFrames = static_cast<uint8_t>(count);
-		f.exec.uiCompositionEnabled = (slot.hasHudless || slot.hasUi) ? 1u : 0u;
+		f.exec.uiCompositionEnabled = (f.hudDecision.useXeFgNativeUi && (slot.hasHudless || slot.hasUi)) ? 1u : 0u;
 
 		if (!RecordOutputs(d, f, command, range))
 		{
@@ -1564,7 +1991,8 @@ namespace
 				didExecute = f.batchReady;
 				f.batches++;
 
-				Plugin::Report({ f.width, f.height, count, f.exec.uiCompositionEnabled != 0, NetworkOf(f.model),
+				Plugin::Report({ f.width, f.height, count, f.hudDecision.activeTier != HudTier::ActiveTier::Interpolated,
+					static_cast<int32_t>(f.hudDecision.activeTier), NetworkOf(f.model),
 					f.context == nullptr, f.format == DXGI_FORMAT_R16G16B16A16_FLOAT });
 
 				if (!f.batchReady)

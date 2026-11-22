@@ -3,6 +3,7 @@
 #include "../MfgPort/Cuda/cuda_layers.h"
 #include "../MfgPort/Sha256.h"
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 
@@ -84,24 +85,34 @@ bool CoopMatrixRoute::SelectTile(const VkCooperativeMatrixPropertiesKHR* propert
     if (!properties || !count)
         return false;
 
-    // xefg_coopmat_layers.comp uses fixed 16x16x16 subgroup-scope SINT8 x SINT8 -> SINT32 fragments
-    // (AMD RDNA 4 / RDNA 3 WMMA v_wmma_i32_16x16x16_iu8 and any GPU advertising 16x16x16 SINT8->SINT32).
-    // Only admit devices that actually support 16x16x16 so unsupported GPUs cleanly stay on DP4a.
+    // Prefer 16x16x16 (AMD RDNA 4 / RDNA 3 WMMA Wave32), then 8x8x32 (Intel Arc / Battlemage XMX SIMD16).
+    // Only admit devices advertising an exact supported SINT8 x SINT8 -> SINT32 subgroup shape.
+    bool has8x8x32 = false;
     for (uint32_t i = 0; i < count; ++i)
     {
         const auto& p = properties[i];
-        if (p.scope == VK_SCOPE_SUBGROUP_KHR &&
-            p.AType == VK_COMPONENT_TYPE_SINT8_KHR &&
-            p.BType == VK_COMPONENT_TYPE_SINT8_KHR &&
-            p.CType == VK_COMPONENT_TYPE_SINT32_KHR &&
-            p.ResultType == VK_COMPONENT_TYPE_SINT32_KHR &&
-            p.MSize == 16u && p.NSize == 16u && p.KSize == 16u)
+        if (p.scope != VK_SCOPE_SUBGROUP_KHR ||
+            p.AType != VK_COMPONENT_TYPE_SINT8_KHR ||
+            p.BType != VK_COMPONENT_TYPE_SINT8_KHR ||
+            p.CType != VK_COMPONENT_TYPE_SINT32_KHR ||
+            p.ResultType != VK_COMPONENT_TYPE_SINT32_KHR)
+            continue;
+        if (p.MSize == 16u && p.NSize == 16u && p.KSize == 16u)
         {
             m = 16u;
             n = 16u;
             k = 16u;
             return true;
         }
+        if (p.MSize == 8u && p.NSize == 8u && p.KSize == 32u)
+            has8x8x32 = true;
+    }
+    if (has8x8x32)
+    {
+        m = 8u;
+        n = 8u;
+        k = 32u;
+        return true;
     }
 
     return false;
@@ -109,6 +120,7 @@ bool CoopMatrixRoute::SelectTile(const VkCooperativeMatrixPropertiesKHR* propert
 
 CoopMatrixRoute::~CoopMatrixRoute()
 {
+    SavePipelineCache();
     if (!device_ || !destroyPipeline_)
         return;
 
@@ -119,6 +131,11 @@ CoopMatrixRoute::~CoopMatrixRoute()
             destroyPipeline_(device_, pipeline, nullptr);
             pipeline = VK_NULL_HANDLE;
         }
+    }
+    if (pipelineCache_ && destroyPipelineCache_)
+    {
+        destroyPipelineCache_(device_, pipelineCache_, nullptr);
+        pipelineCache_ = VK_NULL_HANDLE;
     }
 }
 
@@ -185,16 +202,17 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
         VkPhysicalDeviceProperties2 devProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &subgroup};
         props2(desc.physicalDevice, &devProps);
 
-        const bool supportsWave32 =
+        const uint32_t wantedSubgroup = (m == 8u && n == 8u && k == 32u) ? 16u : 32u;
+        const bool supportsWantedSubgroup =
             (subgroupCtrl.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
-            subgroupCtrl.minSubgroupSize <= 32u && subgroupCtrl.maxSubgroupSize >= 32u;
-        if (!supportsWave32 && subgroup.subgroupSize != 32u)
+            subgroupCtrl.minSubgroupSize <= wantedSubgroup && subgroupCtrl.maxSubgroupSize >= wantedSubgroup;
+        if (!supportsWantedSubgroup && subgroup.subgroupSize != wantedSubgroup)
         {
             reason = "no_s8_matrix_shape";
             return false;
         }
-        subgroupSize_ = 32u;
-        requireSubgroupSize32_ = supportsWave32;
+        subgroupSize_ = wantedSubgroup;
+        requireSubgroupSize_ = supportsWantedSubgroup;
 
         device_ = desc.device;
         options_ = options;
@@ -207,6 +225,9 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
         LOAD_FN(destroyShaderModule_, vkDestroyShaderModule);
         LOAD_FN(createComputePipelines_, vkCreateComputePipelines);
         LOAD_FN(destroyPipeline_, vkDestroyPipeline);
+        LOAD_FN(createPipelineCache_, vkCreatePipelineCache);
+        LOAD_FN(destroyPipelineCache_, vkDestroyPipelineCache);
+        LOAD_FN(getPipelineCacheData_, vkGetPipelineCacheData);
         LOAD_FN(bindPipeline_, vkCmdBindPipeline);
         LOAD_FN(pushDescriptorSet_, vkCmdPushDescriptorSetKHR);
         LOAD_FN(pushConstants_, vkCmdPushConstants);
@@ -221,19 +242,59 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
             return false;
         }
 
+        const std::filesystem::path spvDir = (tileM_ == 8u && tileN_ == 8u && tileK_ == 32u)
+            ? (moduleDir / L"xmx_8x8x32")
+            : moduleDir;
         uint32_t loadedCount = 0;
         for (size_t i = 0; i < std::size(xefg_cuda::kLayers); ++i)
         {
             const auto& layer = xefg_cuda::kLayers[i];
-            auto words = LoadSpirvFile(moduleDir / (std::string(layer.info.program) + ".spv"));
+            auto words = LoadSpirvFile(spvDir / (std::string(layer.info.program) + ".spv"));
             if (words.empty())
-                words = LoadSpirvFile(moduleDir / (std::string(layer.info.kernel) + ".spv"));
+                words = LoadSpirvFile(spvDir / (std::string(layer.info.kernel) + ".spv"));
 
             if (!words.empty())
             {
                 spirvModules_[i] = std::move(words);
                 ++loadedCount;
             }
+        }
+        if (loadedCount == 0)
+        {
+            reason = "no_coopmat_modules";
+            return false;
+        }
+
+        // Load persistent VkPipelineCache from %LOCALAPPDATA%\dlssg-to-xefg to eliminate multi-second
+        // shader compilation hitches across sessions.
+        if (createPipelineCache_ && destroyPipelineCache_ && getPipelineCacheData_)
+        {
+            wchar_t localAppData[MAX_PATH]{};
+            const DWORD envLen = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH);
+            std::vector<uint8_t> initialData;
+            if (envLen > 0 && envLen < MAX_PATH)
+            {
+                const std::filesystem::path cacheDir = std::filesystem::path(localAppData) / L"dlssg-to-xefg";
+                std::error_code ec;
+                std::filesystem::create_directories(cacheDir, ec);
+                char fname[96]{};
+                std::snprintf(fname, sizeof(fname), "vk_coopmat_cache_%04x_%04x_%ux%ux%u.bin",
+                    devProps.properties.vendorID, devProps.properties.deviceID, tileM_, tileN_, tileK_);
+                cachePath_ = cacheDir / fname;
+                const auto sz = std::filesystem::file_size(cachePath_, ec);
+                if (!ec && sz > 0 && sz <= 32 * 1024 * 1024)
+                {
+                    std::ifstream in(cachePath_, std::ios::binary);
+                    initialData.resize(static_cast<size_t>(sz));
+                    if (!in.read(reinterpret_cast<char*>(initialData.data()), static_cast<std::streamsize>(sz)))
+                        initialData.clear();
+                }
+            }
+            VkPipelineCacheCreateInfo cacheInfo{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+            cacheInfo.initialDataSize = initialData.size();
+            cacheInfo.pInitialData = initialData.empty() ? nullptr : initialData.data();
+            if (createPipelineCache_(device_, &cacheInfo, nullptr, &pipelineCache_) != VK_SUCCESS)
+                pipelineCache_ = VK_NULL_HANDLE;
         }
 
         installedLayers_ = loadedCount;
@@ -302,18 +363,18 @@ bool CoopMatrixRoute::EnsureLayerPipeline(Device& device, uint8_t layerIdx, Pipe
     specInfo.dataSize = sizeof(specData);
     specInfo.pData = specData;
 
-    // Enforce Wave32 (subgroup size 32) on AMD RDNA 3 / RDNA 4 so the 128-thread workgroup always maps to
-    // 4 uniform 32-lane warps (warp = tid >> 5) for coopMatLoad / coopMatMulAdd.
+    // Enforce Wave32 (16x16x16 AMD WMMA) or SIMD16 (8x8x32 Intel Arc/Battlemage XMX) so the 128-thread
+    // workgroup always maps cleanly to uniform subgroups for coopMatLoad / coopMatMulAdd.
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo reqSubgroup{
         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
         nullptr,
-        32u
+        subgroupSize_
     };
     VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     pipelineInfo.stage = {
         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        requireSubgroupSize32_ ? &reqSubgroup : nullptr,
-        (requireSubgroupSize32_ || subgroupSize_ == 16u || subgroupSize_ == 32u)
+        requireSubgroupSize_ ? &reqSubgroup : nullptr,
+        (requireSubgroupSize_ || subgroupSize_ == 16u || subgroupSize_ == 32u)
             ? VkPipelineShaderStageCreateFlags(VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT) : 0u,
         VK_SHADER_STAGE_COMPUTE_BIT,
         shaderModule,
@@ -323,7 +384,7 @@ bool CoopMatrixRoute::EnsureLayerPipeline(Device& device, uint8_t layerIdx, Pipe
     pipelineInfo.layout = basePso.layout();
 
     VkPipeline created = VK_NULL_HANDLE;
-    const VkResult res = createComputePipelines_(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &created);
+    const VkResult res = createComputePipelines_(device_, pipelineCache_, 1, &pipelineInfo, nullptr, &created);
     destroyShaderModule_(device_, shaderModule, nullptr);
 
     if (res != VK_SUCCESS || !created)
@@ -335,7 +396,46 @@ bool CoopMatrixRoute::EnsureLayerPipeline(Device& device, uint8_t layerIdx, Pipe
     (void)device;
     pipelines_[idx] = created;
     pipelineReady_[idx].store(true, std::memory_order_release);
+    cacheDirty_.store(true, std::memory_order_relaxed);
     return true;
+}
+
+void CoopMatrixRoute::PrecompileLayer(Device& device, uint8_t layerIdx, PipelineState& basePso) noexcept
+{
+    if (!active() || !layerIdx || !xefg_cuda::CoopMatrixLayerEnabled(layerIdx))
+        return;
+    (void)EnsureLayerPipeline(device, layerIdx, basePso);
+}
+
+void CoopMatrixRoute::SavePipelineCache() noexcept
+{
+    if (!device_ || !pipelineCache_ || !getPipelineCacheData_ || cachePath_.empty())
+        return;
+    if (!cacheDirty_.exchange(false, std::memory_order_acq_rel))
+        return;
+    try
+    {
+        size_t bytes = 0;
+        if (getPipelineCacheData_(device_, pipelineCache_, &bytes, nullptr) != VK_SUCCESS || !bytes || bytes > 32 * 1024 * 1024)
+            return;
+        std::vector<uint8_t> blob(bytes);
+        if (getPipelineCacheData_(device_, pipelineCache_, &bytes, blob.data()) != VK_SUCCESS || !bytes)
+            return;
+        std::filesystem::path tmpPath = cachePath_;
+        tmpPath += L".tmp";
+        {
+            std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
+            if (!out.write(reinterpret_cast<const char*>(blob.data()), static_cast<std::streamsize>(bytes)))
+                return;
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmpPath, cachePath_, ec);
+        if (ec)
+            std::filesystem::remove(tmpPath, ec);
+    }
+    catch (...)
+    {
+    }
 }
 
 bool CoopMatrixRoute::TryLaunch(Device& device, VkCommandBuffer buffer, uint8_t id, PipelineState& basePso,

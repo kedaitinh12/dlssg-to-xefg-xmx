@@ -38,6 +38,11 @@ public:
     bool Install(Device& owner, const DeviceDesc& desc, const std::filesystem::path& moduleDir,
                  const CoopMatrixOptions& options, std::string& reason) noexcept;
 
+    // Pre-compiles a cooperative-matrix VkPipeline ahead of first Dispatch (called during background XeFG::Init).
+    void PrecompileLayer(Device& device, uint8_t layerIdx, PipelineState& basePso) noexcept;
+    // Persists the VkPipelineCache to disk if new pipelines were compiled.
+    void SavePipelineCache() noexcept;
+
     bool TryLaunch(Device& device, VkCommandBuffer buffer, uint8_t layer, PipelineState& basePso,
                    const std::array<const Descriptor*, 64>& tables,
                    const std::array<std::array<uint32_t, 64>, 16>& constants,
@@ -59,6 +64,12 @@ private:
     PFN_vkDestroyShaderModule destroyShaderModule_{};
     PFN_vkCreateComputePipelines createComputePipelines_{};
     PFN_vkDestroyPipeline destroyPipeline_{};
+    PFN_vkCreatePipelineCache createPipelineCache_{};
+    PFN_vkDestroyPipelineCache destroyPipelineCache_{};
+    PFN_vkGetPipelineCacheData getPipelineCacheData_{};
+    VkPipelineCache pipelineCache_ = VK_NULL_HANDLE;
+    std::filesystem::path cachePath_;
+    std::atomic<bool> cacheDirty_{false};
     PFN_vkCmdBindPipeline bindPipeline_{};
     PFN_vkCmdPushDescriptorSetKHR pushDescriptorSet_{};
     PFN_vkCmdPushConstants pushConstants_{};
@@ -68,7 +79,7 @@ private:
     CoopMatrixOptions options_{};
     uint32_t tileM_{}, tileN_{}, tileK_{};
     uint32_t subgroupSize_{};
-    bool requireSubgroupSize32_{};
+    bool requireSubgroupSize_{};
     uint32_t installedLayers_{};
     std::array<std::vector<uint32_t>, 17> spirvModules_{};
     std::array<VkPipeline, 17> pipelines_{};

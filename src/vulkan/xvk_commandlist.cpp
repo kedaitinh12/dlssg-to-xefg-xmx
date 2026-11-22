@@ -58,8 +58,23 @@ HRESULT CommandList::Begin(CommandAllocator* allocator)
         if (device_->vk().vkBeginCommandBuffer(buffer_, &begin) != VK_SUCCESS) return E_FAIL;
     }
     // D3D12 makes earlier ExecuteCommandLists work on the queue visible to the next list (state decay); Vulkan
-    // has no implicit dependency between submissions, so each list starts with one full barrier.
-    Barrier();
+    // has no implicit dependency between submissions. Recorded devices run pure compute+transfer batches so
+    // scoping to COMPUTE|TRANSFER avoids stalling graphics pipelines on shared GFX queues.
+    if (device_->recorded()) {
+        VkMemoryBarrier2 memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        memory.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        memory.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        memory.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        memory.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                               VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT |
+                               VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dependency.memoryBarrierCount = 1;
+        dependency.pMemoryBarriers = &memory;
+        device_->vk().vkCmdPipelineBarrier2(buffer_, &dependency);
+    } else {
+        Barrier();
+    }
     recording_ = true;
     failed_ = false;
     ClearState(nullptr);

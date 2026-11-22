@@ -690,6 +690,8 @@ HRESULT STDMETHODCALLTYPE Device::CreateComputePipelineState(const D3D12_COMPUTE
     auto* pso = new PipelineState(this);
     pso->SetTensorLayer(xefg_cuda::LayerForSha256(sha));
     const HRESULT hr = pso->Init(rootSignature, *program);
+    if (SUCCEEDED(hr) && pso->tensorLayer() != 0 && coopmat_.active())
+        coopmat_.PrecompileLayer(*this, pso->tensorLayer(), *pso);
     if (embedded) embedded->Release();
     return Hand(pso, hr, riid, out);
 }
@@ -1161,6 +1163,20 @@ VkImage ImageOf(ID3D12Resource* resource) noexcept
     return own->IsBuffer() ? VK_NULL_HANDLE : own->image();
 }
 
+HRESULT WrapExternalImage(ID3D12Device* d3d, const D3D12_RESOURCE_DESC& desc, VkImage image,
+                          VkFormat imageFormat, REFIID riid, void** out) noexcept
+{
+    if (!d3d || !image || !out) return E_INVALIDARG;
+    try {
+        auto* own = Own<Device>(static_cast<ID3D12Device1*>(d3d));
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        auto* resource = new Resource(own, desc, heap, D3D12_HEAP_FLAG_NONE);
+        return Hand(resource, resource->InitExternalImage(image, imageFormat), riid, out);
+    } catch (...) {
+        return E_OUTOFMEMORY;
+    }
+}
+
 bool InstallTensorCores(ID3D12Device* device, const void* fatbin, size_t bytes, const TensorOptions& options, std::string& reason) noexcept
 {
     auto* own = Own<Device>(device);
@@ -1179,5 +1195,9 @@ bool InstallCoopMatrix(ID3D12Device* device, const wchar_t* moduleDir, const Coo
 void SetCoopMatrixEnabled(ID3D12Device* device, bool enabled) noexcept
 {
     if (auto* own = Own<Device>(device)) own->coopmat().Enable(enabled);
+}
+void FlushCoopMatrixCache(ID3D12Device* device) noexcept
+{
+    if (auto* own = Own<Device>(device)) own->coopmat().SavePipelineCache();
 }
 } // namespace xvk

@@ -521,6 +521,15 @@ namespace VulkanPolicy
 		static constexpr uint64_t BurstEngageNs = 2'000'000'000ull;
 		static constexpr uint64_t BurstReleaseNs = 2'000'000'000ull;
 
+		// Selective Source Cadence Alternation Smoothing for XeFG X3+ (RTX-Encore xefgSourcePacing):
+		// Observes source intervals without limiting steady frames; only engages on persistent short/long
+		// alternation (>= 4 consecutive sign flips > 15% swing) and caps adjustment to <= 4% above EMA.
+		static constexpr uint32_t AltEngageStreak = 4u;
+		static constexpr uint64_t AltSwingNum = 15ull;
+		static constexpr uint64_t AltSwingDen = 100ull;
+		static constexpr uint64_t AltMaxBudgetNum = 104ull;
+		static constexpr uint64_t AltMaxBudgetDen = 100ull;
+
 		// Auto VRR (Hz - 3) cap & Queue-Pressure Guard state
 		uint32_t displayRefreshHz = 0;
 		bool autoVrrEnabled = false;
@@ -528,6 +537,10 @@ namespace VulkanPolicy
 		bool gpuBoundBurst = false;
 		uint64_t burstEngageSinceNs = 0;
 		uint64_t burstReleaseSinceNs = 0;
+		uint64_t prevDeltaNs = 0;
+		int8_t lastSwingSign = 0;
+		uint32_t altStreak = 0;
+		bool alternationActive = false;
 
 		void SetDisplayRefreshHz(uint32_t hz) noexcept
 		{
@@ -558,6 +571,10 @@ namespace VulkanPolicy
 			gpuBoundBurst = false;
 			burstEngageSinceNs = 0;
 			burstReleaseSinceNs = 0;
+			prevDeltaNs = 0;
+			lastSwingSign = 0;
+			altStreak = 0;
+			alternationActive = false;
 		}
 
 		void OnPaused() noexcept
@@ -574,6 +591,10 @@ namespace VulkanPolicy
 			gpuBoundBurst = false;
 			burstEngageSinceNs = 0;
 			burstReleaseSinceNs = 0;
+			prevDeltaNs = 0;
+			lastSwingSign = 0;
+			altStreak = 0;
+			alternationActive = false;
 		}
 
 		void OnBatchStart(uint64_t nowNs, uint32_t count) noexcept
@@ -598,16 +619,21 @@ namespace VulkanPolicy
 					const bool isHitch = emaBatchNs != 0 &&
 						delta * HitchThresholdDen > emaBatchNs * HitchThresholdNum;
 
-					recentDeltas[recentWrite] = delta;
-					recentWrite = (recentWrite + 1u) % MedianWindow;
-					if (recentCount < MedianWindow)
-						++recentCount;
+					// Post-Hitch Median Window Protection: never let a hitch spike pollute recentDeltas
+					// once steady cadence is established, so back-to-back hitches cannot inflate medianDelta.
+					if (!isHitch)
+					{
+						recentDeltas[recentWrite] = delta;
+						recentWrite = (recentWrite + 1u) % MedianWindow;
+						if (recentCount < MedianWindow)
+							++recentCount;
+					}
 
 					uint64_t sorted[MedianWindow]{};
 					for (uint32_t i = 0; i < recentCount; ++i)
 						sorted[i] = recentDeltas[i];
 					std::sort(sorted, sorted + recentCount);
-					const uint64_t medianDelta = sorted[recentCount / 2u];
+					const uint64_t medianDelta = recentCount ? sorted[recentCount / 2u] : delta;
 
 					if (emaBatchNs == 0)
 					{
@@ -627,8 +653,45 @@ namespace VulkanPolicy
 						}
 					}
 
+					// Selective Source Cadence Alternation Smoothing (X3+ only: count >= 2).
+					// Detects persistent short/long frame alternation and uses the pair-average (capped at +4%)
+					// so generated frames keep even spacing; stays completely idle on steady frames or X2.
+					uint64_t effectiveBatchNs = emaBatchNs;
+					if (count >= 2u && !isHitch && prevDeltaNs != 0 && emaBatchNs != 0)
+					{
+						const uint64_t diff = (delta > prevDeltaNs) ? (delta - prevDeltaNs) : (prevDeltaNs - delta);
+						const int8_t sign = (delta > prevDeltaNs) ? 1 : ((delta < prevDeltaNs) ? -1 : 0);
+						if (sign != 0 && diff * AltSwingDen >= emaBatchNs * AltSwingNum && (lastSwingSign == 0 || sign == -lastSwingSign))
+						{
+							if (altStreak < 16u)
+								++altStreak;
+							lastSwingSign = sign;
+						}
+						else
+						{
+							altStreak = (altStreak > 0u) ? (altStreak - 1u) : 0u;
+							if (altStreak == 0u)
+								lastSwingSign = 0;
+						}
+						alternationActive = (altStreak >= AltEngageStreak);
+						if (alternationActive)
+						{
+							const uint64_t pairAvgNs = (prevDeltaNs + delta) / 2ull;
+							const uint64_t maxBudgetNs = (emaBatchNs * AltMaxBudgetNum) / AltMaxBudgetDen;
+							if (pairAvgNs > effectiveBatchNs)
+								effectiveBatchNs = std::min(pairAvgNs, maxBudgetNs);
+						}
+					}
+					else
+					{
+						altStreak = 0;
+						lastSwingSign = 0;
+						alternationActive = false;
+					}
+					prevDeltaNs = isHitch ? 0ull : delta;
+
 					const uint64_t totalFrames = static_cast<uint64_t>(count) + 1ull;
-					targetStepNs = (emaBatchNs * TargetRatioNum) / (totalFrames * TargetRatioDen);
+					targetStepNs = (effectiveBatchNs * TargetRatioNum) / (totalFrames * TargetRatioDen);
 
 					// Auto VRR (Hz - 3) floor: keep generated presents inside the display's VRR window
 					if (autoVrrEnabled && displayRefreshHz >= 48u)
@@ -692,6 +755,10 @@ namespace VulkanPolicy
 					lastPresentNs = 0;
 					recentCount = 0;
 					recentWrite = 0;
+					prevDeltaNs = 0;
+					lastSwingSign = 0;
+					altStreak = 0;
+					alternationActive = false;
 				}
 			}
 

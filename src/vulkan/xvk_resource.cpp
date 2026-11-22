@@ -66,7 +66,7 @@ Resource::~Resource()
     for (auto& [key, view] : views_) views.push_back(view);
     Device* owner = device_;
     const VkBuffer buffer = buffer_;
-    const VkImage image = image_;
+    const VkImage image = ownsImage_ ? image_ : VK_NULL_HANDLE;
     const VkDeviceMemory memory = ownMemory_;
     Heap* heap = heap_;
     auto shadows = std::move(shadows_);
@@ -153,6 +153,15 @@ HRESULT Resource::Init(Heap* placedHeap, UINT64 placedOffset)
     } else {
         device_->InitializeResource(image_, format.aspect, VK_NULL_HANDLE);
     }
+    return S_OK;
+}
+
+HRESULT Resource::InitExternalImage(VkImage image, VkFormat imageFormat)
+{
+    if (!image || imageFormat == VK_FORMAT_UNDEFINED || IsBuffer()) return E_INVALIDARG;
+    image_ = image;
+    ownsImage_ = false;
+    imageFormat_ = imageFormat;
     return S_OK;
 }
 

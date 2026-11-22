@@ -18,4 +18,19 @@ namespace xvk
 			return VK_NULL_HANDLE;
 		}
 	}
+
+	VkBuffer BufferOf(ID3D12Resource* resource) noexcept
+	{
+		if (!resource)
+			return VK_NULL_HANDLE;
+
+		try
+		{
+			return Own<Resource>(resource)->buffer();
+		}
+		catch (...)
+		{
+			return VK_NULL_HANDLE;
+		}
+	}
 } // namespace xvk

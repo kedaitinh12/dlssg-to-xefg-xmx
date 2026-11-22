@@ -115,6 +115,7 @@ struct SharedImport
 	uint32_t width = 0;
 	uint32_t height = 0;
 	bool isOutput = false;
+	bool zeroCopy = false;
 };
 
 struct OutputCopy
@@ -224,6 +225,8 @@ struct Bridge
 	std::atomic<bool> initInFlight{ false };
 	std::atomic<bool> resetRequested{ false };
 	bool contextFailed = false;
+	uint32_t contextFailCount = 0;
+	std::chrono::steady_clock::time_point contextFailedAt{};
 	ContextSettings failedContextSettings{};
 	uint32_t tileM = 0;
 	uint32_t tileN = 0;
@@ -415,7 +418,10 @@ uint32_t FindMemoryType(const VkPhysicalDeviceMemoryProperties& props, uint32_t 
 
 void DestroyImport(Bridge& b, SharedImport& imp) noexcept
 {
+	const bool hadWrapped = imp.zeroCopy && imp.xvkResource != nullptr;
 	imp.xvkResource.Reset();
+	if (hadWrapped && b.xvkDevice)
+		xvk::WaitRecordedIdle(b.xvkDevice.Get(), 50'000'000ull);
 	if (imp.vkImage)
 	{
 		b.vkDestroyImage(b.device, imp.vkImage, nullptr);
@@ -480,6 +486,7 @@ SharedImport* GetOrImportLocked(Bridge& b, ID3D12Resource* d3dRes, bool isOutput
 	imgInfo.arrayLayers = desc.DepthOrArraySize ? desc.DepthOrArraySize : 1u;
 	imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
 	imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+	imgInfo.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
 	imgInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
 		(isOutput ? VK_IMAGE_USAGE_STORAGE_BIT : 0u);
 	imgInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -491,10 +498,15 @@ SharedImport* GetOrImportLocked(Bridge& b, ID3D12Resource* d3dRes, bool isOutput
 	imp.height = desc.Height;
 	imp.isOutput = isOutput;
 
-	if (b.vkCreateImage(b.device, &imgInfo, nullptr, &imp.vkImage) != VK_SUCCESS)
+	bool mutableOk = (b.vkCreateImage(b.device, &imgInfo, nullptr, &imp.vkImage) == VK_SUCCESS);
+	if (!mutableOk)
 	{
-		CloseHandle(ntHandle);
-		return nullptr;
+		imgInfo.flags = 0;
+		if (b.vkCreateImage(b.device, &imgInfo, nullptr, &imp.vkImage) != VK_SUCCESS)
+		{
+			CloseHandle(ntHandle);
+			return nullptr;
+		}
 	}
 
 	VkMemoryWin32HandlePropertiesKHR handleProps{ VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR };
@@ -539,21 +551,33 @@ SharedImport* GetOrImportLocked(Bridge& b, ID3D12Resource* d3dRes, bool isOutput
 		return nullptr;
 	}
 
-	// Create matching xvk texture so XeFG's Vulkan runtime sees native GENERAL-layout xvk images.
+	// Zero-copy: wrap the imported D3D12 shared VkImage directly as an xvk ID3D12Resource so XeFG
+	// samples inputs and writes outputs directly without per-frame full-resolution vkCmdCopyImage copies.
 	D3D12_RESOURCE_DESC xvkDesc = desc;
 	xvkDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 	xvkDesc.Flags = isOutput ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
-	const D3D12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
-	const D3D12_RESOURCE_STATES xvkState = isOutput
-		? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-		: D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
-	if (FAILED(b.xvkDevice->CreateCommittedResource(
-			&heap, D3D12_HEAP_FLAG_NONE, &xvkDesc, xvkState, nullptr, IID_PPV_ARGS(&imp.xvkResource))) ||
-		!imp.xvkResource || !xvk::ImageOf(imp.xvkResource.Get()))
+	if (mutableOk &&
+		SUCCEEDED(xvk::WrapExternalImage(b.xvkDevice.Get(), xvkDesc, imp.vkImage, vkFmt, IID_PPV_ARGS(&imp.xvkResource))) &&
+		imp.xvkResource && xvk::ImageOf(imp.xvkResource.Get()) == imp.vkImage)
 	{
-		DestroyImport(b, imp);
-		return nullptr;
+		imp.zeroCopy = true;
+	}
+	else
+	{
+		// Fallback: allocate a separate xvk texture and copy per frame if mutable external views are unsupported.
+		const D3D12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
+		const D3D12_RESOURCE_STATES xvkState = isOutput
+			? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+			: D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+		if (FAILED(b.xvkDevice->CreateCommittedResource(
+				&heap, D3D12_HEAP_FLAG_NONE, &xvkDesc, xvkState, nullptr, IID_PPV_ARGS(&imp.xvkResource))) ||
+			!imp.xvkResource || !xvk::ImageOf(imp.xvkResource.Get()))
+		{
+			DestroyImport(b, imp);
+			return nullptr;
+		}
+		imp.zeroCopy = false;
 	}
 
 	auto [inserted, _] = b.imports.emplace(d3dRes, std::move(imp));
@@ -586,27 +610,32 @@ void RecordCopyImage(const Bridge& b, VkCommandBuffer cmd, VkImage src, VkImage 
 	b.vkCmdCopyImage(cmd, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
 }
 
-void RecordD3D12Copy(ID3D12GraphicsCommandList* list, ID3D12Resource* dst, D3D12_RESOURCE_STATES dstState,
-	ID3D12Resource* src, D3D12_RESOURCE_STATES srcState) noexcept
+void RecordD3D12CopiesBatched(ID3D12GraphicsCommandList* list, const std::vector<OutputCopy>& copies) noexcept
 {
-	D3D12_RESOURCE_BARRIER barriers[2]{};
+	D3D12_RESOURCE_BARRIER barriers[kMaxFrames * 2]{};
 	UINT count = 0;
-	if (dstState != D3D12_RESOURCE_STATE_COPY_DEST)
+	const size_t n = std::min<size_t>(copies.size(), kMaxFrames);
+	for (size_t i = 0; i < n; ++i)
 	{
-		barriers[count].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		barriers[count].Transition = { dst, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, dstState, D3D12_RESOURCE_STATE_COPY_DEST };
-		++count;
-	}
-	if (srcState != D3D12_RESOURCE_STATE_COPY_SOURCE)
-	{
-		barriers[count].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		barriers[count].Transition = { src, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, srcState, D3D12_RESOURCE_STATE_COPY_SOURCE };
-		++count;
+		const auto& cp = copies[i];
+		if (cp.outputState != D3D12_RESOURCE_STATE_COPY_DEST)
+		{
+			barriers[count].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			barriers[count].Transition = { cp.gameOutput.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, cp.outputState, D3D12_RESOURCE_STATE_COPY_DEST };
+			++count;
+		}
+		if (cp.outputState != D3D12_RESOURCE_STATE_COPY_SOURCE)
+		{
+			barriers[count].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			barriers[count].Transition = { cp.sharedOutput.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, cp.outputState, D3D12_RESOURCE_STATE_COPY_SOURCE };
+			++count;
+		}
 	}
 	if (count)
 		list->ResourceBarrier(count, barriers);
 
-	list->CopyResource(dst, src);
+	for (size_t i = 0; i < n; ++i)
+		list->CopyResource(copies[i].gameOutput.Get(), copies[i].sharedOutput.Get());
 
 	for (UINT i = 0; i < count; ++i)
 		std::swap(barriers[i].Transition.StateBefore, barriers[i].Transition.StateAfter);
@@ -688,39 +717,62 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 	bool execOk = false;
 	if (xvk::BeginRecording(gBridge.xvkDevice.Get(), cmd))
 	{
-		// Copy D3D12 shared inputs into xvk's GENERAL-layout textures with batched barriers (24 -> 2 barriers).
+		// Prepare D3D12 shared inputs & outputs for XeFG compute. Zero-copy imports only need a single
+		// batched acquire barrier (zero vkCmdCopyImage); non-zero-copy fallbacks copy into xvk textures.
 		SharedImport* const inputs[8] = { prevBB, prevD, prevMV, prevHL, nextBB, nextD, nextMV, nextHL };
-		VkImageMemoryBarrier preIn[16]{};
-		VkImageMemoryBarrier postIn[8]{};
+		VkImageMemoryBarrier copyPreIn[16]{};
+		VkImageMemoryBarrier computeReady[8 + kMaxFrames]{};
 		VkImage xvkInImgs[8]{};
-		uint32_t preInCount = 0;
-		uint32_t postInCount = 0;
+		uint32_t copyPreInCount = 0;
+		uint32_t computeReadyCount = 0;
+		bool anyInputCopy = false;
 		for (uint32_t i = 0; i < 8; ++i)
 		{
 			if (!inputs[i])
 				continue;
 			VkImage xvkImg = xvk::ImageOf(inputs[i]->xvkResource.Get());
 			xvkInImgs[i] = xvkImg;
-			preIn[preInCount++] = MakeImageBarrier(inputs[i]->vkImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-				0, VK_ACCESS_TRANSFER_READ_BIT);
-			preIn[preInCount++] = MakeImageBarrier(xvkImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-				VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-			postIn[postInCount++] = MakeImageBarrier(xvkImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-				VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+			if (inputs[i]->zeroCopy)
+			{
+				computeReady[computeReadyCount++] = MakeImageBarrier(inputs[i]->vkImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+					0, VK_ACCESS_SHADER_READ_BIT);
+			}
+			else
+			{
+				anyInputCopy = true;
+				copyPreIn[copyPreInCount++] = MakeImageBarrier(inputs[i]->vkImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+					0, VK_ACCESS_TRANSFER_READ_BIT);
+				copyPreIn[copyPreInCount++] = MakeImageBarrier(xvkImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+					VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+				computeReady[computeReadyCount++] = MakeImageBarrier(xvkImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+					VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+			}
 		}
-		if (preInCount)
+		for (uint32_t i = 0; i < batch.frameCount; ++i)
+		{
+			if (outImports[i]->zeroCopy)
+			{
+				computeReady[computeReadyCount++] = MakeImageBarrier(outImports[i]->vkImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+					0, VK_ACCESS_SHADER_WRITE_BIT);
+			}
+		}
+		if (copyPreInCount)
 			gBridge.vkCmdPipelineBarrier(cmd,
 				VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, preInCount, preIn);
-		for (uint32_t i = 0; i < 8; ++i)
+				VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, copyPreInCount, copyPreIn);
+		if (anyInputCopy)
 		{
-			if (inputs[i])
-				RecordCopyImage(gBridge, cmd, inputs[i]->vkImage, xvkInImgs[i], inputs[i]->width, inputs[i]->height);
+			for (uint32_t i = 0; i < 8; ++i)
+			{
+				if (inputs[i] && !inputs[i]->zeroCopy)
+					RecordCopyImage(gBridge, cmd, inputs[i]->vkImage, xvkInImgs[i], inputs[i]->width, inputs[i]->height);
+			}
 		}
-		if (postInCount)
+		if (computeReadyCount)
 			gBridge.vkCmdPipelineBarrier(cmd,
-				VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				0, 0, nullptr, 0, nullptr, postInCount, postIn);
+				anyInputCopy ? (VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT) : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				0, 0, nullptr, 0, nullptr, computeReadyCount, computeReady);
 
 		// Record the entire XeFG batch (all 28 layers, with 17 INT8 layers on hardware VK_KHR_cooperative_matrix).
 		xefgd_exec_params_t vkParams{};
@@ -772,32 +824,50 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 		return;
 	}
 
-	// Copy xvk outputs back into the shared D3D12 output textures with batched barriers (3*N -> 2 barriers).
+	// Publish generated outputs back to D3D12. Zero-copy outputs were written directly by XeFG compute
+	// and only need a single release barrier; non-zero-copy fallbacks copy xvkOut -> shared vkImage first.
 	VkImageMemoryBarrier preOut[kMaxFrames * 2]{};
 	VkImageMemoryBarrier postOut[kMaxFrames]{};
 	VkImage xvkOutImgs[kMaxFrames]{};
 	uint32_t preOutCount = 0;
 	uint32_t postOutCount = 0;
+	bool anyOutputCopy = false;
 	for (uint32_t i = 0; i < batch.frameCount; ++i)
 	{
-		VkImage xvkOut = xvk::ImageOf(outImports[i]->xvkResource.Get());
-		xvkOutImgs[i] = xvkOut;
-		preOut[preOutCount++] = MakeImageBarrier(xvkOut, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-			VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-		preOut[preOutCount++] = MakeImageBarrier(outImports[i]->vkImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-			0, VK_ACCESS_TRANSFER_WRITE_BIT);
-		postOut[postOutCount++] = MakeImageBarrier(outImports[i]->vkImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-			VK_ACCESS_TRANSFER_WRITE_BIT, 0);
+		if (outImports[i]->zeroCopy)
+		{
+			postOut[postOutCount++] = MakeImageBarrier(outImports[i]->vkImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+				VK_ACCESS_SHADER_WRITE_BIT, 0);
+		}
+		else
+		{
+			anyOutputCopy = true;
+			VkImage xvkOut = xvk::ImageOf(outImports[i]->xvkResource.Get());
+			xvkOutImgs[i] = xvkOut;
+			preOut[preOutCount++] = MakeImageBarrier(xvkOut, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+				VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+			preOut[preOutCount++] = MakeImageBarrier(outImports[i]->vkImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+				0, VK_ACCESS_TRANSFER_WRITE_BIT);
+			postOut[postOutCount++] = MakeImageBarrier(outImports[i]->vkImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+				VK_ACCESS_TRANSFER_WRITE_BIT, 0);
+		}
 	}
 	if (preOutCount)
 		gBridge.vkCmdPipelineBarrier(cmd,
 			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, preOutCount, preOut);
-	for (uint32_t i = 0; i < batch.frameCount; ++i)
-		RecordCopyImage(gBridge, cmd, xvkOutImgs[i], outImports[i]->vkImage, outImports[i]->width, outImports[i]->height);
+	if (anyOutputCopy)
+	{
+		for (uint32_t i = 0; i < batch.frameCount; ++i)
+		{
+			if (!outImports[i]->zeroCopy)
+				RecordCopyImage(gBridge, cmd, xvkOutImgs[i], outImports[i]->vkImage, outImports[i]->width, outImports[i]->height);
+		}
+	}
 	if (postOutCount)
 		gBridge.vkCmdPipelineBarrier(cmd,
-			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+			anyOutputCopy ? (VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT) : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
 			0, 0, nullptr, 0, nullptr, postOutCount, postOut);
 
 	if (gBridge.vkEndCommandBuffer(cmd) != VK_SUCCESS)
@@ -879,8 +949,7 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 			if (SUCCEEDED(ring.alloc[slot]->Reset()) &&
 				SUCCEEDED(ring.list[slot]->Reset(ring.alloc[slot].Get(), nullptr)))
 			{
-				for (const auto& cp : batch.copies)
-					RecordD3D12Copy(ring.list[slot].Get(), cp.gameOutput.Get(), cp.outputState, cp.sharedOutput.Get(), cp.outputState);
+				RecordD3D12CopiesBatched(ring.list[slot].Get(), batch.copies);
 				ring.list[slot]->Close();
 
 				ID3D12CommandList* postLists[1] = { ring.list[slot].Get() };
@@ -1319,7 +1388,12 @@ bool EnsureContext(const ContextSettings& settings) noexcept
 
 	auto markFailed = [&]() noexcept {
 		std::lock_guard lock(gBridge.mutex);
+		if (!gBridge.contextFailed || !SameContextSettings(gBridge.failedContextSettings, settings))
+			gBridge.contextFailCount = 1;
+		else if (gBridge.contextFailCount < 3u)
+			++gBridge.contextFailCount;
 		gBridge.contextFailed = true;
+		gBridge.contextFailedAt = std::chrono::steady_clock::now();
 		gBridge.failedContextSettings = settings;
 		return false;
 	};
@@ -1336,7 +1410,11 @@ bool EnsureContext(const ContextSettings& settings) noexcept
 		if (gBridge.xefgContext && SameContextSettings(gBridge.contextSettings, settings))
 			return true;
 
-		if (gBridge.contextFailed && SameContextSettings(gBridge.failedContextSettings, settings))
+		const auto canRetryFailed = [&]() noexcept {
+			return gBridge.contextFailCount < 3u &&
+				(std::chrono::steady_clock::now() - gBridge.contextFailedAt) >= std::chrono::seconds(10);
+		};
+		if (gBridge.contextFailed && SameContextSettings(gBridge.failedContextSettings, settings) && !canRetryFailed())
 			return false;
 
 		// Drain in-flight Vulkan work with a bounded timeout so destroying any prior context and
@@ -1473,7 +1551,9 @@ bool EnsureContext(const ContextSettings& settings) noexcept
 		gBridge.xefgContext = ctx;
 		gBridge.contextSettings = settings;
 		gBridge.contextFailed = false;
+		gBridge.contextFailCount = 0;
 	}
+	xvk::FlushCoopMatrixCache(gBridge.xvkDevice.Get());
 	gBridge.contextReady.store(true, std::memory_order_release);
 	Log::Info("D3D12->Vulkan WMMA bridge context ready ({} ms): {}x{}, format {}, model {}, {}x{}x{} hardware WMMA",
 		elapsedMs(), settings.width, settings.height, static_cast<uint32_t>(settings.format), settings.model,
@@ -1512,6 +1592,7 @@ void ResetContext() noexcept
 	}
 	std::lock_guard lock(gBridge.mutex);
 	gBridge.contextFailed = false;
+	gBridge.contextFailCount = 0;
 	if (gBridge.xefgContext)
 	{
 		DrainVulkanQueueLocked(500'000'000ull);
@@ -1545,7 +1626,12 @@ bool ScheduleBatch(
 		{
 			std::lock_guard lock(gBridge.mutex);
 			if (gBridge.contextFailed && SameContextSettings(gBridge.failedContextSettings, settings))
-				return false;
+			{
+				const bool retryReady = gBridge.contextFailCount < 3u &&
+					(std::chrono::steady_clock::now() - gBridge.contextFailedAt) >= std::chrono::seconds(10);
+				if (!retryReady)
+					return false;
+			}
 		}
 		WarmupContextAsync(settings);
 		return false;
@@ -1556,7 +1642,8 @@ bool ScheduleBatch(
 		std::lock_guard lock(gBridge.mutex);
 		if (!gBridge.xefgContext || !SameContextSettings(gBridge.contextSettings, settings))
 		{
-			const bool alreadyFailed = gBridge.contextFailed && SameContextSettings(gBridge.failedContextSettings, settings);
+			const bool alreadyFailed = gBridge.contextFailed && SameContextSettings(gBridge.failedContextSettings, settings) &&
+				!(gBridge.contextFailCount < 3u && (std::chrono::steady_clock::now() - gBridge.contextFailedAt) >= std::chrono::seconds(10));
 			gBridge.contextReady.store(false, std::memory_order_release);
 			if (!alreadyFailed)
 				WarmupContextAsync(settings);
