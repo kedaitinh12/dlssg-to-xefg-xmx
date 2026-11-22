@@ -312,5 +312,9 @@ namespace AmdFlipMeterReg
 		const HINSTANCE res = shellExec(nullptr, L"runas", L"cmd.exe", args.c_str(), nullptr, SW_HIDE);
 		return reinterpret_cast<intptr_t>(res) > 32;
 	}
+#else
+	inline ScanResult ScanRdna4Adapters() noexcept { return {}; }
+	inline bool TryDirectApply(const ScanResult&, bool = false) noexcept { return false; }
+	inline bool LaunchElevatedApply(const ScanResult&, bool = false) noexcept { return false; }
 #endif
 } // namespace AmdFlipMeterReg
