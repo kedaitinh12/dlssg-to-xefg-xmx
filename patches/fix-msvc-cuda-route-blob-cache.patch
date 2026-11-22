@@ -1,0 +1,92 @@
+diff --git a/src/MfgPort/Cuda/cuda_route.cpp b/src/MfgPort/Cuda/cuda_route.cpp
+index ef52a83..824184f 100644
+--- a/src/MfgPort/Cuda/cuda_route.cpp
++++ b/src/MfgPort/Cuda/cuda_route.cpp
+@@ -273,6 +273,7 @@ std::vector<ID3D12PipelineState*> gHeld;
+ std::atomic<bool> gAnyLayer{};
+ // cudaheld.1: sequence lock so Lookup() can run lock-free while ContextRetired()/Prune() rebuilds gKeys/gValues.
+ std::atomic<uint64_t> gPipelineGeneration{};
++std::atomic<uint64_t> gCacheEpoch{ 1 };
+ PipelineBlobCache gBlobCache;
+ 
+ size_t Home(const void* key) noexcept
+@@ -503,7 +504,6 @@ struct LayerReplayEntry
+     XefgCudaParams params{};
+ };
+ 
+-std::atomic<uint64_t> gCacheEpoch{ 1 };
+ 
+ // Persists across HookReset on the same thread as long as the shader-visible CBV/SRV/UAV heap and context
+ // epoch are unchanged, mirroring CUDA Graph parameter-update replay (avoiding ~100 NvAPI descriptor lookups per frame).
+@@ -1285,7 +1285,7 @@ HRESULT STDMETHODCALLTYPE HookCreateRootSignature(ID3D12Device* self, UINT nodeM
+     {
+         ComPtr<ID3D12RootSignature> rs;
+         if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&rs))) && rs)
+-            gBlobCache.RememberRootSignature(rs.Get(), blob, blobBytes);
++            RecordPipelineRootSignature(rs.Get(), nodeMask, blob, blobBytes);
+     }
+     return result;
+ }
+@@ -1294,33 +1294,13 @@ HRESULT STDMETHODCALLTYPE HookCreateComputePipelineState(ID3D12Device* self, con
+ {
+     void* caller = _ReturnAddress();
+     const auto orig = DeviceOriginal<CreateComputeFn>(self, kCreateComputePipelineState);
+-    HRESULT result = E_FAIL;
+-    bool usedCachedBlob = false;
+     const bool providerCaller = desc && (FromProvider(caller) || FromWrapper(caller));
+-    if (providerCaller && desc->CachedPSO.pCachedBlob == nullptr && desc->pRootSignature && desc->CS.pShaderBytecode && desc->CS.BytecodeLength >= 32)
+-    {
+-        std::vector<uint8_t> cachedBlob;
+-        if (gBlobCache.Lookup(desc->pRootSignature, desc->CS.pShaderBytecode, desc->CS.BytecodeLength, cachedBlob))
+-        {
+-            D3D12_COMPUTE_PIPELINE_STATE_DESC withCache = *desc;
+-            withCache.CachedPSO.pCachedBlob = cachedBlob.data();
+-            withCache.CachedPSO.CachedBlobSizeInBytes = cachedBlob.size();
+-            result = orig(self, &withCache, iid, out);
+-            usedCachedBlob = SUCCEEDED(result);
+-        }
+-    }
+-    if (!usedCachedBlob)
+-        result = orig(self, desc, iid, out);
++    const HRESULT result = providerCaller
++        ? gBlobCache.CreateCompute(desc, iid, out,
++            [&](const D3D12_COMPUTE_PIPELINE_STATE_DESC* d, void** o) { return orig(self, d, iid, o); })
++        : orig(self, desc, iid, out);
+     if (SUCCEEDED(result) && desc && out && *out)
+-    {
+-        if (providerCaller && !usedCachedBlob && desc->pRootSignature && desc->CS.pShaderBytecode && desc->CS.BytecodeLength >= 32)
+-        {
+-            ComPtr<ID3D12PipelineState> pso;
+-            if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&pso))) && pso)
+-                gBlobCache.Store(desc->pRootSignature, desc->CS.pShaderBytecode, desc->CS.BytecodeLength, pso.Get());
+-        }
+         Recognize(self, *desc, iid, *out, caller);
+-    }
+     return result;
+ }
+ 
+@@ -1653,6 +1633,7 @@ void InvalidateCache() noexcept
+ 
+ void ContextRetired() noexcept
+ {
++    gBlobCache.ContextRetired();
+     if (gState.load(std::memory_order_acquire) != State::Active) return;
+     std::lock_guard lock(gMutex);
+     Prune();
+diff --git a/src/MfgPort/Cuda/pipeline_blob_cache.h b/src/MfgPort/Cuda/pipeline_blob_cache.h
+index 4cb120f..7fbe578 100644
+--- a/src/MfgPort/Cuda/pipeline_blob_cache.h
++++ b/src/MfgPort/Cuda/pipeline_blob_cache.h
+@@ -47,6 +47,12 @@ namespace xefg_cuda
+ 			++generation_;
+ 		}
+ 
++		void Clear() noexcept
++		{
++			std::lock_guard lock(mutex_);
++			entries_.clear();
++		}
++
+ 		template <class Create>
+ 		HRESULT CreateCompute(const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID iid, void** out, Create create) noexcept
+ 		{
