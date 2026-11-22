@@ -118,6 +118,7 @@
   <ItemGroup>
     <ClInclude Include="src\D3D12VulkanWmma.h" />
     <ClInclude Include="src\FrameGenerator.h" />
+    <ClInclude Include="src\XeFgEnabler.h" />
     <ClInclude Include="src\loader\EarlyLoaderCore.h" />
     <ClInclude Include="src\Log.h" />
     <ClInclude Include="src\MfgKernels.h" />
