@@ -67,6 +67,8 @@ void SetStackRecognition(bool enabled) noexcept;
 void ForgetLayers() noexcept;
 // Invalidate thread-local descriptor/replay caches on context teardown or recreation.
 void InvalidateCache() noexcept;
+// Notify CUDA pipeline table & DX12 PSO blob cache when a XeFG context is retired (MFG-Unlocker V1.7.2 #174).
+void ContextRetired() noexcept;
 
 struct Status
 {

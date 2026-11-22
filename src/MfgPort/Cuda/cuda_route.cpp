@@ -1,6 +1,7 @@
 // Ported from MFG-Unlocker source/native/xess/cuda/cuda_route.cpp, MIT licensed, see NOTICE.md.
 #include "cuda_route.h"
 #include "xefg_cuda_params.h"
+#include "pipeline_blob_cache.h"
 #include "../AdapterIdentity.h"
 #include "AdapterDiscovery.h"
 #include "../Sha256.h"
@@ -270,6 +271,9 @@ std::array<std::atomic<void*>, kSlots> gKeys{};
 std::array<std::atomic<uint8_t>, kSlots> gValues{};
 std::vector<ID3D12PipelineState*> gHeld;
 std::atomic<bool> gAnyLayer{};
+// cudaheld.1: sequence lock so Lookup() can run lock-free while ContextRetired()/Prune() rebuilds gKeys/gValues.
+std::atomic<uint64_t> gPipelineGeneration{};
+PipelineBlobCache gBlobCache;
 
 size_t Home(const void* key) noexcept
 {
@@ -278,11 +282,24 @@ size_t Home(const void* key) noexcept
 uint8_t Lookup(const void* key) noexcept
 {
     if (!key || !gAnyLayer.load(std::memory_order_acquire)) return 0;
-    for (size_t n = 0, i = Home(key); n < kSlots; ++n, i = (i + 1) & (kSlots - 1))
+    for (int attempt = 0; attempt < 64; ++attempt)
     {
-        const void* found = gKeys[i].load(std::memory_order_acquire);
-        if (found == key) return gValues[i].load(std::memory_order_relaxed);
-        if (!found) return 0;
+        const uint64_t gen1 = gPipelineGeneration.load(std::memory_order_acquire);
+        if (gen1 & 1ull)
+        {
+            _mm_pause();
+            continue;
+        }
+        uint8_t result = 0;
+        for (size_t n = 0, i = Home(key); n < kSlots; ++n, i = (i + 1) & (kSlots - 1))
+        {
+            const void* found = gKeys[i].load(std::memory_order_acquire);
+            if (found == key) { result = gValues[i].load(std::memory_order_relaxed); break; }
+            if (!found) break;
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (gPipelineGeneration.load(std::memory_order_relaxed) == gen1)
+            return result;
     }
     return 0;
 }
@@ -319,12 +336,15 @@ void Prune() noexcept // gMutex held
     std::vector<std::pair<void*, uint8_t>> entries;
     entries.reserve(survivors.size());
     for (ID3D12PipelineState* state : survivors) entries.emplace_back(state, Lookup(state));
-    for (auto& key : gKeys) key.store(nullptr, std::memory_order_release);
+    gPipelineGeneration.fetch_add(1ull, std::memory_order_acq_rel); // odd: table rebuild in progress
+    for (auto& key : gKeys) key.store(nullptr, std::memory_order_relaxed);
     for (auto& value : gValues) value.store(0, std::memory_order_relaxed);
     gHeld.swap(survivors);
+    for (const auto& [key, value] : entries) Insert(key, value);
     gLayerCount.store(uint32_t(gHeld.size()), std::memory_order_relaxed);
     gAnyLayer.store(!gHeld.empty(), std::memory_order_release);
-    for (const auto& [key, value] : entries) Insert(key, value);
+    gPipelineGeneration.fetch_add(1ull, std::memory_order_release); // even: stable
+    gCacheEpoch.fetch_add(1, std::memory_order_release);
 }
 
 
@@ -332,7 +352,7 @@ void Prune() noexcept // gMutex held
 // Slots of the D3D12 ABI (d3d12.h). Device: CreateComputePipelineState, CreateCommandList,
 // ID3D12Device2::CreatePipelineState and ID3D12Device4::CreateCommandList1. Command list: the methods that carry
 // compute recording state.
-constexpr int kCreateComputePipelineState = 11, kCreateCommandList = 12, kCreatePipelineState = 47, kCreateCommandList1 = 51;
+constexpr int kCreateComputePipelineState = 11, kCreateCommandList = 12, kCreateRootSignature = 16, kCreatePipelineState = 47, kCreateCommandList1 = 51;
 constexpr int kReset = 10, kDispatch = 14, kSetPipelineState = 25, kSetDescriptorHeaps = 28,
     kSetComputeRootSignature = 29, kSetComputeRootDescriptorTable = 31, kSetComputeRoot32BitConstant = 33,
     kSetComputeRoot32BitConstants = 35;
@@ -1256,12 +1276,51 @@ void Recognize(ID3D12Device* device, const D3D12_COMPUTE_PIPELINE_STATE_DESC& de
     catch (...) {}
 }
 
+using CreateRootSigFn = HRESULT (STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const void*, SIZE_T, REFIID, void**);
+HRESULT STDMETHODCALLTYPE HookCreateRootSignature(ID3D12Device* self, UINT nodeMask, const void* blob, SIZE_T blobBytes, REFIID iid, void** out)
+{
+    void* caller = _ReturnAddress();
+    const HRESULT result = DeviceOriginal<CreateRootSigFn>(self, kCreateRootSignature)(self, nodeMask, blob, blobBytes, iid, out);
+    if (SUCCEEDED(result) && blob && blobBytes > 0 && out && *out && (FromProvider(caller) || FromWrapper(caller)))
+    {
+        ComPtr<ID3D12RootSignature> rs;
+        if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&rs))) && rs)
+            gBlobCache.RememberRootSignature(rs.Get(), blob, blobBytes);
+    }
+    return result;
+}
+
 HRESULT STDMETHODCALLTYPE HookCreateComputePipelineState(ID3D12Device* self, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID iid, void** out)
 {
     void* caller = _ReturnAddress();
-    const HRESULT result = DeviceOriginal<CreateComputeFn>(self, kCreateComputePipelineState)(self, desc, iid, out);
+    const auto orig = DeviceOriginal<CreateComputeFn>(self, kCreateComputePipelineState);
+    HRESULT result = E_FAIL;
+    bool usedCachedBlob = false;
+    const bool providerCaller = desc && (FromProvider(caller) || FromWrapper(caller));
+    if (providerCaller && desc->CachedPSO.pCachedBlob == nullptr && desc->pRootSignature && desc->CS.pShaderBytecode && desc->CS.BytecodeLength >= 32)
+    {
+        std::vector<uint8_t> cachedBlob;
+        if (gBlobCache.Lookup(desc->pRootSignature, desc->CS.pShaderBytecode, desc->CS.BytecodeLength, cachedBlob))
+        {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC withCache = *desc;
+            withCache.CachedPSO.pCachedBlob = cachedBlob.data();
+            withCache.CachedPSO.CachedBlobSizeInBytes = cachedBlob.size();
+            result = orig(self, &withCache, iid, out);
+            usedCachedBlob = SUCCEEDED(result);
+        }
+    }
+    if (!usedCachedBlob)
+        result = orig(self, desc, iid, out);
     if (SUCCEEDED(result) && desc && out && *out)
+    {
+        if (providerCaller && !usedCachedBlob && desc->pRootSignature && desc->CS.pShaderBytecode && desc->CS.BytecodeLength >= 32)
+        {
+            ComPtr<ID3D12PipelineState> pso;
+            if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&pso))) && pso)
+                gBlobCache.Store(desc->pRootSignature, desc->CS.pShaderBytecode, desc->CS.BytecodeLength, pso.Get());
+        }
         Recognize(self, *desc, iid, *out, caller);
+    }
     return result;
 }
 
@@ -1380,10 +1439,11 @@ bool PatchDevice(ID3D12Device* device, std::string& reason)
     // ID3D12Device2 adds CreatePipelineState (streams), ID3D12Device4 CreateCommandList1.
     const Hook hooks[] = {{kCreateComputePipelineState, reinterpret_cast<void*>(&HookCreateComputePipelineState)},
         {kCreateCommandList, reinterpret_cast<void*>(&HookCreateCommandList)},
+        {kCreateRootSignature, reinterpret_cast<void*>(&HookCreateRootSignature)},
         {kCreatePipelineState, reinterpret_cast<void*>(&HookCreatePipelineState)},
         {kCreateCommandList1, reinterpret_cast<void*>(&HookCreateCommandList1)}};
     for (const auto& [vtable, level] : vtables)
-        if (!ApplyDevice(vtable, std::span<const Hook>(hooks, level >= 4 ? 4 : level >= 2 ? 3 : 2)))
+        if (!ApplyDevice(vtable, std::span<const Hook>(hooks, level >= 4 ? 5 : level >= 2 ? 4 : 3)))
         { reason = "device_patch"; return false; }
     return true;
 }
@@ -1591,15 +1651,27 @@ void InvalidateCache() noexcept
     gCacheEpoch.fetch_add(1, std::memory_order_release);
 }
 
+void ContextRetired() noexcept
+{
+    if (gState.load(std::memory_order_acquire) != State::Active) return;
+    std::lock_guard lock(gMutex);
+    Prune();
+    RetireDropped();
+}
+
 void ForgetLayers() noexcept
 {
     std::lock_guard lock(gMutex);
+    gPipelineGeneration.fetch_add(1ull, std::memory_order_acq_rel);
     gCacheEpoch.fetch_add(1, std::memory_order_release);
     gAnyLayer.store(false, std::memory_order_release);
-    for (auto& key : gKeys) key.store(nullptr, std::memory_order_release);
+    for (auto& key : gKeys) key.store(nullptr, std::memory_order_relaxed);
+    for (auto& value : gValues) value.store(0, std::memory_order_relaxed);
     for (auto* state : gHeld) state->Release();
     gHeld.clear();
     gLayerCount.store(0, std::memory_order_relaxed);
+    gPipelineGeneration.fetch_add(1ull, std::memory_order_release);
+    gBlobCache.Clear();
     // The provider's lists' own tables get their originals back and the lists are released.
     for (auto& table : gTables) Retire(table);
 }

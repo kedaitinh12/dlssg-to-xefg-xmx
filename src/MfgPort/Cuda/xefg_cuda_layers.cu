@@ -274,19 +274,38 @@ DEVI void PoolConv(const XefgCudaParams& p)
     constexpr int ROWS = TILE_H/4;
     constexpr int ZPER = OUT/ZSPLIT;
     constexpr int WBUFS = (ZPER * IN > 1) ? 2 : 1;
+    // When ZPER == 1 and IN > 2 (e.g. L_50f0c205 with IN=8), double-buffer 2 input slices instead of holding
+    // all IN slices in shared memory: cuts smem by 56% with zero extra texture fetches and zero extra barriers.
+    constexpr bool STREAM_WIN = (ZPER == 1 && IN > 2);
+    constexpr int WIN_SLOTS = STREAM_WIN ? 2 : IN;
     static_assert(OUT % ZSPLIT == 0, "output slices per block");
-    __shared__ uint4 win[IN*WIN];
+    __shared__ uint4 win[WIN_SLOTS*WIN];
     __shared__ uint4 wsm[WBUFS][kBlock];
     const int X0 = blockIdx.x*(POOL ? 8 : 16), Y0 = blockIdx.y*TILE_H;
     const int cx0 = POOL ? 2*X0 : X0, cy0 = POOL ? 2*Y0 : Y0;
     const int zBegin = int(blockIdx.z)*ZPER, firstBlock = zBegin*IN;
+    auto fillSlice = [&](int slice, uint4* dst) {
+        for (int r = threadIdx.x; r < WIN; r += 128)
+        {
+            uint4 v = Fetch2D(p.input, cx0 - 1 + r%WIN_W, cy0 - 1 + r/WIN_W, slice);
+            if (BIAS) { v.x += 0x80808080u; v.y += 0x80808080u; v.z += 0x80808080u; v.w += 0x80808080u; }
+            dst[r] = v;
+        }
+    };
     StageBlock(p.weights, firstBlock, wsm[0]);
-    for (int i = threadIdx.x; i < IN*WIN; i += 128)
+    if constexpr (STREAM_WIN)
     {
-        const int slice = i/WIN, r = i%WIN;
-        uint4 v = Fetch2D(p.input, cx0 - 1 + r%WIN_W, cy0 - 1 + r/WIN_W, slice);
-        if (BIAS) { v.x += 0x80808080u; v.y += 0x80808080u; v.z += 0x80808080u; v.w += 0x80808080u; }
-        win[i] = v;
+        fillSlice(0, win);
+    }
+    else
+    {
+        for (int i = threadIdx.x; i < IN*WIN; i += 128)
+        {
+            const int slice = i/WIN, r = i%WIN;
+            uint4 v = Fetch2D(p.input, cx0 - 1 + r%WIN_W, cy0 - 1 + r/WIN_W, slice);
+            if (BIAS) { v.x += 0x80808080u; v.y += 0x80808080u; v.z += 0x80808080u; v.w += 0x80808080u; }
+            win[i] = v;
+        }
     }
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
@@ -315,8 +334,13 @@ DEVI void PoolConv(const XefgCudaParams& p)
             {
                 const int st = z*IN + slice, cur = (st - firstBlock) & 1;
                 const bool hasNext = (st + 1 < (zBegin + ZPER)*IN);
-                if (hasNext) StageBlock(p.weights, st + 1, wsm[cur ^ 1]);
-                ConvSlicePool<ROWS, PY>(ws + slice*WIN*4, wsm[cur], acc, warp, g, t);
+                if (hasNext)
+                {
+                    StageBlock(p.weights, st + 1, wsm[cur ^ 1]);
+                    if constexpr (STREAM_WIN) fillSlice(slice + 1, win + (cur ^ 1)*WIN);
+                }
+                const int winSlot = STREAM_WIN ? cur : slice;
+                ConvSlicePool<ROWS, PY>(ws + winSlot*WIN*4, wsm[cur], acc, warp, g, t);
                 if (hasNext) __syncthreads();   // block st is no longer read; block st + 1 is complete
             }
         }
