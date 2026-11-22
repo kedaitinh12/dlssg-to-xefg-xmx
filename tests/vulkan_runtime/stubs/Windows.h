@@ -110,6 +110,7 @@ extern "C++"
 	BOOL CloseHandle(HANDLE hObject);
 	void Sleep(DWORD dwMilliseconds);
 	inline void YieldProcessor() {}
+	inline BOOL SwitchToThread() { return 0; }
 	ULONGLONG GetTickCount64();
 	int WideCharToMultiByte(UINT codePage, DWORD flags, const wchar_t* wide, int wideCount, char* narrow, int narrowCount,
 		const char* defaultChar, BOOL* usedDefault);
