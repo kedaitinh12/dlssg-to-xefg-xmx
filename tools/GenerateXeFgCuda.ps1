@@ -91,7 +91,7 @@ $command = 'call "' + $VcVars + '"'
 if ($VcVarsVersion) {
     $command += ' -vcvars_ver=' + $VcVarsVersion
 }
-$command += ' >nul 2>nul && "' + $nvcc + '" -fatbin -O3 -allow-unsupported-compiler'
+$command += ' >nul 2>nul && "' + $nvcc + '" -fatbin -O3 -Xptxas -v -allow-unsupported-compiler'
 foreach ($gencode in $Gencodes) {
     $command += ' -gencode ' + $gencode
 }

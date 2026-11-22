@@ -56,62 +56,149 @@ def main() -> int:
         default=shutil.which("glslangValidator") or "glslangValidator",
         help="Path to glslangValidator executable",
     )
+    parser.add_argument(
+        "--spirv-opt",
+        type=str,
+        default="",
+        help="Optional path to spirv-opt executable (auto-detected if omitted)",
+    )
+    parser.add_argument(
+        "--no-opt",
+        action="store_true",
+        help="Skip spirv-opt -O post-optimization even if spirv-opt is available",
+    )
     args = parser.parse_args()
+
+    spirv_opt = None
+    if not args.no_opt:
+        if args.spirv_opt:
+            spirv_opt = args.spirv_opt
+        else:
+            glslang_dir = pathlib.Path(args.glslang).resolve().parent if pathlib.Path(args.glslang).exists() else None
+            for candidate in (
+                (glslang_dir / "spirv-opt.exe") if glslang_dir else None,
+                (glslang_dir / "spirv-opt") if glslang_dir else None,
+                shutil.which("spirv-opt"),
+            ):
+                if candidate and pathlib.Path(candidate).is_file():
+                    spirv_opt = str(candidate)
+                    break
 
     if not args.source.is_file():
         print(f"error: shader source not found: {args.source}", file=sys.stderr)
         return 1
 
-    args.output.mkdir(parents=True, exist_ok=True)
-    manifest = args.output / "coopmat_layers.tsv"
-    alias_manifest = args.output / "coopmat_programs.tsv"
-    manifest.unlink(missing_ok=True)
-    alias_manifest.unlink(missing_ok=True)
-    rows = []
-    tsv_lines = ["program\tkernel\tfamily\tin\tout\ttile_h\tgrid_z\tbytes\tsha256"]
+    def build_set(src_path: pathlib.Path, out_dir: pathlib.Path, label: str) -> int:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        manifest = out_dir / "coopmat_layers.tsv"
+        alias_manifest = out_dir / "coopmat_programs.tsv"
+        manifest.unlink(missing_ok=True)
+        alias_manifest.unlink(missing_ok=True)
+        rows = []
+        tsv_lines = ["program\tkernel\tfamily\tin\tout\ttile_h\tgrid_z\tbytes\tsha256"]
+        for (name, family, in_b, out_b, bias, pool, relu, tile_h, zsplit, acc_bits, nt, programs) in KERNELS:
+            out_spv = out_dir / f"{name}.spv"
+            out_spv.unlink(missing_ok=True)
+            for prog in programs:
+                (out_dir / f"{prog}.spv").unlink(missing_ok=True)
+            cmd = [
+                args.glslang,
+                "-V",
+                "--target-env", "vulkan1.3",
+                "-S", "comp",
+                f"-DLAYER_FAMILY={family}",
+                f"-DLAYER_IN={in_b}",
+                f"-DLAYER_OUT={out_b}",
+                f"-DLAYER_BIAS={bias}",
+                f"-DLAYER_POOL={pool}",
+                f"-DLAYER_RELU={relu}",
+                f"-DLAYER_TILE_H={tile_h}",
+                f"-DLAYER_ZSPLIT={zsplit}",
+                f"-DLAYER_ACC_BITS={acc_bits}",
+                f"-DLAYER_NT={nt}",
+                "-o", str(out_spv),
+                str(src_path),
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode != 0:
+                print(f"FAIL [{label}] {name}: {res.stderr or res.stdout}", file=sys.stderr)
+                return res.returncode
+            if spirv_opt:
+                opt_spv = out_spv.with_suffix(".opt.spv")
+                opt_spv.unlink(missing_ok=True)
+                opt_res = subprocess.run(
+                    [spirv_opt, "-O", "--target-env=vulkan1.3", str(out_spv), "-o", str(opt_spv)],
+                    capture_output=True,
+                    text=True,
+                )
+                if opt_res.returncode == 0 and opt_spv.is_file():
+                    opt_spv.replace(out_spv)
+                else:
+                    opt_spv.unlink(missing_ok=True)
+                    print(f"warn: spirv-opt failed on [{label}] {name}, keeping unoptimized SPIR-V: {opt_res.stderr or opt_res.stdout}", file=sys.stderr)
+            data = out_spv.read_bytes()
+            if len(data) < 20 or len(data) % 4 or struct.unpack_from("<I", data)[0] != 0x07230203:
+                print(f"error: invalid SPIR-V output: {out_spv}", file=sys.stderr)
+                return 1
+            sha256 = hashlib.sha256(data).hexdigest()
+            rows.append(f"{name}\t{sha256}\t{len(data)}\n")
+            for prog in programs:
+                prog_spv = out_dir / f"{prog}.spv"
+                shutil.copyfile(out_spv, prog_spv)
+                tsv_lines.append(f"{prog}\t{name}\t{family}\t{in_b}\t{out_b}\t{tile_h}\t{zsplit}\t{len(data)}\t{sha256}")
+            print(f"ok   [{label}] {out_spv.name} ({len(data)} bytes, sha256={sha256[:12]}...)")
+        alias_manifest.write_text("\n".join(tsv_lines) + "\n", encoding="utf-8")
+        manifest.write_text("".join(rows), encoding="utf-8")
+        return 0
 
-    for (name, family, in_b, out_b, bias, pool, relu, tile_h, zsplit, acc_bits, nt, programs) in KERNELS:
-        out_spv = args.output / f"{name}.spv"
-        out_spv.unlink(missing_ok=True)
-        for prog in programs:
-            (args.output / f"{prog}.spv").unlink(missing_ok=True)
-        cmd = [
-            args.glslang,
-            "-V",
-            "--target-env", "vulkan1.3",
-            "-S", "comp",
-            f"-DLAYER_FAMILY={family}",
-            f"-DLAYER_IN={in_b}",
-            f"-DLAYER_OUT={out_b}",
-            f"-DLAYER_BIAS={bias}",
-            f"-DLAYER_POOL={pool}",
-            f"-DLAYER_RELU={relu}",
-            f"-DLAYER_TILE_H={tile_h}",
-            f"-DLAYER_ZSPLIT={zsplit}",
-            f"-DLAYER_ACC_BITS={acc_bits}",
-            f"-DLAYER_NT={nt}",
-            "-o", str(out_spv),
-            str(args.source),
+    rc = build_set(args.source, args.output, "16x16x16")
+    if rc != 0:
+        return rc
+    xmx_source = args.source.parent / "xefg_coopmat_layers_xmx8x8x32.comp"
+    if xmx_source.is_file():
+        rc = build_set(xmx_source, args.output / "xmx_8x8x32", "8x8x32")
+        if rc != 0:
+            return rc
+    hud_source = args.source.parent / "xefg_hud_tier.comp"
+    if hud_source.is_file():
+        hud_dir = args.output / "hud"
+        hud_dir.mkdir(parents=True, exist_ok=True)
+        hud_variants = [
+            ("hud_diff_guard_rgba8.spv", 0, "rgba8"),
+            ("hud_diff_guard_rgb10a2.spv", 0, "rgb10_a2"),
+            ("hud_diff_composite_rgba8.spv", 1, "rgba8"),
+            ("hud_diff_composite_rgb10a2.spv", 1, "rgb10_a2"),
+            ("hud_static_update_rgba8.spv", 2, "rgba8"),
+            ("hud_static_update_rgb10a2.spv", 2, "rgb10_a2"),
+            ("hud_static_composite_rgba8.spv", 3, "rgba8"),
+            ("hud_static_composite_rgb10a2.spv", 3, "rgb10_a2"),
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode != 0:
-            print(f"FAIL {name}: {res.stderr or res.stdout}", file=sys.stderr)
-            return res.returncode
-
-        data = out_spv.read_bytes()
-        if len(data) < 20 or len(data) % 4 or struct.unpack_from("<I", data)[0] != 0x07230203:
-            print(f"error: invalid SPIR-V output: {out_spv}", file=sys.stderr)
-            return 1
-        sha256 = hashlib.sha256(data).hexdigest()
-        rows.append(f"{name}\t{sha256}\t{len(data)}\n")
-        for prog in programs:
-            prog_spv = args.output / f"{prog}.spv"
-            shutil.copyfile(out_spv, prog_spv)
-            tsv_lines.append(f"{prog}\t{name}\t{family}\t{in_b}\t{out_b}\t{tile_h}\t{zsplit}\t{len(data)}\t{sha256}")
-        print(f"ok   {out_spv.name} ({len(data)} bytes, sha256={sha256[:12]}...)")
-
-    alias_manifest.write_text("\n".join(tsv_lines) + "\n", encoding="utf-8")
-    manifest.write_text("".join(rows), encoding="utf-8")
+        for fname, mode, fmt in hud_variants:
+            out_spv = hud_dir / fname
+            cmd = [
+                str(glslang),
+                "-V",
+                "--target-env",
+                "vulkan1.3",
+                f"-DHUD_MODE={mode}",
+                f"-DCOLOR_FMT={fmt}",
+                "-o",
+                str(out_spv),
+                str(hud_source),
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                print(f"error: glslangValidator failed for {fname}", file=sys.stderr)
+                if proc.stdout:
+                    print(proc.stdout, file=sys.stderr)
+                if proc.stderr:
+                    print(proc.stderr, file=sys.stderr)
+                return 1
+            data = out_spv.read_bytes()
+            if len(data) < 20 or len(data) % 4 or struct.unpack_from("<I", data)[0] != 0x07230203:
+                print(f"error: invalid SPIR-V output: {out_spv}", file=sys.stderr)
+                return 1
+            print(f"ok   [hud] {out_spv.name} ({len(data)} bytes)")
     return 0
 
 
