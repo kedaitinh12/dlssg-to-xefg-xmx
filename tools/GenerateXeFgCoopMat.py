@@ -199,6 +199,44 @@ def main() -> int:
                 print(f"error: invalid SPIR-V output: {out_spv}", file=sys.stderr)
                 return 1
             print(f"ok   [hud] {out_spv.name} ({len(data)} bytes)")
+    tm_source = args.source.parent / "xefg_hud_tonemap.comp"
+    if tm_source.is_file():
+        hud_dir = args.output / "hud"
+        hud_dir.mkdir(parents=True, exist_ok=True)
+        tm_variants = [
+            ("tonemap_clear.spv", 0, "rgba8"),
+            ("tonemap_accumulate.spv", 1, "rgba8"),
+            ("tonemap_median.spv", 2, "rgba8"),
+            ("tonemap_fill.spv", 3, "rgba8"),
+            ("tonemap_apply_rgba8.spv", 4, "rgba8"),
+            ("tonemap_apply_rgb10a2.spv", 4, "rgb10_a2"),
+        ]
+        for fname, tm_pass, fmt in tm_variants:
+            out_spv = hud_dir / fname
+            cmd = [
+                str(glslang),
+                "-V",
+                "--target-env",
+                "vulkan1.3",
+                f"-DTM_PASS={tm_pass}",
+                f"-DCOLOR_FMT={fmt}",
+                "-o",
+                str(out_spv),
+                str(tm_source),
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                print(f"error: glslangValidator failed for {fname}", file=sys.stderr)
+                if proc.stdout:
+                    print(proc.stdout, file=sys.stderr)
+                if proc.stderr:
+                    print(proc.stderr, file=sys.stderr)
+                return 1
+            data = out_spv.read_bytes()
+            if len(data) < 20 or len(data) % 4 or struct.unpack_from("<I", data)[0] != 0x07230203:
+                print(f"error: invalid SPIR-V output: {out_spv}", file=sys.stderr)
+                return 1
+            print(f"ok   [hud-tonemap] {out_spv.name} ({len(data)} bytes)")
     return 0
 
 
