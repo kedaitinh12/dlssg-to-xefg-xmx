@@ -69,6 +69,7 @@
     <ClCompile Include="src\Exports.cpp" />
     <ClCompile Include="src\ExportsVulkan.cpp" />
     <ClCompile Include="src\FrameGenerator.cpp" />
+    <ClCompile Include="src\HudTierPass.cpp" />
     <ClCompile Include="src\Log.cpp" />
     <ClCompile Include="src\MfgKernels.cpp" />
     <ClCompile Include="src\MfgPort\RuntimePayload.cpp" />
@@ -118,6 +119,9 @@
   <ItemGroup>
     <ClInclude Include="src\D3D12VulkanWmma.h" />
     <ClInclude Include="src\FrameGenerator.h" />
+    <ClInclude Include="src\HudTierPass.h" />
+    <ClInclude Include="src\HudTierPolicy.h" />
+    <ClInclude Include="src\AmdFlipMeterReg.h" />
     <ClInclude Include="src\XeFgEnabler.h" />
     <ClInclude Include="src\loader\EarlyLoaderCore.h" />
     <ClInclude Include="src\Log.h" />
@@ -133,6 +137,7 @@
     <ClInclude Include="src\MfgPort\Cuda\AdapterDiscovery.h" />
     <ClInclude Include="src\MfgPort\Cuda\cuda_layers.h" />
     <ClInclude Include="src\MfgPort\Cuda\cuda_route.h" />
+    <ClInclude Include="src\MfgPort\Cuda\pipeline_blob_cache.h" />
     <ClInclude Include="src\MfgPort\Cuda\OverlayNative.h" />
     <ClInclude Include="src\MfgPort\Cuda\xefg_cuda_params.h" />
     <ClInclude Include="src\MfgPort\Wmma\wmma_route.h" />
