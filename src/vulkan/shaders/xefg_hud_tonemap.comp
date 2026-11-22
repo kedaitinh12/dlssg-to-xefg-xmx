@@ -1,0 +1,199 @@
+#version 450
+// Tier 3 Hybrid HUDless Tone-Map Matcher compute shaders for native Vulkan (VulkanRuntime.cpp).
+// Ported from MFG-Unlocker V1.7.2 hudless_match.cpp to give Vulkan 100% parity with DX12 Tier 3 Hybrid.
+// Uses sampler2D + texelFetch for hudless & backBuffer so ANY input format (RGBA8, BGRA8, A2B10G10R10, RGBA16F)
+// works seamlessly without format-combination explosion; only apply writes explicit COLOR_FMT (rgba8 or rgb10_a2).
+//
+// Passes (compile-time -DTM_PASS=0..4):
+//   0 = clear      (zero 3 * 256 * 1024 histogram)
+//   1 = accumulate (1/16 stride 2D histogram per channel: log2(hudless) x backbuffer code)
+//   2 = median     (256-thread groupshared inclusive scan -> per-bin median code)
+//   3 = fill       (5-bin running-median outlier filter + linear fill + monotonic end extrapolation)
+//   4 = apply      (map full HUDless through LUT into OutColor in Backbuffer's format)
+
+#ifndef TM_PASS
+#define TM_PASS 0
+#endif
+
+#ifndef COLOR_FMT
+#define COLOR_FMT rgba8
+#endif
+
+#define STRIDE 4u
+#define OUTLIER (32.0 / 1023.0)
+
+layout(push_constant) uniform MatchParams {
+    uint width;
+    uint height;
+    float logMin;
+    float binsPerOctave;
+    uint bins;
+    uint codes;
+    uint minimumCount;
+    uint unused;
+};
+
+layout(set = 0, binding = 0) uniform sampler2D hudlessTex;
+layout(set = 0, binding = 1) uniform sampler2D backBufferTex;
+layout(set = 0, binding = 2, COLOR_FMT) uniform writeonly image2D outColor;
+layout(set = 0, binding = 3, std430) buffer HistogramBuf {
+    uint hist[];
+};
+layout(set = 0, binding = 4, std430) buffer LutBuf {
+    float lut[];
+};
+
+uint BinOf(float v) {
+    if (!(v > 0.0)) return 0u;
+    return uint(clamp((log2(v) - logMin) * binsPerOctave, 0.0, float(bins - 1u)));
+}
+
+#if TM_PASS == 0
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx < 3u * bins * codes) {
+        hist[idx] = 0u;
+    }
+}
+
+#elif TM_PASS == 1
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy * STRIDE;
+    if (p.x >= width || p.y >= height) return;
+    vec3 h = texelFetch(hudlessTex, ivec2(p), 0).rgb;
+    vec3 b = texelFetch(backBufferTex, ivec2(p), 0).rgb;
+    for (uint c = 0u; c < 3u; ++c) {
+        uint code = uint(clamp(b[c], 0.0, 1.0) * float(codes - 1u) + 0.5);
+        uint bin = BinOf(h[c]);
+        atomicAdd(hist[(c * bins + bin) * codes + code], 1u);
+    }
+}
+
+#elif TM_PASS == 2
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+shared uint partial[256];
+void main() {
+    uint bin = gl_WorkGroupID.x;
+    uint c = gl_WorkGroupID.y;
+    uint gi = gl_LocalInvocationIndex;
+    uint base = (c * bins + bin) * codes + gi * 4u;
+    uint counts[4];
+    uint sum = 0u;
+    for (uint k = 0u; k < 4u; ++k) {
+        counts[k] = hist[base + k];
+        sum += counts[k];
+    }
+    partial[gi] = sum;
+    barrier();
+    for (uint offset = 1u; offset < 256u; offset <<= 1u) {
+        uint v = partial[gi];
+        if (gi >= offset) v += partial[gi - offset];
+        barrier();
+        partial[gi] = v;
+        barrier();
+    }
+    uint total = partial[255];
+    uint before = (gi > 0u) ? partial[gi - 1u] : 0u;
+    uint slot = c * bins + bin;
+    if (total < minimumCount) {
+        if (gi == 0u) lut[slot] = -1.0;
+        return;
+    }
+    uint middle = (total + 1u) / 2u;
+    if (before < middle && partial[gi] >= middle) {
+        uint seen = before;
+        uint code = gi * 4u + 3u;
+        for (uint j = 0u; j < 4u; ++j) {
+            seen += counts[j];
+            if (seen >= middle) {
+                code = gi * 4u + j;
+                break;
+            }
+        }
+        lut[slot] = float(code) / float(codes - 1u);
+    }
+}
+
+#elif TM_PASS == 3
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+void main() {
+    uint c = gl_WorkGroupID.x;
+    uint base = c * bins;
+    float raw[256];
+    float l[256];
+    for (uint r = 0u; r < 256u; ++r) {
+        raw[r] = lut[base + r];
+        l[r] = raw[r];
+    }
+    for (uint k = 0u; k < 256u; ++k) {
+        if (raw[k] < 0.0) continue;
+        float w[5];
+        uint n = 0u;
+        for (int d = -2; d <= 2; ++d) {
+            int j = int(k) + d;
+            if (j >= 0 && j < 256 && raw[j] >= 0.0) {
+                w[n] = raw[j];
+                ++n;
+            }
+        }
+        for (uint a = 1u; a < n; ++a) {
+            float x = w[a];
+            int p = int(a) - 1;
+            while (p >= 0 && w[p] > x) {
+                w[p + 1] = w[p];
+                --p;
+            }
+            w[p + 1] = x;
+        }
+        if (abs(raw[k] - w[n / 2u]) > OUTLIER) {
+            l[k] = w[n / 2u];
+        }
+    }
+    int first = -1;
+    int last = -1;
+    for (uint i = 0u; i < 256u; ++i) {
+        if (l[i] >= 0.0) {
+            if (first < 0) first = int(i);
+            last = int(i);
+        }
+    }
+    if (first < 0) {
+        for (uint z = 0u; z < 256u; ++z) lut[base + z] = 0.0;
+        return;
+    }
+    int previous = first;
+    for (int b = first + 1; b <= last; ++b) {
+        if (l[b] < 0.0) continue;
+        for (int g = previous + 1; g < b; ++g) {
+            l[g] = mix(l[previous], l[b], float(g - previous) / float(b - previous));
+        }
+        previous = b;
+    }
+    int span = min(4, last - first);
+    float headSlope = (span > 0) ? max((l[first + span] - l[first]) / float(span), 0.0) : 0.0;
+    float tailSlope = (span > 0) ? max((l[last] - l[last - span]) / float(span), 0.0) : 0.0;
+    for (int h = 0; h < first; ++h) l[h] = clamp(l[first] - headSlope * float(first - h), 0.0, 1.0);
+    for (int t = last + 1; t < 256; ++t) l[t] = clamp(l[last] + tailSlope * float(t - last), 0.0, 1.0);
+    for (uint o = 0u; o < 256u; ++o) lut[base + o] = l[o];
+}
+
+#elif TM_PASS == 4
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+void main() {
+    uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= width || id.y >= height) return;
+    vec3 h = texelFetch(hudlessTex, ivec2(id), 0).rgb;
+    vec3 o = vec3(0.0);
+    for (uint c = 0u; c < 3u; ++c) {
+        float v = h[c];
+        float f = (v > 0.0) ? ((log2(v) - logMin) * binsPerOctave - 0.5) : 0.0;
+        f = clamp(f, 0.0, float(bins - 1u));
+        uint i = min(uint(f), bins - 2u);
+        float t = clamp(f - float(i), 0.0, 1.0);
+        o[c] = mix(lut[c * bins + i], lut[c * bins + i + 1u], t);
+    }
+    imageStore(outColor, ivec2(id), vec4(o, 1.0));
+}
+#endif
