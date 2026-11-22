@@ -1915,8 +1915,8 @@ VulkanRuntime::CoopMatrixStatus VulkanRuntime::GetCoopMatrixStatus()
 
 	status.reason = route.reason;
 	status.tileM = route.major;
-	status.tileN = route.minor & 0xFFFF;
-	status.tileK = (route.minor >> 16) & 0xFFFF;
+	status.tileN = (route.minor >> 8) & 0xFF;
+	status.tileK = route.minor & 0xFF;
 	status.launches = route.launches;
 	status.fallbacks = route.fallbacks;
 	status.replacing = status.state == TensorState::Active && gCoopGate.load();

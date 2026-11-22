@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -176,6 +177,7 @@ struct PostCopyRing
 struct Bridge
 {
 	std::mutex mutex;
+	std::mutex reasonMutex;
 	std::atomic<bool> active{ false };
 	bool attempted = false;
 	std::string reason = "not_attempted";
@@ -933,7 +935,10 @@ bool Install(ID3D12Device* d3dDevice, std::string& reason) noexcept
 	gBridge.attempted = true;
 
 	auto fail = [&](const char* code) -> bool {
-		gBridge.reason = code;
+		{
+			std::lock_guard rlock(gBridge.reasonMutex);
+			gBridge.reason = code;
+		}
 		reason = code;
 		gBridge.active.store(false, std::memory_order_release);
 		return false;
@@ -1262,7 +1267,10 @@ bool Install(ID3D12Device* d3dDevice, std::string& reason) noexcept
 	gBridge.tileN = static_cast<uint32_t>((coopStatus.minor >> 8) & 0xFF);
 	gBridge.tileK = static_cast<uint32_t>(coopStatus.minor & 0xFF);
 	gBridge.coopLayers = coopStatus.layers;
-	gBridge.reason.clear();
+	{
+		std::lock_guard rlock(gBridge.reasonMutex);
+		gBridge.reason.clear();
+	}
 	gBridge.active.store(true, std::memory_order_release);
 
 	Log::Info("D3D12->Vulkan WMMA bridge ready (vendor {:#06x}, queue family {}, VK_KHR_cooperative_matrix {}x{}x{} s8->s32, {} hardware WMMA shaders)",
@@ -1282,46 +1290,61 @@ bool SameContextSettings(const ContextSettings& a, const ContextSettings& b) noe
 
 bool EnsureContext(const ContextSettings& settings) noexcept
 {
-	std::lock_guard lock(gBridge.mutex);
-	if (!gBridge.active.load(std::memory_order_acquire) || !gBridge.xvkDevice)
-		return false;
-
-	if (gBridge.xefgContext && SameContextSettings(gBridge.contextSettings, settings))
-		return true;
-
-	if (gBridge.contextFailed && SameContextSettings(gBridge.failedContextSettings, settings))
-		return false;
+	const auto tStart = std::chrono::steady_clock::now();
+	auto elapsedMs = [&]() noexcept -> long long {
+		return std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now() - tStart).count();
+	};
 
 	auto markFailed = [&]() noexcept {
+		std::lock_guard lock(gBridge.mutex);
 		gBridge.contextFailed = true;
 		gBridge.failedContextSettings = settings;
 		return false;
 	};
 
-	// Drain in-flight Vulkan work with a bounded timeout so destroying any prior context and
-	// reusing cmdBufs[0] for XeFG::Init weight uploads can never hang indefinitely.
-	gBridge.contextReady.store(false, std::memory_order_release);
-	if (!DrainVulkanQueueLocked(500'000'000ull))
+	// Never hold gBridge.mutex across XeFG::CreateContext / XeFG::Init / vkQueueSubmit2 / vkWaitForFences
+	// so UI/render threads calling Snapshot() or ForgetResource() can never stall on async init.
+	xefgd_handle_t oldCtx = nullptr;
+	VkCommandBuffer initCmd = VK_NULL_HANDLE;
 	{
-		Log::Warn("D3D12->Vulkan WMMA bridge: timed out draining prior Vulkan work, disabling bridge and falling back to D3D12");
-		gBridge.active.store(false, std::memory_order_release);
-		return markFailed();
-	}
-	for (uint32_t i = 0; i < kRingSize; ++i)
-		gBridge.vkSlotDoneFence[i] = 0;
+		std::lock_guard lock(gBridge.mutex);
+		if (!gBridge.active.load(std::memory_order_acquire) || !gBridge.xvkDevice)
+			return false;
 
-	if (gBridge.xefgContext)
-	{
-		XeFG::Destroy(gBridge.xefgContext);
+		if (gBridge.xefgContext && SameContextSettings(gBridge.contextSettings, settings))
+			return true;
+
+		if (gBridge.contextFailed && SameContextSettings(gBridge.failedContextSettings, settings))
+			return false;
+
+		// Drain in-flight Vulkan work with a bounded timeout so destroying any prior context and
+		// reusing cmdBufs[0] for XeFG::Init weight uploads can never hang indefinitely.
+		gBridge.contextReady.store(false, std::memory_order_release);
+		if (!DrainVulkanQueueLocked(500'000'000ull))
+		{
+			Log::Warn("D3D12->Vulkan WMMA bridge: timed out draining prior Vulkan work, disabling bridge and falling back to D3D12");
+			gBridge.active.store(false, std::memory_order_release);
+			gBridge.contextFailed = true;
+			gBridge.failedContextSettings = settings;
+			return false;
+		}
+		for (uint32_t i = 0; i < kRingSize; ++i)
+			gBridge.vkSlotDoneFence[i] = 0;
+
+		oldCtx = gBridge.xefgContext;
 		gBridge.xefgContext = nullptr;
+		initCmd = gBridge.cmdBufs[0];
 	}
+
+	if (oldCtx)
+		XeFG::Destroy(oldCtx);
 
 	XeFG::OverrideModel(settings.model);
 
 	// Recorded xvk devices require an open VkCommandBuffer + xvk::BeginRecording()
 	// during XeFG::Init because libxess_fg creates internal command lists to upload
 	// neural network weights and initialize resources.
-	VkCommandBuffer initCmd = gBridge.cmdBufs[0];
 	gBridge.vkResetCommandBuffer(initCmd, 0);
 	VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
 	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -1338,16 +1361,20 @@ bool EnsureContext(const ContextSettings& settings) noexcept
 		return markFailed();
 	}
 
+	Log::Info("D3D12->Vulkan WMMA bridge: async init start ({}x{}, format {}, model {})",
+		settings.width, settings.height, static_cast<uint32_t>(settings.format), settings.model);
+
 	xefgd_handle_t ctx = nullptr;
 	const xefgd_result_t createRes = XeFG::CreateContext(gBridge.xvkDevice.Get(), &ctx);
 	if (createRes != XEFGD_RESULT_SUCCESS || !ctx)
 	{
 		xvk::EndRecording(gBridge.xvkDevice.Get());
 		gBridge.vkEndCommandBuffer(initCmd);
-		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::CreateContext failed (result {}), falling back to D3D12",
-			static_cast<int>(createRes));
+		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::CreateContext failed (result {}, {} ms), falling back to D3D12",
+			static_cast<int>(createRes), elapsedMs());
 		return markFailed();
 	}
+	Log::Info("D3D12->Vulkan WMMA bridge: XeFG::CreateContext ok ({} ms), starting XeFG::Init", elapsedMs());
 
 	xefgd_init_params_t init{};
 	init.outputResolution = { settings.width, settings.height };
@@ -1359,14 +1386,15 @@ bool EnsureContext(const ContextSettings& settings) noexcept
 	init.uiMode = settings.uiMode;
 
 	const xefgd_result_t initRes = XeFG::Init(ctx, init);
+	Log::Info("D3D12->Vulkan WMMA bridge: XeFG::Init returned {} ({} ms)", static_cast<int>(initRes), elapsedMs());
 	xvk::EndRecording(gBridge.xvkDevice.Get());
 	const VkResult endRes = gBridge.vkEndCommandBuffer(initCmd);
 
 	if (initRes != XEFGD_RESULT_SUCCESS || endRes != VK_SUCCESS)
 	{
 		XeFG::Destroy(ctx);
-		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init failed (result {}, vkEnd {}), falling back to D3D12",
-			static_cast<int>(initRes), static_cast<int>(endRes));
+		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init failed (result {}, vkEnd {}, {} ms), falling back to D3D12",
+			static_cast<int>(initRes), static_cast<int>(endRes), elapsedMs());
 		return markFailed();
 	}
 
@@ -1389,14 +1417,15 @@ bool EnsureContext(const ContextSettings& settings) noexcept
 	submitInfo.commandBufferInfoCount = 1;
 	submitInfo.pCommandBufferInfos = &cmdInfo;
 
-	Log::Info("D3D12->Vulkan WMMA bridge: submitting XeFG::Init weight upload on queue family {}", gBridge.queueFamily);
+	Log::Info("D3D12->Vulkan WMMA bridge: submitting XeFG::Init weight upload on queue family {} ({} ms)",
+		gBridge.queueFamily, elapsedMs());
 	const VkResult subRes = gBridge.vkQueueSubmit2(gBridge.queue, 1, &submitInfo, initFence);
 	if (subRes != VK_SUCCESS)
 	{
 		gBridge.vkDestroyFence(gBridge.device, initFence, nullptr);
 		XeFG::Destroy(ctx);
-		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init vkQueueSubmit2 failed (result {}), falling back to D3D12",
-			static_cast<int>(subRes));
+		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init vkQueueSubmit2 failed (result {}, {} ms), falling back to D3D12",
+			static_cast<int>(subRes), elapsedMs());
 		return markFailed();
 	}
 
@@ -1404,8 +1433,8 @@ bool EnsureContext(const ContextSettings& settings) noexcept
 	if (waitRes != VK_SUCCESS)
 	{
 		// Do not destroy initFence while the GPU submission may still be in flight.
-		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init vkWaitForFences timed out/failed (result {}), disabling bridge and falling back to D3D12",
-			static_cast<int>(waitRes));
+		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init vkWaitForFences timed out/failed (result {}, {} ms), disabling bridge and falling back to D3D12",
+			static_cast<int>(waitRes), elapsedMs());
 		gBridge.active.store(false, std::memory_order_release);
 		gBridge.contextReady.store(false, std::memory_order_release);
 		return markFailed();
@@ -1418,12 +1447,15 @@ bool EnsureContext(const ContextSettings& settings) noexcept
 		return false;
 	}
 
-	gBridge.xefgContext = ctx;
-	gBridge.contextSettings = settings;
-	gBridge.contextFailed = false;
+	{
+		std::lock_guard lock(gBridge.mutex);
+		gBridge.xefgContext = ctx;
+		gBridge.contextSettings = settings;
+		gBridge.contextFailed = false;
+	}
 	gBridge.contextReady.store(true, std::memory_order_release);
-	Log::Info("D3D12->Vulkan WMMA bridge context ready: {}x{}, format {}, model {}, {}x{}x{} hardware WMMA",
-		settings.width, settings.height, static_cast<uint32_t>(settings.format), settings.model,
+	Log::Info("D3D12->Vulkan WMMA bridge context ready ({} ms): {}x{}, format {}, model {}, {}x{}x{} hardware WMMA",
+		elapsedMs(), settings.width, settings.height, static_cast<uint32_t>(settings.format), settings.model,
 		gBridge.tileM, gBridge.tileN, gBridge.tileK);
 	return true;
 }
@@ -1613,7 +1645,7 @@ Status Snapshot() noexcept
 	s.batches = gBridge.batches.load(std::memory_order_relaxed);
 	s.fallbacks = gBridge.fallbacks.load(std::memory_order_relaxed);
 	{
-		std::lock_guard lock(gBridge.mutex);
+		std::lock_guard lock(gBridge.reasonMutex);
 		s.reason = gBridge.reason;
 	}
 	return s;

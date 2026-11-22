@@ -42,6 +42,7 @@ void CommandList::Fail(const char* what)
 HRESULT CommandList::Begin(CommandAllocator* allocator)
 {
     if (!allocator) return E_INVALIDARG;
+    auto recLock = device_->LockRecording();
     if (device_->recorded()) {
         // vkprov.1: straight into the open recording (begun and ended by its owner, never here).
         buffer_ = device_->RecordingBuffer();
@@ -134,6 +135,7 @@ void STDMETHODCALLTYPE CommandList::SetComputeRoot32BitConstants(UINT parameter,
 void STDMETHODCALLTYPE CommandList::Dispatch(UINT x, UINT y, UINT z)
 {
     if (!recording_ || failed_) return;
+    auto recLock = device_->LockRecording();
     if (!pso_) { Fail("Dispatch without a pipeline state"); return; }
     if (device_->tensor().TryLaunch(*device_, buffer_, pso_->tensorLayer(), tables_[0], tables_[1], constants_[2].data(), constantMasks_[2], x, y, z))
     { boundPipeline_ = VK_NULL_HANDLE; return; }
@@ -219,6 +221,7 @@ void STDMETHODCALLTYPE CommandList::Dispatch(UINT x, UINT y, UINT z)
 
 void CommandList::Barrier()
 {
+    auto recLock = device_->LockRecording();
     VkMemoryBarrier2 memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     memory.srcStageMask = memory.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     memory.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
@@ -310,6 +313,7 @@ void STDMETHODCALLTYPE CommandList::ResourceBarrier(UINT count, const D3D12_RESO
         }
     }
     if (!needed) return;
+    auto recLock = device_->LockRecording();
     VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     dependency.memoryBarrierCount = 1;
     dependency.pMemoryBarriers = &memory;
@@ -319,6 +323,7 @@ void STDMETHODCALLTYPE CommandList::ResourceBarrier(UINT count, const D3D12_RESO
 void STDMETHODCALLTYPE CommandList::CopyBufferRegion(ID3D12Resource* dst, UINT64 dstOffset, ID3D12Resource* src, UINT64 srcOffset, UINT64 bytes)
 {
     if (!recording_ || failed_) return;
+    auto recLock = device_->LockRecording();
     auto* d = Own<Resource>(dst);
     auto* s = Own<Resource>(src);
     if (!d->IsBuffer() || !s->IsBuffer()) { Fail("CopyBufferRegion on a texture"); return; }
@@ -330,6 +335,7 @@ void STDMETHODCALLTYPE CommandList::CopyBufferRegion(ID3D12Resource* dst, UINT64
 void STDMETHODCALLTYPE CommandList::CopyResource(ID3D12Resource* dst, ID3D12Resource* src)
 {
     if (!recording_ || failed_) return;
+    auto recLock = device_->LockRecording();
     auto* d = Own<Resource>(dst);
     auto* s = Own<Resource>(src);
     const auto& vk = device_->vk();
@@ -361,6 +367,7 @@ void STDMETHODCALLTYPE CommandList::CopyTextureRegion(const D3D12_TEXTURE_COPY_L
     const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* box)
 {
     if (!recording_ || failed_) return;
+    auto recLock = device_->LockRecording();
     if (!dst || !src) { Fail("CopyTextureRegion arguments"); return; }
     auto* d = Own<Resource>(dst->pResource);
     auto* s = Own<Resource>(src->pResource);
@@ -419,6 +426,7 @@ void STDMETHODCALLTYPE CommandList::CopyTextureRegion(const D3D12_TEXTURE_COPY_L
 
 void CommandList::ClearUav(Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE cpu, const VkClearColorValue& value, uint32_t fillValue)
 {
+    auto recLock = device_->LockRecording();
     const Descriptor& d = *At(cpu);
     const auto& vk = device_->vk();
     if (d.kind == DescriptorKind::UavBuffer) {
@@ -456,6 +464,7 @@ void STDMETHODCALLTYPE CommandList::ClearUnorderedAccessViewFloat(D3D12_GPU_DESC
 void STDMETHODCALLTYPE CommandList::EndQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index)
 {
     if (!recording_ || failed_) return;
+    auto recLock = device_->LockRecording();
     if (type != D3D12_QUERY_TYPE_TIMESTAMP) { Unimplemented("EndQuery(non-timestamp)"); return; }
     const VkQueryPool pool = Own<QueryHeap>(heap)->pool();
     device_->vk().vkCmdResetQueryPool(buffer_, pool, index, 1);
@@ -466,6 +475,7 @@ void STDMETHODCALLTYPE CommandList::ResolveQueryData(ID3D12QueryHeap* heap, D3D1
     UINT64 offset)
 {
     if (!recording_ || failed_) return;
+    auto recLock = device_->LockRecording();
     if (type != D3D12_QUERY_TYPE_TIMESTAMP) { Unimplemented("ResolveQueryData(non-timestamp)"); return; }
     device_->vk().vkCmdCopyQueryPoolResults(buffer_, Own<QueryHeap>(heap)->pool(), start, count, Own<Resource>(dst)->buffer(), offset, 8,
                                             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);

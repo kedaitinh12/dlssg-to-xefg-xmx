@@ -187,6 +187,15 @@ HRESULT Device::Init(const DeviceDesc& desc)
         if (vk_.vkCreateSemaphore(device_, &progressInfo, nullptr, &slot->timeline) != VK_SUCCESS) return E_FAIL;
         slots_.push_back(std::move(slot));
     }
+    {
+        uint32_t famCount = 0;
+        vk_.vkGetPhysicalDeviceQueueFamilyProperties(physical_, &famCount, nullptr);
+        if (queueFamily_ < famCount) {
+            std::vector<VkQueueFamilyProperties> fams(famCount);
+            vk_.vkGetPhysicalDeviceQueueFamilyProperties(physical_, &famCount, fams.data());
+            queueHasGraphics_ = (fams[queueFamily_].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
+        }
+    }
     programs_.Load(desc.programModule);
 
     VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, queueFamily_};
@@ -259,7 +268,7 @@ Resource* Device::ResolveVa(D3D12_GPU_VIRTUAL_ADDRESS va, uint64_t& offset)
 namespace
 {
 // A new image moves from UNDEFINED to GENERAL and is cleared, a new buffer is zeroed, then one full barrier.
-void RecordInitialization(const VkFns& vk, VkCommandBuffer command, VkImage image, VkImageAspectFlags aspect, VkBuffer buffer)
+void RecordInitialization(const VkFns& vk, VkCommandBuffer command, VkImage image, VkImageAspectFlags aspect, VkBuffer buffer, bool allowDepthClear)
 {
     VkMemoryBarrier2 memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     memory.srcStageMask = memory.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
@@ -282,7 +291,7 @@ void RecordInitialization(const VkFns& vk, VkCommandBuffer command, VkImage imag
         if (aspect & VK_IMAGE_ASPECT_COLOR_BIT) {
             VkClearColorValue zero{};
             vk.vkCmdClearColorImage(command, image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
-        } else {
+        } else if (allowDepthClear) {
             VkClearDepthStencilValue zero{};
             vk.vkCmdClearDepthStencilImage(command, image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
         }
@@ -301,9 +310,9 @@ void Device::InitializeResource(VkImage image, VkImageAspectFlags aspect, VkBuff
         // vkprov.1: into the open recording, ahead of any use (lists record into the same command buffer after this);
         // before the first recording, at its start.
         std::lock_guard lock(recordMutex_);
-        if (recording_) RecordInitialization(vk_, recording_, image, aspect, buffer);
+        if (recording_) RecordInitialization(vk_, recording_, image, aspect, buffer, queueHasGraphics_);
         else pendingInit_.push_back([this, image, aspect, buffer](VkCommandBuffer command) {
-            RecordInitialization(vk_, command, image, aspect, buffer);
+            RecordInitialization(vk_, command, image, aspect, buffer, queueHasGraphics_);
         });
         return;
     }
@@ -319,7 +328,7 @@ void Device::InitializeResource(VkImage image, VkImageAspectFlags aspect, VkBuff
     }
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vk_.vkBeginCommandBuffer(command, &begin);
-    RecordInitialization(vk_, command, image, aspect, buffer);
+    RecordInitialization(vk_, command, image, aspect, buffer, queueHasGraphics_);
     vk_.vkEndCommandBuffer(command);
     const uint64_t value = ++initValue_;
     VkCommandBufferSubmitInfo commandInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, nullptr, command};
@@ -423,13 +432,11 @@ bool Device::BeginRecording(VkCommandBuffer commandBuffer)
 {
     if (!recorded_ || !commandBuffer) return false;
     PollRecordings();
+    std::lock_guard lock(recordMutex_);
+    if (recording_) return false;
+    recording_ = commandBuffer;
     std::vector<std::function<void(VkCommandBuffer)>> pending;
-    {
-        std::lock_guard lock(recordMutex_);
-        if (recording_) return false;
-        recording_ = commandBuffer;
-        pending.swap(pendingInit_);
-    }
+    pending.swap(pendingInit_);
     for (auto& record : pending) record(commandBuffer);
     return true;
 }

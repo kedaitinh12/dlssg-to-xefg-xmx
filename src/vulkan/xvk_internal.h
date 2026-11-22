@@ -728,6 +728,11 @@ public:
     // vkprov.1 (DeviceDesc::recorded): the command buffer lists record into while a recording is open (null
     // otherwise), and the recording's bounds (xvk.h BeginRecording / EndRecording).
     bool recorded() const { return recorded_; }
+    std::unique_lock<std::recursive_mutex> LockRecording()
+    {
+        return recorded_ ? std::unique_lock<std::recursive_mutex>(recordMutex_)
+                         : std::unique_lock<std::recursive_mutex>();
+    }
     VkCommandBuffer RecordingBuffer();
     bool BeginRecording(VkCommandBuffer commandBuffer);
     void EndRecording();
@@ -829,7 +834,8 @@ private:
     // vkprov.1: recorded mode. One queue-less slot carries the progress timeline; each ended recording is an epoch
     // whose event, set by the GPU at the end of the caller's command buffer, moves the timeline to its value.
     bool recorded_ = false;
-    std::mutex recordMutex_;
+    bool queueHasGraphics_ = true;
+    std::recursive_mutex recordMutex_;
     VkCommandBuffer recording_ = VK_NULL_HANDLE;
     struct Epoch { VkEvent event; uint64_t value; };
     std::vector<Epoch> epochs_;
