@@ -33,9 +33,9 @@ namespace Plugin
 		std::atomic_bool vramGuard = true;
 		// Caps Vulkan present pacer cadence to (DisplayHz - 3) to stay inside the VRR/G-Sync/FreeSync window
 		std::atomic_bool autoVrrPacing = false;
-		// Experimental D3D12->Vulkan VK_KHR_cooperative_matrix bridge (default off: D3D12 cs_6_6 WMMA overrides run without
-		// allocating a duplicate Vulkan XeFG context or triggering OptiScaler Vulkan_wDx12 hooks on DX12 games)
-		std::atomic_bool d3d12VulkanWmmaBridge = false;
+		// Experimental D3D12->Vulkan VK_KHR_cooperative_matrix bridge (default on; disable in OptiScaler menu or via
+		// XEFG_D3D12_VULKAN_WMMA=0 to fall back to D3D12 cs_6_6 WMMA overrides if a game freezes or conflicts with hooks)
+		std::atomic_bool d3d12VulkanWmmaBridge = true;
 		// DLSS Enabler 4.10.0.26 RC1 features:
 		// Skips 10 real frames when HUD-less/UI composition state toggles to prevent glitched menu transitions
 		std::atomic_bool uiTransitionCooldown = true;

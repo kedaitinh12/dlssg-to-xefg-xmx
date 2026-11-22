@@ -507,8 +507,8 @@ namespace
 		}
 
 		api->ItemTooltip("Routes D3D12 WMMA batches through a private Vulkan VK_KHR_cooperative_matrix device\n"
-						 "(takes effect on next game launch, or set XEFG_D3D12_VULKAN_WMMA=1).\n"
-						 "Off by default to use freeze-free D3D12 cs_6_6 WMMA overrides without duplicate VRAM\n"
+						 "(takes effect on next game launch; set XEFG_D3D12_VULKAN_WMMA=0 to force off).\n"
+						 "On by default; disable to fall back to D3D12 cs_6_6 WMMA overrides without duplicate VRAM\n"
 						 "or OptiScaler Vulkan_wDx12 hook interference. Saved as D3D12VulkanWmmaBridge.");
 
 		bool uiCooldown = Plugin::options.uiTransitionCooldown;
