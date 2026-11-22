@@ -19,6 +19,7 @@
 #include "../MfgPort/Cuda/cuda_route.h"
 #include "../NGX.h"
 #include "../Plugin.h"
+#include "../XeFgEnabler.h"
 #include "../VulkanPrograms.h"
 #include "../XeFG.h"
 #include "VulkanCoopMat.h"
@@ -207,7 +208,12 @@ namespace
 		// HUD-less mismatch one-shot warning, and consecutive execute-failure stall circuit breaker.
 		float prevCameraPos[3]{};
 		float prevCameraFwd[3]{};
+		float prevCameraFov = 0.0f;
 		bool hasPrevCamera = false;
+		bool hasPrevFov = false;
+		bool hasPrevUiState = false;
+		bool prevUiState = false;
+		uint32_t uiTransitionCooldown = 0;
 		std::array<uint32_t, 12> prevSubrects{};
 		bool hasPrevSubrects = false;
 		bool hudlessMismatchLogged = false;
@@ -1118,8 +1124,12 @@ namespace
 		}
 		if (!usableUi(in.ui, false)) in.ui = nullptr;
 
-		const bool inverted = parameters.GetOr<uint32_t>("DLSSG.DepthInverted", 0) != 0;
-		const bool jittered = parameters.GetOr<uint32_t>("DLSSG.MvecJittered", 0) != 0;
+		const bool inverted = XeFgEnabler::ApplyTriStateOverride(
+			Plugin::options.depthInvertedOverride.load(std::memory_order_relaxed),
+			parameters.GetOr<uint32_t>("DLSSG.DepthInverted", 0) != 0);
+		const bool jittered = XeFgEnabler::ApplyTriStateOverride(
+			Plugin::options.jitteredMvOverride.load(std::memory_order_relaxed),
+			parameters.GetOr<uint32_t>("DLSSG.MvecJittered", 0) != 0);
 
 		if (!EnsureFeature(d, f, in, inverted, jittered))
 			return false;
@@ -1130,7 +1140,8 @@ namespace
 		if (sLastDebugLines.exchange(debugLines ? 1 : 0, std::memory_order_relaxed) != (debugLines ? 1 : 0))
 			XeFG::SetDebugLines(debugLines);
 
-		bool reset = parameters.GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
+		const bool ignoreGameReset = Plugin::options.ignoreGameReset.load(std::memory_order_relaxed);
+		bool reset = !ignoreGameReset && (parameters.GetOr<uint32_t>("DLSSG.Reset", 0) != 0);
 
 		// DRS / Subrect Change Detector (dlssg-0.4.2 M3): force history reset if any active subrect changes
 		// between consecutive batches even when the game omits DLSSG.Reset.
@@ -1153,8 +1164,10 @@ namespace
 		f.prevSubrects = curSubrects;
 		f.hasPrevSubrects = true;
 
-		// Camera Cut & Teleport Detector (DLSSG-MFG v3.0.1): force history reset on sudden cuts/teleports on Vulkan too.
-		if (Plugin::options.cameraCutDetection.load(std::memory_order_relaxed))
+		// Camera Cut & Teleport Detector + GhostBuster anti-ghosting
+		const bool camCutOn = Plugin::options.cameraCutDetection.load(std::memory_order_relaxed);
+		const bool ghostBusterOn = Plugin::options.ghostBuster.load(std::memory_order_relaxed);
+		if (camCutOn || ghostBusterOn)
 		{
 			auto finiteOr = [](float v, float fallback) noexcept { return std::isfinite(v) ? v : fallback; };
 			const float px = finiteOr(parameters.GetOr<float>("DLSSG.CameraPosX", 0.0f), 0.0f);
@@ -1165,25 +1178,40 @@ namespace
 			const float fz = finiteOr(parameters.GetOr<float>("DLSSG.CameraFwdZ", 0.0f), 0.0f);
 			const float fwdLenSq = fx * fx + fy * fy + fz * fz;
 			const bool hasCamera = fwdLenSq > 1e-6f;
+			float curFov = finiteOr(parameters.GetOr<float>("DLSSG.CameraFOV", 0.0f), 0.0f);
+			if (curFov > 10.0f)
+				curFov *= 3.14159265358979323846f / 180.0f;
 
-			if (hasCamera && f.hasPrevCamera && !reset)
+			float distSq = 0.0f;
+			float fwdDot = 1.0f;
+			if (hasCamera && f.hasPrevCamera)
 			{
 				const float dx = px - f.prevCameraPos[0];
 				const float dy = py - f.prevCameraPos[1];
 				const float dz = pz - f.prevCameraPos[2];
-				const float distSq = dx * dx + dy * dy + dz * dz;
-				constexpr float kCutThresholdSq = 4.5f * 4.5f;
+				distSq = dx * dx + dy * dy + dz * dz;
 
 				const float prevLenSq = f.prevCameraFwd[0] * f.prevCameraFwd[0] +
 					f.prevCameraFwd[1] * f.prevCameraFwd[1] +
 					f.prevCameraFwd[2] * f.prevCameraFwd[2];
-				const float fwdDot = (prevLenSq > 1e-6f)
+				fwdDot = (prevLenSq > 1e-6f)
 					? ((fx * f.prevCameraFwd[0] + fy * f.prevCameraFwd[1] + fz * f.prevCameraFwd[2]) /
 					   std::sqrt(fwdLenSq * prevLenSq))
 					: 1.0f;
 
-				if (distSq > kCutThresholdSq || fwdDot < -0.5f)
+				constexpr float kCutThresholdSq = 4.5f * 4.5f;
+				if (camCutOn && !reset && (distSq > kCutThresholdSq || fwdDot < -0.5f))
 					reset = true;
+			}
+
+			if (ghostBusterOn && !reset)
+			{
+				const bool camMvIncluded = parameters.GetOr<uint32_t>("DLSSG.CameraMotionIncluded", 1) != 0;
+				if (XeFgEnabler::ShouldGhostBusterReset(true, hasCamera, f.hasPrevCamera, fwdDot,
+					curFov, f.prevCameraFov, f.hasPrevFov, camMvIncluded, distSq))
+				{
+					reset = true;
+				}
 			}
 
 			if (hasCamera)
@@ -1196,6 +1224,31 @@ namespace
 				f.prevCameraFwd[2] = fz;
 				f.hasPrevCamera = true;
 			}
+			if (curFov > 0.01f)
+			{
+				f.prevCameraFov = curFov;
+				f.hasPrevFov = true;
+			}
+		}
+
+		// UI / HUD-less transition cooldown (DLSS Enabler XeFG): skip 10 batches on HUD-less/UI toggle
+		const bool curUiState = (in.hudless && f.hudlessFormat != DXGI_FORMAT_UNKNOWN) ||
+			(in.ui && f.uiFormat != DXGI_FORMAT_UNKNOWN);
+		if (f.hasPrevUiState && curUiState != f.prevUiState &&
+			Plugin::options.uiTransitionCooldown.load(std::memory_order_relaxed))
+		{
+			f.uiTransitionCooldown = 10u;
+			Log::Info("Vulkan: HUD-less/UI state changed ({} -> {}), skipping interpolation for 10 batches",
+				f.prevUiState, curUiState);
+		}
+		f.prevUiState = curUiState;
+		f.hasPrevUiState = true;
+		if (f.uiTransitionCooldown > 0u)
+		{
+			--f.uiTransitionCooldown;
+			f.havePrevious = false;
+			f.fault = "ui_transition";
+			return false;
 		}
 
 		Slot& slot = f.slots[f.current];
@@ -1483,6 +1536,7 @@ namespace
 				f.generatedThrough = 0;
 				f.consecutiveFailures = 0;
 				f.stallCooldownBatches = 0;
+				f.uiTransitionCooldown = 0;
 				f.paused++;
 				VulkanHost::NotifyPaused();
 			}
@@ -1523,7 +1577,7 @@ namespace
 				{
 					f.havePrevious = false;
 					VulkanHost::NotifyPaused();
-					if (f.fault != "stall_cooldown")
+					if (f.fault != "stall_cooldown" && f.fault != "ui_transition")
 					{
 						if (++f.failures <= 16)
 							Log::Error("Vulkan: batch failed ({}), index {}, count {}", f.fault, index, count);

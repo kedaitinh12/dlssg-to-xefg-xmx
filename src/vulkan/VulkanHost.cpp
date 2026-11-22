@@ -65,6 +65,7 @@ namespace
 		using DestroyInstanceFn = void(VKAPI_PTR*)(VkInstance, const VkAllocationCallbacks*);
 
 		PFN_vkGetInstanceProcAddr loaderGipa = nullptr;
+		PFN_vkGetDeviceProcAddr loaderGdpa = nullptr;
 		PFN_vkCreateInstance createInstance = nullptr;
 		DestroyInstanceFn destroyInstance = nullptr;
 		PFN_vkCreateDevice createDevice = nullptr;
@@ -74,14 +75,24 @@ namespace
 		void* rawCreateInstance = nullptr;
 		void* rawDestroyInstance = nullptr;
 		void* rawCreateDevice = nullptr;
+		void* rawGetDeviceProcAddr = nullptr;
 		void* rawCreateSwapchain = nullptr;
 		void* rawDestroySwapchain = nullptr;
 		void* rawQueuePresent = nullptr;
 		std::atomic<PFN_vkCreateInstance> gipaCreateInstance = nullptr;
 		std::atomic<DestroyInstanceFn> gipaDestroyInstance = nullptr;
 		std::atomic<PFN_vkCreateDevice> gipaCreateDevice = nullptr;
+		std::atomic<PFN_vkGetDeviceProcAddr> gipaGetDeviceProcAddr = nullptr;
+		std::atomic<PFN_vkCreateSwapchainKHR> gipaCreateSwapchain = nullptr;
+		std::atomic<PFN_vkDestroySwapchainKHR> gipaDestroySwapchain = nullptr;
+		std::atomic<PFN_vkQueuePresentKHR> gipaQueuePresent = nullptr;
+		std::atomic<PFN_vkCreateSwapchainKHR> gdpaCreateSwapchain = nullptr;
+		std::atomic<PFN_vkDestroySwapchainKHR> gdpaDestroySwapchain = nullptr;
+		std::atomic<PFN_vkQueuePresentKHR> gdpaQueuePresent = nullptr;
 		bool gipaHooked = false;
-		bool presentHooked = false;
+		bool gdpaHooked = false;
+		std::atomic_bool presentHooked = false;
+		std::atomic_bool gdpaPresentLogged = false;
 		HMODULE(WINAPI* loadLibraryExW)(LPCWSTR, HANDLE, DWORD) = nullptr;
 
 		// Dedicated lock for low-overhead present pacing
@@ -152,6 +163,18 @@ namespace
 		return !s.hwPacingActive.load(std::memory_order_relaxed);
 	}
 
+	uint32_t GetSwapchainBufferTarget() noexcept
+	{
+		static const uint32_t target = [] {
+			wchar_t value[32]{};
+			const DWORD len = GetEnvironmentVariableW(L"XEFG_VK_SWAPCHAIN_BUFFERS", value, 32);
+			if (len && len < 32)
+				return VulkanPolicy::ParseSwapchainBufferTarget(std::wstring_view(value, len), 8u);
+			return 8u;
+		}();
+		return target;
+	}
+
 	uint64_t NowNs() noexcept
 	{
 		static const uint64_t freq = [] {
@@ -175,7 +198,8 @@ namespace
 			return;
 
 		const uint64_t deadline = NowNs() + waitNs;
-		constexpr uint64_t SpinTailNs = 1'200'000ull; // 1.2 ms QPC spin tail
+		const bool sleepSpin = Plugin::options.pacingSpinlockSleep.load(std::memory_order_relaxed);
+		const uint64_t SpinTailNs = sleepSpin ? 250'000ull : 1'200'000ull; // 0.25 ms sleep-friendly tail vs 1.2 ms QPC spin tail
 
 		using CreateWaitableTimerExWFn = HANDLE(WINAPI*)(void*, LPCWSTR, DWORD, DWORD);
 		static const auto createTimerEx = [] {
@@ -214,8 +238,16 @@ namespace
 			}
 		}
 
-		while (NowNs() < deadline)
-			YieldProcessor();
+		while (true)
+		{
+			const uint64_t cur = NowNs();
+			if (cur >= deadline)
+				break;
+			if (sleepSpin && (deadline - cur) > 100'000ull)
+				SwitchToThread();
+			else
+				YieldProcessor();
+		}
 	}
 
 	// ----------------------------------------------------------------------------------------------- instance
@@ -1138,7 +1170,66 @@ namespace
 			return next(device, info, allocator, swapchain);
 
 		ReentryGuard guard(inCreateSwapchain);
-		const VkResult result = next(device, info, allocator, swapchain);
+
+		const VkSwapchainCreateInfoKHR* usedInfo = info;
+		VkSwapchainCreateInfoKHR edited{};
+		uint32_t capMin = 0, capMax = 0;
+		bool boosted = false;
+
+		const uint32_t targetBuffers = GetSwapchainBufferTarget();
+		if (targetBuffers >= 6u && info && info->minImageCount >= 6u && info->minImageCount < targetBuffers &&
+			info->surface && S().prepared.load(std::memory_order_relaxed) > 0)
+		{
+			VulkanHost::DeviceRecord record{};
+			bool foundDevice = false;
+			{
+				State& s = S();
+				std::lock_guard lock(s.mutex);
+				const auto it = s.devices.find(device);
+				if (it != s.devices.end())
+				{
+					record = it->second;
+					foundDevice = true;
+				}
+			}
+			if (foundDevice && record.gipa && record.instance && record.physical)
+			{
+				auto getCaps = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(
+					record.gipa(record.instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
+				VkSurfaceCapabilitiesKHR caps{};
+				if (getCaps && getCaps(record.physical, info->surface, &caps) == VK_SUCCESS)
+				{
+					capMin = caps.minImageCount;
+					capMax = caps.maxImageCount;
+					const uint32_t recommended = VulkanPolicy::RecommendSwapchainImageCount(
+						info->minImageCount, capMin, capMax, targetBuffers);
+					if (recommended > info->minImageCount)
+					{
+						edited = *info;
+						edited.minImageCount = recommended;
+						usedInfo = &edited;
+						boosted = true;
+					}
+				}
+			}
+		}
+
+		VkResult result = next(device, usedInfo, allocator, swapchain);
+
+		if (boosted)
+		{
+			if (result == VK_SUCCESS)
+			{
+				Log::Info("Vulkan swapchain: raised minImageCount {} -> {} (surface caps {}..{}, presentMode {})",
+					info->minImageCount, edited.minImageCount, capMin, capMax, static_cast<int>(info->presentMode));
+			}
+			else
+			{
+				Log::Warn("Vulkan swapchain: driver refused minImageCount {} ({}), retrying with original {}",
+					edited.minImageCount, static_cast<int>(result), info->minImageCount);
+				result = next(device, info, allocator, swapchain);
+			}
+		}
 
 		if (result == VK_SUCCESS && info && swapchain && *swapchain && S().prepared.load(std::memory_order_relaxed) > 0)
 		{
@@ -1242,9 +1333,145 @@ namespace
 		return QueuePresentImpl(S().queuePresent, queue, info);
 	}
 
+	VKAPI_ATTR VkResult VKAPI_CALL HookCreateSwapchainViaGdpa(VkDevice device, const VkSwapchainCreateInfoKHR* info,
+		const VkAllocationCallbacks* allocator, VkSwapchainKHR* swapchain)
+	{
+		State& s = S();
+		PFN_vkCreateSwapchainKHR next = s.gdpaCreateSwapchain.load(std::memory_order_acquire);
+		return CreateSwapchainImpl(next ? next : s.createSwapchain, device, info, allocator, swapchain);
+	}
+
+	VKAPI_ATTR void VKAPI_CALL HookDestroySwapchainViaGdpa(VkDevice device, VkSwapchainKHR swapchain,
+		const VkAllocationCallbacks* allocator)
+	{
+		State& s = S();
+		PFN_vkDestroySwapchainKHR next = s.gdpaDestroySwapchain.load(std::memory_order_acquire);
+		DestroySwapchainImpl(next ? next : s.destroySwapchain, device, swapchain, allocator);
+	}
+
+	VKAPI_ATTR VkResult VKAPI_CALL HookQueuePresentViaGdpa(VkQueue queue, const VkPresentInfoKHR* info)
+	{
+		State& s = S();
+		PFN_vkQueuePresentKHR next = s.gdpaQueuePresent.load(std::memory_order_acquire);
+		return QueuePresentImpl(next ? next : s.queuePresent, queue, info);
+	}
+
+	VKAPI_ATTR VkResult VKAPI_CALL HookCreateSwapchainViaGipa(VkDevice device, const VkSwapchainCreateInfoKHR* info,
+		const VkAllocationCallbacks* allocator, VkSwapchainKHR* swapchain)
+	{
+		State& s = S();
+		PFN_vkCreateSwapchainKHR next = s.gipaCreateSwapchain.load(std::memory_order_acquire);
+		return CreateSwapchainImpl(next ? next : s.createSwapchain, device, info, allocator, swapchain);
+	}
+
+	VKAPI_ATTR void VKAPI_CALL HookDestroySwapchainViaGipa(VkDevice device, VkSwapchainKHR swapchain,
+		const VkAllocationCallbacks* allocator)
+	{
+		State& s = S();
+		PFN_vkDestroySwapchainKHR next = s.gipaDestroySwapchain.load(std::memory_order_acquire);
+		DestroySwapchainImpl(next ? next : s.destroySwapchain, device, swapchain, allocator);
+	}
+
+	VKAPI_ATTR VkResult VKAPI_CALL HookQueuePresentViaGipa(VkQueue queue, const VkPresentInfoKHR* info)
+	{
+		State& s = S();
+		PFN_vkQueuePresentKHR next = s.gipaQueuePresent.load(std::memory_order_acquire);
+		return QueuePresentImpl(next ? next : s.queuePresent, queue, info);
+	}
+
+	// Safe per-device swapchain/present interception via vkGetDeviceProcAddr:
+	// When OptiScaler/Detours has already patched vulkan-1.dll's short device-dispatch stubs, inline hooking
+	// vkCreateSwapchainKHR/vkQueuePresentKHR is skipped for safety. Wrapping them here for prepared game devices
+	// restores 6->8 MFG swapchain buffering and CPU present pacing without touching DXVK/VKD3D or bridge devices.
+	PFN_vkVoidFunction GetDeviceProcAddrImpl(PFN_vkGetDeviceProcAddr next, VkDevice device, const char* pName)
+	{
+		if (!next)
+			return nullptr;
+
+		static thread_local bool inGdpa = false;
+		if (inGdpa)
+			return next(device, pName);
+
+		ReentryGuard guard(inGdpa);
+		PFN_vkVoidFunction fn = next(device, pName);
+
+		if (!fn || !pName || !device)
+			return fn;
+
+		State& s = S();
+		if (!s.enabled || s.prepared.load(std::memory_order_relaxed) == 0)
+			return fn;
+
+		const bool isCreateSwap = (std::strcmp(pName, "vkCreateSwapchainKHR") == 0);
+		const bool isDestroySwap = (!isCreateSwap && std::strcmp(pName, "vkDestroySwapchainKHR") == 0);
+		const bool isPresent = (!isCreateSwap && !isDestroySwap && std::strcmp(pName, "vkQueuePresentKHR") == 0);
+		if (!isCreateSwap && !isDestroySwap && !isPresent)
+			return fn;
+
+		bool trackedDevice = false;
+		{
+			std::lock_guard lock(s.mutex);
+			trackedDevice = (s.devices.find(device) != s.devices.end());
+		}
+		if (!trackedDevice)
+			return fn;
+
+		void* addr = reinterpret_cast<void*>(fn);
+		if (isCreateSwap)
+		{
+			if (addr != s.rawCreateSwapchain &&
+				addr != reinterpret_cast<void*>(&HookCreateSwapchain) &&
+				addr != reinterpret_cast<void*>(&HookCreateSwapchainViaGdpa) &&
+				addr != reinterpret_cast<void*>(&HookCreateSwapchainViaGipa))
+			{
+				s.gdpaCreateSwapchain.store(reinterpret_cast<PFN_vkCreateSwapchainKHR>(fn), std::memory_order_release);
+				return reinterpret_cast<PFN_vkVoidFunction>(&HookCreateSwapchainViaGdpa);
+			}
+		}
+		else if (isDestroySwap)
+		{
+			if (addr != s.rawDestroySwapchain &&
+				addr != reinterpret_cast<void*>(&HookDestroySwapchain) &&
+				addr != reinterpret_cast<void*>(&HookDestroySwapchainViaGdpa) &&
+				addr != reinterpret_cast<void*>(&HookDestroySwapchainViaGipa))
+			{
+				s.gdpaDestroySwapchain.store(reinterpret_cast<PFN_vkDestroySwapchainKHR>(fn), std::memory_order_release);
+				return reinterpret_cast<PFN_vkVoidFunction>(&HookDestroySwapchainViaGdpa);
+			}
+		}
+		else if (isPresent)
+		{
+			if (addr != s.rawQueuePresent &&
+				addr != reinterpret_cast<void*>(&HookQueuePresent) &&
+				addr != reinterpret_cast<void*>(&HookQueuePresentViaGdpa) &&
+				addr != reinterpret_cast<void*>(&HookQueuePresentViaGipa))
+			{
+				s.gdpaQueuePresent.store(reinterpret_cast<PFN_vkQueuePresentKHR>(fn), std::memory_order_release);
+				s.presentHooked.store(true, std::memory_order_relaxed);
+				if (!s.gdpaPresentLogged.exchange(true, std::memory_order_relaxed))
+					Log::Info("Vulkan hooks: wrapped swapchain/present via vkGetDeviceProcAddr (pacing & 8-buffer MFG ready)");
+				return reinterpret_cast<PFN_vkVoidFunction>(&HookQueuePresentViaGdpa);
+			}
+		}
+
+		return fn;
+	}
+
+	VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL HookGetDeviceProcAddr(VkDevice device, const char* pName)
+	{
+		return GetDeviceProcAddrImpl(S().loaderGdpa, device, pName);
+	}
+
+	VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL HookGetDeviceProcAddrViaGipa(VkDevice device, const char* pName)
+	{
+		State& s = S();
+		PFN_vkGetDeviceProcAddr next = s.gipaGetDeviceProcAddr.load(std::memory_order_acquire);
+		return GetDeviceProcAddrImpl(next ? next : s.loaderGdpa, device, pName);
+	}
+
 	// OptiScaler hooks vulkan-1.dll before ASI plugins run and returns its own hkvkCreateDevice from
-	// vkGetInstanceProcAddr. Wrapping vkGetInstanceProcAddr catches games that resolve vkCreateInstance,
-	// vkDestroyInstance, or vkCreateDevice via GIPA without touching per-device vkGetDeviceProcAddr chains.
+	// vkGetInstanceProcAddr. Wrapping vkGetInstanceProcAddr catches games and Streamline plugins that resolve
+	// instance/device procs (including vkGetDeviceProcAddr and swapchain/present) via GIPA.
 	VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL HookGetInstanceProcAddr(VkInstance instance, const char* pName)
 	{
 		State& s = S();
@@ -1287,6 +1514,54 @@ namespace
 			{
 				s.gipaDestroyInstance.store(reinterpret_cast<State::DestroyInstanceFn>(fn), std::memory_order_release);
 				return reinterpret_cast<PFN_vkVoidFunction>(&HookDestroyInstanceViaGipa);
+			}
+		}
+		else if (std::strcmp(pName, "vkGetDeviceProcAddr") == 0)
+		{
+			void* addr = reinterpret_cast<void*>(fn);
+			if (addr != s.rawGetDeviceProcAddr &&
+				addr != reinterpret_cast<void*>(&HookGetDeviceProcAddr) &&
+				addr != reinterpret_cast<void*>(&HookGetDeviceProcAddrViaGipa))
+			{
+				s.gipaGetDeviceProcAddr.store(reinterpret_cast<PFN_vkGetDeviceProcAddr>(fn), std::memory_order_release);
+				return reinterpret_cast<PFN_vkVoidFunction>(&HookGetDeviceProcAddrViaGipa);
+			}
+		}
+		else if (std::strcmp(pName, "vkCreateSwapchainKHR") == 0)
+		{
+			void* addr = reinterpret_cast<void*>(fn);
+			if (addr != s.rawCreateSwapchain &&
+				addr != reinterpret_cast<void*>(&HookCreateSwapchain) &&
+				addr != reinterpret_cast<void*>(&HookCreateSwapchainViaGdpa) &&
+				addr != reinterpret_cast<void*>(&HookCreateSwapchainViaGipa))
+			{
+				s.gipaCreateSwapchain.store(reinterpret_cast<PFN_vkCreateSwapchainKHR>(fn), std::memory_order_release);
+				return reinterpret_cast<PFN_vkVoidFunction>(&HookCreateSwapchainViaGipa);
+			}
+		}
+		else if (std::strcmp(pName, "vkDestroySwapchainKHR") == 0)
+		{
+			void* addr = reinterpret_cast<void*>(fn);
+			if (addr != s.rawDestroySwapchain &&
+				addr != reinterpret_cast<void*>(&HookDestroySwapchain) &&
+				addr != reinterpret_cast<void*>(&HookDestroySwapchainViaGdpa) &&
+				addr != reinterpret_cast<void*>(&HookDestroySwapchainViaGipa))
+			{
+				s.gipaDestroySwapchain.store(reinterpret_cast<PFN_vkDestroySwapchainKHR>(fn), std::memory_order_release);
+				return reinterpret_cast<PFN_vkVoidFunction>(&HookDestroySwapchainViaGipa);
+			}
+		}
+		else if (std::strcmp(pName, "vkQueuePresentKHR") == 0)
+		{
+			void* addr = reinterpret_cast<void*>(fn);
+			if (addr != s.rawQueuePresent &&
+				addr != reinterpret_cast<void*>(&HookQueuePresent) &&
+				addr != reinterpret_cast<void*>(&HookQueuePresentViaGdpa) &&
+				addr != reinterpret_cast<void*>(&HookQueuePresentViaGipa))
+			{
+				s.gipaQueuePresent.store(reinterpret_cast<PFN_vkQueuePresentKHR>(fn), std::memory_order_release);
+				s.presentHooked.store(true, std::memory_order_relaxed);
+				return reinterpret_cast<PFN_vkVoidFunction>(&HookQueuePresentViaGipa);
 			}
 		}
 
@@ -1421,9 +1696,10 @@ namespace
 		};
 
 		tryHook(loader, "vkDestroyInstance", reinterpret_cast<void*>(&HookDestroyInstance), &s.rawDestroyInstance, s.destroyInstance, false);
+		s.gdpaHooked = tryHook(loader, "vkGetDeviceProcAddr", reinterpret_cast<void*>(&HookGetDeviceProcAddr), &s.rawGetDeviceProcAddr, s.loaderGdpa, true);
 		tryHook(loader, "vkCreateSwapchainKHR", reinterpret_cast<void*>(&HookCreateSwapchain), &s.rawCreateSwapchain, s.createSwapchain, true);
 		tryHook(loader, "vkDestroySwapchainKHR", reinterpret_cast<void*>(&HookDestroySwapchain), &s.rawDestroySwapchain, s.destroySwapchain, true);
-		s.presentHooked = tryHook(loader, "vkQueuePresentKHR", reinterpret_cast<void*>(&HookQueuePresent), &s.rawQueuePresent, s.queuePresent, true);
+		s.presentHooked.store(tryHook(loader, "vkQueuePresentKHR", reinterpret_cast<void*>(&HookQueuePresent), &s.rawQueuePresent, s.queuePresent, true), std::memory_order_relaxed);
 
 		s.loaderHooked = true;
 		return true;

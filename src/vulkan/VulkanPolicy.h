@@ -445,6 +445,47 @@ namespace VulkanPolicy
 		return std::string(reason);
 	}
 
+	// XEFG_VK_SWAPCHAIN_BUFFERS: target minimum swapchain image count for Multi-Frame Generation swapchains
+	// (requested >= 6, e.g. Streamline's 6-buffer Vulkan swapchain). Raising 6 -> 8 allows 4x MFG (4 frames/batch)
+	// to double-buffer cleanly (8 / 4 = 2) instead of hitting wrap-around phase stalls every alternating batch.
+	// Empty or invalid falls back to defaultTarget (8); 0/off/false disables boosting; valid explicit values are 6..12.
+	inline uint32_t ParseSwapchainBufferTarget(std::wstring_view value, uint32_t defaultTarget = 8u) noexcept
+	{
+		while (!value.empty() && (value.front() == L' ' || value.front() == L'\t'))
+			value.remove_prefix(1);
+		while (!value.empty() && (value.back() == L' ' || value.back() == L'\t'))
+			value.remove_suffix(1);
+		if (value.empty())
+			return defaultTarget;
+		if (IsOffWord(value))
+			return 0u;
+		uint32_t parsed = 0;
+		for (const wchar_t c : value)
+		{
+			if (c < L'0' || c > L'9')
+				return defaultTarget;
+			parsed = parsed * 10u + static_cast<uint32_t>(c - L'0');
+			if (parsed > 12u)
+				return defaultTarget;
+		}
+		return (parsed >= 6u && parsed <= 12u) ? parsed : defaultTarget;
+	}
+
+	// Computes the safe boosted swapchain minImageCount within surface capabilities (capMax == 0 means unbounded).
+	// Only boosts MFG-sized swapchains (requested >= 6) so non-FG or 2-3 buffer game swapchains stay untouched.
+	inline uint32_t RecommendSwapchainImageCount(uint32_t requested, uint32_t capMin, uint32_t capMax,
+		uint32_t targetMin = 8u) noexcept
+	{
+		if (targetMin < 6u || requested < 6u || requested >= targetMin)
+			return requested;
+		uint32_t desired = std::clamp<uint32_t>(targetMin, 6u, 12u);
+		if (capMax > 0u && desired > capMax)
+			desired = capMax;
+		if (desired < capMin)
+			desired = capMin;
+		return desired > requested ? desired : requested;
+	}
+
 	// CPU-side Vulkan present pacer for recorded-mode Multi-Frame Generation (e.g. Streamline/OptiScaler on GPUs
 	// without hardware flip metering and with V-Sync FIFO off).
 	// Tracks real-frame batch cadence with a 5-sample median-filtered EMA (rejecting single-frame asset-streaming
