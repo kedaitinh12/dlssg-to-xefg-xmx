@@ -105,7 +105,7 @@ namespace Plugin
 		uint32_t height = 0;
 		uint32_t generatedFrames = 0; // between two real frames
 		bool hudless = false;
-		int32_t hudTier = 0; // HudTier::ActiveTier (0=Interpolated, 1=Native, 2=Diff-Comp, 3=Static Mask)
+		int32_t hudTier = 0; // HudTier::ActiveTier (0=Interpolated, 1=Native, 2=Diff-Comp, 3=Hybrid)
 		Network network = Network::Unknown;
 		bool failed = false; // no XeFG context
 		bool fp16 = false;   // 16-bit float (scRGB) back buffer, XeFG only takes 8-bit and HDR10

@@ -1158,7 +1158,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	wanted.format = TypedFormat(outputDesc.Format);
 	wanted.initFlags = (depthInverted ? XEFGD_INIT_FLAG_INVERTED_DEPTH : 0) |
 		(mvecJittered ? XEFGD_INIT_FLAG_JITTERED_MV : 0);
-	// 4-Tier Adaptive HUD Protection: poll non-blocking GPU readbacks from 2 frames ago and evaluate active tier.
+	// 3-Tier Adaptive HUD Protection (Tier 3 Hybrid = Tone-Map Match + Static HUD Mask): poll readbacks & evaluate.
 	const bool hudComputeReady = hudTierPass.EnsureInitialized(device.Get(), wanted.width, wanted.height);
 	if (hudComputeReady)
 	{
@@ -1172,7 +1172,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	}
 
 	HudTier::Inputs hudInputs{};
-	hudInputs.mode = static_cast<HudTier::Mode>(std::clamp(Plugin::options.hudTierMode.load(std::memory_order_relaxed), 0, 4));
+	hudInputs.mode = static_cast<HudTier::Mode>(std::clamp(Plugin::options.hudTierMode.load(std::memory_order_relaxed), 0, 3));
 	hudInputs.hudlessUiEnabled = Plugin::options.hudlessUi.load(std::memory_order_relaxed);
 	hudInputs.hasGameHudless = rawHudless != nullptr;
 	hudInputs.hudlessStructurallyValid = hudless != nullptr && !hudlessFormatMismatch;
@@ -1840,7 +1840,9 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 							compositeHudless, InputState, compositeTarget, OutputState,
 							frameIndex == 1, debugMagenta, hudDecision.runToneMapMatch && curFrame.matchedHudless != nullptr);
 					}
-					else if (runTier3)
+					// In Tier 3 Hybrid, Static HUD Mask runs alongside Tone-Map Match to lock fixed UI (crosshairs/text)
+					// sharp, and takes over completely when HUDLess is missing or Tone-Map Match is unavailable.
+					if (runTier3)
 					{
 						hudTierPass.RecordStaticHudComposite(cmdList, curFrame.backbuffer.Get(), BackbufferState,
 							compositeTarget, OutputState, debugMagenta);

@@ -599,23 +599,22 @@ namespace
 				   "Turn OFF only if FPS feels stuck or the HUD looks glitched.");
 
 		static const char* const HudTierNames[] = {
-			"Auto (4-Tier)", "Tier 1 (Native HUDless)", "Tier 2 (HUD-Diff Composite)", "Tier 3 (Static HUD Mask)",
-			"Tier 4 (Tone-Map Match HUDless)"
+			"Auto (3-Tier)", "Tier 1 (Native HUDless)", "Tier 2 (HUD-Diff Composite)", "Tier 3 (Hybrid: Tone-Match + Static)"
 		};
-		int32_t hudTierMode = std::clamp(Plugin::options.hudTierMode.load(), 0, 4);
-		if (api->Combo("HUD protection tier", &hudTierMode, HudTierNames, 5, nullptr))
+		int32_t hudTierMode = std::clamp(Plugin::options.hudTierMode.load(), 0, 3);
+		if (api->Combo("HUD protection tier", &hudTierMode, HudTierNames, 4, nullptr))
 		{
 			Plugin::options.hudTierMode = hudTierMode;
 			api->SetInt(self, "HudTierMode", hudTierMode);
 			NotifySettingChanged(NoticeKind::LiveSaved, "HUD protection tier");
 		}
 		HelpMarker("Controls how the mod keeps your crosshair and game HUD clean:\n"
-				   "- Auto (4-Tier): Recommended. Uses fast Tier 1 on normal games (zero\n"
-				   "  extra cost) and auto-switches to Tier 4 or Tier 3 only if HUD data breaks.\n"
+				   "- Auto (3-Tier): Recommended. Uses fast Tier 1 on normal games (zero\n"
+				   "  extra cost) and auto-switches to Tier 3 only if HUD data breaks.\n"
 				   "- Tier 1: Uses only the game's built-in HUD data.\n"
 				   "- Tier 2: Separates HUD manually (helps if Tier 1 flickers).\n"
-				   "- Tier 3: Protects fixed crosshairs & text in games without HUD support.\n"
-				   "- Tier 4: Re-matches HDR/RenoDX HUD colors automatically (DX12 only).");
+				   "- Tier 3 (Hybrid): Combines Tone-Map Matching (fixes HDR/dynamic UI)\n"
+				   "  with Static Mask (protects fixed crosshairs & text) on DX12 & Vulkan.");
 
 		bool hudDebug = Plugin::options.hudDebugMagenta;
 		if (api->Checkbox("HUD mask debug (magenta)", &hudDebug))
@@ -1139,7 +1138,7 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* optiAp
 	Plugin::options.depthInvertedOverride = std::clamp(api->GetInt(self, "DepthInvertedOverride", 0), 0, 2);
 	Plugin::options.jitteredMvOverride = std::clamp(api->GetInt(self, "JitteredMvOverride", 0), 0, 2);
 	Plugin::options.uiAlphaMode = std::clamp(api->GetInt(self, "UiAlphaMode", 0), 0, 2);
-	Plugin::options.hudTierMode = std::clamp(api->GetInt(self, "HudTierMode", 0), 0, 4);
+	Plugin::options.hudTierMode = std::clamp(api->GetInt(self, "HudTierMode", 0), 0, 3);
 	Plugin::options.ignoreGameReset = api->GetBool(self, "IgnoreGameReset", Plugin::options.ignoreGameReset);
 	RefreshAmdFlipMeterState(true);
 

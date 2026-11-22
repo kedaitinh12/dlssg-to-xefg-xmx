@@ -1,8 +1,9 @@
-// D3D12 GPU compute passes for the 4-Tier Adaptive HUD Protection system:
+// D3D12 GPU compute passes for the 3-Tier Adaptive HUD Protection system:
 // - Tier 1 Guard: 1/16-pixel |Real - Hudless| diff counter (non-blocking ring-buffered readback, 0 GPU stall)
 // - Tier 2 Composite: 3x3 dilated |Real - Hudless| > tolerance HUD composite onto generated output (xmx_hud_composite)
-// - Tier 3 Static HUD Mask: Temporal per-pixel stability map across real frames + selective static-HUD composite
-// - Tier 4 Tone-Map Match (lazy-allocated inline): 256-bin log-luminance median LUT (ported from MFG-Unlocker V1.7.2)
+// - Tier 3 Hybrid (Tone-Map Match + Static HUD Mask):
+//     * Lazy-allocated inline 256-bin log-luminance median LUT (MFG-Unlocker V1.7.2) for dynamic/HDR-mismatched UI
+//     * Temporal per-pixel stability map + static-HUD composite for fixed UI (crosshairs, static HUD bars/text)
 #pragma once
 
 #include <d3d12.h>
