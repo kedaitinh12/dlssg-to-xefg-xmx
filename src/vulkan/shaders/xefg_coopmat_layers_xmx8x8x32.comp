@@ -1,0 +1,796 @@
+// SPDX-License-Identifier: MIT
+//
+// Full 9-tap 3x3 INT8 convolution GLSL compute shader template for XeFG's 17 ported INT8 layers
+// using VK_KHR_cooperative_matrix 8x8x32 (SINT8 x SINT8 -> SINT32) with SIMD16 subgroups
+// on Intel Arc (Alchemist Xe-HPG) and Intel Battlemage (Xe2) XMX on Vulkan.
+//
+// Mapping onto 8x8x32 XMX tiles with 128 threads = 8 SIMD16 subgroups:
+//   - Subgroup sg = tid >> 4 (0..7) splits into rowSlot = sg >> 1 (0..3) and xHalf = sg & 1 (0 = px 0..7, 1 = px 8..15).
+//   - Each subgroup computes 8 pixels (M = 8) x 16 output channels (two N = 8 halves: oc 0..7 and oc 8..15).
+//   - K = 32 packs two adjacent 16-channel horizontal taps per step with stride = 4 uint32 (zero winWords repacking):
+//       step 0: taps (0, 1)  [dy=0, dx=0..1]
+//       step 1: tap  (2, 0)  [dy=0, dx=2 + zero-padded upper K=16..31 in B]
+//       step 2: taps (3, 4)  [dy=1, dx=0..1]
+//       step 3: tap  (5, 0)  [dy=1, dx=2 + zero-padded upper K=16..31 in B]
+//       step 4: taps (6, 7)  [dy=2, dx=0..1]
+//       step 5: tap  (8, 0)  [dy=2, dx=2 + zero-padded upper K=16..31 in B]
+//   - 4 trailing padding words on winWords keep dx=2 upper-half K=16..31 loads in-bounds while B zeros them out.
+//
+// Compiled per layer via tools/GenerateXeFgCoopMat.py into <output>/xmx_8x8x32/<kernel>.spv (and <program>.spv).
+#version 460
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_samplerless_texture_functions : enable
+
+layout(constant_id = 0) const uint COOP_M = 8;
+layout(constant_id = 1) const uint COOP_N = 8;
+layout(constant_id = 2) const uint COOP_K = 32;
+layout(constant_id = 3) const uint SUBGROUP_SIZE = 16;
+
+#ifndef LAYER_FAMILY
+#define LAYER_FAMILY 0
+#endif
+#ifndef LAYER_IN
+#define LAYER_IN 1
+#endif
+#ifndef LAYER_OUT
+#define LAYER_OUT 1
+#endif
+#ifndef LAYER_BIAS
+#define LAYER_BIAS 0
+#endif
+#ifndef LAYER_POOL
+#define LAYER_POOL 0
+#endif
+#ifndef LAYER_RELU
+#define LAYER_RELU 0
+#endif
+#ifndef LAYER_TILE_H
+#define LAYER_TILE_H 16
+#endif
+#ifndef LAYER_ZSPLIT
+#define LAYER_ZSPLIT 1
+#endif
+#ifndef LAYER_ACC_BITS
+#define LAYER_ACC_BITS 16
+#endif
+#ifndef LAYER_NT
+#define LAYER_NT 4
+#endif
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform utexture2DArray uInput;
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuf { uvec4 data[]; } uWeights;
+layout(set = 0, binding = 2, std430) readonly buffer ScaleBuf  { uvec4 data[]; } uScale;
+layout(set = 0, binding = 3, std430) readonly buffer BiasBuf   { uvec4 data[]; } uBias;
+#if LAYER_FAMILY == 1
+layout(set = 0, binding = 4) uniform utexture2DArray uSkip;
+#endif
+#if LAYER_FAMILY == 2 && LAYER_OUT == 8
+layout(set = 0, binding = 64, rg32ui) uniform writeonly uimage2DArray uDst;
+#else
+layout(set = 0, binding = 64, rgba32ui) uniform writeonly uimage2DArray uDst;
+#endif
+
+#if LAYER_FAMILY == 2
+layout(push_constant) uniform PushConstants
+{
+	uvec4 words[3];
+} pc;
+#else
+layout(push_constant) uniform PushConstants
+{
+	uvec4 words[1];
+} pc;
+#endif
+
+const int WIN_W = 18;
+#if LAYER_FAMILY == 0 && LAYER_POOL != 0
+const int PY = 2;
+#else
+const int PY = 1;
+#endif
+const int CONV_H = LAYER_TILE_H * PY;
+const int WIN_H  = CONV_H + 2;
+const int WIN    = WIN_W * WIN_H;
+
+#if LAYER_FAMILY == 2
+// +4 trailing words so dx=2 K=32 load at final pixel stays strictly in-bounds
+shared uint winWords[WIN * 4 + 4];
+// 2 output halves (h = 0, 1) x 6 K=32 steps x 16 cols x 8 uint32 words/col
+shared uint wsmWords[2 * 6 * 128];
+// 8 subgroups x 2 output halves (h = 0, 1) x 8 pixels x 16 channels
+shared int  sAcc[8 * 2 * 128];
+#else
+const int ZPER = LAYER_OUT / LAYER_ZSPLIT;
+#if (LAYER_OUT / LAYER_ZSPLIT) == 1 && LAYER_IN > 1
+#define STREAM_SLICE 1
+shared uint winWords[WIN * 4 + 4];
+#else
+#define STREAM_SLICE 0
+shared uint winWords[LAYER_IN * WIN * 4 + 4];
+#endif
+// 6 K=32 steps x 16 cols x 8 uint32 words/col
+shared uint wsmWords[6 * 128];
+// 8 subgroups x PY rows x 8 pixels x 16 channels
+shared int  sAcc[8 * PY * 128];
+#endif
+
+int sbyte(uint w, uint k)
+{
+	return bitfieldExtract(int(w), int(k * 8u), 8);
+}
+
+int div16Signed(int v)
+{
+	return v >= 0 ? (v >> 4) : -((-v) >> 4);
+}
+
+uvec4 fetchInput(int x, int y, int slice, ivec3 sz)
+{
+	if (x < 0 || y < 0 || slice < 0 || x >= sz.x || y >= sz.y || slice >= sz.z)
+		return uvec4(0u);
+	return texelFetch(uInput, ivec3(x, y, slice), 0);
+}
+
+#if LAYER_FAMILY == 1
+uvec4 fetchSkip(int x, int y, int slice, ivec3 sz)
+{
+	if (x < 0 || y < 0 || slice < 0 || x >= sz.x || y >= sz.y || slice >= sz.z)
+		return uvec4(0u);
+	return texelFetch(uSkip, ivec3(x, y, slice), 0);
+}
+
+uint upSkipBilinearWord(uint aw, uint bw, uint cw, uint dw, uint sw)
+{
+	uint packed = 0u;
+	for (uint k = 0u; k < 4u; ++k)
+	{
+		int dot = 9 * sbyte(aw, k) + 3 * (sbyte(bw, k) + sbyte(cw, k)) + sbyte(dw, k);
+		int v = clamp(sbyte(sw, k) + div16Signed(dot), 0, 127);
+		packed |= (uint(v) & 0xFFu) << (k * 8u);
+	}
+	return packed;
+}
+#endif
+
+#if LAYER_FAMILY != 2
+uint requantFloat(int acc, float s, float b, int lo)
+{
+	int q = int(fma(float(acc), s, b));
+	return uint(clamp(q, lo, 127)) & 0xFFu;
+}
+
+// Stages one 144-uvec4 weight block into 6 column-major 32x16 int8 matrices (stride = 8 uint32 words/col):
+//   step = dy*2 + (dx == 2 ? 1 : 0), kOff = (dx == 1 ? 4 : 0) + word; dx == 2 zeroes kOff = 4 + word.
+void stagePoolWeights(int block, uint tid)
+{
+	for (uint i = tid; i < 144u; i += 128u)
+	{
+		uint tap  = i / 16u;
+		uint rem  = i % 16u;
+		uint word = rem / 4u;
+		uint s    = rem % 4u;
+		uint dy   = tap / 3u;
+		uint dx   = tap % 3u;
+		uint step = dy * 2u + (dx == 2u ? 1u : 0u);
+		uint kOff = (dx == 1u ? 4u : 0u) + word;
+		uvec4 v   = uWeights.data[uint(block) * 144u + i];
+		uint base = step * 128u + (4u * s) * 8u + kOff;
+		wsmWords[base + 0u * 8u] = v.x;
+		wsmWords[base + 1u * 8u] = v.y;
+		wsmWords[base + 2u * 8u] = v.z;
+		wsmWords[base + 3u * 8u] = v.w;
+		if (dx == 2u)
+		{
+			uint zBase = step * 128u + (4u * s) * 8u + 4u + word;
+			wsmWords[zBase + 0u * 8u] = 0u;
+			wsmWords[zBase + 1u * 8u] = 0u;
+			wsmWords[zBase + 2u * 8u] = 0u;
+			wsmWords[zBase + 3u * 8u] = 0u;
+		}
+	}
+}
+
+void emitPoolRow(int r, int z, int X0, int Y0, int limitW, int limitH, uint sg, uint rowSlot, uint xHalf, uint lane,
+                 float s[16], float bi[16], int lo)
+{
+	int Y = Y0 + int(rowSlot) + r * 4;
+	if (Y >= limitH)
+		return;
+
+#if LAYER_POOL != 0
+	if (lane < 4u)
+	{
+		int px = int(lane);
+		int X = X0 + int(xHalf) * 4 + px;
+		if (X < limitW)
+		{
+			uint base0 = (sg * 2u + 0u) * 128u;
+			uint base1 = (sg * 2u + 1u) * 128u;
+			uint m0 = uint(2 * px) * 16u;
+			uint m1 = uint(2 * px + 1) * 16u;
+			uint words[4];
+			for (int w = 0; w < 4; ++w)
+			{
+				uint packed = 0u;
+				for (int c = 0; c < 4; ++c)
+				{
+					int oc = w * 4 + c;
+					int v00 = sAcc[base0 + m0 + uint(oc)];
+					int v10 = sAcc[base0 + m1 + uint(oc)];
+					int v01 = sAcc[base1 + m0 + uint(oc)];
+					int v11 = sAcc[base1 + m1 + uint(oc)];
+					int m = max(max(v00, v01), max(v10, v11));
+					packed |= requantFloat(m, s[oc], bi[oc], lo) << uint(c * 8);
+				}
+				words[w] = packed;
+			}
+			imageStore(uDst, ivec3(X, Y, z), uvec4(words[0], words[1], words[2], words[3]));
+		}
+	}
+#else
+	if (lane < 8u)
+	{
+		int px = int(lane);
+		int X = X0 + int(xHalf) * 8 + px;
+		if (X < limitW)
+		{
+			uint base0 = sg * 128u + uint(px) * 16u;
+			uint words[4];
+			for (int w = 0; w < 4; ++w)
+			{
+				uint packed = 0u;
+				for (int c = 0; c < 4; ++c)
+				{
+					int oc = w * 4 + c;
+					int val = sAcc[base0 + uint(oc)];
+					packed |= requantFloat(val, s[oc], bi[oc], lo) << uint(c * 8);
+				}
+				words[w] = packed;
+			}
+			imageStore(uDst, ivec3(X, Y, z), uvec4(words[0], words[1], words[2], words[3]));
+		}
+	}
+#endif
+}
+#else
+uint requantFlow(int a, int ib, int neg, int lim, uint posMul, uint s1, uint s2)
+{
+	int clamped = clamp(a + ib, -lim, lim - 1);
+	uint roundPos = 1u << ((s1 + 31u) & 31u);
+	uint roundNeg = 1u << ((s2 + 31u) & 31u);
+	int pp = int(uint(max(clamped, 0)) * posMul + roundPos) >> int(s1);
+	int nn = int(uint(min(clamped, 0)) * uint(neg) + roundNeg) >> int(s2);
+	return uint(clamp(pp + nn, -128, 127)) & 0xFFu;
+}
+
+void fillFlowWindow(int step, int X0, int Y0, int Wd, int Hd, ivec3 inSz, uint tid)
+{
+	for (uint e = tid; e < uint(WIN); e += 128u)
+	{
+		int x  = X0 - 1 + (int(e) % WIN_W);
+		int ys = Y0 + (int(e) / WIN_W);
+		uvec4 v = uvec4(0u);
+		if (x >= 0 && x < Wd && ys >= 1 && ys <= Hd)
+		{
+#if LAYER_OUT == 8
+			uvec4 a = fetchInput(x, ys, 2 * step, inSz);
+			uvec4 b = fetchInput(x, ys, 2 * step + 1, inSz);
+			v = uvec4(a.x, a.y, b.x, b.y);
+#else
+			v = fetchInput(x, ys, step, inSz);
+#endif
+		}
+		winWords[e * 4u + 0u] = v.x;
+		winWords[e * 4u + 1u] = v.y;
+		winWords[e * 4u + 2u] = v.z;
+		winWords[e * 4u + 3u] = v.w;
+	}
+}
+
+void stageFlowWeights(int step, int n0, uint tid)
+{
+	for (uint e = tid; e < uint(LAYER_NT * 72); e += 128u)
+	{
+		int nt    = int(e) / 72;
+		int group = (int(e) % 72) / 36;
+		int k     = int(e) % 36;
+		int tap   = k / 4;
+		int word  = k % 4;
+		int dy    = tap / 3;
+		int dx    = tap % 3;
+		int kStep = dy * 2 + (dx == 2 ? 1 : 0);
+		int kOff  = (dx == 1 ? 4 : 0) + word;
+		int ch    = (n0 + nt) * 8;
+		int z     = ch / LAYER_OUT;
+		int c     = ch % LAYER_OUT;
+		uint idx  = uint(((z * LAYER_IN + step) * (LAYER_OUT / 4) + (c / 4) + group) * 36 + k);
+		uvec4 v   = uWeights.data[idx];
+
+		int h      = nt >> 1;
+		int ocBase = (nt & 1) * 8 + group * 4;
+		uint base  = uint((h * 6 + kStep) * 128 + ocBase * 8 + kOff);
+		wsmWords[base + 0u * 8u] = v.x;
+		wsmWords[base + 1u * 8u] = v.y;
+		wsmWords[base + 2u * 8u] = v.z;
+		wsmWords[base + 3u * 8u] = v.w;
+		if (dx == 2)
+		{
+			uint zBase = uint((h * 6 + kStep) * 128 + ocBase * 8 + 4 + word);
+			wsmWords[zBase + 0u * 8u] = 0u;
+			wsmWords[zBase + 1u * 8u] = 0u;
+			wsmWords[zBase + 2u * 8u] = 0u;
+			wsmWords[zBase + 3u * 8u] = 0u;
+		}
+	}
+}
+
+void emitFlowRow(int r, int n0, int X0, int Y0, int limitW, int limitH,
+                 int lim, uint posMul, uint s1, uint s2, uint sg, uint rowSlot, uint xHalf, uint lane,
+                 uvec4 flowScale[8], uvec4 flowBias[8])
+{
+	int y = Y0 + int(rowSlot) + r * 4;
+	if (lane >= 8u || y >= limitH)
+		return;
+
+	int px = int(lane);
+	int x = X0 + int(xHalf) * 8 + px;
+	if (x >= limitW)
+		return;
+
+	uint words[8];
+	for (int h = 0; h < 2; ++h)
+	{
+		uint baseAcc = (sg * 2u + uint(h)) * 128u + uint(px) * 16u;
+		for (int w = 0; w < 4; ++w)
+		{
+			uvec4 bv = flowScale[h * 4 + w];
+			uvec4 nv = flowBias[h * 4 + w];
+			int ib[4] = { int(bv.x), int(bv.y), int(bv.z), int(bv.w) };
+			int ng[4] = { int(nv.x), int(nv.y), int(nv.z), int(nv.w) };
+			uint packed = 0u;
+			for (int c = 0; c < 4; ++c)
+			{
+				int a = sAcc[baseAcc + uint(w * 4 + c)];
+				packed |= requantFlow(a, ib[c], ng[c], lim, posMul, s1, s2) << uint(c * 8);
+			}
+			words[h * 4 + w] = packed;
+		}
+	}
+
+#if LAYER_OUT == 8
+	for (int nt = 0; nt < 4; ++nt)
+	{
+		uint w0 = words[2 * nt + 0];
+		uint w1 = words[2 * nt + 1];
+		imageStore(uDst, ivec3(x, y + 1, n0 + nt), uvec4(w0, w1, w0, w0));
+	}
+#else
+	for (int h = 0; h < 2; ++h)
+	{
+		imageStore(uDst, ivec3(x, y + 1, (n0 / 2) + h),
+		           uvec4(words[4 * h + 0], words[4 * h + 1], words[4 * h + 2], words[4 * h + 3]));
+	}
+#endif
+}
+#endif
+
+void main()
+{
+	const uint tid     = gl_LocalInvocationIndex;
+	const uint sg      = tid >> 4u;      // 0..7 (8 SIMD16 subgroups per 128-thread workgroup)
+	const uint lane    = tid & 15u;      // 0..15
+	const uint rowSlot = sg >> 1u;       // 0..3
+	const uint xHalf   = sg & 1u;        // 0 = pixels 0..7, 1 = pixels 8..15
+	const int  xOff    = int(xHalf) * 8;
+	ivec3 outSz = imageSize(uDst);
+
+	coopmat<int8_t, gl_ScopeSubgroup, 8, 32, gl_MatrixUseA> matA;
+	coopmat<int8_t, gl_ScopeSubgroup, 32, 8, gl_MatrixUseB> matB0;
+	coopmat<int8_t, gl_ScopeSubgroup, 32, 8, gl_MatrixUseB> matB1;
+
+#if LAYER_FAMILY != 2
+	const int X0 = int(gl_WorkGroupID.x) * ((LAYER_POOL != 0) ? 8 : 16);
+	const int Y0 = int(gl_WorkGroupID.y) * LAYER_TILE_H;
+	const int limitW = outSz.x;
+	const int limitH = outSz.y;
+	const int lo = (LAYER_FAMILY == 1 || LAYER_RELU != 0) ? 0 : -128;
+	const ivec3 inSz = textureSize(uInput, 0);
+
+#if LAYER_FAMILY == 0
+	const int cx0 = (LAYER_POOL != 0) ? (2 * X0) : X0;
+	const int cy0 = (LAYER_POOL != 0) ? (2 * Y0) : Y0;
+#if STREAM_SLICE == 0
+	for (uint i = tid; i < uint(LAYER_IN * WIN); i += 128u)
+	{
+		int slice = int(i) / WIN;
+		int r     = int(i) % WIN;
+		uvec4 v   = fetchInput(cx0 - 1 + (r % WIN_W), cy0 - 1 + (r / WIN_W), slice, inSz);
+#if LAYER_BIAS != 0
+		v += uvec4(0x80808080u);
+#endif
+		winWords[i * 4u + 0u] = v.x;
+		winWords[i * 4u + 1u] = v.y;
+		winWords[i * 4u + 2u] = v.z;
+		winWords[i * 4u + 3u] = v.w;
+	}
+	barrier();
+#endif
+#else
+	const ivec3 skipSz = textureSize(uSkip, 0);
+	const int Wd = int(pc.words[0].x);
+	const int Hd = int(pc.words[0].y);
+#if STREAM_SLICE == 0
+	for (uint i = tid; i < uint(LAYER_IN * WIN); i += 128u)
+	{
+		int slice = int(i) / WIN;
+		int r     = int(i) % WIN;
+		int x     = X0 - 1 + (r % WIN_W);
+		int y     = Y0 - 1 + (r / WIN_W);
+		uvec4 res = uvec4(0u);
+		if (x >= 0 && y >= 0 && x < Wd && y < Hd)
+		{
+			int xn = x >> 1;
+			int yn = y >> 1;
+			int xf = ((x & 1) != 0) ? (xn + 1) : (xn - 1);
+			int yf = ((y & 1) != 0) ? (yn + 1) : (yn - 1);
+			uvec4 a = fetchInput(xn, yn, slice, inSz);
+			uvec4 b = fetchInput(xf, yn, slice, inSz);
+			uvec4 c = fetchInput(xn, yf, slice, inSz);
+			uvec4 d = fetchInput(xf, yf, slice, inSz);
+			uvec4 s = fetchSkip(x, y, slice, skipSz);
+			res = uvec4(
+				upSkipBilinearWord(a.x, b.x, c.x, d.x, s.x),
+				upSkipBilinearWord(a.y, b.y, c.y, d.y, s.y),
+				upSkipBilinearWord(a.z, b.z, c.z, d.z, s.z),
+				upSkipBilinearWord(a.w, b.w, c.w, d.w, s.w));
+		}
+		winWords[i * 4u + 0u] = res.x;
+		winWords[i * 4u + 1u] = res.y;
+		winWords[i * 4u + 2u] = res.z;
+		winWords[i * 4u + 3u] = res.w;
+	}
+	barrier();
+#endif
+#endif
+
+	const int zBegin = int(gl_WorkGroupID.z) * ZPER;
+	for (int z = zBegin; z < zBegin + ZPER; ++z)
+	{
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC0_0_lo =
+			coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC0_0_hi =
+			coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+#if LAYER_POOL != 0
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC0_1_lo =
+			coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC0_1_hi =
+			coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+#endif
+#if LAYER_TILE_H >= 8
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC1_0_lo =
+			coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC1_0_hi =
+			coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+#if LAYER_POOL != 0
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC1_1_lo =
+			coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC1_1_hi =
+			coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+#endif
+#endif
+#if LAYER_TILE_H >= 16
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC2_0_lo =
+			coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC2_0_hi =
+			coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC3_0_lo =
+			coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC3_0_hi =
+			coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+#if LAYER_POOL != 0
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC2_1_lo =
+			coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC2_1_hi =
+			coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC3_1_lo =
+			coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC3_1_hi =
+			coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+#endif
+#endif
+
+		for (int slice = 0; slice < LAYER_IN; ++slice)
+		{
+#if STREAM_SLICE != 0
+#if LAYER_FAMILY == 0
+			for (uint r = tid; r < uint(WIN); r += 128u)
+			{
+				uvec4 v = fetchInput(cx0 - 1 + (int(r) % WIN_W), cy0 - 1 + (int(r) / WIN_W), slice, inSz);
+#if LAYER_BIAS != 0
+				v += uvec4(0x80808080u);
+#endif
+				winWords[r * 4u + 0u] = v.x;
+				winWords[r * 4u + 1u] = v.y;
+				winWords[r * 4u + 2u] = v.z;
+				winWords[r * 4u + 3u] = v.w;
+			}
+#else
+			for (uint r = tid; r < uint(WIN); r += 128u)
+			{
+				int x = X0 - 1 + (int(r) % WIN_W);
+				int y = Y0 - 1 + (int(r) / WIN_W);
+				uvec4 res = uvec4(0u);
+				if (x >= 0 && y >= 0 && x < Wd && y < Hd)
+				{
+					int xn = x >> 1;
+					int yn = y >> 1;
+					int xf = ((x & 1) != 0) ? (xn + 1) : (xn - 1);
+					int yf = ((y & 1) != 0) ? (yn + 1) : (yn - 1);
+					uvec4 a = fetchInput(xn, yn, slice, inSz);
+					uvec4 b = fetchInput(xf, yn, slice, inSz);
+					uvec4 c = fetchInput(xn, yf, slice, inSz);
+					uvec4 d = fetchInput(xf, yf, slice, inSz);
+					uvec4 s = fetchSkip(x, y, slice, skipSz);
+					res = uvec4(
+						upSkipBilinearWord(a.x, b.x, c.x, d.x, s.x),
+						upSkipBilinearWord(a.y, b.y, c.y, d.y, s.y),
+						upSkipBilinearWord(a.z, b.z, c.z, d.z, s.z),
+						upSkipBilinearWord(a.w, b.w, c.w, d.w, s.w));
+				}
+				winWords[r * 4u + 0u] = res.x;
+				winWords[r * 4u + 1u] = res.y;
+				winWords[r * 4u + 2u] = res.z;
+				winWords[r * 4u + 3u] = res.w;
+			}
+#endif
+#endif
+			stagePoolWeights(z * LAYER_IN + slice, tid);
+			barrier();
+
+			int sliceBase = (STREAM_SLICE != 0) ? 0 : (slice * WIN);
+			for (int kStep = 0; kStep < 6; ++kStep)
+			{
+				int dy = kStep >> 1;
+				int dx = (kStep & 1) * 2;
+				coopMatLoad(matB0, wsmWords, uint(kStep * 128 + 0),  8u, gl_CooperativeMatrixLayoutColumnMajor);
+				coopMatLoad(matB1, wsmWords, uint(kStep * 128 + 64), 8u, gl_CooperativeMatrixLayoutColumnMajor);
+
+				// Row group r = 0
+				{
+					int yl = int(rowSlot);
+					uint aOff0 = uint((sliceBase + (yl * PY + 0 + dy) * WIN_W + xOff + dx) * 4);
+					coopMatLoad(matA, winWords, aOff0, 4u, gl_CooperativeMatrixLayoutRowMajor);
+					matC0_0_lo = coopMatMulAdd(matA, matB0, matC0_0_lo);
+					matC0_0_hi = coopMatMulAdd(matA, matB1, matC0_0_hi);
+#if LAYER_POOL != 0
+					uint aOff1 = uint((sliceBase + (yl * PY + 1 + dy) * WIN_W + xOff + dx) * 4);
+					coopMatLoad(matA, winWords, aOff1, 4u, gl_CooperativeMatrixLayoutRowMajor);
+					matC0_1_lo = coopMatMulAdd(matA, matB0, matC0_1_lo);
+					matC0_1_hi = coopMatMulAdd(matA, matB1, matC0_1_hi);
+#endif
+				}
+
+#if LAYER_TILE_H >= 8
+				// Row group r = 1
+				{
+					int yl = int(rowSlot) + 4;
+					uint aOff0 = uint((sliceBase + (yl * PY + 0 + dy) * WIN_W + xOff + dx) * 4);
+					coopMatLoad(matA, winWords, aOff0, 4u, gl_CooperativeMatrixLayoutRowMajor);
+					matC1_0_lo = coopMatMulAdd(matA, matB0, matC1_0_lo);
+					matC1_0_hi = coopMatMulAdd(matA, matB1, matC1_0_hi);
+#if LAYER_POOL != 0
+					uint aOff1 = uint((sliceBase + (yl * PY + 1 + dy) * WIN_W + xOff + dx) * 4);
+					coopMatLoad(matA, winWords, aOff1, 4u, gl_CooperativeMatrixLayoutRowMajor);
+					matC1_1_lo = coopMatMulAdd(matA, matB0, matC1_1_lo);
+					matC1_1_hi = coopMatMulAdd(matA, matB1, matC1_1_hi);
+#endif
+				}
+#endif
+
+#if LAYER_TILE_H >= 16
+				// Row groups r = 2 and r = 3
+				{
+					int yl2 = int(rowSlot) + 8;
+					uint aOff2_0 = uint((sliceBase + (yl2 * PY + 0 + dy) * WIN_W + xOff + dx) * 4);
+					coopMatLoad(matA, winWords, aOff2_0, 4u, gl_CooperativeMatrixLayoutRowMajor);
+					matC2_0_lo = coopMatMulAdd(matA, matB0, matC2_0_lo);
+					matC2_0_hi = coopMatMulAdd(matA, matB1, matC2_0_hi);
+#if LAYER_POOL != 0
+					uint aOff2_1 = uint((sliceBase + (yl2 * PY + 1 + dy) * WIN_W + xOff + dx) * 4);
+					coopMatLoad(matA, winWords, aOff2_1, 4u, gl_CooperativeMatrixLayoutRowMajor);
+					matC2_1_lo = coopMatMulAdd(matA, matB0, matC2_1_lo);
+					matC2_1_hi = coopMatMulAdd(matA, matB1, matC2_1_hi);
+#endif
+					int yl3 = int(rowSlot) + 12;
+					uint aOff3_0 = uint((sliceBase + (yl3 * PY + 0 + dy) * WIN_W + xOff + dx) * 4);
+					coopMatLoad(matA, winWords, aOff3_0, 4u, gl_CooperativeMatrixLayoutRowMajor);
+					matC3_0_lo = coopMatMulAdd(matA, matB0, matC3_0_lo);
+					matC3_0_hi = coopMatMulAdd(matA, matB1, matC3_0_hi);
+#if LAYER_POOL != 0
+					uint aOff3_1 = uint((sliceBase + (yl3 * PY + 1 + dy) * WIN_W + xOff + dx) * 4);
+					coopMatLoad(matA, winWords, aOff3_1, 4u, gl_CooperativeMatrixLayoutRowMajor);
+					matC3_1_lo = coopMatMulAdd(matA, matB0, matC3_1_lo);
+					matC3_1_hi = coopMatMulAdd(matA, matB1, matC3_1_hi);
+#endif
+				}
+#endif
+			}
+			barrier();
+		}
+
+		float s[16];
+		float bi[16];
+		for (int w = 0; w < 4; ++w)
+		{
+			uvec4 sv = uScale.data[uint(z * 4 + w)];
+			uvec4 bv = uBias.data[uint(z * 4 + w)];
+			s[w * 4 + 0]  = uintBitsToFloat(sv.x);
+			s[w * 4 + 1]  = uintBitsToFloat(sv.y);
+			s[w * 4 + 2]  = uintBitsToFloat(sv.z);
+			s[w * 4 + 3]  = uintBitsToFloat(sv.w);
+			bi[w * 4 + 0] = uintBitsToFloat(bv.x);
+			bi[w * 4 + 1] = uintBitsToFloat(bv.y);
+			bi[w * 4 + 2] = uintBitsToFloat(bv.z);
+			bi[w * 4 + 3] = uintBitsToFloat(bv.w);
+		}
+
+		// Store & requantize r = 0 (stride = 16 ints/row, lo at +0, hi at +8)
+		coopMatStore(matC0_0_lo, sAcc, (sg * uint(PY) + 0u) * 128u + 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+		coopMatStore(matC0_0_hi, sAcc, (sg * uint(PY) + 0u) * 128u + 8u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+#if LAYER_POOL != 0
+		coopMatStore(matC0_1_lo, sAcc, (sg * uint(PY) + 1u) * 128u + 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+		coopMatStore(matC0_1_hi, sAcc, (sg * uint(PY) + 1u) * 128u + 8u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+		subgroupMemoryBarrierShared();
+		subgroupBarrier();
+		emitPoolRow(0, z, X0, Y0, limitW, limitH, sg, rowSlot, xHalf, lane, s, bi, lo);
+#if LAYER_TILE_H >= 8
+		subgroupMemoryBarrierShared();
+		subgroupBarrier();
+		coopMatStore(matC1_0_lo, sAcc, (sg * uint(PY) + 0u) * 128u + 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+		coopMatStore(matC1_0_hi, sAcc, (sg * uint(PY) + 0u) * 128u + 8u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+#if LAYER_POOL != 0
+		coopMatStore(matC1_1_lo, sAcc, (sg * uint(PY) + 1u) * 128u + 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+		coopMatStore(matC1_1_hi, sAcc, (sg * uint(PY) + 1u) * 128u + 8u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+		subgroupMemoryBarrierShared();
+		subgroupBarrier();
+		emitPoolRow(1, z, X0, Y0, limitW, limitH, sg, rowSlot, xHalf, lane, s, bi, lo);
+#endif
+#if LAYER_TILE_H >= 16
+		subgroupMemoryBarrierShared();
+		subgroupBarrier();
+		coopMatStore(matC2_0_lo, sAcc, (sg * uint(PY) + 0u) * 128u + 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+		coopMatStore(matC2_0_hi, sAcc, (sg * uint(PY) + 0u) * 128u + 8u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+#if LAYER_POOL != 0
+		coopMatStore(matC2_1_lo, sAcc, (sg * uint(PY) + 1u) * 128u + 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+		coopMatStore(matC2_1_hi, sAcc, (sg * uint(PY) + 1u) * 128u + 8u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+		subgroupMemoryBarrierShared();
+		subgroupBarrier();
+		emitPoolRow(2, z, X0, Y0, limitW, limitH, sg, rowSlot, xHalf, lane, s, bi, lo);
+		subgroupMemoryBarrierShared();
+		subgroupBarrier();
+		coopMatStore(matC3_0_lo, sAcc, (sg * uint(PY) + 0u) * 128u + 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+		coopMatStore(matC3_0_hi, sAcc, (sg * uint(PY) + 0u) * 128u + 8u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+#if LAYER_POOL != 0
+		coopMatStore(matC3_1_lo, sAcc, (sg * uint(PY) + 1u) * 128u + 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+		coopMatStore(matC3_1_hi, sAcc, (sg * uint(PY) + 1u) * 128u + 8u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+		subgroupMemoryBarrierShared();
+		subgroupBarrier();
+		emitPoolRow(3, z, X0, Y0, limitW, limitH, sg, rowSlot, xHalf, lane, s, bi, lo);
+#endif
+	}
+
+#else
+	const int Wd      = int(pc.words[0].z);
+	const int Hd      = int(pc.words[0].w);
+	const int Wout    = int(pc.words[1].x);
+	const int Hout    = int(pc.words[1].y);
+	const uint posMul = pc.words[2].y;
+	const uint shifts = pc.words[2].z;
+	const uint s1     = shifts & 31u;
+	const uint s2     = (shifts >> 8u) & 31u;
+	const int lim     = 1 << LAYER_ACC_BITS;
+	const int X0      = int(gl_WorkGroupID.x) * 16;
+	const int Y0      = int(gl_WorkGroupID.y) * LAYER_TILE_H;
+	const int n0      = int(gl_WorkGroupID.z) * LAYER_NT;
+	const int limitW  = min(outSz.x, Wout);
+	const int limitH  = min(outSz.y, Hout);
+	const ivec3 inSz  = textureSize(uInput, 0);
+
+	coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC0_0_lo =
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+	coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC0_0_hi =
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+	coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC0_1_lo =
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+	coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC0_1_hi =
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+	coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC1_0_lo =
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+	coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC1_0_hi =
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+	coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC1_1_lo =
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+	coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator> matC1_1_hi =
+		coopmat<int32_t, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>(0);
+
+	coopmat<int8_t, gl_ScopeSubgroup, 8, 32, gl_MatrixUseA> matA1;
+	for (int step = 0; step < LAYER_IN; ++step)
+	{
+		fillFlowWindow(step, X0, Y0, Wd, Hd, inSz, tid);
+		stageFlowWeights(step, n0, tid);
+		barrier();
+
+		for (int kStep = 0; kStep < 6; ++kStep)
+		{
+			int dy = kStep >> 1;
+			int dx = (kStep & 1) * 2;
+			uint aOff0 = uint(((int(rowSlot) + 0 + dy) * WIN_W + xOff + dx) * 4);
+			uint aOff1 = uint(((int(rowSlot) + 4 + dy) * WIN_W + xOff + dx) * 4);
+			coopMatLoad(matA,  winWords, aOff0, 4u, gl_CooperativeMatrixLayoutRowMajor);
+			coopMatLoad(matA1, winWords, aOff1, 4u, gl_CooperativeMatrixLayoutRowMajor);
+
+			// Output half h = 0 (oc 0..15)
+			coopMatLoad(matB0, wsmWords, uint((0 * 6 + kStep) * 128 + 0),  8u, gl_CooperativeMatrixLayoutColumnMajor);
+			coopMatLoad(matB1, wsmWords, uint((0 * 6 + kStep) * 128 + 64), 8u, gl_CooperativeMatrixLayoutColumnMajor);
+			matC0_0_lo = coopMatMulAdd(matA,  matB0, matC0_0_lo);
+			matC1_0_lo = coopMatMulAdd(matA1, matB0, matC1_0_lo);
+			matC0_0_hi = coopMatMulAdd(matA,  matB1, matC0_0_hi);
+			matC1_0_hi = coopMatMulAdd(matA1, matB1, matC1_0_hi);
+
+			// Output half h = 1 (oc 16..31)
+			coopMatLoad(matB0, wsmWords, uint((1 * 6 + kStep) * 128 + 0),  8u, gl_CooperativeMatrixLayoutColumnMajor);
+			coopMatLoad(matB1, wsmWords, uint((1 * 6 + kStep) * 128 + 64), 8u, gl_CooperativeMatrixLayoutColumnMajor);
+			matC0_1_lo = coopMatMulAdd(matA,  matB0, matC0_1_lo);
+			matC1_1_lo = coopMatMulAdd(matA1, matB0, matC1_1_lo);
+			matC0_1_hi = coopMatMulAdd(matA,  matB1, matC0_1_hi);
+			matC1_1_hi = coopMatMulAdd(matA1, matB1, matC1_1_hi);
+		}
+		barrier();
+	}
+
+	uvec4 flowScale[8];
+	uvec4 flowBias[8];
+	for (int h = 0; h < 2; ++h)
+	{
+		for (int w = 0; w < 4; ++w)
+		{
+			int ch4 = (n0 * 8 + h * 16) + w * 4;
+			flowScale[h * 4 + w] = uScale.data[uint(ch4 >> 2)];
+			flowBias[h * 4 + w]  = uBias.data[uint(ch4 >> 2)];
+		}
+	}
+
+	// Emit r = 0
+	coopMatStore(matC0_0_lo, sAcc, (sg * 2u + 0u) * 128u + 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+	coopMatStore(matC0_0_hi, sAcc, (sg * 2u + 0u) * 128u + 8u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+	coopMatStore(matC0_1_lo, sAcc, (sg * 2u + 1u) * 128u + 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+	coopMatStore(matC0_1_hi, sAcc, (sg * 2u + 1u) * 128u + 8u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+	subgroupMemoryBarrierShared();
+	subgroupBarrier();
+	emitFlowRow(0, n0, X0, Y0, limitW, limitH, lim, posMul, s1, s2, sg, rowSlot, xHalf, lane, flowScale, flowBias);
+	subgroupMemoryBarrierShared();
+	subgroupBarrier();
+
+	// Emit r = 1
+	coopMatStore(matC1_0_lo, sAcc, (sg * 2u + 0u) * 128u + 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+	coopMatStore(matC1_0_hi, sAcc, (sg * 2u + 0u) * 128u + 8u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+	coopMatStore(matC1_1_lo, sAcc, (sg * 2u + 1u) * 128u + 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+	coopMatStore(matC1_1_hi, sAcc, (sg * 2u + 1u) * 128u + 8u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+	subgroupMemoryBarrierShared();
+	subgroupBarrier();
+	emitFlowRow(1, n0, X0, Y0, limitW, limitH, lim, posMul, s1, s2, sg, rowSlot, xHalf, lane, flowScale, flowBias);
+#endif
+}

@@ -1,0 +1,124 @@
+#version 450
+// 3-Tier Adaptive HUD Protection compute shaders for native Vulkan (VulkanRuntime.cpp).
+// Uses explicit storage-image format qualifiers (COLOR_FMT = rgba8 or rgb10_a2, r8ui for StaticCount)
+// so it requires only shaderStorageImageExtendedFormats (no StorageImageRead/WriteWithoutFormat needed).
+// Compiled by tools/GenerateXeFgCoopMat.py into coopmat/hud/*.spv.
+//
+// Modes (compile-time -DHUD_MODE=...):
+//   0 = Tier 1 Guard (1/16 sampled |Real - Hudless| > Tolerance counter)
+//   1 = Tier 2 Diff Composite (3x3 dilated |Real - Hudless| > Tolerance -> OutColor + optional 1/16 counter)
+//   2 = Tier 3 Static HUD Update (compare CurrReal vs PrevReal -> update r8ui StaticCount + 1/16 counter)
+//   3 = Tier 3 Static HUD Composite (copy CurrReal where StaticCount >= 4 -> OutColor)
+
+#ifndef HUD_MODE
+#define HUD_MODE 0
+#endif
+
+#ifndef COLOR_FMT
+#define COLOR_FMT rgba8
+#endif
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint Width;
+    uint Height;
+    float Tolerance;
+    uint Flags;
+};
+
+layout(set = 0, binding = 0, COLOR_FMT) uniform readonly image2D TexA;
+
+#if HUD_MODE == 3
+layout(set = 0, binding = 1, r8ui) uniform readonly uimage2D StaticCountIn;
+#else
+layout(set = 0, binding = 1, COLOR_FMT) uniform readonly image2D TexB;
+#endif
+
+#if HUD_MODE == 2
+layout(set = 0, binding = 2, r8ui) uniform uimage2D StaticCountOut;
+#else
+layout(set = 0, binding = 2, COLOR_FMT) uniform writeonly image2D OutColor;
+#endif
+
+layout(set = 0, binding = 3, std430) buffer CounterBuf {
+    uint Counts[4]; // [0] = diffCount (1/16 sample), [1] = staticCount (1/16 sample)
+};
+
+#if HUD_MODE == 0
+void main() {
+    uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= Width || id.y >= Height) return;
+    if ((id.x & 3u) != 0u || (id.y & 3u) != 0u) return;
+
+    ivec2 p = ivec2(id);
+    vec3 d = abs(imageLoad(TexA, p).rgb - imageLoad(TexB, p).rgb);
+    if (max(d.r, max(d.g, d.b)) > Tolerance) {
+        atomicAdd(Counts[0], 1u);
+    }
+}
+#elif HUD_MODE == 1
+bool isHudDiff(ivec2 p) {
+    vec3 d = abs(imageLoad(TexA, p).rgb - imageLoad(TexB, p).rgb);
+    return max(d.r, max(d.g, d.b)) > Tolerance;
+}
+
+void main() {
+    uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= Width || id.y >= Height) return;
+
+    ivec2 maxCoord = ivec2(int(Width) - 1, int(Height) - 1);
+    bool hud = false;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            ivec2 q = clamp(ivec2(id) + ivec2(dx, dy), ivec2(0), maxCoord);
+            hud = hud || isHudDiff(q);
+        }
+    }
+
+    if ((Flags & 1u) != 0u && hud && (id.x & 3u) == 0u && (id.y & 3u) == 0u) {
+        atomicAdd(Counts[0], 1u);
+    }
+
+    if (hud) {
+        ivec2 p = ivec2(id);
+        if ((Flags & 2u) != 0u)
+            imageStore(OutColor, p, vec4(1.0, 0.0, 1.0, 1.0));
+        else
+            imageStore(OutColor, p, imageLoad(TexA, p));
+    }
+}
+#elif HUD_MODE == 2
+void main() {
+    uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= Width || id.y >= Height) return;
+
+    ivec2 p = ivec2(id);
+    uint count = 0u;
+    if ((Flags & 1u) == 0u) {
+        vec3 d = abs(imageLoad(TexA, p).rgb - imageLoad(TexB, p).rgb);
+        bool unchanged = max(d.r, max(d.g, d.b)) <= Tolerance;
+        uint prev = imageLoad(StaticCountOut, p).r;
+        count = unchanged ? min(prev + 1u, 8u) : 0u;
+    }
+
+    imageStore(StaticCountOut, p, uvec4(count, 0u, 0u, 0u));
+
+    if (count >= 4u && (id.x & 3u) == 0u && (id.y & 3u) == 0u) {
+        atomicAdd(Counts[1], 1u);
+    }
+}
+#elif HUD_MODE == 3
+void main() {
+    uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= Width || id.y >= Height) return;
+
+    ivec2 p = ivec2(id);
+    if (imageLoad(StaticCountIn, p).r >= 4u) {
+        if ((Flags & 2u) != 0u)
+            imageStore(OutColor, p, vec4(1.0, 0.0, 1.0, 1.0));
+        else
+            imageStore(OutColor, p, imageLoad(TexA, p));
+    }
+}
+#endif
