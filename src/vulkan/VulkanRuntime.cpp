@@ -30,6 +30,7 @@
 #include "VulkanTensor.h"
 #include "xvk_extra.h"
 
+#include <dxgi1_4.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -146,6 +147,13 @@ namespace
 		VkPipelineLayout hudPipelineLayout = VK_NULL_HANDLE;
 		VkPipeline hudPipelines[4][2] = {};
 		bool hudPipelinesReady = false;
+
+		// Tier 3 Hybrid Tone-Map Matcher pipelines (clear, accumulate, median, fill, apply[rgba8/rgb10a2])
+		VkDescriptorSetLayout hudTmSetLayout = VK_NULL_HANDLE;
+		VkPipelineLayout hudTmPipelineLayout = VK_NULL_HANDLE;
+		VkPipeline hudTmPipelines[4] = {};      // 0=clear, 1=accumulate, 2=median, 3=fill
+		VkPipeline hudTmApplyPipelines[2] = {}; // 0=rgba8, 1=rgb10a2
+		bool hudToneMatchReady = false;
 	};
 
 	// The game owns the VkDevice and destroys it before the CRT is torn down. The layer's device is kept for the life of
@@ -166,9 +174,10 @@ namespace
 	// One real frame's inputs, kept for the next batch as its previous frame
 	struct Slot
 	{
-		ComPtr<ID3D12Resource> backbuffer, hudless, ui, depth, motion;
+		ComPtr<ID3D12Resource> backbuffer, hudless, matchedHudless, ui, depth, motion;
 		VkImageView bbView = VK_NULL_HANDLE;
 		VkImageView hudlessView = VK_NULL_HANDLE;
+		VkImageView matchedHudlessView = VK_NULL_HANDLE;
 		VkImageView depthView = VK_NULL_HANDLE;
 		VkImageView motionView = VK_NULL_HANDLE;
 		bool hasHudless = false;
@@ -222,14 +231,31 @@ namespace
 		VkBuffer hudCounterReadbackBuf[2]{};
 		const uint32_t* hudMappedReadback[2]{};
 		bool hudReadbackHasDiff[2]{};
+		bool hudReadbackDiffFromToneMatch[2]{};
 		bool hudReadbackHasStatic[2]{};
 		uint64_t hudRealFrameCount = 0;
 		uint32_t hudReadbackSlot = 0;
 		bool hudResourcesReady = false;
 		uint32_t activeBatchSlot = 0;
 
+		// Tier 3 Hybrid Tone-Map Matcher lazy buffers (0 VRAM allocated unless Tier 3 Tone-Map activates)
+		ComPtr<ID3D12Resource> hudTmHistogram;
+		VkBuffer hudTmHistogramBuf = VK_NULL_HANDLE;
+		ComPtr<ID3D12Resource> hudTmLut;
+		VkBuffer hudTmLutBuf = VK_NULL_HANDLE;
+		bool hudTmResourcesReady = false;
+
+		// Adaptive VRAM Guard (DXGI budget via physical device LUID, identical hysteresis to DX12)
+		ComPtr<IDXGIAdapter3> vramAdapter;
+		bool vramAdapterChecked = false;
+		bool vramGuardActive = false;
+		uint32_t vramPollCounter = 0;
+		uint32_t vramUsageMiB = 0;
+		uint32_t vramBudgetMiB = 0;
+
 		uint32_t lastIndex = 0; // the previous evaluation's DLSSG.MultiFrameIndex
 		uint32_t batchCount = 0;
+		uint32_t requestedBatchCount = 0;
 		bool batchReady = false;
 		bool cameraLogged = false;
 		uint64_t batches = 0, failures = 0, evaluations = 0, realCopies = 0, paused = 0;
@@ -569,6 +595,126 @@ namespace
 
 		d.hudPipelinesReady = true;
 		Log::Info("Vulkan 3-tier HUD compute pipelines ready (8/8 SPIR-V from {})", hudDir.string());
+
+		// Optional Tier 3 Hybrid Tone-Map Matcher pipelines (6 SPIR-V files in the same hud/ directory).
+		struct VkToneMatchPushConstants {
+			uint32_t width, height;
+			float logMin, binsPerOctave;
+			uint32_t bins, codes, minimumCount, unused;
+		};
+		VkDescriptorSetLayoutBinding tmBindings[5] = {
+			{ 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+			{ 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+			{ 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+			{ 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+			{ 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+		};
+		VkDescriptorSetLayoutCreateInfo tmSetInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr,
+			VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, 5, tmBindings };
+		VkPushConstantRange tmPush{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(VkToneMatchPushConstants) };
+		if (d.vkCreateDescriptorSetLayout(d.device, &tmSetInfo, nullptr, &d.hudTmSetLayout) != VK_SUCCESS)
+			return;
+		VkPipelineLayoutCreateInfo tmLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1,
+			&d.hudTmSetLayout, 1, &tmPush };
+		if (d.vkCreatePipelineLayout(d.device, &tmLayoutInfo, nullptr, &d.hudTmPipelineLayout) != VK_SUCCESS)
+			return;
+
+		auto loadTmPipe = [&](const char* fname, VkPipeline& outPipe) -> bool {
+			if (!LoadSpirvFileBytes(hudDir / fname, words))
+				return false;
+			VkShaderModuleCreateInfo modInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0,
+				words.size() * sizeof(uint32_t), words.data() };
+			VkShaderModule mod = VK_NULL_HANDLE;
+			if (d.vkCreateShaderModule(d.device, &modInfo, nullptr, &mod) != VK_SUCCESS)
+				return false;
+			VkComputePipelineCreateInfo pipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+			pipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+				VK_SHADER_STAGE_COMPUTE_BIT, mod, "main", nullptr };
+			pipeInfo.layout = d.hudTmPipelineLayout;
+			const VkResult res = d.vkCreateComputePipelines(d.device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &outPipe);
+			d.vkDestroyShaderModule(d.device, mod, nullptr);
+			return res == VK_SUCCESS;
+		};
+
+		if (loadTmPipe("tonemap_clear.spv", d.hudTmPipelines[0]) &&
+			loadTmPipe("tonemap_accumulate.spv", d.hudTmPipelines[1]) &&
+			loadTmPipe("tonemap_median.spv", d.hudTmPipelines[2]) &&
+			loadTmPipe("tonemap_fill.spv", d.hudTmPipelines[3]) &&
+			loadTmPipe("tonemap_apply_rgba8.spv", d.hudTmApplyPipelines[0]) &&
+			loadTmPipe("tonemap_apply_rgb10a2.spv", d.hudTmApplyPipelines[1]))
+		{
+			d.hudToneMatchReady = true;
+			Log::Info("Vulkan Tier 3 Hybrid Tone-Map Matcher pipelines ready (6/6 SPIR-V)");
+		}
+	}
+
+	bool IsVkToneMapSupported(DXGI_FORMAT bbFormat) noexcept
+	{
+		return bbFormat == DXGI_FORMAT_R10G10B10A2_UNORM ||
+			bbFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
+			bbFormat == DXGI_FORMAT_B8G8R8A8_UNORM;
+	}
+
+	bool PollVkVramGuard(const Device& d, Feature& f) noexcept
+	{
+		if (!Plugin::options.vramGuard.load(std::memory_order_relaxed))
+		{
+			if (f.vramGuardActive)
+			{
+				f.vramGuardActive = false;
+				Log::Info("Vulkan: Adaptive VRAM guard disabled by user, restoring full MFG multiplier");
+			}
+			return false;
+		}
+
+		if (!f.vramAdapterChecked)
+		{
+			f.vramAdapterChecked = true;
+			ComPtr<IDXGIFactory4> factory;
+			if (d.d3d && SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
+			{
+				const LUID luid = d.d3d->GetAdapterLuid();
+				ComPtr<IDXGIAdapter1> adapter;
+				if (SUCCEEDED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter))) && adapter)
+					adapter.As(&f.vramAdapter);
+			}
+		}
+
+		if (!f.vramAdapter)
+			return false;
+
+		if ((f.vramPollCounter++ & 7u) != 0)
+			return f.vramGuardActive;
+
+		DXGI_QUERY_VIDEO_MEMORY_INFO memInfo{};
+		if (FAILED(f.vramAdapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memInfo)) || memInfo.Budget == 0)
+			return f.vramGuardActive;
+
+		f.vramUsageMiB = static_cast<uint32_t>(memInfo.CurrentUsage / (1024ull * 1024ull));
+		f.vramBudgetMiB = static_cast<uint32_t>(memInfo.Budget / (1024ull * 1024ull));
+
+		constexpr uint64_t kSafetyMarginBytes = 200ull * 1024ull * 1024ull;
+		constexpr uint64_t kReleaseMarginBytes = 400ull * 1024ull * 1024ull;
+
+		if (!f.vramGuardActive)
+		{
+			if (memInfo.Budget > kSafetyMarginBytes && memInfo.CurrentUsage + kSafetyMarginBytes >= memInfo.Budget)
+			{
+				f.vramGuardActive = true;
+				Log::Warn("Vulkan: Adaptive VRAM guard engaged ({} MiB / {} MiB budget): clamping MFG temporarily to 2x",
+					f.vramUsageMiB, f.vramBudgetMiB);
+			}
+		}
+		else
+		{
+			if (memInfo.Budget > kReleaseMarginBytes && memInfo.CurrentUsage + kReleaseMarginBytes < memInfo.Budget)
+			{
+				f.vramGuardActive = false;
+				Log::Info("Vulkan: Adaptive VRAM guard released ({} MiB / {} MiB budget): restoring full MFG multiplier",
+					f.vramUsageMiB, f.vramBudgetMiB);
+			}
+		}
+		return f.vramGuardActive;
 	}
 
 	// ------------------------------------------------------------------------------------------ the device
@@ -1015,6 +1161,13 @@ namespace
 			f.outputViews[i] = xvk::StorageImageView(f.outputs[i].Get(), vkOutColorView);
 		}
 
+		// Reset lazy Tier 3 Tone-Map Matcher resources on feature recreation (re-allocated lazily only if Tier 3 needs them)
+		f.hudTmResourcesReady = false;
+		f.hudTmHistogram.Reset();
+		f.hudTmHistogramBuf = VK_NULL_HANDLE;
+		f.hudTmLut.Reset();
+		f.hudTmLutBuf = VK_NULL_HANDLE;
+
 		// Allocate 3-tier HUD compute resources (R8_UINT static map + 16-byte GPU counter + 2-slot mapped readback)
 		f.hudResourcesReady = false;
 		f.staticCountTex.Reset();
@@ -1027,6 +1180,7 @@ namespace
 			f.hudCounterReadbackBuf[i] = VK_NULL_HANDLE;
 			f.hudMappedReadback[i] = nullptr;
 			f.hudReadbackHasDiff[i] = false;
+			f.hudReadbackDiffFromToneMatch[i] = false;
 			f.hudReadbackHasStatic[i] = false;
 		}
 		f.hudRealFrameCount = 0;
@@ -1239,17 +1393,130 @@ namespace
 		outSize = { w, h };
 	}
 
+	bool EnsureVkToneMapResources(const Device& d, Feature& f) noexcept
+	{
+		if (f.hudTmResourcesReady)
+			return true;
+		if (!d.hudToneMatchReady || !d.d3d || f.width == 0 || f.height == 0 || !IsVkToneMapSupported(f.format))
+			return false;
+
+		ID3D12Device* d3d = d.d3d.Get();
+		D3D12_HEAP_PROPERTIES defaultHeap{ D3D12_HEAP_TYPE_DEFAULT };
+		auto makeBuf = [&](uint64_t bytes, ComPtr<ID3D12Resource>& res, VkBuffer& vkBuf) -> bool {
+			D3D12_RESOURCE_DESC bd{};
+			bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+			bd.Width = bytes;
+			bd.Height = 1;
+			bd.DepthOrArraySize = 1;
+			bd.MipLevels = 1;
+			bd.SampleDesc.Count = 1;
+			bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+			bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+			if (FAILED(d3d->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &bd,
+				D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&res))))
+				return false;
+			vkBuf = xvk::BufferOf(res.Get());
+			return vkBuf != VK_NULL_HANDLE;
+		};
+
+		constexpr uint32_t kBins = 256u, kCodes = 1024u;
+		if (!makeBuf(uint64_t(3u) * kBins * kCodes * 4ull, f.hudTmHistogram, f.hudTmHistogramBuf) ||
+			!makeBuf(uint64_t(3u) * kBins * 4ull, f.hudTmLut, f.hudTmLutBuf))
+			return false;
+
+		const VkFormat vkColorView = (f.format == DXGI_FORMAT_R10G10B10A2_UNORM)
+			? VK_FORMAT_A2B10G10R10_UNORM_PACK32
+			: (f.format == DXGI_FORMAT_B8G8R8A8_UNORM ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM);
+		for (Slot& s : f.slots)
+		{
+			if (FAILED(CreateTexture(d3d, f.width, f.height, f.format, s.matchedHudless)))
+				return false;
+			s.matchedHudlessView = xvk::StorageImageView(s.matchedHudless.Get(), vkColorView);
+			if (!s.matchedHudlessView)
+				return false;
+		}
+		f.hudTmResourcesReady = true;
+		Log::Info("Vulkan: lazy-allocated Tier 3 Hybrid Tone-Map Matcher resources ({}x{})", f.width, f.height);
+		return true;
+	}
+
+	void RecordVkToneMapMatch(const Device& d, Feature& f, VkCommandBuffer command, Slot& slot,
+		VkImageView rawHudlessView, VkImageView rawBackbufferView) noexcept
+	{
+		if (!EnsureVkToneMapResources(d, f) || !rawHudlessView || !rawBackbufferView || !slot.matchedHudlessView)
+			return;
+
+		struct VkToneMatchPushConstants {
+			uint32_t width, height;
+			float logMin, binsPerOctave;
+			uint32_t bins, codes, minimumCount, unused;
+		};
+		constexpr uint32_t kBins = 256u, kCodes = 1024u, kStride = 4u;
+		const VkToneMatchPushConstants pc{ f.width, f.height, -16.0f, 12.0f, kBins, kCodes, 8u, 0u };
+		const int fmtIdx = (f.format == DXGI_FORMAT_R10G10B10A2_UNORM) ? 1 : 0;
+
+		VkDescriptorImageInfo img0{ d.sampler, rawHudlessView, GameLayout };
+		VkDescriptorImageInfo img1{ d.sampler, rawBackbufferView, GameLayout };
+		VkDescriptorImageInfo img2{ VK_NULL_HANDLE, slot.matchedHudlessView, VK_IMAGE_LAYOUT_GENERAL };
+		VkDescriptorBufferInfo buf3{ f.hudTmHistogramBuf, 0, VK_WHOLE_SIZE };
+		VkDescriptorBufferInfo buf4{ f.hudTmLutBuf, 0, VK_WHOLE_SIZE };
+		VkWriteDescriptorSet writes[5]{};
+		writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &img0 };
+		writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &img1 };
+		writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &img2 };
+		writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &buf3 };
+		writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &buf4 };
+
+		d.vkCmdPushDescriptorSetKHR(command, VK_PIPELINE_BIND_POINT_COMPUTE, d.hudTmPipelineLayout, 0, 5, writes);
+		d.vkCmdPushConstants(command, d.hudTmPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+
+		// 1. clear
+		d.vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, d.hudTmPipelines[0]);
+		d.vkCmdDispatch(command, (3u * kBins * kCodes + 63u) / 64u, 1u, 1u);
+		StageBarrier(d, command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+
+		// 2. accumulate (1/16 stride)
+		d.vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, d.hudTmPipelines[1]);
+		const uint32_t sampleW = (f.width + kStride - 1u) / kStride;
+		const uint32_t sampleH = (f.height + kStride - 1u) / kStride;
+		d.vkCmdDispatch(command, (sampleW + 7u) / 8u, (sampleH + 7u) / 8u, 1u);
+		StageBarrier(d, command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+
+		// 3. median
+		d.vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, d.hudTmPipelines[2]);
+		d.vkCmdDispatch(command, kBins, 3u, 1u);
+		StageBarrier(d, command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+
+		// 4. fill
+		d.vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, d.hudTmPipelines[3]);
+		d.vkCmdDispatch(command, 3u, 1u, 1u);
+		StageBarrier(d, command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+		// 5. apply
+		d.vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, d.hudTmApplyPipelines[fmtIdx]);
+		d.vkCmdDispatch(command, (f.width + 7u) / 8u, (f.height + 7u) / 8u, 1u);
+		StageBarrier(d, command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+	}
+
 	void DescribeFrame(const Feature& f, const Slot& slot, xefgd_frame_t& frame)
 	{
 		frame = {};
-		const bool useHudlessScene = f.hudDecision.useHudlessAsSceneSource && slot.hasHudless && slot.hudless;
-		frame.backBuffer = Region(useHudlessScene ? slot.hudless.Get() : slot.backbuffer.Get(),
+		ID3D12Resource* effectiveHudless = (f.hudDecision.runToneMapMatch && slot.matchedHudless)
+			? slot.matchedHudless.Get()
+			: (slot.hasHudless ? slot.hudless.Get() : nullptr);
+		const bool useHudlessScene = f.hudDecision.useHudlessAsSceneSource && effectiveHudless != nullptr;
+		frame.backBuffer = Region(useHudlessScene ? effectiveHudless : slot.backbuffer.Get(),
 			f.width, f.height, slot.bbBase, slot.bbSize);
 		frame.depth = Region(slot.depth.Get(), f.depthWidth, f.depthHeight, slot.depthBase, slot.depthSize);
 		frame.motionVectors = Region(slot.motion.Get(), f.depthWidth, f.depthHeight, slot.motionBase, slot.motionSize);
 
-		if (slot.hasHudless && f.hudDecision.useXeFgNativeUi)
-			frame.hudlessColor = Region(slot.hudless.Get(), f.width, f.height, slot.hudlessBase, slot.hudlessSize);
+		if (effectiveHudless && f.hudDecision.useXeFgNativeUi)
+			frame.hudlessColor = Region(effectiveHudless, f.width, f.height, slot.hudlessBase, slot.hudlessSize);
 
 		if (slot.hasUi)
 			frame.uiTexture = Region(slot.ui.Get(), f.width, f.height);
@@ -1317,7 +1584,9 @@ namespace
 				if (outIdx >= f.outputViews.size() || !f.outputViews[outIdx])
 					continue;
 
-				if (f.hudDecision.runHudDiffComposite && curSlot.bbView && curSlot.hudlessView)
+				const bool useMatched = f.hudDecision.runToneMapMatch && curSlot.matchedHudlessView != VK_NULL_HANDLE;
+				VkImageView compositeHudlessView = useMatched ? curSlot.matchedHudlessView : curSlot.hudlessView;
+				if (f.hudDecision.runHudDiffComposite && curSlot.bbView && compositeHudlessView)
 				{
 					const bool updateCounter = (outIdx == 0);
 					if (updateCounter)
@@ -1328,7 +1597,7 @@ namespace
 					}
 					const uint32_t flags = (updateCounter ? 1u : 0u) | (debugMagenta ? 2u : 0u);
 					RecordHudDispatch(d, command, d.hudPipelines[1][fmtIdx],
-						curSlot.bbView, curSlot.hudlessView, f.outputViews[outIdx], f.hudCounterGpuBuf,
+						curSlot.bbView, compositeHudlessView, f.outputViews[outIdx], f.hudCounterGpuBuf,
 						f.width, f.height, 0.02f, flags);
 					dispatched = true;
 					if (updateCounter)
@@ -1338,10 +1607,17 @@ namespace
 						const VkBufferCopy copy{ 0, 0, 4 };
 						d.vkCmdCopyBuffer(command, f.hudCounterGpuBuf, f.hudCounterReadbackBuf[f.hudReadbackSlot], 1, &copy);
 						f.hudReadbackHasDiff[f.hudReadbackSlot] = true;
+						f.hudReadbackDiffFromToneMatch[f.hudReadbackSlot] = useMatched;
 					}
 				}
-				else if (f.hudDecision.runStaticHudComposite && curSlot.bbView && f.staticCountView)
+				// In Tier 3 Hybrid, Static HUD Mask runs alongside Tone-Map Match to lock fixed UI (crosshairs/text) sharp.
+				if (f.hudDecision.runStaticHudComposite && curSlot.bbView && f.staticCountView)
 				{
+					if (dispatched)
+					{
+						StageBarrier(d, command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+							VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+					}
 					const uint32_t flags = debugMagenta ? 2u : 0u;
 					RecordHudDispatch(d, command, d.hudPipelines[3][fmtIdx],
 						curSlot.bbView, f.staticCountView, f.outputViews[outIdx], f.hudCounterGpuBuf,
@@ -1429,6 +1705,8 @@ namespace
 			}
 			in.hudless = nullptr;
 		}
+		bool vkHudlessFormatMismatch = false;
+		const NgxResource* toneMatchHudless = nullptr;
 		if (in.hudless)
 		{
 			const bool sameAsBackbuffer = (in.hudless->image == in.backbuffer->image);
@@ -1441,7 +1719,7 @@ namespace
 			const uint32_t hlSubW = parameters.GetOr<uint32_t>("DLSSG.HUDLessSubrectWidth", in.hudless->width);
 			const uint32_t hlSubH = parameters.GetOr<uint32_t>("DLSSG.HUDLessSubrectHeight", in.hudless->height);
 			const bool subrectMismatch = (hlSubX != bbSubX || hlSubY != bbSubY || hlSubW != bbSubW || hlSubH != bbSubH);
-			if (sameAsBackbuffer || subrectMismatch || !usableUi(in.hudless, true))
+			if (sameAsBackbuffer || subrectMismatch || !usableUi(in.hudless, false))
 			{
 				if (!f.hudlessMismatchLogged)
 				{
@@ -1454,6 +1732,31 @@ namespace
 						bbSubX, bbSubY, bbSubW, bbSubH);
 				}
 				in.hudless = nullptr;
+			}
+			else if (!usableUi(in.hudless, true))
+			{
+				// Same geometry/subrect, different color format (e.g. RGBA16F HUDLess + R10G10B10A2 HDR10 Backbuffer):
+				// keep raw pointer for Tier 3 Hybrid Tone-Map Matcher if supported, otherwise reject cleanly.
+				if (d.hudToneMatchReady && IsVkToneMapSupported(bbFormat) && in.hudless->imageView && in.backbuffer->imageView)
+				{
+					vkHudlessFormatMismatch = true;
+					toneMatchHudless = in.hudless;
+					in.hudless = nullptr; // do not copy mismatched format into slot.hudless
+				}
+				else
+				{
+					if (!f.hudlessMismatchLogged)
+					{
+						f.hudlessMismatchLogged = true;
+						Log::Warn("Vulkan: HUD-less format mismatch (VkFormat {} vs backbuffer VkFormat {}); falling back to UI Auto",
+							static_cast<int>(in.hudless->format), static_cast<int>(in.backbuffer->format));
+					}
+					in.hudless = nullptr;
+				}
+			}
+			else
+			{
+				toneMatchHudless = in.hudless;
 			}
 		}
 		if (!usableUi(in.ui, false)) in.ui = nullptr;
@@ -1468,8 +1771,9 @@ namespace
 				if (f.hudReadbackHasDiff[rslot])
 				{
 					const float frac = std::clamp(static_cast<float>(f.hudMappedReadback[rslot][0]) / static_cast<float>(sampledTotal), 0.0f, 1.0f);
-					f.hudTierState.FeedHudDiffFraction(frac);
+					f.hudTierState.FeedHudDiffFraction(frac, f.hudReadbackDiffFromToneMatch[rslot]);
 					f.hudReadbackHasDiff[rslot] = false;
+					f.hudReadbackDiffFromToneMatch[rslot] = false;
 				}
 				if (f.hudReadbackHasStatic[rslot])
 				{
@@ -1485,8 +1789,11 @@ namespace
 		vkHudInputs.hudlessUiEnabled = Plugin::options.hudlessUi.load(std::memory_order_relaxed);
 		vkHudInputs.hasGameHudless = rawGameHudless != nullptr;
 		vkHudInputs.hudlessStructurallyValid = in.hudless != nullptr;
+		vkHudInputs.hudlessFormatMismatch = vkHudlessFormatMismatch;
 		vkHudInputs.hasSeparateUiPlane = in.ui != nullptr;
 		vkHudInputs.gpuComputeAvailable = d.hudPipelinesReady;
+		vkHudInputs.toneMapMatchAvailable = d.hudToneMatchReady && IsVkToneMapSupported(bbFormat) &&
+			toneMatchHudless != nullptr && toneMatchHudless->imageView != VK_NULL_HANDLE && in.backbuffer->imageView != VK_NULL_HANDLE;
 		f.hudDecision = f.hudTierState.Evaluate(vkHudInputs);
 
 		if (!f.hasLoggedHudTier || f.hudDecision.activeTier != f.loggedHudTier)
@@ -1498,7 +1805,7 @@ namespace
 				f.hudTierState.LastDiffFraction() * 100.0f, f.hudTierState.LastStaticFraction() * 100.0f);
 		}
 
-		if (!f.hudDecision.useXeFgNativeUi && !f.hudDecision.useHudlessAsSceneSource && !f.hudDecision.runHudDiffGuard)
+		if (!f.hudDecision.useXeFgNativeUi && !f.hudDecision.useHudlessAsSceneSource && !f.hudDecision.runHudDiffGuard && !f.hudDecision.runToneMapMatch)
 			in.hudless = nullptr;
 		if (!f.hudDecision.useXeFgNativeUi)
 			in.ui = nullptr;
@@ -1666,13 +1973,18 @@ namespace
 			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 
-		// Record inline Tier 1 Pixel-Diff Guard and/or Tier 3 Static-HUD temporal update (0 extra submits / 0 PCL)
+		// Record inline Tier 3 Hybrid Tone-Map Match, Tier 1 Pixel-Diff Guard, and/or Tier 3 Static-HUD update (0 extra submits / 0 PCL)
 		f.activeBatchSlot = f.current;
 		if (d.hudPipelinesReady && f.hudResourcesReady)
 		{
 			++f.hudRealFrameCount;
 			f.hudReadbackSlot = static_cast<uint32_t>(f.hudRealFrameCount & 1u);
 			const int fmtIdx = (f.format == DXGI_FORMAT_R10G10B10A2_UNORM) ? 1 : 0;
+
+			if (f.hudDecision.runToneMapMatch && toneMatchHudless && toneMatchHudless->imageView && in.backbuffer->imageView)
+			{
+				RecordVkToneMapMatch(d, f, command, slot, toneMatchHudless->imageView, in.backbuffer->imageView);
+			}
 
 			if (f.hudDecision.runHudDiffGuard && !f.hudDecision.runHudDiffComposite && slot.hasHudless && slot.bbView && slot.hudlessView)
 			{
@@ -1687,6 +1999,7 @@ namespace
 				const VkBufferCopy copy{ 0, 0, 4 };
 				d.vkCmdCopyBuffer(command, f.hudCounterGpuBuf, f.hudCounterReadbackBuf[f.hudReadbackSlot], 1, &copy);
 				f.hudReadbackHasDiff[f.hudReadbackSlot] = true;
+				f.hudReadbackDiffFromToneMatch[f.hudReadbackSlot] = false;
 			}
 
 			if (f.hudDecision.runStaticHudUpdate && slot.bbView && f.staticCountView)
@@ -1961,7 +2274,7 @@ namespace
 				f.paused++;
 				VulkanHost::NotifyPaused();
 			}
-			else if (VulkanPolicy::NewBatch(index, f.lastIndex, count, f.batchCount, f.batches))
+			else if (VulkanPolicy::NewBatch(index, f.lastIndex, count, f.requestedBatchCount, f.batches))
 			{
 				if (resetRequested)
 				{
@@ -1969,7 +2282,12 @@ namespace
 					f.stallCooldownBatches = 0;
 				}
 
-				f.batchCount = count;
+				const bool vramGuarded = PollVkVramGuard(d, f);
+				const bool vramClamped = vramGuarded && count > 1u;
+				const uint32_t effectiveCount = vramClamped ? 1u : count;
+
+				f.requestedBatchCount = count;
+				f.batchCount = effectiveCount;
 				f.fault.clear();
 				f.generatedThrough = 0;
 
@@ -1985,15 +2303,16 @@ namespace
 				}
 				else
 				{
-					f.batchReady = GenerateBatch(d, f, command, *parameters, count,
-						VulkanPolicy::ExecuteRange(true, index, count, false));
+					f.batchReady = GenerateBatch(d, f, command, *parameters, effectiveCount,
+						VulkanPolicy::ExecuteRange(true, index, effectiveCount, false));
 				}
 				didExecute = f.batchReady;
 				f.batches++;
 
-				Plugin::Report({ f.width, f.height, count, f.hudDecision.activeTier != HudTier::ActiveTier::Interpolated,
+				Plugin::Report({ f.width, f.height, effectiveCount, f.hudDecision.activeTier != HudTier::ActiveTier::Interpolated,
 					static_cast<int32_t>(f.hudDecision.activeTier), NetworkOf(f.model),
-					f.context == nullptr, f.format == DXGI_FORMAT_R16G16B16A16_FLOAT });
+					f.context == nullptr, f.format == DXGI_FORMAT_R16G16B16A16_FLOAT,
+					count, vramClamped, f.vramUsageMiB, f.vramBudgetMiB });
 
 				if (!f.batchReady)
 				{
@@ -2014,7 +2333,7 @@ namespace
 				else
 				{
 					f.consecutiveFailures = 0;
-					VulkanHost::NotifyBatchStart(count);
+					VulkanHost::NotifyBatchStart(effectiveCount);
 					if (f.batches == 1 || f.batches % 6000 == 0)
 					{
 						Log::Info("Vulkan: {} batches of {} generated frames, {} evaluations, {} failures, {} paused", f.batches,
@@ -2022,7 +2341,7 @@ namespace
 					}
 				}
 			}
-			else if (f.batchReady && index > f.generatedThrough)
+			else if (f.batchReady && index > f.generatedThrough && index <= f.batchCount)
 			{
 				const auto range = VulkanPolicy::ExecuteRange(false, index, f.batchCount, false);
 
