@@ -1,0 +1,59 @@
+From 1d7b73c5d1367c967a09889e906155c3d2d03e07 Mon Sep 17 00:00:00 2001
+From: dlssg-to-xefg <dev@local>
+Date: Sun, 22 Nov 2026 05:02:27 +0000
+Subject: [PATCH] Enable D3D12 Vulkan WMMA bridge by default in OptiScaler menu
+
+---
+ src/Plugin.cpp                 | 4 ++--
+ src/Plugin.h                   | 6 +++---
+ src/vulkan/D3D12VulkanWmma.cpp | 2 +-
+ 3 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/src/Plugin.cpp b/src/Plugin.cpp
+index cec3f2d..1eb9890 100644
+--- a/src/Plugin.cpp
++++ b/src/Plugin.cpp
+@@ -507,8 +507,8 @@ namespace
+ 		}
+ 
+ 		api->ItemTooltip("Routes D3D12 WMMA batches through a private Vulkan VK_KHR_cooperative_matrix device\n"
+-						 "(takes effect on next game launch, or set XEFG_D3D12_VULKAN_WMMA=1).\n"
+-						 "Off by default to use freeze-free D3D12 cs_6_6 WMMA overrides without duplicate VRAM\n"
++						 "(takes effect on next game launch; set XEFG_D3D12_VULKAN_WMMA=0 to force off).\n"
++						 "On by default; disable to fall back to D3D12 cs_6_6 WMMA overrides without duplicate VRAM\n"
+ 						 "or OptiScaler Vulkan_wDx12 hook interference. Saved as D3D12VulkanWmmaBridge.");
+ 
+ 		bool uiCooldown = Plugin::options.uiTransitionCooldown;
+diff --git a/src/Plugin.h b/src/Plugin.h
+index 5e17f88..0efef1e 100644
+--- a/src/Plugin.h
++++ b/src/Plugin.h
+@@ -33,9 +33,9 @@ namespace Plugin
+ 		std::atomic_bool vramGuard = true;
+ 		// Caps Vulkan present pacer cadence to (DisplayHz - 3) to stay inside the VRR/G-Sync/FreeSync window
+ 		std::atomic_bool autoVrrPacing = false;
+-		// Experimental D3D12->Vulkan VK_KHR_cooperative_matrix bridge (default off: D3D12 cs_6_6 WMMA overrides run without
+-		// allocating a duplicate Vulkan XeFG context or triggering OptiScaler Vulkan_wDx12 hooks on DX12 games)
+-		std::atomic_bool d3d12VulkanWmmaBridge = false;
++		// Experimental D3D12->Vulkan VK_KHR_cooperative_matrix bridge (default on; disable in OptiScaler menu or via
++		// XEFG_D3D12_VULKAN_WMMA=0 to fall back to D3D12 cs_6_6 WMMA overrides if a game freezes or conflicts with hooks)
++		std::atomic_bool d3d12VulkanWmmaBridge = true;
+ 		// DLSS Enabler 4.10.0.26 RC1 features:
+ 		// Skips 10 real frames when HUD-less/UI composition state toggles to prevent glitched menu transitions
+ 		std::atomic_bool uiTransitionCooldown = true;
+diff --git a/src/vulkan/D3D12VulkanWmma.cpp b/src/vulkan/D3D12VulkanWmma.cpp
+index 3ccf818..f0b421f 100644
+--- a/src/vulkan/D3D12VulkanWmma.cpp
++++ b/src/vulkan/D3D12VulkanWmma.cpp
+@@ -943,7 +943,7 @@ bool Install(ID3D12Device* d3dDevice, std::string& reason) noexcept
+ 	if (VulkanPolicy::IsOffWord(envBridge))
+ 		return fail("environment_off");
+ 	if (!VulkanPolicy::IsOnWord(envBridge) && !Plugin::options.d3d12VulkanWmmaBridge.load(std::memory_order_acquire))
+-		return fail("disabled_by_default");
++		return fail("disabled_in_options");
+ 
+ 	if (!d3dDevice)
+ 		return fail("no_d3d12_device");
+-- 
+2.39.5
+
