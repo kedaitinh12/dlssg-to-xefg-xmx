@@ -519,8 +519,7 @@ namespace
 			api->SetBool(self, "UiTransitionCooldown", uiCooldown);
 		}
 
-		api->ItemTooltip("Skips interpolation for 10 frames whenever HUD-less or UI composition state toggles
-"
+		api->ItemTooltip("Skips interpolation for 10 frames whenever HUD-less or UI composition state toggles "
 						 "(from DLSS Enabler XeFG) to prevent glitched menu/overlay transition frames. Saved as UiTransitionCooldown.");
 
 		bool ghostBuster = Plugin::options.ghostBuster;
@@ -531,8 +530,7 @@ namespace
 			api->SetBool(self, "GhostBuster", ghostBuster);
 		}
 
-		api->ItemTooltip("Tightens disocclusion history resets on sharp camera snaps (>45 deg), sudden FOV/ADS jumps,
-"
+		api->ItemTooltip("Tightens disocclusion history resets on sharp camera snaps (>45 deg), sudden FOV/ADS jumps, "
 						 "and missing camera motion vectors (from DLSS Enabler GhostBuster). Saved as GhostBuster.");
 
 		bool spinSleep = Plugin::options.pacingSpinlockSleep;
@@ -543,8 +541,7 @@ namespace
 			api->SetBool(self, "PacingSpinlockSleep", spinSleep);
 		}
 
-		api->ItemTooltip("Shrinks the Vulkan pacer spin tail and yields the thread while waiting, reducing CPU usage
-"
+		api->ItemTooltip("Shrinks the Vulkan pacer spin tail and yields the thread while waiting, reducing CPU usage "
 						 "(from DLSS Enabler). Saved as PacingSpinlockSleep.");
 
 		bool debugLines = Plugin::options.debugLines;
@@ -564,8 +561,7 @@ namespace
 			Plugin::options.depthInvertedOverride = depthOv;
 			api->SetInt(self, "DepthInvertedOverride", depthOv);
 		}
-		api->ItemTooltip("Overrides XeFG DepthInverted flag when a game reports inverted depth incorrectly.
-"
+		api->ItemTooltip("Overrides XeFG DepthInverted flag when a game reports inverted depth incorrectly. "
 						 "Saved as DepthInvertedOverride.");
 
 		int32_t jitterOv = Plugin::options.jitteredMvOverride.load();
@@ -574,8 +570,7 @@ namespace
 			Plugin::options.jitteredMvOverride = jitterOv;
 			api->SetInt(self, "JitteredMvOverride", jitterOv);
 		}
-		api->ItemTooltip("Overrides XeFG JitteredMV flag when a game misreports motion-vector jitter.
-"
+		api->ItemTooltip("Overrides XeFG JitteredMV flag when a game misreports motion-vector jitter. "
 						 "Saved as JitteredMvOverride.");
 
 		bool ignoreReset = Plugin::options.ignoreGameReset;
@@ -584,8 +579,7 @@ namespace
 			Plugin::options.ignoreGameReset = ignoreReset;
 			api->SetBool(self, "IgnoreGameReset", ignoreReset);
 		}
-		api->ItemTooltip("Ignores DLSSG.Reset=1 from games that spam reset every frame. Internal safety resets
-"
+		api->ItemTooltip("Ignores DLSSG.Reset=1 from games that spam reset every frame. Internal safety resets "
 						 "(subrect change, camera cut, HUD-less toggle) still run. Saved as IgnoreGameReset.");
 	}
 
