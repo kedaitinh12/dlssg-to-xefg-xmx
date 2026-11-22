@@ -1,0 +1,586 @@
+From 0587c06b16da9a00fa3a09a9bd03d3abf06377eb Mon Sep 17 00:00:00 2001
+From: dlssg-to-xefg <dev@local>
+Date: Sat, 21 Nov 2026 22:45:18 +0000
+Subject: [PATCH 1/2] Add DLSS Enabler 4.10.0.26 RC1 features (without DFG):
+ 10-frame UI cooldown, GhostBuster, pacing sleep, and XeFG overrides
+
+---
+ dlssg-to-xefg.vcxproj        |  1 +
+ src/FrameGenerator.cpp       | 74 ++++++++++++++++++++++++++++------
+ src/FrameGenerator.h         |  8 +++-
+ src/Plugin.cpp               | 77 ++++++++++++++++++++++++++++++++++++
+ src/Plugin.h                 | 12 ++++++
+ src/XeFgEnabler.h            | 44 +++++++++++++++++++++
+ src/vulkan/VulkanHost.cpp    | 15 +++++--
+ src/vulkan/VulkanRuntime.cpp | 76 +++++++++++++++++++++++++++++------
+ 8 files changed, 279 insertions(+), 28 deletions(-)
+ create mode 100644 src/XeFgEnabler.h
+
+diff --git a/dlssg-to-xefg.vcxproj b/dlssg-to-xefg.vcxproj
+index f7a0e5d..34c19e1 100644
+--- a/dlssg-to-xefg.vcxproj
++++ b/dlssg-to-xefg.vcxproj
+@@ -118,6 +118,7 @@
+   <ItemGroup>
+     <ClInclude Include="src\D3D12VulkanWmma.h" />
+     <ClInclude Include="src\FrameGenerator.h" />
++    <ClInclude Include="src\XeFgEnabler.h" />
+     <ClInclude Include="src\loader\EarlyLoaderCore.h" />
+     <ClInclude Include="src\Log.h" />
+     <ClInclude Include="src\MfgKernels.h" />
+diff --git a/src/FrameGenerator.cpp b/src/FrameGenerator.cpp
+index 035ba29..8cecfd9 100644
+--- a/src/FrameGenerator.cpp
++++ b/src/FrameGenerator.cpp
+@@ -1021,7 +1021,12 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const
+ 	auto mvecs = params.GetOr<ID3D12Resource*>("DLSSG.MVecs", nullptr);
+ 	auto output = params.GetOr<ID3D12Resource*>("DLSSG.OutputInterpolated", nullptr);
+ 
+-	const bool depthInverted = params.GetOr<uint32_t>("DLSSG.DepthInverted", 0) != 0;
++	const bool depthInverted = XeFgEnabler::ApplyTriStateOverride(
++		Plugin::options.depthInvertedOverride.load(std::memory_order_relaxed),
++		params.GetOr<uint32_t>("DLSSG.DepthInverted", 0) != 0);
++	const bool mvecJittered = XeFgEnabler::ApplyTriStateOverride(
++		Plugin::options.jitteredMvOverride.load(std::memory_order_relaxed),
++		params.GetOr<uint32_t>("DLSSG.MvecJittered", 0) != 0);
+ 
+ 	const auto bbDesc = backbuffer->GetDesc();
+ 	const auto backbufferFormat = TypedFormat(bbDesc.Format);
+@@ -1050,7 +1055,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const
+ 	wanted.height = outputDesc.Height;
+ 	wanted.format = TypedFormat(outputDesc.Format);
+ 	wanted.initFlags = (depthInverted ? XEFGD_INIT_FLAG_INVERTED_DEPTH : 0) |
+-		(params.GetOr<uint32_t>("DLSSG.MvecJittered", 0) ? XEFGD_INIT_FLAG_JITTERED_MV : 0);
++		(mvecJittered ? XEFGD_INIT_FLAG_JITTERED_MV : 0);
+ 	wanted.uiMode = hudless ? XEFGD_UI_MODE_BACKBUFFER_HUDLESS : XEFGD_UI_MODE_AUTO;
+ 	wanted.model = PickModel(device.Get());
+ 
+@@ -1249,7 +1254,8 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const
+ 	data.motionVectorScale[0] = (std::isfinite(mvsx) && mvsx != 0.0f) ? mvsx : 1.0f;
+ 	data.motionVectorScale[1] = (std::isfinite(mvsy) && mvsy != 0.0f) ? mvsy : 1.0f;
+ 
+-	bool reset = params.GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
++	const bool ignoreGameReset = Plugin::options.ignoreGameReset.load(std::memory_order_relaxed);
++	bool reset = !ignoreGameReset && (params.GetOr<uint32_t>("DLSSG.Reset", 0) != 0);
+ 
+ 	// Dynamic Resolution / Subrect Change Detector: reset XeFG history if active render/viewport rect changed
+ 	if (captured && previous.valid && !reset)
+@@ -1266,33 +1272,52 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const
+ 		}
+ 	}
+ 
+-	// Camera Cut & Teleport Detector: force history reset on sudden position jumps or sharp orientation snaps
+-	if (Plugin::options.cameraCutDetection.load(std::memory_order_relaxed))
++	// Camera Cut & Teleport Detector + GhostBuster anti-ghosting
++	const bool camCutOn = Plugin::options.cameraCutDetection.load(std::memory_order_relaxed);
++	const bool ghostBusterOn = Plugin::options.ghostBuster.load(std::memory_order_relaxed);
++	if (camCutOn || ghostBusterOn)
+ 	{
+ 		const XMFLOAT3 curPos = GetVector(params, "DLSSG.CameraPosX", "DLSSG.CameraPosY", "DLSSG.CameraPosZ");
+ 		const XMFLOAT3 curFwd = GetVector(params, "DLSSG.CameraFwdX", "DLSSG.CameraFwdY", "DLSSG.CameraFwdZ");
+ 		const float fwdLenSq = curFwd.x * curFwd.x + curFwd.y * curFwd.y + curFwd.z * curFwd.z;
+ 		const bool hasCamera = fwdLenSq > 1e-6f;
+-
+-		if (hasCamera && context->hasPrevCamera && !reset)
++		float curFov = params.GetOr("DLSSG.CameraFOV", 0.0f);
++		if (!std::isfinite(curFov))
++			curFov = 0.0f;
++		if (curFov > 10.0f)
++			curFov *= std::numbers::pi_v<float> / 180.0f;
++
++		float distSq = 0.0f;
++		float fwdDot = 1.0f;
++		if (hasCamera && context->hasPrevCamera)
+ 		{
+ 			const float dx = curPos.x - context->prevCameraPos[0];
+ 			const float dy = curPos.y - context->prevCameraPos[1];
+ 			const float dz = curPos.z - context->prevCameraPos[2];
+-			const float distSq = dx * dx + dy * dy + dz * dz;
+-			constexpr float kCutThresholdSq = 4.5f * 4.5f;
++			distSq = dx * dx + dy * dy + dz * dz;
+ 
+ 			const float invCur = 1.0f / std::sqrt(fwdLenSq);
+ 			const float prevLenSq = context->prevCameraFwd[0] * context->prevCameraFwd[0] +
+ 				context->prevCameraFwd[1] * context->prevCameraFwd[1] +
+ 				context->prevCameraFwd[2] * context->prevCameraFwd[2];
+-			const float fwdDot = (prevLenSq > 1e-6f)
++			fwdDot = (prevLenSq > 1e-6f)
+ 				? ((curFwd.x * context->prevCameraFwd[0] + curFwd.y * context->prevCameraFwd[1] +
+ 				    curFwd.z * context->prevCameraFwd[2]) * invCur / std::sqrt(prevLenSq))
+ 				: 1.0f;
+ 
+-			if (distSq > kCutThresholdSq || fwdDot < -0.5f)
++			constexpr float kCutThresholdSq = 4.5f * 4.5f;
++			if (camCutOn && !reset && (distSq > kCutThresholdSq || fwdDot < -0.5f))
++				reset = true;
++		}
++
++		if (ghostBusterOn && !reset)
++		{
++			const bool camMvIncluded = params.GetOr<uint32_t>("DLSSG.CameraMotionIncluded", 1) != 0;
++			if (XeFgEnabler::ShouldGhostBusterReset(true, hasCamera, context->hasPrevCamera, fwdDot,
++				curFov, context->prevCameraFov, context->hasPrevFov, camMvIncluded, distSq))
++			{
+ 				reset = true;
++			}
+ 		}
+ 
+ 		if (hasCamera)
+@@ -1305,11 +1330,32 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const
+ 			context->prevCameraFwd[2] = curFwd.z;
+ 			context->hasPrevCamera = true;
+ 		}
++		if (curFov > 0.01f)
++		{
++			context->prevCameraFov = curFov;
++			context->hasPrevFov = true;
++		}
+ 	}
+ 
+-	// Force history reset if HUD-less presence toggles between frames (network source switch, dlssg-0.4.2 M3)
++	// Force history reset + 10-frame UI transition cooldown if HUD-less presence toggles (DLSS Enabler XeFG_Dx12)
+ 	if (captured && previous.valid && (frame.hudless != nullptr) != (previous.hudless != nullptr))
++	{
+ 		reset = true;
++		if (Plugin::options.uiTransitionCooldown.load(std::memory_order_relaxed))
++		{
++			context->uiTransitionCooldown = 10u;
++			Log::Info("HUD-less state changed ({} -> {}), skipping interpolation for 10 frames",
++				previous.hudless != nullptr, frame.hudless != nullptr);
++		}
++	}
++
++	bool inUiCooldown = false;
++	if (context->uiTransitionCooldown > 0u)
++	{
++		--context->uiTransitionCooldown;
++		inUiCooldown = true;
++		reset = true;
++	}
+ 
+ 	if (reset)
+ 	{
+@@ -1320,7 +1366,8 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const
+ 	data.resetHistory = reset;
+ 
+ 	// XeFG needs both frames to have hudless or neither
+-	context->pairValid = captured && previous.valid && !reset && (frame.hudless != nullptr) == (previous.hudless != nullptr);
++	context->pairValid = captured && previous.valid && !reset && !inUiCooldown &&
++		(frame.hudless != nullptr) == (previous.hudless != nullptr);
+ 	context->batchGeneratedThrough = 0;
+ 	context->directOutput = false;
+ 	frame.valid = captured;
+@@ -1498,6 +1545,7 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
+ 			context->pairValid = false;
+ 			context->consecutiveExecuteFailures = 0;
+ 			context->stallCooldownEvaluations = 0;
++			context->uiTransitionCooldown = 0;
+ 		}
+ 
+ 		if (output)
+diff --git a/src/FrameGenerator.h b/src/FrameGenerator.h
+index dcd2cab..4241aeb 100644
+--- a/src/FrameGenerator.h
++++ b/src/FrameGenerator.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "NGX.h"
++#include "XeFgEnabler.h"
+ #include "XeFG.h"
+ 
+ #include <dxgi1_4.h>
+@@ -70,10 +71,15 @@ private:
+ 		// Tracks whether cached frame/output copies were allocated with D3D12_HEAP_FLAG_SHARED for Vulkan WMMA
+ 		bool sharedTexturesMode = false;
+ 
+-		// Camera Cut & Teleport Detector state (prevents smearing on sudden cuts/teleports)
++		// Camera Cut & Teleport Detector + GhostBuster state (prevents smearing/ghosting on cuts, snaps, FOV jumps)
+ 		float prevCameraPos[3]{};
+ 		float prevCameraFwd[3]{};
++		float prevCameraFov = 0.0f;
+ 		bool hasPrevCamera = false;
++		bool hasPrevFov = false;
++
++		// UI / HUD-less transition cooldown (DLSS Enabler XeFG: skip 10 real frames on state toggle)
++		uint32_t uiTransitionCooldown = 0;
+ 
+ 		// Stall circuit breaker (dlssg-0.4.2): bypass XeFG temporarily after 3 consecutive Execute failures
+ 		uint32_t consecutiveExecuteFailures = 0;
+diff --git a/src/Plugin.cpp b/src/Plugin.cpp
+index 95ff9aa..c2f6665 100644
+--- a/src/Plugin.cpp
++++ b/src/Plugin.cpp
+@@ -9,6 +9,7 @@
+ #include "optiscaler_plugin.h"
+ #include "vulkan/VulkanPolicy.h"
+ 
++#include <algorithm>
+ #include <filesystem>
+ #include <format>
+ #include <mutex>
+@@ -510,12 +511,82 @@ namespace
+ 						 "Off by default to use freeze-free D3D12 cs_6_6 WMMA overrides without duplicate VRAM\n"
+ 						 "or OptiScaler Vulkan_wDx12 hook interference. Saved as D3D12VulkanWmmaBridge.");
+ 
++		bool uiCooldown = Plugin::options.uiTransitionCooldown;
++
++		if (api->Checkbox("UI / HUDless transition guard (10 frames)", &uiCooldown))
++		{
++			Plugin::options.uiTransitionCooldown = uiCooldown;
++			api->SetBool(self, "UiTransitionCooldown", uiCooldown);
++		}
++
++		api->ItemTooltip("Skips interpolation for 10 frames whenever HUD-less or UI composition state toggles
++"
++						 "(from DLSS Enabler XeFG) to prevent glitched menu/overlay transition frames. Saved as UiTransitionCooldown.");
++
++		bool ghostBuster = Plugin::options.ghostBuster;
++
++		if (api->Checkbox("GhostBuster anti-ghosting", &ghostBuster))
++		{
++			Plugin::options.ghostBuster = ghostBuster;
++			api->SetBool(self, "GhostBuster", ghostBuster);
++		}
++
++		api->ItemTooltip("Tightens disocclusion history resets on sharp camera snaps (>45 deg), sudden FOV/ADS jumps,
++"
++						 "and missing camera motion vectors (from DLSS Enabler GhostBuster). Saved as GhostBuster.");
++
++		bool spinSleep = Plugin::options.pacingSpinlockSleep;
++
++		if (api->Checkbox("Pacing spinlock sleep (lower CPU)", &spinSleep))
++		{
++			Plugin::options.pacingSpinlockSleep = spinSleep;
++			api->SetBool(self, "PacingSpinlockSleep", spinSleep);
++		}
++
++		api->ItemTooltip("Shrinks the Vulkan pacer spin tail and yields the thread while waiting, reducing CPU usage
++"
++						 "(from DLSS Enabler). Saved as PacingSpinlockSleep.");
++
+ 		bool debugLines = Plugin::options.debugLines;
+ 
+ 		if (api->Checkbox("Debug lines", &debugLines))
+ 			Plugin::options.debugLines = debugLines;
+ 
+ 		api->ItemTooltip("XeFG draws debug lines into the frames it generated. Not saved.");
++
++		api->Section("Extended XeFG Overrides");
++
++		static constexpr const char* TriStateNames[] = { "Auto (Game)", "Force Off", "Force On" };
++
++		int32_t depthOv = Plugin::options.depthInvertedOverride.load();
++		if (api->Combo("Depth inverted", &depthOv, TriStateNames, 3, nullptr))
++		{
++			Plugin::options.depthInvertedOverride = depthOv;
++			api->SetInt(self, "DepthInvertedOverride", depthOv);
++		}
++		api->ItemTooltip("Overrides XeFG DepthInverted flag when a game reports inverted depth incorrectly.
++"
++						 "Saved as DepthInvertedOverride.");
++
++		int32_t jitterOv = Plugin::options.jitteredMvOverride.load();
++		if (api->Combo("Jittered motion vectors", &jitterOv, TriStateNames, 3, nullptr))
++		{
++			Plugin::options.jitteredMvOverride = jitterOv;
++			api->SetInt(self, "JitteredMvOverride", jitterOv);
++		}
++		api->ItemTooltip("Overrides XeFG JitteredMV flag when a game misreports motion-vector jitter.
++"
++						 "Saved as JitteredMvOverride.");
++
++		bool ignoreReset = Plugin::options.ignoreGameReset;
++		if (api->Checkbox("Ignore game Reset signals", &ignoreReset))
++		{
++			Plugin::options.ignoreGameReset = ignoreReset;
++			api->SetBool(self, "IgnoreGameReset", ignoreReset);
++		}
++		api->ItemTooltip("Ignores DLSSG.Reset=1 from games that spam reset every frame. Internal safety resets
++"
++						 "(subrect change, camera cut, HUD-less toggle) still run. Saved as IgnoreGameReset.");
+ 	}
+ 
+ 	void DrawTab(void*)
+@@ -749,6 +820,12 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* optiAp
+ 	Plugin::options.vramGuard = api->GetBool(self, "VramGuard", Plugin::options.vramGuard);
+ 	Plugin::options.autoVrrPacing = api->GetBool(self, "AutoVrrPacing", Plugin::options.autoVrrPacing);
+ 	Plugin::options.d3d12VulkanWmmaBridge = api->GetBool(self, "D3D12VulkanWmmaBridge", Plugin::options.d3d12VulkanWmmaBridge);
++	Plugin::options.uiTransitionCooldown = api->GetBool(self, "UiTransitionCooldown", Plugin::options.uiTransitionCooldown);
++	Plugin::options.ghostBuster = api->GetBool(self, "GhostBuster", Plugin::options.ghostBuster);
++	Plugin::options.pacingSpinlockSleep = api->GetBool(self, "PacingSpinlockSleep", Plugin::options.pacingSpinlockSleep);
++	Plugin::options.depthInvertedOverride = std::clamp(api->GetInt(self, "DepthInvertedOverride", 0), 0, 2);
++	Plugin::options.jitteredMvOverride = std::clamp(api->GetInt(self, "JitteredMvOverride", 0), 0, 2);
++	Plugin::options.ignoreGameReset = api->GetBool(self, "IgnoreGameReset", Plugin::options.ignoreGameReset);
+ 
+ 	// Off in OptiScaler.ini, the Vulkan hooks aren't installed. Said before they are, and a copy started by
+ 	// InitializeASI that has installed them already only passes the game's calls on from here
+diff --git a/src/Plugin.h b/src/Plugin.h
+index 03644c0..5e17f88 100644
+--- a/src/Plugin.h
++++ b/src/Plugin.h
+@@ -36,6 +36,18 @@ namespace Plugin
+ 		// Experimental D3D12->Vulkan VK_KHR_cooperative_matrix bridge (default off: D3D12 cs_6_6 WMMA overrides run without
+ 		// allocating a duplicate Vulkan XeFG context or triggering OptiScaler Vulkan_wDx12 hooks on DX12 games)
+ 		std::atomic_bool d3d12VulkanWmmaBridge = false;
++		// DLSS Enabler 4.10.0.26 RC1 features:
++		// Skips 10 real frames when HUD-less/UI composition state toggles to prevent glitched menu transitions
++		std::atomic_bool uiTransitionCooldown = true;
++		// GhostBuster anti-ghosting: resets history on sharp snaps (>45 deg), sudden FOV/ADS jumps, or missing camera MV
++		std::atomic_bool ghostBuster = true;
++		// Allows Vulkan present pacer spinlock to sleep/yield to reduce CPU usage
++		std::atomic_bool pacingSpinlockSleep = false;
++		// Extended XeFG flag overrides: 0 = Auto (game), 1 = Force Off, 2 = Force On
++		std::atomic<int32_t> depthInvertedOverride = 0;
++		std::atomic<int32_t> jitteredMvOverride = 0;
++		// Ignores game-supplied DLSSG.Reset (fixes games that spam Reset=1 every frame; internal safety resets still apply)
++		std::atomic_bool ignoreGameReset = false;
+ 		// Not saved
+ 		std::atomic_bool debugLines = false;
+ 	};
+diff --git a/src/XeFgEnabler.h b/src/XeFgEnabler.h
+new file mode 100644
+index 0000000..52febfe
+--- /dev/null
++++ b/src/XeFgEnabler.h
+@@ -0,0 +1,44 @@
++// Shared GhostBuster anti-ghosting and extended XeFG override helpers inspired by DLSS Enabler 4.10.0.26 RC1.
++// Header-only with zero OS dependencies so both D3D12 (FrameGenerator) and Vulkan (VulkanRuntime) share identical
++// behavior and can be unit-tested offline.
++#pragma once
++
++#include <cmath>
++#include <cstdint>
++
++namespace XeFgEnabler
++{
++	// Tri-state override matching DLSS Enabler XeFG extended settings:
++	// 0 = Auto (keep game value), 1 = Force Off, 2 = Force On.
++	inline bool ApplyTriStateOverride(int32_t mode, bool gameValue) noexcept
++	{
++		if (mode == 1)
++			return false;
++		if (mode == 2)
++			return true;
++		return gameValue;
++	}
++
++	// GhostBuster anti-ghosting guard (DLSS Enabler [GhostBuster]):
++	// Forces a clean XeFG history reset when rapid disocclusion would otherwise leave ghosting trails:
++	// - Sharp single-frame camera rotation snap (> ~45 deg, cos(45 deg) ~= 0.707)
++	// - Sudden FOV / zoom / ADS jump (> 0.25 rad ~= 14.3 deg)
++	// - Missing camera motion in motion vectors (DLSSG.CameraMotionIncluded == 0) combined with camera movement
++	inline bool ShouldGhostBusterReset(bool enabled, bool hasCamera, bool hasPrevCamera, float fwdDot,
++		float curFovRad, float prevFovRad, bool hasPrevFov, bool cameraMotionIncluded, float distSq) noexcept
++	{
++		if (!enabled)
++			return false;
++
++		if (hasCamera && hasPrevCamera && fwdDot < 0.707f)
++			return true;
++
++		if (hasPrevFov && curFovRad > 0.01f && prevFovRad > 0.01f && std::abs(curFovRad - prevFovRad) > 0.25f)
++			return true;
++
++		if (!cameraMotionIncluded && hasCamera && hasPrevCamera && (distSq > 0.25f || fwdDot < 0.985f))
++			return true;
++
++		return false;
++	}
++} // namespace XeFgEnabler
+diff --git a/src/vulkan/VulkanHost.cpp b/src/vulkan/VulkanHost.cpp
+index 399ff8e..f6b5adc 100644
+--- a/src/vulkan/VulkanHost.cpp
++++ b/src/vulkan/VulkanHost.cpp
+@@ -175,7 +175,8 @@ namespace
+ 			return;
+ 
+ 		const uint64_t deadline = NowNs() + waitNs;
+-		constexpr uint64_t SpinTailNs = 1'200'000ull; // 1.2 ms QPC spin tail
++		const bool sleepSpin = Plugin::options.pacingSpinlockSleep.load(std::memory_order_relaxed);
++		const uint64_t SpinTailNs = sleepSpin ? 250'000ull : 1'200'000ull; // 0.25 ms sleep-friendly tail vs 1.2 ms QPC spin tail
+ 
+ 		using CreateWaitableTimerExWFn = HANDLE(WINAPI*)(void*, LPCWSTR, DWORD, DWORD);
+ 		static const auto createTimerEx = [] {
+@@ -214,8 +215,16 @@ namespace
+ 			}
+ 		}
+ 
+-		while (NowNs() < deadline)
+-			YieldProcessor();
++		while (true)
++		{
++			const uint64_t cur = NowNs();
++			if (cur >= deadline)
++				break;
++			if (sleepSpin && (deadline - cur) > 100'000ull)
++				SwitchToThread();
++			else
++				YieldProcessor();
++		}
+ 	}
+ 
+ 	// ----------------------------------------------------------------------------------------------- instance
+diff --git a/src/vulkan/VulkanRuntime.cpp b/src/vulkan/VulkanRuntime.cpp
+index d734b26..f313570 100644
+--- a/src/vulkan/VulkanRuntime.cpp
++++ b/src/vulkan/VulkanRuntime.cpp
+@@ -19,6 +19,7 @@
+ #include "../MfgPort/Cuda/cuda_route.h"
+ #include "../NGX.h"
+ #include "../Plugin.h"
++#include "../XeFgEnabler.h"
+ #include "../VulkanPrograms.h"
+ #include "../XeFG.h"
+ #include "VulkanCoopMat.h"
+@@ -207,7 +208,12 @@ namespace
+ 		// HUD-less mismatch one-shot warning, and consecutive execute-failure stall circuit breaker.
+ 		float prevCameraPos[3]{};
+ 		float prevCameraFwd[3]{};
++		float prevCameraFov = 0.0f;
+ 		bool hasPrevCamera = false;
++		bool hasPrevFov = false;
++		bool hasPrevUiState = false;
++		bool prevUiState = false;
++		uint32_t uiTransitionCooldown = 0;
+ 		std::array<uint32_t, 12> prevSubrects{};
+ 		bool hasPrevSubrects = false;
+ 		bool hudlessMismatchLogged = false;
+@@ -1118,8 +1124,12 @@ namespace
+ 		}
+ 		if (!usableUi(in.ui, false)) in.ui = nullptr;
+ 
+-		const bool inverted = parameters.GetOr<uint32_t>("DLSSG.DepthInverted", 0) != 0;
+-		const bool jittered = parameters.GetOr<uint32_t>("DLSSG.MvecJittered", 0) != 0;
++		const bool inverted = XeFgEnabler::ApplyTriStateOverride(
++			Plugin::options.depthInvertedOverride.load(std::memory_order_relaxed),
++			parameters.GetOr<uint32_t>("DLSSG.DepthInverted", 0) != 0);
++		const bool jittered = XeFgEnabler::ApplyTriStateOverride(
++			Plugin::options.jitteredMvOverride.load(std::memory_order_relaxed),
++			parameters.GetOr<uint32_t>("DLSSG.MvecJittered", 0) != 0);
+ 
+ 		if (!EnsureFeature(d, f, in, inverted, jittered))
+ 			return false;
+@@ -1130,7 +1140,8 @@ namespace
+ 		if (sLastDebugLines.exchange(debugLines ? 1 : 0, std::memory_order_relaxed) != (debugLines ? 1 : 0))
+ 			XeFG::SetDebugLines(debugLines);
+ 
+-		bool reset = parameters.GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
++		const bool ignoreGameReset = Plugin::options.ignoreGameReset.load(std::memory_order_relaxed);
++		bool reset = !ignoreGameReset && (parameters.GetOr<uint32_t>("DLSSG.Reset", 0) != 0);
+ 
+ 		// DRS / Subrect Change Detector (dlssg-0.4.2 M3): force history reset if any active subrect changes
+ 		// between consecutive batches even when the game omits DLSSG.Reset.
+@@ -1153,8 +1164,10 @@ namespace
+ 		f.prevSubrects = curSubrects;
+ 		f.hasPrevSubrects = true;
+ 
+-		// Camera Cut & Teleport Detector (DLSSG-MFG v3.0.1): force history reset on sudden cuts/teleports on Vulkan too.
+-		if (Plugin::options.cameraCutDetection.load(std::memory_order_relaxed))
++		// Camera Cut & Teleport Detector + GhostBuster anti-ghosting
++		const bool camCutOn = Plugin::options.cameraCutDetection.load(std::memory_order_relaxed);
++		const bool ghostBusterOn = Plugin::options.ghostBuster.load(std::memory_order_relaxed);
++		if (camCutOn || ghostBusterOn)
+ 		{
+ 			auto finiteOr = [](float v, float fallback) noexcept { return std::isfinite(v) ? v : fallback; };
+ 			const float px = finiteOr(parameters.GetOr<float>("DLSSG.CameraPosX", 0.0f), 0.0f);
+@@ -1165,27 +1178,42 @@ namespace
+ 			const float fz = finiteOr(parameters.GetOr<float>("DLSSG.CameraFwdZ", 0.0f), 0.0f);
+ 			const float fwdLenSq = fx * fx + fy * fy + fz * fz;
+ 			const bool hasCamera = fwdLenSq > 1e-6f;
++			float curFov = finiteOr(parameters.GetOr<float>("DLSSG.CameraFOV", 0.0f), 0.0f);
++			if (curFov > 10.0f)
++				curFov *= 3.14159265358979323846f / 180.0f;
+ 
+-			if (hasCamera && f.hasPrevCamera && !reset)
++			float distSq = 0.0f;
++			float fwdDot = 1.0f;
++			if (hasCamera && f.hasPrevCamera)
+ 			{
+ 				const float dx = px - f.prevCameraPos[0];
+ 				const float dy = py - f.prevCameraPos[1];
+ 				const float dz = pz - f.prevCameraPos[2];
+-				const float distSq = dx * dx + dy * dy + dz * dz;
+-				constexpr float kCutThresholdSq = 4.5f * 4.5f;
++				distSq = dx * dx + dy * dy + dz * dz;
+ 
+ 				const float prevLenSq = f.prevCameraFwd[0] * f.prevCameraFwd[0] +
+ 					f.prevCameraFwd[1] * f.prevCameraFwd[1] +
+ 					f.prevCameraFwd[2] * f.prevCameraFwd[2];
+-				const float fwdDot = (prevLenSq > 1e-6f)
++				fwdDot = (prevLenSq > 1e-6f)
+ 					? ((fx * f.prevCameraFwd[0] + fy * f.prevCameraFwd[1] + fz * f.prevCameraFwd[2]) /
+ 					   std::sqrt(fwdLenSq * prevLenSq))
+ 					: 1.0f;
+ 
+-				if (distSq > kCutThresholdSq || fwdDot < -0.5f)
++				constexpr float kCutThresholdSq = 4.5f * 4.5f;
++				if (camCutOn && !reset && (distSq > kCutThresholdSq || fwdDot < -0.5f))
+ 					reset = true;
+ 			}
+ 
++			if (ghostBusterOn && !reset)
++			{
++				const bool camMvIncluded = parameters.GetOr<uint32_t>("DLSSG.CameraMotionIncluded", 1) != 0;
++				if (XeFgEnabler::ShouldGhostBusterReset(true, hasCamera, f.hasPrevCamera, fwdDot,
++					curFov, f.prevCameraFov, f.hasPrevFov, camMvIncluded, distSq))
++				{
++					reset = true;
++				}
++			}
++
+ 			if (hasCamera)
+ 			{
+ 				f.prevCameraPos[0] = px;
+@@ -1196,6 +1224,31 @@ namespace
+ 				f.prevCameraFwd[2] = fz;
+ 				f.hasPrevCamera = true;
+ 			}
++			if (curFov > 0.01f)
++			{
++				f.prevCameraFov = curFov;
++				f.hasPrevFov = true;
++			}
++		}
++
++		// UI / HUD-less transition cooldown (DLSS Enabler XeFG): skip 10 batches on HUD-less/UI toggle
++		const bool curUiState = (in.hudless && f.hudlessFormat != DXGI_FORMAT_UNKNOWN) ||
++			(in.ui && f.uiFormat != DXGI_FORMAT_UNKNOWN);
++		if (f.hasPrevUiState && curUiState != f.prevUiState &&
++			Plugin::options.uiTransitionCooldown.load(std::memory_order_relaxed))
++		{
++			f.uiTransitionCooldown = 10u;
++			Log::Info("Vulkan: HUD-less/UI state changed ({} -> {}), skipping interpolation for 10 batches",
++				f.prevUiState, curUiState);
++		}
++		f.prevUiState = curUiState;
++		f.hasPrevUiState = true;
++		if (f.uiTransitionCooldown > 0u)
++		{
++			--f.uiTransitionCooldown;
++			f.havePrevious = false;
++			f.fault = "ui_transition";
++			return false;
+ 		}
+ 
+ 		Slot& slot = f.slots[f.current];
+@@ -1483,6 +1536,7 @@ namespace
+ 				f.generatedThrough = 0;
+ 				f.consecutiveFailures = 0;
+ 				f.stallCooldownBatches = 0;
++				f.uiTransitionCooldown = 0;
+ 				f.paused++;
+ 				VulkanHost::NotifyPaused();
+ 			}
+@@ -1523,7 +1577,7 @@ namespace
+ 				{
+ 					f.havePrevious = false;
+ 					VulkanHost::NotifyPaused();
+-					if (f.fault != "stall_cooldown")
++					if (f.fault != "stall_cooldown" && f.fault != "ui_transition")
+ 					{
+ 						if (++f.failures <= 16)
+ 							Log::Error("Vulkan: batch failed ({}), index {}, count {}", f.fault, index, count);
+-- 
+2.39.5
+
