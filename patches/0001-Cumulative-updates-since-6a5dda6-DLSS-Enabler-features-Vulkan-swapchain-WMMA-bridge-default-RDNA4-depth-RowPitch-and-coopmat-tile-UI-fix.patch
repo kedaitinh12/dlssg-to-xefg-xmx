@@ -1,0 +1,1521 @@
+diff --git a/dlssg-to-xefg.vcxproj b/dlssg-to-xefg.vcxproj
+index f7a0e5d..34c19e1 100644
+--- a/dlssg-to-xefg.vcxproj
++++ b/dlssg-to-xefg.vcxproj
+@@ -118,6 +118,7 @@
+   <ItemGroup>
+     <ClInclude Include="src\D3D12VulkanWmma.h" />
+     <ClInclude Include="src\FrameGenerator.h" />
++    <ClInclude Include="src\XeFgEnabler.h" />
+     <ClInclude Include="src\loader\EarlyLoaderCore.h" />
+     <ClInclude Include="src\Log.h" />
+     <ClInclude Include="src\MfgKernels.h" />
+diff --git a/src/FrameGenerator.cpp b/src/FrameGenerator.cpp
+index 035ba29..47eaabe 100644
+--- a/src/FrameGenerator.cpp
++++ b/src/FrameGenerator.cpp
+@@ -245,8 +245,21 @@ static bool CaptureDepth32Plane0(ID3D12Device* device, ID3D12GraphicsCommandList
+ 	UINT64 dstBytes = 0;
+ 	device->GetCopyableFootprints(&dstDesc, 0, 1, 0, &dstFootprint, nullptr, nullptr, &dstBytes);
+ 
++	const bool validPlane0Fmt =
++		srcFootprint.Footprint.Format == DXGI_FORMAT_R32_TYPELESS ||
++		srcFootprint.Footprint.Format == DXGI_FORMAT_R32_FLOAT ||
++		srcFootprint.Footprint.Format == DXGI_FORMAT_D32_FLOAT;
++	const bool sameDims =
++		srcFootprint.Footprint.Width == dstFootprint.Footprint.Width &&
++		srcFootprint.Footprint.Height == dstFootprint.Footprint.Height &&
++		srcFootprint.Footprint.Depth == dstFootprint.Footprint.Depth &&
++		dstFootprint.Footprint.Width > 0u && dstFootprint.Footprint.Height > 0u;
++	const UINT commonPitch = std::max(srcFootprint.Footprint.RowPitch, dstFootprint.Footprint.RowPitch);
++	const UINT64 rowBytes = static_cast<UINT64>(dstFootprint.Footprint.Width) * 4u;
++
+ 	if (srcBytes == 0 || srcBytes == UINT64_MAX || dstBytes == 0 || dstBytes == UINT64_MAX ||
+-		srcFootprint.Footprint.RowPitch != dstFootprint.Footprint.RowPitch)
++		!validPlane0Fmt || !sameDims || commonPitch < rowBytes ||
++		(commonPitch % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) != 0)
+ 	{
+ 		static std::atomic<bool> logged{ false };
+ 		if (!logged.exchange(true, std::memory_order_relaxed))
+@@ -257,7 +270,15 @@ static bool CaptureDepth32Plane0(ID3D12Device* device, ID3D12GraphicsCommandList
+ 		return false;
+ 	}
+ 
+-	const UINT64 bufBytes = std::max(srcBytes, dstBytes);
++	// AMD RDNA drivers can report a wider RowPitch for R32G8X24 plane 0 than for plain R32_FLOAT
++	// (e.g., 7168 vs 6912 for 1708x960). D3D12 CopyTextureRegion allows any RowPitch >= minimum
++	// that stays aligned to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (256), so share the larger pitch.
++	srcFootprint.Footprint.RowPitch = commonPitch;
++	dstFootprint.Footprint.RowPitch = commonPitch;
++
++	const UINT64 requiredBytes =
++		static_cast<UINT64>(commonPitch) * (dstFootprint.Footprint.Height - 1u) + rowBytes;
++	const UINT64 bufBytes = std::max(std::max(srcBytes, dstBytes), requiredBytes);
+ 	if (scratch && scratch->GetDesc().Width < bufBytes)
+ 	{
+ 		DeferredDestroy::Add(std::make_shared<ComPtr<ID3D12Resource>>(std::move(scratch)));
+@@ -1021,7 +1042,12 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const
+ 	auto mvecs = params.GetOr<ID3D12Resource*>("DLSSG.MVecs", nullptr);
+ 	auto output = params.GetOr<ID3D12Resource*>("DLSSG.OutputInterpolated", nullptr);
+ 
+-	const bool depthInverted = params.GetOr<uint32_t>("DLSSG.DepthInverted", 0) != 0;
++	const bool depthInverted = XeFgEnabler::ApplyTriStateOverride(
++		Plugin::options.depthInvertedOverride.load(std::memory_order_relaxed),
++		params.GetOr<uint32_t>("DLSSG.DepthInverted", 0) != 0);
++	const bool mvecJittered = XeFgEnabler::ApplyTriStateOverride(
++		Plugin::options.jitteredMvOverride.load(std::memory_order_relaxed),
++		params.GetOr<uint32_t>("DLSSG.MvecJittered", 0) != 0);
+ 
+ 	const auto bbDesc = backbuffer->GetDesc();
+ 	const auto backbufferFormat = TypedFormat(bbDesc.Format);
+@@ -1050,7 +1076,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const
+ 	wanted.height = outputDesc.Height;
+ 	wanted.format = TypedFormat(outputDesc.Format);
+ 	wanted.initFlags = (depthInverted ? XEFGD_INIT_FLAG_INVERTED_DEPTH : 0) |
+-		(params.GetOr<uint32_t>("DLSSG.MvecJittered", 0) ? XEFGD_INIT_FLAG_JITTERED_MV : 0);
++		(mvecJittered ? XEFGD_INIT_FLAG_JITTERED_MV : 0);
+ 	wanted.uiMode = hudless ? XEFGD_UI_MODE_BACKBUFFER_HUDLESS : XEFGD_UI_MODE_AUTO;
+ 	wanted.model = PickModel(device.Get());
+ 
+@@ -1249,7 +1275,8 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const
+ 	data.motionVectorScale[0] = (std::isfinite(mvsx) && mvsx != 0.0f) ? mvsx : 1.0f;
+ 	data.motionVectorScale[1] = (std::isfinite(mvsy) && mvsy != 0.0f) ? mvsy : 1.0f;
+ 
+-	bool reset = params.GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
++	const bool ignoreGameReset = Plugin::options.ignoreGameReset.load(std::memory_order_relaxed);
++	bool reset = !ignoreGameReset && (params.GetOr<uint32_t>("DLSSG.Reset", 0) != 0);
+ 
+ 	// Dynamic Resolution / Subrect Change Detector: reset XeFG history if active render/viewport rect changed
+ 	if (captured && previous.valid && !reset)
+@@ -1266,35 +1293,54 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const
+ 		}
+ 	}
+ 
+-	// Camera Cut & Teleport Detector: force history reset on sudden position jumps or sharp orientation snaps
+-	if (Plugin::options.cameraCutDetection.load(std::memory_order_relaxed))
++	// Camera Cut & Teleport Detector + GhostBuster anti-ghosting
++	const bool camCutOn = Plugin::options.cameraCutDetection.load(std::memory_order_relaxed);
++	const bool ghostBusterOn = Plugin::options.ghostBuster.load(std::memory_order_relaxed);
++	if (camCutOn || ghostBusterOn)
+ 	{
+ 		const XMFLOAT3 curPos = GetVector(params, "DLSSG.CameraPosX", "DLSSG.CameraPosY", "DLSSG.CameraPosZ");
+ 		const XMFLOAT3 curFwd = GetVector(params, "DLSSG.CameraFwdX", "DLSSG.CameraFwdY", "DLSSG.CameraFwdZ");
+ 		const float fwdLenSq = curFwd.x * curFwd.x + curFwd.y * curFwd.y + curFwd.z * curFwd.z;
+ 		const bool hasCamera = fwdLenSq > 1e-6f;
+-
+-		if (hasCamera && context->hasPrevCamera && !reset)
++		float curFov = params.GetOr("DLSSG.CameraFOV", 0.0f);
++		if (!std::isfinite(curFov))
++			curFov = 0.0f;
++		if (curFov > 10.0f)
++			curFov *= std::numbers::pi_v<float> / 180.0f;
++
++		float distSq = 0.0f;
++		float fwdDot = 1.0f;
++		if (hasCamera && context->hasPrevCamera)
+ 		{
+ 			const float dx = curPos.x - context->prevCameraPos[0];
+ 			const float dy = curPos.y - context->prevCameraPos[1];
+ 			const float dz = curPos.z - context->prevCameraPos[2];
+-			const float distSq = dx * dx + dy * dy + dz * dz;
+-			constexpr float kCutThresholdSq = 4.5f * 4.5f;
++			distSq = dx * dx + dy * dy + dz * dz;
+ 
+ 			const float invCur = 1.0f / std::sqrt(fwdLenSq);
+ 			const float prevLenSq = context->prevCameraFwd[0] * context->prevCameraFwd[0] +
+ 				context->prevCameraFwd[1] * context->prevCameraFwd[1] +
+ 				context->prevCameraFwd[2] * context->prevCameraFwd[2];
+-			const float fwdDot = (prevLenSq > 1e-6f)
++			fwdDot = (prevLenSq > 1e-6f)
+ 				? ((curFwd.x * context->prevCameraFwd[0] + curFwd.y * context->prevCameraFwd[1] +
+ 				    curFwd.z * context->prevCameraFwd[2]) * invCur / std::sqrt(prevLenSq))
+ 				: 1.0f;
+ 
+-			if (distSq > kCutThresholdSq || fwdDot < -0.5f)
++			constexpr float kCutThresholdSq = 4.5f * 4.5f;
++			if (camCutOn && !reset && (distSq > kCutThresholdSq || fwdDot < -0.5f))
+ 				reset = true;
+ 		}
+ 
++		if (ghostBusterOn && !reset)
++		{
++			const bool camMvIncluded = params.GetOr<uint32_t>("DLSSG.CameraMotionIncluded", 1) != 0;
++			if (XeFgEnabler::ShouldGhostBusterReset(true, hasCamera, context->hasPrevCamera, fwdDot,
++				curFov, context->prevCameraFov, context->hasPrevFov, camMvIncluded, distSq))
++			{
++				reset = true;
++			}
++		}
++
+ 		if (hasCamera)
+ 		{
+ 			context->prevCameraPos[0] = curPos.x;
+@@ -1305,11 +1351,32 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const
+ 			context->prevCameraFwd[2] = curFwd.z;
+ 			context->hasPrevCamera = true;
+ 		}
++		if (curFov > 0.01f)
++		{
++			context->prevCameraFov = curFov;
++			context->hasPrevFov = true;
++		}
+ 	}
+ 
+-	// Force history reset if HUD-less presence toggles between frames (network source switch, dlssg-0.4.2 M3)
++	// Force history reset + 10-frame UI transition cooldown if HUD-less presence toggles (DLSS Enabler XeFG_Dx12)
+ 	if (captured && previous.valid && (frame.hudless != nullptr) != (previous.hudless != nullptr))
++	{
++		reset = true;
++		if (Plugin::options.uiTransitionCooldown.load(std::memory_order_relaxed))
++		{
++			context->uiTransitionCooldown = 10u;
++			Log::Info("HUD-less state changed ({} -> {}), skipping interpolation for 10 frames",
++				previous.hudless != nullptr, frame.hudless != nullptr);
++		}
++	}
++
++	bool inUiCooldown = false;
++	if (context->uiTransitionCooldown > 0u)
++	{
++		--context->uiTransitionCooldown;
++		inUiCooldown = true;
+ 		reset = true;
++	}
+ 
+ 	if (reset)
+ 	{
+@@ -1320,7 +1387,8 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const
+ 	data.resetHistory = reset;
+ 
+ 	// XeFG needs both frames to have hudless or neither
+-	context->pairValid = captured && previous.valid && !reset && (frame.hudless != nullptr) == (previous.hudless != nullptr);
++	context->pairValid = captured && previous.valid && !reset && !inUiCooldown &&
++		(frame.hudless != nullptr) == (previous.hudless != nullptr);
+ 	context->batchGeneratedThrough = 0;
+ 	context->directOutput = false;
+ 	frame.valid = captured;
+@@ -1498,6 +1566,7 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
+ 			context->pairValid = false;
+ 			context->consecutiveExecuteFailures = 0;
+ 			context->stallCooldownEvaluations = 0;
++			context->uiTransitionCooldown = 0;
+ 		}
+ 
+ 		if (output)
+diff --git a/src/FrameGenerator.h b/src/FrameGenerator.h
+index dcd2cab..4241aeb 100644
+--- a/src/FrameGenerator.h
++++ b/src/FrameGenerator.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "NGX.h"
++#include "XeFgEnabler.h"
+ #include "XeFG.h"
+ 
+ #include <dxgi1_4.h>
+@@ -70,10 +71,15 @@ private:
+ 		// Tracks whether cached frame/output copies were allocated with D3D12_HEAP_FLAG_SHARED for Vulkan WMMA
+ 		bool sharedTexturesMode = false;
+ 
+-		// Camera Cut & Teleport Detector state (prevents smearing on sudden cuts/teleports)
++		// Camera Cut & Teleport Detector + GhostBuster state (prevents smearing/ghosting on cuts, snaps, FOV jumps)
+ 		float prevCameraPos[3]{};
+ 		float prevCameraFwd[3]{};
++		float prevCameraFov = 0.0f;
+ 		bool hasPrevCamera = false;
++		bool hasPrevFov = false;
++
++		// UI / HUD-less transition cooldown (DLSS Enabler XeFG: skip 10 real frames on state toggle)
++		uint32_t uiTransitionCooldown = 0;
+ 
+ 		// Stall circuit breaker (dlssg-0.4.2): bypass XeFG temporarily after 3 consecutive Execute failures
+ 		uint32_t consecutiveExecuteFailures = 0;
+diff --git a/src/Plugin.cpp b/src/Plugin.cpp
+index 95ff9aa..1eb9890 100644
+--- a/src/Plugin.cpp
++++ b/src/Plugin.cpp
+@@ -9,6 +9,7 @@
+ #include "optiscaler_plugin.h"
+ #include "vulkan/VulkanPolicy.h"
+ 
++#include <algorithm>
+ #include <filesystem>
+ #include <format>
+ #include <mutex>
+@@ -506,16 +507,80 @@ namespace
+ 		}
+ 
+ 		api->ItemTooltip("Routes D3D12 WMMA batches through a private Vulkan VK_KHR_cooperative_matrix device\n"
+-						 "(takes effect on next game launch, or set XEFG_D3D12_VULKAN_WMMA=1).\n"
+-						 "Off by default to use freeze-free D3D12 cs_6_6 WMMA overrides without duplicate VRAM\n"
++						 "(takes effect on next game launch; set XEFG_D3D12_VULKAN_WMMA=0 to force off).\n"
++						 "On by default; disable to fall back to D3D12 cs_6_6 WMMA overrides without duplicate VRAM\n"
+ 						 "or OptiScaler Vulkan_wDx12 hook interference. Saved as D3D12VulkanWmmaBridge.");
+ 
++		bool uiCooldown = Plugin::options.uiTransitionCooldown;
++
++		if (api->Checkbox("UI / HUDless transition guard (10 frames)", &uiCooldown))
++		{
++			Plugin::options.uiTransitionCooldown = uiCooldown;
++			api->SetBool(self, "UiTransitionCooldown", uiCooldown);
++		}
++
++		api->ItemTooltip("Skips interpolation for 10 frames whenever HUD-less or UI composition state toggles "
++						 "(from DLSS Enabler XeFG) to prevent glitched menu/overlay transition frames. Saved as UiTransitionCooldown.");
++
++		bool ghostBuster = Plugin::options.ghostBuster;
++
++		if (api->Checkbox("GhostBuster anti-ghosting", &ghostBuster))
++		{
++			Plugin::options.ghostBuster = ghostBuster;
++			api->SetBool(self, "GhostBuster", ghostBuster);
++		}
++
++		api->ItemTooltip("Tightens disocclusion history resets on sharp camera snaps (>45 deg), sudden FOV/ADS jumps, "
++						 "and missing camera motion vectors (from DLSS Enabler GhostBuster). Saved as GhostBuster.");
++
++		bool spinSleep = Plugin::options.pacingSpinlockSleep;
++
++		if (api->Checkbox("Pacing spinlock sleep (lower CPU)", &spinSleep))
++		{
++			Plugin::options.pacingSpinlockSleep = spinSleep;
++			api->SetBool(self, "PacingSpinlockSleep", spinSleep);
++		}
++
++		api->ItemTooltip("Shrinks the Vulkan pacer spin tail and yields the thread while waiting, reducing CPU usage "
++						 "(from DLSS Enabler). Saved as PacingSpinlockSleep.");
++
+ 		bool debugLines = Plugin::options.debugLines;
+ 
+ 		if (api->Checkbox("Debug lines", &debugLines))
+ 			Plugin::options.debugLines = debugLines;
+ 
+ 		api->ItemTooltip("XeFG draws debug lines into the frames it generated. Not saved.");
++
++		api->Section("Extended XeFG Overrides");
++
++		static constexpr const char* TriStateNames[] = { "Auto (Game)", "Force Off", "Force On" };
++
++		int32_t depthOv = Plugin::options.depthInvertedOverride.load();
++		if (api->Combo("Depth inverted", &depthOv, TriStateNames, 3, nullptr))
++		{
++			Plugin::options.depthInvertedOverride = depthOv;
++			api->SetInt(self, "DepthInvertedOverride", depthOv);
++		}
++		api->ItemTooltip("Overrides XeFG DepthInverted flag when a game reports inverted depth incorrectly. "
++						 "Saved as DepthInvertedOverride.");
++
++		int32_t jitterOv = Plugin::options.jitteredMvOverride.load();
++		if (api->Combo("Jittered motion vectors", &jitterOv, TriStateNames, 3, nullptr))
++		{
++			Plugin::options.jitteredMvOverride = jitterOv;
++			api->SetInt(self, "JitteredMvOverride", jitterOv);
++		}
++		api->ItemTooltip("Overrides XeFG JitteredMV flag when a game misreports motion-vector jitter. "
++						 "Saved as JitteredMvOverride.");
++
++		bool ignoreReset = Plugin::options.ignoreGameReset;
++		if (api->Checkbox("Ignore game Reset signals", &ignoreReset))
++		{
++			Plugin::options.ignoreGameReset = ignoreReset;
++			api->SetBool(self, "IgnoreGameReset", ignoreReset);
++		}
++		api->ItemTooltip("Ignores DLSSG.Reset=1 from games that spam reset every frame. Internal safety resets "
++						 "(subrect change, camera cut, HUD-less toggle) still run. Saved as IgnoreGameReset.");
+ 	}
+ 
+ 	void DrawTab(void*)
+@@ -749,6 +814,12 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* optiAp
+ 	Plugin::options.vramGuard = api->GetBool(self, "VramGuard", Plugin::options.vramGuard);
+ 	Plugin::options.autoVrrPacing = api->GetBool(self, "AutoVrrPacing", Plugin::options.autoVrrPacing);
+ 	Plugin::options.d3d12VulkanWmmaBridge = api->GetBool(self, "D3D12VulkanWmmaBridge", Plugin::options.d3d12VulkanWmmaBridge);
++	Plugin::options.uiTransitionCooldown = api->GetBool(self, "UiTransitionCooldown", Plugin::options.uiTransitionCooldown);
++	Plugin::options.ghostBuster = api->GetBool(self, "GhostBuster", Plugin::options.ghostBuster);
++	Plugin::options.pacingSpinlockSleep = api->GetBool(self, "PacingSpinlockSleep", Plugin::options.pacingSpinlockSleep);
++	Plugin::options.depthInvertedOverride = std::clamp(api->GetInt(self, "DepthInvertedOverride", 0), 0, 2);
++	Plugin::options.jitteredMvOverride = std::clamp(api->GetInt(self, "JitteredMvOverride", 0), 0, 2);
++	Plugin::options.ignoreGameReset = api->GetBool(self, "IgnoreGameReset", Plugin::options.ignoreGameReset);
+ 
+ 	// Off in OptiScaler.ini, the Vulkan hooks aren't installed. Said before they are, and a copy started by
+ 	// InitializeASI that has installed them already only passes the game's calls on from here
+diff --git a/src/Plugin.h b/src/Plugin.h
+index 03644c0..0efef1e 100644
+--- a/src/Plugin.h
++++ b/src/Plugin.h
+@@ -33,9 +33,21 @@ namespace Plugin
+ 		std::atomic_bool vramGuard = true;
+ 		// Caps Vulkan present pacer cadence to (DisplayHz - 3) to stay inside the VRR/G-Sync/FreeSync window
+ 		std::atomic_bool autoVrrPacing = false;
+-		// Experimental D3D12->Vulkan VK_KHR_cooperative_matrix bridge (default off: D3D12 cs_6_6 WMMA overrides run without
+-		// allocating a duplicate Vulkan XeFG context or triggering OptiScaler Vulkan_wDx12 hooks on DX12 games)
+-		std::atomic_bool d3d12VulkanWmmaBridge = false;
++		// Experimental D3D12->Vulkan VK_KHR_cooperative_matrix bridge (default on; disable in OptiScaler menu or via
++		// XEFG_D3D12_VULKAN_WMMA=0 to fall back to D3D12 cs_6_6 WMMA overrides if a game freezes or conflicts with hooks)
++		std::atomic_bool d3d12VulkanWmmaBridge = true;
++		// DLSS Enabler 4.10.0.26 RC1 features:
++		// Skips 10 real frames when HUD-less/UI composition state toggles to prevent glitched menu transitions
++		std::atomic_bool uiTransitionCooldown = true;
++		// GhostBuster anti-ghosting: resets history on sharp snaps (>45 deg), sudden FOV/ADS jumps, or missing camera MV
++		std::atomic_bool ghostBuster = true;
++		// Allows Vulkan present pacer spinlock to sleep/yield to reduce CPU usage
++		std::atomic_bool pacingSpinlockSleep = false;
++		// Extended XeFG flag overrides: 0 = Auto (game), 1 = Force Off, 2 = Force On
++		std::atomic<int32_t> depthInvertedOverride = 0;
++		std::atomic<int32_t> jitteredMvOverride = 0;
++		// Ignores game-supplied DLSSG.Reset (fixes games that spam Reset=1 every frame; internal safety resets still apply)
++		std::atomic_bool ignoreGameReset = false;
+ 		// Not saved
+ 		std::atomic_bool debugLines = false;
+ 	};
+diff --git a/src/XeFgEnabler.h b/src/XeFgEnabler.h
+new file mode 100644
+index 0000000..52febfe
+--- /dev/null
++++ b/src/XeFgEnabler.h
+@@ -0,0 +1,44 @@
++// Shared GhostBuster anti-ghosting and extended XeFG override helpers inspired by DLSS Enabler 4.10.0.26 RC1.
++// Header-only with zero OS dependencies so both D3D12 (FrameGenerator) and Vulkan (VulkanRuntime) share identical
++// behavior and can be unit-tested offline.
++#pragma once
++
++#include <cmath>
++#include <cstdint>
++
++namespace XeFgEnabler
++{
++	// Tri-state override matching DLSS Enabler XeFG extended settings:
++	// 0 = Auto (keep game value), 1 = Force Off, 2 = Force On.
++	inline bool ApplyTriStateOverride(int32_t mode, bool gameValue) noexcept
++	{
++		if (mode == 1)
++			return false;
++		if (mode == 2)
++			return true;
++		return gameValue;
++	}
++
++	// GhostBuster anti-ghosting guard (DLSS Enabler [GhostBuster]):
++	// Forces a clean XeFG history reset when rapid disocclusion would otherwise leave ghosting trails:
++	// - Sharp single-frame camera rotation snap (> ~45 deg, cos(45 deg) ~= 0.707)
++	// - Sudden FOV / zoom / ADS jump (> 0.25 rad ~= 14.3 deg)
++	// - Missing camera motion in motion vectors (DLSSG.CameraMotionIncluded == 0) combined with camera movement
++	inline bool ShouldGhostBusterReset(bool enabled, bool hasCamera, bool hasPrevCamera, float fwdDot,
++		float curFovRad, float prevFovRad, bool hasPrevFov, bool cameraMotionIncluded, float distSq) noexcept
++	{
++		if (!enabled)
++			return false;
++
++		if (hasCamera && hasPrevCamera && fwdDot < 0.707f)
++			return true;
++
++		if (hasPrevFov && curFovRad > 0.01f && prevFovRad > 0.01f && std::abs(curFovRad - prevFovRad) > 0.25f)
++			return true;
++
++		if (!cameraMotionIncluded && hasCamera && hasPrevCamera && (distSq > 0.25f || fwdDot < 0.985f))
++			return true;
++
++		return false;
++	}
++} // namespace XeFgEnabler
+diff --git a/src/vulkan/D3D12VulkanWmma.cpp b/src/vulkan/D3D12VulkanWmma.cpp
+index 3ccf818..fcc7338 100644
+--- a/src/vulkan/D3D12VulkanWmma.cpp
++++ b/src/vulkan/D3D12VulkanWmma.cpp
+@@ -18,6 +18,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <chrono>
+ #include <cstring>
+ #include <mutex>
+ #include <string>
+@@ -176,6 +177,7 @@ struct PostCopyRing
+ struct Bridge
+ {
+ 	std::mutex mutex;
++	std::mutex reasonMutex;
+ 	std::atomic<bool> active{ false };
+ 	bool attempted = false;
+ 	std::string reason = "not_attempted";
+@@ -933,7 +935,10 @@ bool Install(ID3D12Device* d3dDevice, std::string& reason) noexcept
+ 	gBridge.attempted = true;
+ 
+ 	auto fail = [&](const char* code) -> bool {
+-		gBridge.reason = code;
++		{
++			std::lock_guard rlock(gBridge.reasonMutex);
++			gBridge.reason = code;
++		}
+ 		reason = code;
+ 		gBridge.active.store(false, std::memory_order_release);
+ 		return false;
+@@ -943,7 +948,7 @@ bool Install(ID3D12Device* d3dDevice, std::string& reason) noexcept
+ 	if (VulkanPolicy::IsOffWord(envBridge))
+ 		return fail("environment_off");
+ 	if (!VulkanPolicy::IsOnWord(envBridge) && !Plugin::options.d3d12VulkanWmmaBridge.load(std::memory_order_acquire))
+-		return fail("disabled_by_default");
++		return fail("disabled_in_options");
+ 
+ 	if (!d3dDevice)
+ 		return fail("no_d3d12_device");
+@@ -1262,7 +1267,10 @@ bool Install(ID3D12Device* d3dDevice, std::string& reason) noexcept
+ 	gBridge.tileN = static_cast<uint32_t>((coopStatus.minor >> 8) & 0xFF);
+ 	gBridge.tileK = static_cast<uint32_t>(coopStatus.minor & 0xFF);
+ 	gBridge.coopLayers = coopStatus.layers;
+-	gBridge.reason.clear();
++	{
++		std::lock_guard rlock(gBridge.reasonMutex);
++		gBridge.reason.clear();
++	}
+ 	gBridge.active.store(true, std::memory_order_release);
+ 
+ 	Log::Info("D3D12->Vulkan WMMA bridge ready (vendor {:#06x}, queue family {}, VK_KHR_cooperative_matrix {}x{}x{} s8->s32, {} hardware WMMA shaders)",
+@@ -1282,46 +1290,61 @@ bool SameContextSettings(const ContextSettings& a, const ContextSettings& b) noe
+ 
+ bool EnsureContext(const ContextSettings& settings) noexcept
+ {
+-	std::lock_guard lock(gBridge.mutex);
+-	if (!gBridge.active.load(std::memory_order_acquire) || !gBridge.xvkDevice)
+-		return false;
+-
+-	if (gBridge.xefgContext && SameContextSettings(gBridge.contextSettings, settings))
+-		return true;
+-
+-	if (gBridge.contextFailed && SameContextSettings(gBridge.failedContextSettings, settings))
+-		return false;
++	const auto tStart = std::chrono::steady_clock::now();
++	auto elapsedMs = [&]() noexcept -> long long {
++		return std::chrono::duration_cast<std::chrono::milliseconds>(
++			std::chrono::steady_clock::now() - tStart).count();
++	};
+ 
+ 	auto markFailed = [&]() noexcept {
++		std::lock_guard lock(gBridge.mutex);
+ 		gBridge.contextFailed = true;
+ 		gBridge.failedContextSettings = settings;
+ 		return false;
+ 	};
+ 
+-	// Drain in-flight Vulkan work with a bounded timeout so destroying any prior context and
+-	// reusing cmdBufs[0] for XeFG::Init weight uploads can never hang indefinitely.
+-	gBridge.contextReady.store(false, std::memory_order_release);
+-	if (!DrainVulkanQueueLocked(500'000'000ull))
++	// Never hold gBridge.mutex across XeFG::CreateContext / XeFG::Init / vkQueueSubmit2 / vkWaitForFences
++	// so UI/render threads calling Snapshot() or ForgetResource() can never stall on async init.
++	xefgd_handle_t oldCtx = nullptr;
++	VkCommandBuffer initCmd = VK_NULL_HANDLE;
+ 	{
+-		Log::Warn("D3D12->Vulkan WMMA bridge: timed out draining prior Vulkan work, disabling bridge and falling back to D3D12");
+-		gBridge.active.store(false, std::memory_order_release);
+-		return markFailed();
+-	}
+-	for (uint32_t i = 0; i < kRingSize; ++i)
+-		gBridge.vkSlotDoneFence[i] = 0;
++		std::lock_guard lock(gBridge.mutex);
++		if (!gBridge.active.load(std::memory_order_acquire) || !gBridge.xvkDevice)
++			return false;
+ 
+-	if (gBridge.xefgContext)
+-	{
+-		XeFG::Destroy(gBridge.xefgContext);
++		if (gBridge.xefgContext && SameContextSettings(gBridge.contextSettings, settings))
++			return true;
++
++		if (gBridge.contextFailed && SameContextSettings(gBridge.failedContextSettings, settings))
++			return false;
++
++		// Drain in-flight Vulkan work with a bounded timeout so destroying any prior context and
++		// reusing cmdBufs[0] for XeFG::Init weight uploads can never hang indefinitely.
++		gBridge.contextReady.store(false, std::memory_order_release);
++		if (!DrainVulkanQueueLocked(500'000'000ull))
++		{
++			Log::Warn("D3D12->Vulkan WMMA bridge: timed out draining prior Vulkan work, disabling bridge and falling back to D3D12");
++			gBridge.active.store(false, std::memory_order_release);
++			gBridge.contextFailed = true;
++			gBridge.failedContextSettings = settings;
++			return false;
++		}
++		for (uint32_t i = 0; i < kRingSize; ++i)
++			gBridge.vkSlotDoneFence[i] = 0;
++
++		oldCtx = gBridge.xefgContext;
+ 		gBridge.xefgContext = nullptr;
++		initCmd = gBridge.cmdBufs[0];
+ 	}
+ 
++	if (oldCtx)
++		XeFG::Destroy(oldCtx);
++
+ 	XeFG::OverrideModel(settings.model);
+ 
+ 	// Recorded xvk devices require an open VkCommandBuffer + xvk::BeginRecording()
+ 	// during XeFG::Init because libxess_fg creates internal command lists to upload
+ 	// neural network weights and initialize resources.
+-	VkCommandBuffer initCmd = gBridge.cmdBufs[0];
+ 	gBridge.vkResetCommandBuffer(initCmd, 0);
+ 	VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+ 	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+@@ -1338,16 +1361,20 @@ bool EnsureContext(const ContextSettings& settings) noexcept
+ 		return markFailed();
+ 	}
+ 
++	Log::Info("D3D12->Vulkan WMMA bridge: async init start ({}x{}, format {}, model {})",
++		settings.width, settings.height, static_cast<uint32_t>(settings.format), settings.model);
++
+ 	xefgd_handle_t ctx = nullptr;
+ 	const xefgd_result_t createRes = XeFG::CreateContext(gBridge.xvkDevice.Get(), &ctx);
+ 	if (createRes != XEFGD_RESULT_SUCCESS || !ctx)
+ 	{
+ 		xvk::EndRecording(gBridge.xvkDevice.Get());
+ 		gBridge.vkEndCommandBuffer(initCmd);
+-		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::CreateContext failed (result {}), falling back to D3D12",
+-			static_cast<int>(createRes));
++		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::CreateContext failed (result {}, {} ms), falling back to D3D12",
++			static_cast<int>(createRes), elapsedMs());
+ 		return markFailed();
+ 	}
++	Log::Info("D3D12->Vulkan WMMA bridge: XeFG::CreateContext ok ({} ms), starting XeFG::Init", elapsedMs());
+ 
+ 	xefgd_init_params_t init{};
+ 	init.outputResolution = { settings.width, settings.height };
+@@ -1359,14 +1386,15 @@ bool EnsureContext(const ContextSettings& settings) noexcept
+ 	init.uiMode = settings.uiMode;
+ 
+ 	const xefgd_result_t initRes = XeFG::Init(ctx, init);
++	Log::Info("D3D12->Vulkan WMMA bridge: XeFG::Init returned {} ({} ms)", static_cast<int>(initRes), elapsedMs());
+ 	xvk::EndRecording(gBridge.xvkDevice.Get());
+ 	const VkResult endRes = gBridge.vkEndCommandBuffer(initCmd);
+ 
+ 	if (initRes != XEFGD_RESULT_SUCCESS || endRes != VK_SUCCESS)
+ 	{
+ 		XeFG::Destroy(ctx);
+-		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init failed (result {}, vkEnd {}), falling back to D3D12",
+-			static_cast<int>(initRes), static_cast<int>(endRes));
++		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init failed (result {}, vkEnd {}, {} ms), falling back to D3D12",
++			static_cast<int>(initRes), static_cast<int>(endRes), elapsedMs());
+ 		return markFailed();
+ 	}
+ 
+@@ -1389,14 +1417,15 @@ bool EnsureContext(const ContextSettings& settings) noexcept
+ 	submitInfo.commandBufferInfoCount = 1;
+ 	submitInfo.pCommandBufferInfos = &cmdInfo;
+ 
+-	Log::Info("D3D12->Vulkan WMMA bridge: submitting XeFG::Init weight upload on queue family {}", gBridge.queueFamily);
++	Log::Info("D3D12->Vulkan WMMA bridge: submitting XeFG::Init weight upload on queue family {} ({} ms)",
++		gBridge.queueFamily, elapsedMs());
+ 	const VkResult subRes = gBridge.vkQueueSubmit2(gBridge.queue, 1, &submitInfo, initFence);
+ 	if (subRes != VK_SUCCESS)
+ 	{
+ 		gBridge.vkDestroyFence(gBridge.device, initFence, nullptr);
+ 		XeFG::Destroy(ctx);
+-		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init vkQueueSubmit2 failed (result {}), falling back to D3D12",
+-			static_cast<int>(subRes));
++		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init vkQueueSubmit2 failed (result {}, {} ms), falling back to D3D12",
++			static_cast<int>(subRes), elapsedMs());
+ 		return markFailed();
+ 	}
+ 
+@@ -1404,8 +1433,8 @@ bool EnsureContext(const ContextSettings& settings) noexcept
+ 	if (waitRes != VK_SUCCESS)
+ 	{
+ 		// Do not destroy initFence while the GPU submission may still be in flight.
+-		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init vkWaitForFences timed out/failed (result {}), disabling bridge and falling back to D3D12",
+-			static_cast<int>(waitRes));
++		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init vkWaitForFences timed out/failed (result {}, {} ms), disabling bridge and falling back to D3D12",
++			static_cast<int>(waitRes), elapsedMs());
+ 		gBridge.active.store(false, std::memory_order_release);
+ 		gBridge.contextReady.store(false, std::memory_order_release);
+ 		return markFailed();
+@@ -1418,12 +1447,15 @@ bool EnsureContext(const ContextSettings& settings) noexcept
+ 		return false;
+ 	}
+ 
+-	gBridge.xefgContext = ctx;
+-	gBridge.contextSettings = settings;
+-	gBridge.contextFailed = false;
++	{
++		std::lock_guard lock(gBridge.mutex);
++		gBridge.xefgContext = ctx;
++		gBridge.contextSettings = settings;
++		gBridge.contextFailed = false;
++	}
+ 	gBridge.contextReady.store(true, std::memory_order_release);
+-	Log::Info("D3D12->Vulkan WMMA bridge context ready: {}x{}, format {}, model {}, {}x{}x{} hardware WMMA",
+-		settings.width, settings.height, static_cast<uint32_t>(settings.format), settings.model,
++	Log::Info("D3D12->Vulkan WMMA bridge context ready ({} ms): {}x{}, format {}, model {}, {}x{}x{} hardware WMMA",
++		elapsedMs(), settings.width, settings.height, static_cast<uint32_t>(settings.format), settings.model,
+ 		gBridge.tileM, gBridge.tileN, gBridge.tileK);
+ 	return true;
+ }
+@@ -1613,7 +1645,7 @@ Status Snapshot() noexcept
+ 	s.batches = gBridge.batches.load(std::memory_order_relaxed);
+ 	s.fallbacks = gBridge.fallbacks.load(std::memory_order_relaxed);
+ 	{
+-		std::lock_guard lock(gBridge.mutex);
++		std::lock_guard lock(gBridge.reasonMutex);
+ 		s.reason = gBridge.reason;
+ 	}
+ 	return s;
+diff --git a/src/vulkan/VulkanHost.cpp b/src/vulkan/VulkanHost.cpp
+index 399ff8e..ebe6018 100644
+--- a/src/vulkan/VulkanHost.cpp
++++ b/src/vulkan/VulkanHost.cpp
+@@ -65,6 +65,7 @@ namespace
+ 		using DestroyInstanceFn = void(VKAPI_PTR*)(VkInstance, const VkAllocationCallbacks*);
+ 
+ 		PFN_vkGetInstanceProcAddr loaderGipa = nullptr;
++		PFN_vkGetDeviceProcAddr loaderGdpa = nullptr;
+ 		PFN_vkCreateInstance createInstance = nullptr;
+ 		DestroyInstanceFn destroyInstance = nullptr;
+ 		PFN_vkCreateDevice createDevice = nullptr;
+@@ -74,14 +75,24 @@ namespace
+ 		void* rawCreateInstance = nullptr;
+ 		void* rawDestroyInstance = nullptr;
+ 		void* rawCreateDevice = nullptr;
++		void* rawGetDeviceProcAddr = nullptr;
+ 		void* rawCreateSwapchain = nullptr;
+ 		void* rawDestroySwapchain = nullptr;
+ 		void* rawQueuePresent = nullptr;
+ 		std::atomic<PFN_vkCreateInstance> gipaCreateInstance = nullptr;
+ 		std::atomic<DestroyInstanceFn> gipaDestroyInstance = nullptr;
+ 		std::atomic<PFN_vkCreateDevice> gipaCreateDevice = nullptr;
++		std::atomic<PFN_vkGetDeviceProcAddr> gipaGetDeviceProcAddr = nullptr;
++		std::atomic<PFN_vkCreateSwapchainKHR> gipaCreateSwapchain = nullptr;
++		std::atomic<PFN_vkDestroySwapchainKHR> gipaDestroySwapchain = nullptr;
++		std::atomic<PFN_vkQueuePresentKHR> gipaQueuePresent = nullptr;
++		std::atomic<PFN_vkCreateSwapchainKHR> gdpaCreateSwapchain = nullptr;
++		std::atomic<PFN_vkDestroySwapchainKHR> gdpaDestroySwapchain = nullptr;
++		std::atomic<PFN_vkQueuePresentKHR> gdpaQueuePresent = nullptr;
+ 		bool gipaHooked = false;
+-		bool presentHooked = false;
++		bool gdpaHooked = false;
++		std::atomic_bool presentHooked = false;
++		std::atomic_bool gdpaPresentLogged = false;
+ 		HMODULE(WINAPI* loadLibraryExW)(LPCWSTR, HANDLE, DWORD) = nullptr;
+ 
+ 		// Dedicated lock for low-overhead present pacing
+@@ -152,6 +163,18 @@ namespace
+ 		return !s.hwPacingActive.load(std::memory_order_relaxed);
+ 	}
+ 
++	uint32_t GetSwapchainBufferTarget() noexcept
++	{
++		static const uint32_t target = [] {
++			wchar_t value[32]{};
++			const DWORD len = GetEnvironmentVariableW(L"XEFG_VK_SWAPCHAIN_BUFFERS", value, 32);
++			if (len && len < 32)
++				return VulkanPolicy::ParseSwapchainBufferTarget(std::wstring_view(value, len), 8u);
++			return 8u;
++		}();
++		return target;
++	}
++
+ 	uint64_t NowNs() noexcept
+ 	{
+ 		static const uint64_t freq = [] {
+@@ -175,7 +198,8 @@ namespace
+ 			return;
+ 
+ 		const uint64_t deadline = NowNs() + waitNs;
+-		constexpr uint64_t SpinTailNs = 1'200'000ull; // 1.2 ms QPC spin tail
++		const bool sleepSpin = Plugin::options.pacingSpinlockSleep.load(std::memory_order_relaxed);
++		const uint64_t SpinTailNs = sleepSpin ? 250'000ull : 1'200'000ull; // 0.25 ms sleep-friendly tail vs 1.2 ms QPC spin tail
+ 
+ 		using CreateWaitableTimerExWFn = HANDLE(WINAPI*)(void*, LPCWSTR, DWORD, DWORD);
+ 		static const auto createTimerEx = [] {
+@@ -214,8 +238,16 @@ namespace
+ 			}
+ 		}
+ 
+-		while (NowNs() < deadline)
+-			YieldProcessor();
++		while (true)
++		{
++			const uint64_t cur = NowNs();
++			if (cur >= deadline)
++				break;
++			if (sleepSpin && (deadline - cur) > 100'000ull)
++				SwitchToThread();
++			else
++				YieldProcessor();
++		}
+ 	}
+ 
+ 	// ----------------------------------------------------------------------------------------------- instance
+@@ -1138,7 +1170,66 @@ namespace
+ 			return next(device, info, allocator, swapchain);
+ 
+ 		ReentryGuard guard(inCreateSwapchain);
+-		const VkResult result = next(device, info, allocator, swapchain);
++
++		const VkSwapchainCreateInfoKHR* usedInfo = info;
++		VkSwapchainCreateInfoKHR edited{};
++		uint32_t capMin = 0, capMax = 0;
++		bool boosted = false;
++
++		const uint32_t targetBuffers = GetSwapchainBufferTarget();
++		if (targetBuffers >= 6u && info && info->minImageCount >= 6u && info->minImageCount < targetBuffers &&
++			info->surface && S().prepared.load(std::memory_order_relaxed) > 0)
++		{
++			VulkanHost::DeviceRecord record{};
++			bool foundDevice = false;
++			{
++				State& s = S();
++				std::lock_guard lock(s.mutex);
++				const auto it = s.devices.find(device);
++				if (it != s.devices.end())
++				{
++					record = it->second;
++					foundDevice = true;
++				}
++			}
++			if (foundDevice && record.gipa && record.instance && record.physical)
++			{
++				auto getCaps = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(
++					record.gipa(record.instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
++				VkSurfaceCapabilitiesKHR caps{};
++				if (getCaps && getCaps(record.physical, info->surface, &caps) == VK_SUCCESS)
++				{
++					capMin = caps.minImageCount;
++					capMax = caps.maxImageCount;
++					const uint32_t recommended = VulkanPolicy::RecommendSwapchainImageCount(
++						info->minImageCount, capMin, capMax, targetBuffers);
++					if (recommended > info->minImageCount)
++					{
++						edited = *info;
++						edited.minImageCount = recommended;
++						usedInfo = &edited;
++						boosted = true;
++					}
++				}
++			}
++		}
++
++		VkResult result = next(device, usedInfo, allocator, swapchain);
++
++		if (boosted)
++		{
++			if (result == VK_SUCCESS)
++			{
++				Log::Info("Vulkan swapchain: raised minImageCount {} -> {} (surface caps {}..{}, presentMode {})",
++					info->minImageCount, edited.minImageCount, capMin, capMax, static_cast<int>(info->presentMode));
++			}
++			else
++			{
++				Log::Warn("Vulkan swapchain: driver refused minImageCount {} ({}), retrying with original {}",
++					edited.minImageCount, static_cast<int>(result), info->minImageCount);
++				result = next(device, info, allocator, swapchain);
++			}
++		}
+ 
+ 		if (result == VK_SUCCESS && info && swapchain && *swapchain && S().prepared.load(std::memory_order_relaxed) > 0)
+ 		{
+@@ -1242,9 +1333,145 @@ namespace
+ 		return QueuePresentImpl(S().queuePresent, queue, info);
+ 	}
+ 
++	VKAPI_ATTR VkResult VKAPI_CALL HookCreateSwapchainViaGdpa(VkDevice device, const VkSwapchainCreateInfoKHR* info,
++		const VkAllocationCallbacks* allocator, VkSwapchainKHR* swapchain)
++	{
++		State& s = S();
++		PFN_vkCreateSwapchainKHR next = s.gdpaCreateSwapchain.load(std::memory_order_acquire);
++		return CreateSwapchainImpl(next ? next : s.createSwapchain, device, info, allocator, swapchain);
++	}
++
++	VKAPI_ATTR void VKAPI_CALL HookDestroySwapchainViaGdpa(VkDevice device, VkSwapchainKHR swapchain,
++		const VkAllocationCallbacks* allocator)
++	{
++		State& s = S();
++		PFN_vkDestroySwapchainKHR next = s.gdpaDestroySwapchain.load(std::memory_order_acquire);
++		DestroySwapchainImpl(next ? next : s.destroySwapchain, device, swapchain, allocator);
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL HookQueuePresentViaGdpa(VkQueue queue, const VkPresentInfoKHR* info)
++	{
++		State& s = S();
++		PFN_vkQueuePresentKHR next = s.gdpaQueuePresent.load(std::memory_order_acquire);
++		return QueuePresentImpl(next ? next : s.queuePresent, queue, info);
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL HookCreateSwapchainViaGipa(VkDevice device, const VkSwapchainCreateInfoKHR* info,
++		const VkAllocationCallbacks* allocator, VkSwapchainKHR* swapchain)
++	{
++		State& s = S();
++		PFN_vkCreateSwapchainKHR next = s.gipaCreateSwapchain.load(std::memory_order_acquire);
++		return CreateSwapchainImpl(next ? next : s.createSwapchain, device, info, allocator, swapchain);
++	}
++
++	VKAPI_ATTR void VKAPI_CALL HookDestroySwapchainViaGipa(VkDevice device, VkSwapchainKHR swapchain,
++		const VkAllocationCallbacks* allocator)
++	{
++		State& s = S();
++		PFN_vkDestroySwapchainKHR next = s.gipaDestroySwapchain.load(std::memory_order_acquire);
++		DestroySwapchainImpl(next ? next : s.destroySwapchain, device, swapchain, allocator);
++	}
++
++	VKAPI_ATTR VkResult VKAPI_CALL HookQueuePresentViaGipa(VkQueue queue, const VkPresentInfoKHR* info)
++	{
++		State& s = S();
++		PFN_vkQueuePresentKHR next = s.gipaQueuePresent.load(std::memory_order_acquire);
++		return QueuePresentImpl(next ? next : s.queuePresent, queue, info);
++	}
++
++	// Safe per-device swapchain/present interception via vkGetDeviceProcAddr:
++	// When OptiScaler/Detours has already patched vulkan-1.dll's short device-dispatch stubs, inline hooking
++	// vkCreateSwapchainKHR/vkQueuePresentKHR is skipped for safety. Wrapping them here for prepared game devices
++	// restores 6->8 MFG swapchain buffering and CPU present pacing without touching DXVK/VKD3D or bridge devices.
++	PFN_vkVoidFunction GetDeviceProcAddrImpl(PFN_vkGetDeviceProcAddr next, VkDevice device, const char* pName)
++	{
++		if (!next)
++			return nullptr;
++
++		static thread_local bool inGdpa = false;
++		if (inGdpa)
++			return next(device, pName);
++
++		ReentryGuard guard(inGdpa);
++		PFN_vkVoidFunction fn = next(device, pName);
++
++		if (!fn || !pName || !device)
++			return fn;
++
++		State& s = S();
++		if (!s.enabled || s.prepared.load(std::memory_order_relaxed) == 0)
++			return fn;
++
++		const bool isCreateSwap = (std::strcmp(pName, "vkCreateSwapchainKHR") == 0);
++		const bool isDestroySwap = (!isCreateSwap && std::strcmp(pName, "vkDestroySwapchainKHR") == 0);
++		const bool isPresent = (!isCreateSwap && !isDestroySwap && std::strcmp(pName, "vkQueuePresentKHR") == 0);
++		if (!isCreateSwap && !isDestroySwap && !isPresent)
++			return fn;
++
++		bool trackedDevice = false;
++		{
++			std::lock_guard lock(s.mutex);
++			trackedDevice = (s.devices.find(device) != s.devices.end());
++		}
++		if (!trackedDevice)
++			return fn;
++
++		void* addr = reinterpret_cast<void*>(fn);
++		if (isCreateSwap)
++		{
++			if (addr != s.rawCreateSwapchain &&
++				addr != reinterpret_cast<void*>(&HookCreateSwapchain) &&
++				addr != reinterpret_cast<void*>(&HookCreateSwapchainViaGdpa) &&
++				addr != reinterpret_cast<void*>(&HookCreateSwapchainViaGipa))
++			{
++				s.gdpaCreateSwapchain.store(reinterpret_cast<PFN_vkCreateSwapchainKHR>(fn), std::memory_order_release);
++				return reinterpret_cast<PFN_vkVoidFunction>(&HookCreateSwapchainViaGdpa);
++			}
++		}
++		else if (isDestroySwap)
++		{
++			if (addr != s.rawDestroySwapchain &&
++				addr != reinterpret_cast<void*>(&HookDestroySwapchain) &&
++				addr != reinterpret_cast<void*>(&HookDestroySwapchainViaGdpa) &&
++				addr != reinterpret_cast<void*>(&HookDestroySwapchainViaGipa))
++			{
++				s.gdpaDestroySwapchain.store(reinterpret_cast<PFN_vkDestroySwapchainKHR>(fn), std::memory_order_release);
++				return reinterpret_cast<PFN_vkVoidFunction>(&HookDestroySwapchainViaGdpa);
++			}
++		}
++		else if (isPresent)
++		{
++			if (addr != s.rawQueuePresent &&
++				addr != reinterpret_cast<void*>(&HookQueuePresent) &&
++				addr != reinterpret_cast<void*>(&HookQueuePresentViaGdpa) &&
++				addr != reinterpret_cast<void*>(&HookQueuePresentViaGipa))
++			{
++				s.gdpaQueuePresent.store(reinterpret_cast<PFN_vkQueuePresentKHR>(fn), std::memory_order_release);
++				s.presentHooked.store(true, std::memory_order_relaxed);
++				if (!s.gdpaPresentLogged.exchange(true, std::memory_order_relaxed))
++					Log::Info("Vulkan hooks: wrapped swapchain/present via vkGetDeviceProcAddr (pacing & 8-buffer MFG ready)");
++				return reinterpret_cast<PFN_vkVoidFunction>(&HookQueuePresentViaGdpa);
++			}
++		}
++
++		return fn;
++	}
++
++	VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL HookGetDeviceProcAddr(VkDevice device, const char* pName)
++	{
++		return GetDeviceProcAddrImpl(S().loaderGdpa, device, pName);
++	}
++
++	VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL HookGetDeviceProcAddrViaGipa(VkDevice device, const char* pName)
++	{
++		State& s = S();
++		PFN_vkGetDeviceProcAddr next = s.gipaGetDeviceProcAddr.load(std::memory_order_acquire);
++		return GetDeviceProcAddrImpl(next ? next : s.loaderGdpa, device, pName);
++	}
++
+ 	// OptiScaler hooks vulkan-1.dll before ASI plugins run and returns its own hkvkCreateDevice from
+-	// vkGetInstanceProcAddr. Wrapping vkGetInstanceProcAddr catches games that resolve vkCreateInstance,
+-	// vkDestroyInstance, or vkCreateDevice via GIPA without touching per-device vkGetDeviceProcAddr chains.
++	// vkGetInstanceProcAddr. Wrapping vkGetInstanceProcAddr catches games and Streamline plugins that resolve
++	// instance/device procs (including vkGetDeviceProcAddr and swapchain/present) via GIPA.
+ 	VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL HookGetInstanceProcAddr(VkInstance instance, const char* pName)
+ 	{
+ 		State& s = S();
+@@ -1289,6 +1516,54 @@ namespace
+ 				return reinterpret_cast<PFN_vkVoidFunction>(&HookDestroyInstanceViaGipa);
+ 			}
+ 		}
++		else if (std::strcmp(pName, "vkGetDeviceProcAddr") == 0)
++		{
++			void* addr = reinterpret_cast<void*>(fn);
++			if (addr != s.rawGetDeviceProcAddr &&
++				addr != reinterpret_cast<void*>(&HookGetDeviceProcAddr) &&
++				addr != reinterpret_cast<void*>(&HookGetDeviceProcAddrViaGipa))
++			{
++				s.gipaGetDeviceProcAddr.store(reinterpret_cast<PFN_vkGetDeviceProcAddr>(fn), std::memory_order_release);
++				return reinterpret_cast<PFN_vkVoidFunction>(&HookGetDeviceProcAddrViaGipa);
++			}
++		}
++		else if (std::strcmp(pName, "vkCreateSwapchainKHR") == 0)
++		{
++			void* addr = reinterpret_cast<void*>(fn);
++			if (addr != s.rawCreateSwapchain &&
++				addr != reinterpret_cast<void*>(&HookCreateSwapchain) &&
++				addr != reinterpret_cast<void*>(&HookCreateSwapchainViaGdpa) &&
++				addr != reinterpret_cast<void*>(&HookCreateSwapchainViaGipa))
++			{
++				s.gipaCreateSwapchain.store(reinterpret_cast<PFN_vkCreateSwapchainKHR>(fn), std::memory_order_release);
++				return reinterpret_cast<PFN_vkVoidFunction>(&HookCreateSwapchainViaGipa);
++			}
++		}
++		else if (std::strcmp(pName, "vkDestroySwapchainKHR") == 0)
++		{
++			void* addr = reinterpret_cast<void*>(fn);
++			if (addr != s.rawDestroySwapchain &&
++				addr != reinterpret_cast<void*>(&HookDestroySwapchain) &&
++				addr != reinterpret_cast<void*>(&HookDestroySwapchainViaGdpa) &&
++				addr != reinterpret_cast<void*>(&HookDestroySwapchainViaGipa))
++			{
++				s.gipaDestroySwapchain.store(reinterpret_cast<PFN_vkDestroySwapchainKHR>(fn), std::memory_order_release);
++				return reinterpret_cast<PFN_vkVoidFunction>(&HookDestroySwapchainViaGipa);
++			}
++		}
++		else if (std::strcmp(pName, "vkQueuePresentKHR") == 0)
++		{
++			void* addr = reinterpret_cast<void*>(fn);
++			if (addr != s.rawQueuePresent &&
++				addr != reinterpret_cast<void*>(&HookQueuePresent) &&
++				addr != reinterpret_cast<void*>(&HookQueuePresentViaGdpa) &&
++				addr != reinterpret_cast<void*>(&HookQueuePresentViaGipa))
++			{
++				s.gipaQueuePresent.store(reinterpret_cast<PFN_vkQueuePresentKHR>(fn), std::memory_order_release);
++				s.presentHooked.store(true, std::memory_order_relaxed);
++				return reinterpret_cast<PFN_vkVoidFunction>(&HookQueuePresentViaGipa);
++			}
++		}
+ 
+ 		return fn;
+ 	}
+@@ -1421,9 +1696,10 @@ namespace
+ 		};
+ 
+ 		tryHook(loader, "vkDestroyInstance", reinterpret_cast<void*>(&HookDestroyInstance), &s.rawDestroyInstance, s.destroyInstance, false);
++		s.gdpaHooked = tryHook(loader, "vkGetDeviceProcAddr", reinterpret_cast<void*>(&HookGetDeviceProcAddr), &s.rawGetDeviceProcAddr, s.loaderGdpa, true);
+ 		tryHook(loader, "vkCreateSwapchainKHR", reinterpret_cast<void*>(&HookCreateSwapchain), &s.rawCreateSwapchain, s.createSwapchain, true);
+ 		tryHook(loader, "vkDestroySwapchainKHR", reinterpret_cast<void*>(&HookDestroySwapchain), &s.rawDestroySwapchain, s.destroySwapchain, true);
+-		s.presentHooked = tryHook(loader, "vkQueuePresentKHR", reinterpret_cast<void*>(&HookQueuePresent), &s.rawQueuePresent, s.queuePresent, true);
++		s.presentHooked.store(tryHook(loader, "vkQueuePresentKHR", reinterpret_cast<void*>(&HookQueuePresent), &s.rawQueuePresent, s.queuePresent, true), std::memory_order_relaxed);
+ 
+ 		s.loaderHooked = true;
+ 		return true;
+diff --git a/src/vulkan/VulkanPolicy.h b/src/vulkan/VulkanPolicy.h
+index 71e7789..d026549 100644
+--- a/src/vulkan/VulkanPolicy.h
++++ b/src/vulkan/VulkanPolicy.h
+@@ -445,6 +445,47 @@ namespace VulkanPolicy
+ 		return std::string(reason);
+ 	}
+ 
++	// XEFG_VK_SWAPCHAIN_BUFFERS: target minimum swapchain image count for Multi-Frame Generation swapchains
++	// (requested >= 6, e.g. Streamline's 6-buffer Vulkan swapchain). Raising 6 -> 8 allows 4x MFG (4 frames/batch)
++	// to double-buffer cleanly (8 / 4 = 2) instead of hitting wrap-around phase stalls every alternating batch.
++	// Empty or invalid falls back to defaultTarget (8); 0/off/false disables boosting; valid explicit values are 6..12.
++	inline uint32_t ParseSwapchainBufferTarget(std::wstring_view value, uint32_t defaultTarget = 8u) noexcept
++	{
++		while (!value.empty() && (value.front() == L' ' || value.front() == L'\t'))
++			value.remove_prefix(1);
++		while (!value.empty() && (value.back() == L' ' || value.back() == L'\t'))
++			value.remove_suffix(1);
++		if (value.empty())
++			return defaultTarget;
++		if (IsOffWord(value))
++			return 0u;
++		uint32_t parsed = 0;
++		for (const wchar_t c : value)
++		{
++			if (c < L'0' || c > L'9')
++				return defaultTarget;
++			parsed = parsed * 10u + static_cast<uint32_t>(c - L'0');
++			if (parsed > 12u)
++				return defaultTarget;
++		}
++		return (parsed >= 6u && parsed <= 12u) ? parsed : defaultTarget;
++	}
++
++	// Computes the safe boosted swapchain minImageCount within surface capabilities (capMax == 0 means unbounded).
++	// Only boosts MFG-sized swapchains (requested >= 6) so non-FG or 2-3 buffer game swapchains stay untouched.
++	inline uint32_t RecommendSwapchainImageCount(uint32_t requested, uint32_t capMin, uint32_t capMax,
++		uint32_t targetMin = 8u) noexcept
++	{
++		if (targetMin < 6u || requested < 6u || requested >= targetMin)
++			return requested;
++		uint32_t desired = std::clamp<uint32_t>(targetMin, 6u, 12u);
++		if (capMax > 0u && desired > capMax)
++			desired = capMax;
++		if (desired < capMin)
++			desired = capMin;
++		return desired > requested ? desired : requested;
++	}
++
+ 	// CPU-side Vulkan present pacer for recorded-mode Multi-Frame Generation (e.g. Streamline/OptiScaler on GPUs
+ 	// without hardware flip metering and with V-Sync FIFO off).
+ 	// Tracks real-frame batch cadence with a 5-sample median-filtered EMA (rejecting single-frame asset-streaming
+diff --git a/src/vulkan/VulkanRuntime.cpp b/src/vulkan/VulkanRuntime.cpp
+index d734b26..bc6d813 100644
+--- a/src/vulkan/VulkanRuntime.cpp
++++ b/src/vulkan/VulkanRuntime.cpp
+@@ -19,6 +19,7 @@
+ #include "../MfgPort/Cuda/cuda_route.h"
+ #include "../NGX.h"
+ #include "../Plugin.h"
++#include "../XeFgEnabler.h"
+ #include "../VulkanPrograms.h"
+ #include "../XeFG.h"
+ #include "VulkanCoopMat.h"
+@@ -207,7 +208,12 @@ namespace
+ 		// HUD-less mismatch one-shot warning, and consecutive execute-failure stall circuit breaker.
+ 		float prevCameraPos[3]{};
+ 		float prevCameraFwd[3]{};
++		float prevCameraFov = 0.0f;
+ 		bool hasPrevCamera = false;
++		bool hasPrevFov = false;
++		bool hasPrevUiState = false;
++		bool prevUiState = false;
++		uint32_t uiTransitionCooldown = 0;
+ 		std::array<uint32_t, 12> prevSubrects{};
+ 		bool hasPrevSubrects = false;
+ 		bool hudlessMismatchLogged = false;
+@@ -1118,8 +1124,12 @@ namespace
+ 		}
+ 		if (!usableUi(in.ui, false)) in.ui = nullptr;
+ 
+-		const bool inverted = parameters.GetOr<uint32_t>("DLSSG.DepthInverted", 0) != 0;
+-		const bool jittered = parameters.GetOr<uint32_t>("DLSSG.MvecJittered", 0) != 0;
++		const bool inverted = XeFgEnabler::ApplyTriStateOverride(
++			Plugin::options.depthInvertedOverride.load(std::memory_order_relaxed),
++			parameters.GetOr<uint32_t>("DLSSG.DepthInverted", 0) != 0);
++		const bool jittered = XeFgEnabler::ApplyTriStateOverride(
++			Plugin::options.jitteredMvOverride.load(std::memory_order_relaxed),
++			parameters.GetOr<uint32_t>("DLSSG.MvecJittered", 0) != 0);
+ 
+ 		if (!EnsureFeature(d, f, in, inverted, jittered))
+ 			return false;
+@@ -1130,7 +1140,8 @@ namespace
+ 		if (sLastDebugLines.exchange(debugLines ? 1 : 0, std::memory_order_relaxed) != (debugLines ? 1 : 0))
+ 			XeFG::SetDebugLines(debugLines);
+ 
+-		bool reset = parameters.GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
++		const bool ignoreGameReset = Plugin::options.ignoreGameReset.load(std::memory_order_relaxed);
++		bool reset = !ignoreGameReset && (parameters.GetOr<uint32_t>("DLSSG.Reset", 0) != 0);
+ 
+ 		// DRS / Subrect Change Detector (dlssg-0.4.2 M3): force history reset if any active subrect changes
+ 		// between consecutive batches even when the game omits DLSSG.Reset.
+@@ -1153,8 +1164,10 @@ namespace
+ 		f.prevSubrects = curSubrects;
+ 		f.hasPrevSubrects = true;
+ 
+-		// Camera Cut & Teleport Detector (DLSSG-MFG v3.0.1): force history reset on sudden cuts/teleports on Vulkan too.
+-		if (Plugin::options.cameraCutDetection.load(std::memory_order_relaxed))
++		// Camera Cut & Teleport Detector + GhostBuster anti-ghosting
++		const bool camCutOn = Plugin::options.cameraCutDetection.load(std::memory_order_relaxed);
++		const bool ghostBusterOn = Plugin::options.ghostBuster.load(std::memory_order_relaxed);
++		if (camCutOn || ghostBusterOn)
+ 		{
+ 			auto finiteOr = [](float v, float fallback) noexcept { return std::isfinite(v) ? v : fallback; };
+ 			const float px = finiteOr(parameters.GetOr<float>("DLSSG.CameraPosX", 0.0f), 0.0f);
+@@ -1165,27 +1178,42 @@ namespace
+ 			const float fz = finiteOr(parameters.GetOr<float>("DLSSG.CameraFwdZ", 0.0f), 0.0f);
+ 			const float fwdLenSq = fx * fx + fy * fy + fz * fz;
+ 			const bool hasCamera = fwdLenSq > 1e-6f;
++			float curFov = finiteOr(parameters.GetOr<float>("DLSSG.CameraFOV", 0.0f), 0.0f);
++			if (curFov > 10.0f)
++				curFov *= 3.14159265358979323846f / 180.0f;
+ 
+-			if (hasCamera && f.hasPrevCamera && !reset)
++			float distSq = 0.0f;
++			float fwdDot = 1.0f;
++			if (hasCamera && f.hasPrevCamera)
+ 			{
+ 				const float dx = px - f.prevCameraPos[0];
+ 				const float dy = py - f.prevCameraPos[1];
+ 				const float dz = pz - f.prevCameraPos[2];
+-				const float distSq = dx * dx + dy * dy + dz * dz;
+-				constexpr float kCutThresholdSq = 4.5f * 4.5f;
++				distSq = dx * dx + dy * dy + dz * dz;
+ 
+ 				const float prevLenSq = f.prevCameraFwd[0] * f.prevCameraFwd[0] +
+ 					f.prevCameraFwd[1] * f.prevCameraFwd[1] +
+ 					f.prevCameraFwd[2] * f.prevCameraFwd[2];
+-				const float fwdDot = (prevLenSq > 1e-6f)
++				fwdDot = (prevLenSq > 1e-6f)
+ 					? ((fx * f.prevCameraFwd[0] + fy * f.prevCameraFwd[1] + fz * f.prevCameraFwd[2]) /
+ 					   std::sqrt(fwdLenSq * prevLenSq))
+ 					: 1.0f;
+ 
+-				if (distSq > kCutThresholdSq || fwdDot < -0.5f)
++				constexpr float kCutThresholdSq = 4.5f * 4.5f;
++				if (camCutOn && !reset && (distSq > kCutThresholdSq || fwdDot < -0.5f))
+ 					reset = true;
+ 			}
+ 
++			if (ghostBusterOn && !reset)
++			{
++				const bool camMvIncluded = parameters.GetOr<uint32_t>("DLSSG.CameraMotionIncluded", 1) != 0;
++				if (XeFgEnabler::ShouldGhostBusterReset(true, hasCamera, f.hasPrevCamera, fwdDot,
++					curFov, f.prevCameraFov, f.hasPrevFov, camMvIncluded, distSq))
++				{
++					reset = true;
++				}
++			}
++
+ 			if (hasCamera)
+ 			{
+ 				f.prevCameraPos[0] = px;
+@@ -1196,6 +1224,31 @@ namespace
+ 				f.prevCameraFwd[2] = fz;
+ 				f.hasPrevCamera = true;
+ 			}
++			if (curFov > 0.01f)
++			{
++				f.prevCameraFov = curFov;
++				f.hasPrevFov = true;
++			}
++		}
++
++		// UI / HUD-less transition cooldown (DLSS Enabler XeFG): skip 10 batches on HUD-less/UI toggle
++		const bool curUiState = (in.hudless && f.hudlessFormat != DXGI_FORMAT_UNKNOWN) ||
++			(in.ui && f.uiFormat != DXGI_FORMAT_UNKNOWN);
++		if (f.hasPrevUiState && curUiState != f.prevUiState &&
++			Plugin::options.uiTransitionCooldown.load(std::memory_order_relaxed))
++		{
++			f.uiTransitionCooldown = 10u;
++			Log::Info("Vulkan: HUD-less/UI state changed ({} -> {}), skipping interpolation for 10 batches",
++				f.prevUiState, curUiState);
++		}
++		f.prevUiState = curUiState;
++		f.hasPrevUiState = true;
++		if (f.uiTransitionCooldown > 0u)
++		{
++			--f.uiTransitionCooldown;
++			f.havePrevious = false;
++			f.fault = "ui_transition";
++			return false;
+ 		}
+ 
+ 		Slot& slot = f.slots[f.current];
+@@ -1483,6 +1536,7 @@ namespace
+ 				f.generatedThrough = 0;
+ 				f.consecutiveFailures = 0;
+ 				f.stallCooldownBatches = 0;
++				f.uiTransitionCooldown = 0;
+ 				f.paused++;
+ 				VulkanHost::NotifyPaused();
+ 			}
+@@ -1523,7 +1577,7 @@ namespace
+ 				{
+ 					f.havePrevious = false;
+ 					VulkanHost::NotifyPaused();
+-					if (f.fault != "stall_cooldown")
++					if (f.fault != "stall_cooldown" && f.fault != "ui_transition")
+ 					{
+ 						if (++f.failures <= 16)
+ 							Log::Error("Vulkan: batch failed ({}), index {}, count {}", f.fault, index, count);
+@@ -1861,8 +1915,8 @@ VulkanRuntime::CoopMatrixStatus VulkanRuntime::GetCoopMatrixStatus()
+ 
+ 	status.reason = route.reason;
+ 	status.tileM = route.major;
+-	status.tileN = route.minor & 0xFFFF;
+-	status.tileK = (route.minor >> 16) & 0xFFFF;
++	status.tileN = (route.minor >> 8) & 0xFF;
++	status.tileK = route.minor & 0xFF;
+ 	status.launches = route.launches;
+ 	status.fallbacks = route.fallbacks;
+ 	status.replacing = status.state == TensorState::Active && gCoopGate.load();
+diff --git a/src/vulkan/xvk_commandlist.cpp b/src/vulkan/xvk_commandlist.cpp
+index d9ff212..87fd6a5 100644
+--- a/src/vulkan/xvk_commandlist.cpp
++++ b/src/vulkan/xvk_commandlist.cpp
+@@ -42,6 +42,7 @@ void CommandList::Fail(const char* what)
+ HRESULT CommandList::Begin(CommandAllocator* allocator)
+ {
+     if (!allocator) return E_INVALIDARG;
++    auto recLock = device_->LockRecording();
+     if (device_->recorded()) {
+         // vkprov.1: straight into the open recording (begun and ended by its owner, never here).
+         buffer_ = device_->RecordingBuffer();
+@@ -134,6 +135,7 @@ void STDMETHODCALLTYPE CommandList::SetComputeRoot32BitConstants(UINT parameter,
+ void STDMETHODCALLTYPE CommandList::Dispatch(UINT x, UINT y, UINT z)
+ {
+     if (!recording_ || failed_) return;
++    auto recLock = device_->LockRecording();
+     if (!pso_) { Fail("Dispatch without a pipeline state"); return; }
+     if (device_->tensor().TryLaunch(*device_, buffer_, pso_->tensorLayer(), tables_[0], tables_[1], constants_[2].data(), constantMasks_[2], x, y, z))
+     { boundPipeline_ = VK_NULL_HANDLE; return; }
+@@ -219,6 +221,7 @@ void STDMETHODCALLTYPE CommandList::Dispatch(UINT x, UINT y, UINT z)
+ 
+ void CommandList::Barrier()
+ {
++    auto recLock = device_->LockRecording();
+     VkMemoryBarrier2 memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+     memory.srcStageMask = memory.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+     memory.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+@@ -310,6 +313,7 @@ void STDMETHODCALLTYPE CommandList::ResourceBarrier(UINT count, const D3D12_RESO
+         }
+     }
+     if (!needed) return;
++    auto recLock = device_->LockRecording();
+     VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+     dependency.memoryBarrierCount = 1;
+     dependency.pMemoryBarriers = &memory;
+@@ -319,6 +323,7 @@ void STDMETHODCALLTYPE CommandList::ResourceBarrier(UINT count, const D3D12_RESO
+ void STDMETHODCALLTYPE CommandList::CopyBufferRegion(ID3D12Resource* dst, UINT64 dstOffset, ID3D12Resource* src, UINT64 srcOffset, UINT64 bytes)
+ {
+     if (!recording_ || failed_) return;
++    auto recLock = device_->LockRecording();
+     auto* d = Own<Resource>(dst);
+     auto* s = Own<Resource>(src);
+     if (!d->IsBuffer() || !s->IsBuffer()) { Fail("CopyBufferRegion on a texture"); return; }
+@@ -330,6 +335,7 @@ void STDMETHODCALLTYPE CommandList::CopyBufferRegion(ID3D12Resource* dst, UINT64
+ void STDMETHODCALLTYPE CommandList::CopyResource(ID3D12Resource* dst, ID3D12Resource* src)
+ {
+     if (!recording_ || failed_) return;
++    auto recLock = device_->LockRecording();
+     auto* d = Own<Resource>(dst);
+     auto* s = Own<Resource>(src);
+     const auto& vk = device_->vk();
+@@ -361,6 +367,7 @@ void STDMETHODCALLTYPE CommandList::CopyTextureRegion(const D3D12_TEXTURE_COPY_L
+     const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* box)
+ {
+     if (!recording_ || failed_) return;
++    auto recLock = device_->LockRecording();
+     if (!dst || !src) { Fail("CopyTextureRegion arguments"); return; }
+     auto* d = Own<Resource>(dst->pResource);
+     auto* s = Own<Resource>(src->pResource);
+@@ -419,6 +426,7 @@ void STDMETHODCALLTYPE CommandList::CopyTextureRegion(const D3D12_TEXTURE_COPY_L
+ 
+ void CommandList::ClearUav(Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE cpu, const VkClearColorValue& value, uint32_t fillValue)
+ {
++    auto recLock = device_->LockRecording();
+     const Descriptor& d = *At(cpu);
+     const auto& vk = device_->vk();
+     if (d.kind == DescriptorKind::UavBuffer) {
+@@ -456,6 +464,7 @@ void STDMETHODCALLTYPE CommandList::ClearUnorderedAccessViewFloat(D3D12_GPU_DESC
+ void STDMETHODCALLTYPE CommandList::EndQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index)
+ {
+     if (!recording_ || failed_) return;
++    auto recLock = device_->LockRecording();
+     if (type != D3D12_QUERY_TYPE_TIMESTAMP) { Unimplemented("EndQuery(non-timestamp)"); return; }
+     const VkQueryPool pool = Own<QueryHeap>(heap)->pool();
+     device_->vk().vkCmdResetQueryPool(buffer_, pool, index, 1);
+@@ -466,6 +475,7 @@ void STDMETHODCALLTYPE CommandList::ResolveQueryData(ID3D12QueryHeap* heap, D3D1
+     UINT64 offset)
+ {
+     if (!recording_ || failed_) return;
++    auto recLock = device_->LockRecording();
+     if (type != D3D12_QUERY_TYPE_TIMESTAMP) { Unimplemented("ResolveQueryData(non-timestamp)"); return; }
+     device_->vk().vkCmdCopyQueryPoolResults(buffer_, Own<QueryHeap>(heap)->pool(), start, count, Own<Resource>(dst)->buffer(), offset, 8,
+                                             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+diff --git a/src/vulkan/xvk_device.cpp b/src/vulkan/xvk_device.cpp
+index 6de11ac..6e56e2f 100644
+--- a/src/vulkan/xvk_device.cpp
++++ b/src/vulkan/xvk_device.cpp
+@@ -187,6 +187,15 @@ HRESULT Device::Init(const DeviceDesc& desc)
+         if (vk_.vkCreateSemaphore(device_, &progressInfo, nullptr, &slot->timeline) != VK_SUCCESS) return E_FAIL;
+         slots_.push_back(std::move(slot));
+     }
++    {
++        uint32_t famCount = 0;
++        vk_.vkGetPhysicalDeviceQueueFamilyProperties(physical_, &famCount, nullptr);
++        if (queueFamily_ < famCount) {
++            std::vector<VkQueueFamilyProperties> fams(famCount);
++            vk_.vkGetPhysicalDeviceQueueFamilyProperties(physical_, &famCount, fams.data());
++            queueHasGraphics_ = (fams[queueFamily_].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
++        }
++    }
+     programs_.Load(desc.programModule);
+ 
+     VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, queueFamily_};
+@@ -259,7 +268,7 @@ Resource* Device::ResolveVa(D3D12_GPU_VIRTUAL_ADDRESS va, uint64_t& offset)
+ namespace
+ {
+ // A new image moves from UNDEFINED to GENERAL and is cleared, a new buffer is zeroed, then one full barrier.
+-void RecordInitialization(const VkFns& vk, VkCommandBuffer command, VkImage image, VkImageAspectFlags aspect, VkBuffer buffer)
++void RecordInitialization(const VkFns& vk, VkCommandBuffer command, VkImage image, VkImageAspectFlags aspect, VkBuffer buffer, bool allowDepthClear)
+ {
+     VkMemoryBarrier2 memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+     memory.srcStageMask = memory.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+@@ -282,7 +291,7 @@ void RecordInitialization(const VkFns& vk, VkCommandBuffer command, VkImage imag
+         if (aspect & VK_IMAGE_ASPECT_COLOR_BIT) {
+             VkClearColorValue zero{};
+             vk.vkCmdClearColorImage(command, image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+-        } else {
++        } else if (allowDepthClear) {
+             VkClearDepthStencilValue zero{};
+             vk.vkCmdClearDepthStencilImage(command, image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+         }
+@@ -301,9 +310,9 @@ void Device::InitializeResource(VkImage image, VkImageAspectFlags aspect, VkBuff
+         // vkprov.1: into the open recording, ahead of any use (lists record into the same command buffer after this);
+         // before the first recording, at its start.
+         std::lock_guard lock(recordMutex_);
+-        if (recording_) RecordInitialization(vk_, recording_, image, aspect, buffer);
++        if (recording_) RecordInitialization(vk_, recording_, image, aspect, buffer, queueHasGraphics_);
+         else pendingInit_.push_back([this, image, aspect, buffer](VkCommandBuffer command) {
+-            RecordInitialization(vk_, command, image, aspect, buffer);
++            RecordInitialization(vk_, command, image, aspect, buffer, queueHasGraphics_);
+         });
+         return;
+     }
+@@ -319,7 +328,7 @@ void Device::InitializeResource(VkImage image, VkImageAspectFlags aspect, VkBuff
+     }
+     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+     vk_.vkBeginCommandBuffer(command, &begin);
+-    RecordInitialization(vk_, command, image, aspect, buffer);
++    RecordInitialization(vk_, command, image, aspect, buffer, queueHasGraphics_);
+     vk_.vkEndCommandBuffer(command);
+     const uint64_t value = ++initValue_;
+     VkCommandBufferSubmitInfo commandInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, nullptr, command};
+@@ -423,13 +432,11 @@ bool Device::BeginRecording(VkCommandBuffer commandBuffer)
+ {
+     if (!recorded_ || !commandBuffer) return false;
+     PollRecordings();
++    std::lock_guard lock(recordMutex_);
++    if (recording_) return false;
++    recording_ = commandBuffer;
+     std::vector<std::function<void(VkCommandBuffer)>> pending;
+-    {
+-        std::lock_guard lock(recordMutex_);
+-        if (recording_) return false;
+-        recording_ = commandBuffer;
+-        pending.swap(pendingInit_);
+-    }
++    pending.swap(pendingInit_);
+     for (auto& record : pending) record(commandBuffer);
+     return true;
+ }
+diff --git a/src/vulkan/xvk_internal.h b/src/vulkan/xvk_internal.h
+index 59e5bdc..71ad620 100644
+--- a/src/vulkan/xvk_internal.h
++++ b/src/vulkan/xvk_internal.h
+@@ -728,6 +728,11 @@ public:
+     // vkprov.1 (DeviceDesc::recorded): the command buffer lists record into while a recording is open (null
+     // otherwise), and the recording's bounds (xvk.h BeginRecording / EndRecording).
+     bool recorded() const { return recorded_; }
++    std::unique_lock<std::recursive_mutex> LockRecording()
++    {
++        return recorded_ ? std::unique_lock<std::recursive_mutex>(recordMutex_)
++                         : std::unique_lock<std::recursive_mutex>();
++    }
+     VkCommandBuffer RecordingBuffer();
+     bool BeginRecording(VkCommandBuffer commandBuffer);
+     void EndRecording();
+@@ -829,7 +834,8 @@ private:
+     // vkprov.1: recorded mode. One queue-less slot carries the progress timeline; each ended recording is an epoch
+     // whose event, set by the GPU at the end of the caller's command buffer, moves the timeline to its value.
+     bool recorded_ = false;
+-    std::mutex recordMutex_;
++    bool queueHasGraphics_ = true;
++    std::recursive_mutex recordMutex_;
+     VkCommandBuffer recording_ = VK_NULL_HANDLE;
+     struct Epoch { VkEvent event; uint64_t value; };
+     std::vector<Epoch> epochs_;
+diff --git a/tests/vulkan_runtime/policy_test.cpp b/tests/vulkan_runtime/policy_test.cpp
+index 14d87c9..459b6c7 100644
+--- a/tests/vulkan_runtime/policy_test.cpp
++++ b/tests/vulkan_runtime/policy_test.cpp
+@@ -497,6 +497,40 @@ int main()
+ 		CHECK(!mfg6.skipBatch);
+ 	}
+ 
++	// ---- Vulkan MFG swapchain image count policy (6 -> 8 double-buffered 4x MFG)
++	{
++		using VulkanPolicy::ParseSwapchainBufferTarget;
++		using VulkanPolicy::RecommendSwapchainImageCount;
++
++		CHECK(ParseSwapchainBufferTarget(L"") == 8u);
++		CHECK(ParseSwapchainBufferTarget(L"  ") == 8u);
++		CHECK(ParseSwapchainBufferTarget(L"0") == 0u);
++		CHECK(ParseSwapchainBufferTarget(L"off") == 0u);
++		CHECK(ParseSwapchainBufferTarget(L"FALSE") == 0u);
++		CHECK(ParseSwapchainBufferTarget(L"6") == 6u);
++		CHECK(ParseSwapchainBufferTarget(L"8") == 8u);
++		CHECK(ParseSwapchainBufferTarget(L"10") == 10u);
++		CHECK(ParseSwapchainBufferTarget(L"12") == 12u);
++		CHECK(ParseSwapchainBufferTarget(L"5") == 8u);
++		CHECK(ParseSwapchainBufferTarget(L"16") == 8u);
++		CHECK(ParseSwapchainBufferTarget(L"abc") == 8u);
++
++		// Standard Streamline 6-buffer swapchain boosted to 8 when driver allows (capMax == 0 unbounded or >= 8)
++		CHECK(RecommendSwapchainImageCount(6u, 2u, 0u, 8u) == 8u);
++		CHECK(RecommendSwapchainImageCount(6u, 2u, 8u, 8u) == 8u);
++		CHECK(RecommendSwapchainImageCount(6u, 2u, 16u, 8u) == 8u);
++		// Clamped to driver maxImageCount
++		CHECK(RecommendSwapchainImageCount(6u, 2u, 7u, 8u) == 7u);
++		CHECK(RecommendSwapchainImageCount(6u, 2u, 6u, 8u) == 6u);
++		// Non-MFG game swapchains (< 6 buffers) are never touched
++		CHECK(RecommendSwapchainImageCount(3u, 2u, 8u, 8u) == 3u);
++		CHECK(RecommendSwapchainImageCount(4u, 2u, 8u, 8u) == 4u);
++		// Disabled or already >= target
++		CHECK(RecommendSwapchainImageCount(6u, 2u, 8u, 0u) == 6u);
++		CHECK(RecommendSwapchainImageCount(8u, 2u, 16u, 8u) == 8u);
++		CHECK(RecommendSwapchainImageCount(10u, 2u, 16u, 8u) == 10u);
++	}
++
+ 	std::printf("%d checks, %d failed\n", checks, failures);
+ 	return failures ? 1 : 0;
+ }
+diff --git a/tests/vulkan_runtime/stubs/Windows.h b/tests/vulkan_runtime/stubs/Windows.h
+index 7fee563..5266798 100644
+--- a/tests/vulkan_runtime/stubs/Windows.h
++++ b/tests/vulkan_runtime/stubs/Windows.h
+@@ -110,6 +110,7 @@ extern "C++"
+ 	BOOL CloseHandle(HANDLE hObject);
+ 	void Sleep(DWORD dwMilliseconds);
+ 	inline void YieldProcessor() {}
++	inline BOOL SwitchToThread() { return 0; }
+ 	ULONGLONG GetTickCount64();
+ 	int WideCharToMultiByte(UINT codePage, DWORD flags, const wchar_t* wide, int wideCount, char* narrow, int narrowCount,
+ 		const char* defaultChar, BOOL* usedDefault);
+diff --git a/tests/vulkan_runtime/stubs/vulkan/vulkan.h b/tests/vulkan_runtime/stubs/vulkan/vulkan.h
+index fb7b4a5..4c386b1 100644
+--- a/tests/vulkan_runtime/stubs/vulkan/vulkan.h
++++ b/tests/vulkan_runtime/stubs/vulkan/vulkan.h
+@@ -1010,11 +1010,21 @@ typedef VkResult(VKAPI_PTR* PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKH
+ 	uint32_t* pPropertyCount, VkCooperativeMatrixPropertiesKHR* pProperties);
+ typedef void(VKAPI_PTR* PFN_vkCmdPipelineBarrier2)(VkCommandBuffer commandBuffer, const VkDependencyInfo* pDependencyInfo);
+ typedef struct VkQueue_T* VkQueue;
++typedef struct VkSurfaceKHR_T* VkSurfaceKHR;
+ typedef struct VkSwapchainKHR_T* VkSwapchainKHR;
++typedef struct VkSurfaceCapabilitiesKHR
++{
++	uint32_t minImageCount;
++	uint32_t maxImageCount;
++} VkSurfaceCapabilitiesKHR;
++typedef VkResult(VKAPI_PTR* PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)(VkPhysicalDevice physicalDevice,
++	VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR* pSurfaceCapabilities);
+ typedef struct VkSwapchainCreateInfoKHR
+ {
+ 	VkStructureType sType;
+ 	const void* pNext;
++	VkSurfaceKHR surface;
++	uint32_t minImageCount;
+ 	VkPresentModeKHR presentMode;
+ } VkSwapchainCreateInfoKHR;
+ typedef struct VkPresentInfoKHR
