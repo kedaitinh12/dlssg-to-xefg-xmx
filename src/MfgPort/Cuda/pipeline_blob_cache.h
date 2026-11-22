@@ -47,6 +47,12 @@ namespace xefg_cuda
 			++generation_;
 		}
 
+		void Clear() noexcept
+		{
+			std::lock_guard lock(mutex_);
+			entries_.clear();
+		}
+
 		template <class Create>
 		HRESULT CreateCompute(const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID iid, void** out, Create create) noexcept
 		{
