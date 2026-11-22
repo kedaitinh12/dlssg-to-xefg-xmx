@@ -943,7 +943,7 @@ bool Install(ID3D12Device* d3dDevice, std::string& reason) noexcept
 	if (VulkanPolicy::IsOffWord(envBridge))
 		return fail("environment_off");
 	if (!VulkanPolicy::IsOnWord(envBridge) && !Plugin::options.d3d12VulkanWmmaBridge.load(std::memory_order_acquire))
-		return fail("disabled_by_default");
+		return fail("disabled_in_options");
 
 	if (!d3dDevice)
 		return fail("no_d3d12_device");
