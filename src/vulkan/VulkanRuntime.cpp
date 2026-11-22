@@ -2445,12 +2445,20 @@ namespace
 		{
 			std::scoped_lock lock(gDevice.mutex);
 
-			// The layer keeps the released images and XeFG's objects until the GPU has run the recordings that used them
+			// Drain in-flight recorded command buffers before destroying XeFG's context and internal xvk resources,
+			// preventing deferred-resource buildup and XeFG "Invalid internal state" (init_-1000) after rapid
+			// multiplier toggles on Vulkan.
+			if (gDevice.d3d)
+				xvk::WaitRecordedIdle(gDevice.d3d.Get(), 150'000'000ull);
+
 			if (f->context)
 				CallXeFG("Destroy", [&] { return XeFG::Destroy(f->context); });
 
 			f->context = nullptr;
 			delete f;
+
+			if (gDevice.d3d)
+				xvk::WaitRecordedIdle(gDevice.d3d.Get(), 50'000'000ull);
 
 			return NGX_SUCCESS;
 		}

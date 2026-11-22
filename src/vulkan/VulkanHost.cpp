@@ -89,6 +89,13 @@ namespace
 		std::atomic<PFN_vkCreateSwapchainKHR> gdpaCreateSwapchain = nullptr;
 		std::atomic<PFN_vkDestroySwapchainKHR> gdpaDestroySwapchain = nullptr;
 		std::atomic<PFN_vkQueuePresentKHR> gdpaQueuePresent = nullptr;
+		std::atomic<PFN_vkCreateSwapchainKHR> icdCreateSwapchain = nullptr;
+		std::atomic<PFN_vkDestroySwapchainKHR> icdDestroySwapchain = nullptr;
+		std::atomic<PFN_vkQueuePresentKHR> icdQueuePresent = nullptr;
+		void* hookedIcdCreateSwap = nullptr;
+		void* hookedIcdDestroySwap = nullptr;
+		void* hookedIcdQueuePresent = nullptr;
+		HMODULE loaderModule = nullptr;
 		bool gipaHooked = false;
 		bool gdpaHooked = false;
 		std::atomic_bool presentHooked = false;
@@ -1006,6 +1013,8 @@ namespace
 		}
 	}
 
+	void InstallDeviceLevelHooks(State& s, const VulkanHost::DeviceRecord& record, VkDevice device) noexcept;
+
 	void DeviceCreated(const DeviceEdit& edit, VkDevice device) noexcept
 	{
 		try
@@ -1023,6 +1032,8 @@ namespace
 
 			if (edit.record.hwPacing)
 				s.hwPacingActive.store(true, std::memory_order_relaxed);
+
+			InstallDeviceLevelHooks(s, edit.record, device);
 
 			s.prepared++;
 			Log::Info("Vulkan device {} prepared for XeFG: graphics family {}, vendor {:#06x}{}{}{}",
@@ -1379,6 +1390,126 @@ namespace
 		return QueuePresentImpl(next ? next : s.queuePresent, queue, info);
 	}
 
+	VKAPI_ATTR VkResult VKAPI_CALL HookCreateSwapchainViaIcd(VkDevice device, const VkSwapchainCreateInfoKHR* info,
+		const VkAllocationCallbacks* allocator, VkSwapchainKHR* swapchain)
+	{
+		State& s = S();
+		PFN_vkCreateSwapchainKHR next = s.icdCreateSwapchain.load(std::memory_order_acquire);
+		return CreateSwapchainImpl(next ? next : s.createSwapchain, device, info, allocator, swapchain);
+	}
+
+	VKAPI_ATTR void VKAPI_CALL HookDestroySwapchainViaIcd(VkDevice device, VkSwapchainKHR swapchain,
+		const VkAllocationCallbacks* allocator)
+	{
+		State& s = S();
+		PFN_vkDestroySwapchainKHR next = s.icdDestroySwapchain.load(std::memory_order_acquire);
+		DestroySwapchainImpl(next ? next : s.destroySwapchain, device, swapchain, allocator);
+	}
+
+	VKAPI_ATTR VkResult VKAPI_CALL HookQueuePresentViaIcd(VkQueue queue, const VkPresentInfoKHR* info)
+	{
+		State& s = S();
+		PFN_vkQueuePresentKHR next = s.icdQueuePresent.load(std::memory_order_acquire);
+		return QueuePresentImpl(next ? next : s.queuePresent, queue, info);
+	}
+
+	// When vulkan-1.dll's short dispatch stubs (vkGetDeviceProcAddr, vkCreateSwapchainKHR, vkQueuePresentKHR) were
+	// already detoured by OptiScaler/overlays and skipped during InstallLoader, Streamline (sl.dlss_g) resolves the
+	// ICD/layer device functions directly via vkGetDeviceProcAddr and bypasses our GIPA wrapper. Hooking the resolved
+	// device-level ICD functions here avoids vulkan-1.dll's tiny trampolines while intercepting Streamline's real
+	// swapchain creation (for 8-buffer MFG) and per-frame vkQueuePresentKHR calls (for burst pacing).
+	void InstallDeviceLevelHooks(State& s, const VulkanHost::DeviceRecord& record, VkDevice device) noexcept
+	{
+		try
+		{
+			if (!device)
+				return;
+
+			std::lock_guard lock(s.install);
+			if (s.presentHooked.load(std::memory_order_relaxed) && (s.createSwapchain || s.hookedIcdCreateSwap))
+				return;
+
+			PFN_vkGetDeviceProcAddr gdpa = s.loaderGdpa;
+			if (!gdpa)
+				gdpa = s.gipaGetDeviceProcAddr.load(std::memory_order_acquire);
+			if (!gdpa && record.gipa && record.instance)
+				gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(record.gipa(record.instance, "vkGetDeviceProcAddr"));
+			if (!gdpa && s.loaderModule)
+				gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(GetProcAddress(s.loaderModule, "vkGetDeviceProcAddr"));
+			if (!gdpa)
+				return;
+
+			auto isLoaderAddr = [&](void* addr) -> bool {
+				if (!addr || !s.loaderModule)
+					return false;
+				HMODULE mod = nullptr;
+				if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+					reinterpret_cast<LPCWSTR>(addr), &mod))
+					return false;
+				return mod == s.loaderModule;
+			};
+
+			auto isOwnHook = [](void* addr) -> bool {
+				return addr == reinterpret_cast<void*>(&HookCreateSwapchain) ||
+					addr == reinterpret_cast<void*>(&HookCreateSwapchainViaGdpa) ||
+					addr == reinterpret_cast<void*>(&HookCreateSwapchainViaGipa) ||
+					addr == reinterpret_cast<void*>(&HookCreateSwapchainViaIcd) ||
+					addr == reinterpret_cast<void*>(&HookDestroySwapchain) ||
+					addr == reinterpret_cast<void*>(&HookDestroySwapchainViaGdpa) ||
+					addr == reinterpret_cast<void*>(&HookDestroySwapchainViaGipa) ||
+					addr == reinterpret_cast<void*>(&HookDestroySwapchainViaIcd) ||
+					addr == reinterpret_cast<void*>(&HookQueuePresent) ||
+					addr == reinterpret_cast<void*>(&HookQueuePresentViaGdpa) ||
+					addr == reinterpret_cast<void*>(&HookQueuePresentViaGipa) ||
+					addr == reinterpret_cast<void*>(&HookQueuePresentViaIcd);
+			};
+
+			auto hookIcdFn = [&](const char* name, void* detour, void* rawExport, void*& hookedSlot, auto& atomicTramp) -> bool {
+				if (hookedSlot != nullptr)
+					return true;
+				PFN_vkVoidFunction fn = gdpa(device, name);
+				void* target = reinterpret_cast<void*>(fn);
+				if (!target || target == rawExport || isOwnHook(target) || isLoaderAddr(target))
+					return false;
+				using FnType = decltype(atomicTramp.load());
+				FnType tramp = nullptr;
+				if (MH_CreateHook(target, detour, reinterpret_cast<void**>(&tramp)) != MH_OK || !tramp)
+					return false;
+				atomicTramp.store(tramp, std::memory_order_release);
+				if (MH_EnableHook(target) != MH_OK)
+				{
+					atomicTramp.store(nullptr, std::memory_order_release);
+					MH_RemoveHook(target);
+					return false;
+				}
+				hookedSlot = target;
+				return true;
+			};
+
+			const bool hookedCreate = s.createSwapchain != nullptr ||
+				hookIcdFn("vkCreateSwapchainKHR", reinterpret_cast<void*>(&HookCreateSwapchainViaIcd),
+					s.rawCreateSwapchain, s.hookedIcdCreateSwap, s.icdCreateSwapchain);
+			const bool hookedDestroy = s.destroySwapchain != nullptr ||
+				hookIcdFn("vkDestroySwapchainKHR", reinterpret_cast<void*>(&HookDestroySwapchainViaIcd),
+					s.rawDestroySwapchain, s.hookedIcdDestroySwap, s.icdDestroySwapchain);
+			const bool hookedPresent = s.presentHooked.load(std::memory_order_relaxed) ||
+				hookIcdFn("vkQueuePresentKHR", reinterpret_cast<void*>(&HookQueuePresentViaIcd),
+					s.rawQueuePresent, s.hookedIcdQueuePresent, s.icdQueuePresent);
+
+			if (hookedPresent)
+				s.presentHooked.store(true, std::memory_order_relaxed);
+
+			if (s.hookedIcdCreateSwap || s.hookedIcdDestroySwap || s.hookedIcdQueuePresent)
+			{
+				Log::Info("Vulkan hooks: installed device-level hooks (createSwapchain={}, destroySwapchain={}, queuePresent={}) for 8-buffer MFG & present pacing",
+					hookedCreate, hookedDestroy, hookedPresent);
+			}
+		}
+		catch (...)
+		{
+		}
+	}
+
 	// Safe per-device swapchain/present interception via vkGetDeviceProcAddr:
 	// When OptiScaler/Detours has already patched vulkan-1.dll's short device-dispatch stubs, inline hooking
 	// vkCreateSwapchainKHR/vkQueuePresentKHR is skipped for safety. Wrapping them here for prepared game devices
@@ -1422,7 +1553,8 @@ namespace
 			if (addr != s.rawCreateSwapchain &&
 				addr != reinterpret_cast<void*>(&HookCreateSwapchain) &&
 				addr != reinterpret_cast<void*>(&HookCreateSwapchainViaGdpa) &&
-				addr != reinterpret_cast<void*>(&HookCreateSwapchainViaGipa))
+				addr != reinterpret_cast<void*>(&HookCreateSwapchainViaGipa) &&
+				addr != reinterpret_cast<void*>(&HookCreateSwapchainViaIcd))
 			{
 				s.gdpaCreateSwapchain.store(reinterpret_cast<PFN_vkCreateSwapchainKHR>(fn), std::memory_order_release);
 				return reinterpret_cast<PFN_vkVoidFunction>(&HookCreateSwapchainViaGdpa);
@@ -1433,7 +1565,8 @@ namespace
 			if (addr != s.rawDestroySwapchain &&
 				addr != reinterpret_cast<void*>(&HookDestroySwapchain) &&
 				addr != reinterpret_cast<void*>(&HookDestroySwapchainViaGdpa) &&
-				addr != reinterpret_cast<void*>(&HookDestroySwapchainViaGipa))
+				addr != reinterpret_cast<void*>(&HookDestroySwapchainViaGipa) &&
+				addr != reinterpret_cast<void*>(&HookDestroySwapchainViaIcd))
 			{
 				s.gdpaDestroySwapchain.store(reinterpret_cast<PFN_vkDestroySwapchainKHR>(fn), std::memory_order_release);
 				return reinterpret_cast<PFN_vkVoidFunction>(&HookDestroySwapchainViaGdpa);
@@ -1444,7 +1577,8 @@ namespace
 			if (addr != s.rawQueuePresent &&
 				addr != reinterpret_cast<void*>(&HookQueuePresent) &&
 				addr != reinterpret_cast<void*>(&HookQueuePresentViaGdpa) &&
-				addr != reinterpret_cast<void*>(&HookQueuePresentViaGipa))
+				addr != reinterpret_cast<void*>(&HookQueuePresentViaGipa) &&
+				addr != reinterpret_cast<void*>(&HookQueuePresentViaIcd))
 			{
 				s.gdpaQueuePresent.store(reinterpret_cast<PFN_vkQueuePresentKHR>(fn), std::memory_order_release);
 				s.presentHooked.store(true, std::memory_order_relaxed);
@@ -1533,7 +1667,8 @@ namespace
 			if (addr != s.rawCreateSwapchain &&
 				addr != reinterpret_cast<void*>(&HookCreateSwapchain) &&
 				addr != reinterpret_cast<void*>(&HookCreateSwapchainViaGdpa) &&
-				addr != reinterpret_cast<void*>(&HookCreateSwapchainViaGipa))
+				addr != reinterpret_cast<void*>(&HookCreateSwapchainViaGipa) &&
+				addr != reinterpret_cast<void*>(&HookCreateSwapchainViaIcd))
 			{
 				s.gipaCreateSwapchain.store(reinterpret_cast<PFN_vkCreateSwapchainKHR>(fn), std::memory_order_release);
 				return reinterpret_cast<PFN_vkVoidFunction>(&HookCreateSwapchainViaGipa);
@@ -1545,7 +1680,8 @@ namespace
 			if (addr != s.rawDestroySwapchain &&
 				addr != reinterpret_cast<void*>(&HookDestroySwapchain) &&
 				addr != reinterpret_cast<void*>(&HookDestroySwapchainViaGdpa) &&
-				addr != reinterpret_cast<void*>(&HookDestroySwapchainViaGipa))
+				addr != reinterpret_cast<void*>(&HookDestroySwapchainViaGipa) &&
+				addr != reinterpret_cast<void*>(&HookDestroySwapchainViaIcd))
 			{
 				s.gipaDestroySwapchain.store(reinterpret_cast<PFN_vkDestroySwapchainKHR>(fn), std::memory_order_release);
 				return reinterpret_cast<PFN_vkVoidFunction>(&HookDestroySwapchainViaGipa);
@@ -1557,7 +1693,8 @@ namespace
 			if (addr != s.rawQueuePresent &&
 				addr != reinterpret_cast<void*>(&HookQueuePresent) &&
 				addr != reinterpret_cast<void*>(&HookQueuePresentViaGdpa) &&
-				addr != reinterpret_cast<void*>(&HookQueuePresentViaGipa))
+				addr != reinterpret_cast<void*>(&HookQueuePresentViaGipa) &&
+				addr != reinterpret_cast<void*>(&HookQueuePresentViaIcd))
 			{
 				s.gipaQueuePresent.store(reinterpret_cast<PFN_vkQueuePresentKHR>(fn), std::memory_order_release);
 				s.presentHooked.store(true, std::memory_order_relaxed);
@@ -1591,6 +1728,7 @@ namespace
 			return false;
 		}
 
+		s.loaderModule = loader;
 		s.rawCreateInstance = reinterpret_cast<void*>(create);
 		s.rawCreateDevice = reinterpret_cast<void*>(createDevice);
 		s.loaderGipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(gipa);
@@ -1676,12 +1814,12 @@ namespace
 			FARPROC proc = GetProcAddress(mod, name);
 			if (!proc)
 				return false;
+			*rawOut = reinterpret_cast<void*>(proc);
 			if (skipUnsafeStub && isUnsafeShortStub(proc))
 			{
 				Log::Info("Vulkan hooks: skipping inline hook on {} (short/already-detoured dispatch stub)", name);
 				return false;
 			}
-			*rawOut = reinterpret_cast<void*>(proc);
 			std::remove_reference_t<decltype(trampolineOut)> tramp = nullptr;
 			if (MH_CreateHook(reinterpret_cast<void*>(proc), detour, reinterpret_cast<void**>(&tramp)) != MH_OK)
 				return false;
