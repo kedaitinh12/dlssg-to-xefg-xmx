@@ -1,14 +1,15 @@
-From c6206a79a75edcc6aa3e9b9be1b1e7c130a1cc0d Mon Sep 17 00:00:00 2001
+From ceb967b6b931a34d04009863ffba54f040f9c849 Mon Sep 17 00:00:00 2001
 From: dlssg-to-xefg <dev@local>
-Date: Sun, 22 Nov 2026 02:22:08 +0000
+Date: Sun, 22 Nov 2026 03:52:44 +0000
 Subject: [PATCH 2/2] Hook Vulkan swapchain and present via vkGetDeviceProcAddr
  and boost MFG swapchain buffers from 6 to 8
 
 ---
- src/vulkan/VulkanHost.cpp            | 277 ++++++++++++++++++++++++++-
- src/vulkan/VulkanPolicy.h            |  41 ++++
- tests/vulkan_runtime/policy_test.cpp |  34 ++++
- 3 files changed, 347 insertions(+), 5 deletions(-)
+ src/vulkan/VulkanHost.cpp                  | 277 ++++++++++++++++++++-
+ src/vulkan/VulkanPolicy.h                  |  41 +++
+ tests/vulkan_runtime/policy_test.cpp       |  34 +++
+ tests/vulkan_runtime/stubs/vulkan/vulkan.h |  10 +
+ 4 files changed, 357 insertions(+), 5 deletions(-)
 
 diff --git a/src/vulkan/VulkanHost.cpp b/src/vulkan/VulkanHost.cpp
 index f6b5adc..ebe6018 100644
@@ -447,6 +448,32 @@ index 14d87c9..459b6c7 100644
  	std::printf("%d checks, %d failed\n", checks, failures);
  	return failures ? 1 : 0;
  }
+diff --git a/tests/vulkan_runtime/stubs/vulkan/vulkan.h b/tests/vulkan_runtime/stubs/vulkan/vulkan.h
+index fb7b4a5..4c386b1 100644
+--- a/tests/vulkan_runtime/stubs/vulkan/vulkan.h
++++ b/tests/vulkan_runtime/stubs/vulkan/vulkan.h
+@@ -1010,11 +1010,21 @@ typedef VkResult(VKAPI_PTR* PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKH
+ 	uint32_t* pPropertyCount, VkCooperativeMatrixPropertiesKHR* pProperties);
+ typedef void(VKAPI_PTR* PFN_vkCmdPipelineBarrier2)(VkCommandBuffer commandBuffer, const VkDependencyInfo* pDependencyInfo);
+ typedef struct VkQueue_T* VkQueue;
++typedef struct VkSurfaceKHR_T* VkSurfaceKHR;
+ typedef struct VkSwapchainKHR_T* VkSwapchainKHR;
++typedef struct VkSurfaceCapabilitiesKHR
++{
++	uint32_t minImageCount;
++	uint32_t maxImageCount;
++} VkSurfaceCapabilitiesKHR;
++typedef VkResult(VKAPI_PTR* PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)(VkPhysicalDevice physicalDevice,
++	VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR* pSurfaceCapabilities);
+ typedef struct VkSwapchainCreateInfoKHR
+ {
+ 	VkStructureType sType;
+ 	const void* pNext;
++	VkSurfaceKHR surface;
++	uint32_t minImageCount;
+ 	VkPresentModeKHR presentMode;
+ } VkSwapchainCreateInfoKHR;
+ typedef struct VkPresentInfoKHR
 -- 
 2.39.5
 
