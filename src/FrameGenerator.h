@@ -1,6 +1,7 @@
 #pragma once
 
 #include "NGX.h"
+#include "XeFgEnabler.h"
 #include "XeFG.h"
 
 #include <dxgi1_4.h>
@@ -70,10 +71,15 @@ private:
 		// Tracks whether cached frame/output copies were allocated with D3D12_HEAP_FLAG_SHARED for Vulkan WMMA
 		bool sharedTexturesMode = false;
 
-		// Camera Cut & Teleport Detector state (prevents smearing on sudden cuts/teleports)
+		// Camera Cut & Teleport Detector + GhostBuster state (prevents smearing/ghosting on cuts, snaps, FOV jumps)
 		float prevCameraPos[3]{};
 		float prevCameraFwd[3]{};
+		float prevCameraFov = 0.0f;
 		bool hasPrevCamera = false;
+		bool hasPrevFov = false;
+
+		// UI / HUD-less transition cooldown (DLSS Enabler XeFG: skip 10 real frames on state toggle)
+		uint32_t uiTransitionCooldown = 0;
 
 		// Stall circuit breaker (dlssg-0.4.2): bypass XeFG temporarily after 3 consecutive Execute failures
 		uint32_t consecutiveExecuteFailures = 0;

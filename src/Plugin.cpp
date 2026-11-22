@@ -9,6 +9,7 @@
 #include "optiscaler_plugin.h"
 #include "vulkan/VulkanPolicy.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <format>
 #include <mutex>
@@ -510,12 +511,82 @@ namespace
 						 "Off by default to use freeze-free D3D12 cs_6_6 WMMA overrides without duplicate VRAM\n"
 						 "or OptiScaler Vulkan_wDx12 hook interference. Saved as D3D12VulkanWmmaBridge.");
 
+		bool uiCooldown = Plugin::options.uiTransitionCooldown;
+
+		if (api->Checkbox("UI / HUDless transition guard (10 frames)", &uiCooldown))
+		{
+			Plugin::options.uiTransitionCooldown = uiCooldown;
+			api->SetBool(self, "UiTransitionCooldown", uiCooldown);
+		}
+
+		api->ItemTooltip("Skips interpolation for 10 frames whenever HUD-less or UI composition state toggles
+"
+						 "(from DLSS Enabler XeFG) to prevent glitched menu/overlay transition frames. Saved as UiTransitionCooldown.");
+
+		bool ghostBuster = Plugin::options.ghostBuster;
+
+		if (api->Checkbox("GhostBuster anti-ghosting", &ghostBuster))
+		{
+			Plugin::options.ghostBuster = ghostBuster;
+			api->SetBool(self, "GhostBuster", ghostBuster);
+		}
+
+		api->ItemTooltip("Tightens disocclusion history resets on sharp camera snaps (>45 deg), sudden FOV/ADS jumps,
+"
+						 "and missing camera motion vectors (from DLSS Enabler GhostBuster). Saved as GhostBuster.");
+
+		bool spinSleep = Plugin::options.pacingSpinlockSleep;
+
+		if (api->Checkbox("Pacing spinlock sleep (lower CPU)", &spinSleep))
+		{
+			Plugin::options.pacingSpinlockSleep = spinSleep;
+			api->SetBool(self, "PacingSpinlockSleep", spinSleep);
+		}
+
+		api->ItemTooltip("Shrinks the Vulkan pacer spin tail and yields the thread while waiting, reducing CPU usage
+"
+						 "(from DLSS Enabler). Saved as PacingSpinlockSleep.");
+
 		bool debugLines = Plugin::options.debugLines;
 
 		if (api->Checkbox("Debug lines", &debugLines))
 			Plugin::options.debugLines = debugLines;
 
 		api->ItemTooltip("XeFG draws debug lines into the frames it generated. Not saved.");
+
+		api->Section("Extended XeFG Overrides");
+
+		static constexpr const char* TriStateNames[] = { "Auto (Game)", "Force Off", "Force On" };
+
+		int32_t depthOv = Plugin::options.depthInvertedOverride.load();
+		if (api->Combo("Depth inverted", &depthOv, TriStateNames, 3, nullptr))
+		{
+			Plugin::options.depthInvertedOverride = depthOv;
+			api->SetInt(self, "DepthInvertedOverride", depthOv);
+		}
+		api->ItemTooltip("Overrides XeFG DepthInverted flag when a game reports inverted depth incorrectly.
+"
+						 "Saved as DepthInvertedOverride.");
+
+		int32_t jitterOv = Plugin::options.jitteredMvOverride.load();
+		if (api->Combo("Jittered motion vectors", &jitterOv, TriStateNames, 3, nullptr))
+		{
+			Plugin::options.jitteredMvOverride = jitterOv;
+			api->SetInt(self, "JitteredMvOverride", jitterOv);
+		}
+		api->ItemTooltip("Overrides XeFG JitteredMV flag when a game misreports motion-vector jitter.
+"
+						 "Saved as JitteredMvOverride.");
+
+		bool ignoreReset = Plugin::options.ignoreGameReset;
+		if (api->Checkbox("Ignore game Reset signals", &ignoreReset))
+		{
+			Plugin::options.ignoreGameReset = ignoreReset;
+			api->SetBool(self, "IgnoreGameReset", ignoreReset);
+		}
+		api->ItemTooltip("Ignores DLSSG.Reset=1 from games that spam reset every frame. Internal safety resets
+"
+						 "(subrect change, camera cut, HUD-less toggle) still run. Saved as IgnoreGameReset.");
 	}
 
 	void DrawTab(void*)
@@ -749,6 +820,12 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* optiAp
 	Plugin::options.vramGuard = api->GetBool(self, "VramGuard", Plugin::options.vramGuard);
 	Plugin::options.autoVrrPacing = api->GetBool(self, "AutoVrrPacing", Plugin::options.autoVrrPacing);
 	Plugin::options.d3d12VulkanWmmaBridge = api->GetBool(self, "D3D12VulkanWmmaBridge", Plugin::options.d3d12VulkanWmmaBridge);
+	Plugin::options.uiTransitionCooldown = api->GetBool(self, "UiTransitionCooldown", Plugin::options.uiTransitionCooldown);
+	Plugin::options.ghostBuster = api->GetBool(self, "GhostBuster", Plugin::options.ghostBuster);
+	Plugin::options.pacingSpinlockSleep = api->GetBool(self, "PacingSpinlockSleep", Plugin::options.pacingSpinlockSleep);
+	Plugin::options.depthInvertedOverride = std::clamp(api->GetInt(self, "DepthInvertedOverride", 0), 0, 2);
+	Plugin::options.jitteredMvOverride = std::clamp(api->GetInt(self, "JitteredMvOverride", 0), 0, 2);
+	Plugin::options.ignoreGameReset = api->GetBool(self, "IgnoreGameReset", Plugin::options.ignoreGameReset);
 
 	// Off in OptiScaler.ini, the Vulkan hooks aren't installed. Said before they are, and a copy started by
 	// InitializeASI that has installed them already only passes the game's calls on from here

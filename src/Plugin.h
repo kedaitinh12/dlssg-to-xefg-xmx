@@ -36,6 +36,18 @@ namespace Plugin
 		// Experimental D3D12->Vulkan VK_KHR_cooperative_matrix bridge (default off: D3D12 cs_6_6 WMMA overrides run without
 		// allocating a duplicate Vulkan XeFG context or triggering OptiScaler Vulkan_wDx12 hooks on DX12 games)
 		std::atomic_bool d3d12VulkanWmmaBridge = false;
+		// DLSS Enabler 4.10.0.26 RC1 features:
+		// Skips 10 real frames when HUD-less/UI composition state toggles to prevent glitched menu transitions
+		std::atomic_bool uiTransitionCooldown = true;
+		// GhostBuster anti-ghosting: resets history on sharp snaps (>45 deg), sudden FOV/ADS jumps, or missing camera MV
+		std::atomic_bool ghostBuster = true;
+		// Allows Vulkan present pacer spinlock to sleep/yield to reduce CPU usage
+		std::atomic_bool pacingSpinlockSleep = false;
+		// Extended XeFG flag overrides: 0 = Auto (game), 1 = Force Off, 2 = Force On
+		std::atomic<int32_t> depthInvertedOverride = 0;
+		std::atomic<int32_t> jitteredMvOverride = 0;
+		// Ignores game-supplied DLSSG.Reset (fixes games that spam Reset=1 every frame; internal safety resets still apply)
+		std::atomic_bool ignoreGameReset = false;
 		// Not saved
 		std::atomic_bool debugLines = false;
 	};

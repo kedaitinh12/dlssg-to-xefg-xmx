@@ -1021,7 +1021,12 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	auto mvecs = params.GetOr<ID3D12Resource*>("DLSSG.MVecs", nullptr);
 	auto output = params.GetOr<ID3D12Resource*>("DLSSG.OutputInterpolated", nullptr);
 
-	const bool depthInverted = params.GetOr<uint32_t>("DLSSG.DepthInverted", 0) != 0;
+	const bool depthInverted = XeFgEnabler::ApplyTriStateOverride(
+		Plugin::options.depthInvertedOverride.load(std::memory_order_relaxed),
+		params.GetOr<uint32_t>("DLSSG.DepthInverted", 0) != 0);
+	const bool mvecJittered = XeFgEnabler::ApplyTriStateOverride(
+		Plugin::options.jitteredMvOverride.load(std::memory_order_relaxed),
+		params.GetOr<uint32_t>("DLSSG.MvecJittered", 0) != 0);
 
 	const auto bbDesc = backbuffer->GetDesc();
 	const auto backbufferFormat = TypedFormat(bbDesc.Format);
@@ -1050,7 +1055,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	wanted.height = outputDesc.Height;
 	wanted.format = TypedFormat(outputDesc.Format);
 	wanted.initFlags = (depthInverted ? XEFGD_INIT_FLAG_INVERTED_DEPTH : 0) |
-		(params.GetOr<uint32_t>("DLSSG.MvecJittered", 0) ? XEFGD_INIT_FLAG_JITTERED_MV : 0);
+		(mvecJittered ? XEFGD_INIT_FLAG_JITTERED_MV : 0);
 	wanted.uiMode = hudless ? XEFGD_UI_MODE_BACKBUFFER_HUDLESS : XEFGD_UI_MODE_AUTO;
 	wanted.model = PickModel(device.Get());
 
@@ -1249,7 +1254,8 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	data.motionVectorScale[0] = (std::isfinite(mvsx) && mvsx != 0.0f) ? mvsx : 1.0f;
 	data.motionVectorScale[1] = (std::isfinite(mvsy) && mvsy != 0.0f) ? mvsy : 1.0f;
 
-	bool reset = params.GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
+	const bool ignoreGameReset = Plugin::options.ignoreGameReset.load(std::memory_order_relaxed);
+	bool reset = !ignoreGameReset && (params.GetOr<uint32_t>("DLSSG.Reset", 0) != 0);
 
 	// Dynamic Resolution / Subrect Change Detector: reset XeFG history if active render/viewport rect changed
 	if (captured && previous.valid && !reset)
@@ -1266,33 +1272,52 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 		}
 	}
 
-	// Camera Cut & Teleport Detector: force history reset on sudden position jumps or sharp orientation snaps
-	if (Plugin::options.cameraCutDetection.load(std::memory_order_relaxed))
+	// Camera Cut & Teleport Detector + GhostBuster anti-ghosting
+	const bool camCutOn = Plugin::options.cameraCutDetection.load(std::memory_order_relaxed);
+	const bool ghostBusterOn = Plugin::options.ghostBuster.load(std::memory_order_relaxed);
+	if (camCutOn || ghostBusterOn)
 	{
 		const XMFLOAT3 curPos = GetVector(params, "DLSSG.CameraPosX", "DLSSG.CameraPosY", "DLSSG.CameraPosZ");
 		const XMFLOAT3 curFwd = GetVector(params, "DLSSG.CameraFwdX", "DLSSG.CameraFwdY", "DLSSG.CameraFwdZ");
 		const float fwdLenSq = curFwd.x * curFwd.x + curFwd.y * curFwd.y + curFwd.z * curFwd.z;
 		const bool hasCamera = fwdLenSq > 1e-6f;
+		float curFov = params.GetOr("DLSSG.CameraFOV", 0.0f);
+		if (!std::isfinite(curFov))
+			curFov = 0.0f;
+		if (curFov > 10.0f)
+			curFov *= std::numbers::pi_v<float> / 180.0f;
 
-		if (hasCamera && context->hasPrevCamera && !reset)
+		float distSq = 0.0f;
+		float fwdDot = 1.0f;
+		if (hasCamera && context->hasPrevCamera)
 		{
 			const float dx = curPos.x - context->prevCameraPos[0];
 			const float dy = curPos.y - context->prevCameraPos[1];
 			const float dz = curPos.z - context->prevCameraPos[2];
-			const float distSq = dx * dx + dy * dy + dz * dz;
-			constexpr float kCutThresholdSq = 4.5f * 4.5f;
+			distSq = dx * dx + dy * dy + dz * dz;
 
 			const float invCur = 1.0f / std::sqrt(fwdLenSq);
 			const float prevLenSq = context->prevCameraFwd[0] * context->prevCameraFwd[0] +
 				context->prevCameraFwd[1] * context->prevCameraFwd[1] +
 				context->prevCameraFwd[2] * context->prevCameraFwd[2];
-			const float fwdDot = (prevLenSq > 1e-6f)
+			fwdDot = (prevLenSq > 1e-6f)
 				? ((curFwd.x * context->prevCameraFwd[0] + curFwd.y * context->prevCameraFwd[1] +
 				    curFwd.z * context->prevCameraFwd[2]) * invCur / std::sqrt(prevLenSq))
 				: 1.0f;
 
-			if (distSq > kCutThresholdSq || fwdDot < -0.5f)
+			constexpr float kCutThresholdSq = 4.5f * 4.5f;
+			if (camCutOn && !reset && (distSq > kCutThresholdSq || fwdDot < -0.5f))
 				reset = true;
+		}
+
+		if (ghostBusterOn && !reset)
+		{
+			const bool camMvIncluded = params.GetOr<uint32_t>("DLSSG.CameraMotionIncluded", 1) != 0;
+			if (XeFgEnabler::ShouldGhostBusterReset(true, hasCamera, context->hasPrevCamera, fwdDot,
+				curFov, context->prevCameraFov, context->hasPrevFov, camMvIncluded, distSq))
+			{
+				reset = true;
+			}
 		}
 
 		if (hasCamera)
@@ -1305,11 +1330,32 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 			context->prevCameraFwd[2] = curFwd.z;
 			context->hasPrevCamera = true;
 		}
+		if (curFov > 0.01f)
+		{
+			context->prevCameraFov = curFov;
+			context->hasPrevFov = true;
+		}
 	}
 
-	// Force history reset if HUD-less presence toggles between frames (network source switch, dlssg-0.4.2 M3)
+	// Force history reset + 10-frame UI transition cooldown if HUD-less presence toggles (DLSS Enabler XeFG_Dx12)
 	if (captured && previous.valid && (frame.hudless != nullptr) != (previous.hudless != nullptr))
+	{
 		reset = true;
+		if (Plugin::options.uiTransitionCooldown.load(std::memory_order_relaxed))
+		{
+			context->uiTransitionCooldown = 10u;
+			Log::Info("HUD-less state changed ({} -> {}), skipping interpolation for 10 frames",
+				previous.hudless != nullptr, frame.hudless != nullptr);
+		}
+	}
+
+	bool inUiCooldown = false;
+	if (context->uiTransitionCooldown > 0u)
+	{
+		--context->uiTransitionCooldown;
+		inUiCooldown = true;
+		reset = true;
+	}
 
 	if (reset)
 	{
@@ -1320,7 +1366,8 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	data.resetHistory = reset;
 
 	// XeFG needs both frames to have hudless or neither
-	context->pairValid = captured && previous.valid && !reset && (frame.hudless != nullptr) == (previous.hudless != nullptr);
+	context->pairValid = captured && previous.valid && !reset && !inUiCooldown &&
+		(frame.hudless != nullptr) == (previous.hudless != nullptr);
 	context->batchGeneratedThrough = 0;
 	context->directOutput = false;
 	frame.valid = captured;
@@ -1498,6 +1545,7 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 			context->pairValid = false;
 			context->consecutiveExecuteFailures = 0;
 			context->stallCooldownEvaluations = 0;
+			context->uiTransitionCooldown = 0;
 		}
 
 		if (output)
