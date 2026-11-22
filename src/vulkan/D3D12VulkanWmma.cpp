@@ -561,10 +561,9 @@ SharedImport* GetOrImportLocked(Bridge& b, ID3D12Resource* d3dRes, bool isOutput
 	return &inserted->second;
 }
 
-void RecordImageBarrier(const Bridge& b, VkCommandBuffer cmd, VkImage img,
+VkImageMemoryBarrier MakeImageBarrier(VkImage img,
 	VkImageLayout oldLayout, VkImageLayout newLayout,
-	VkPipelineStageFlags srcStage, VkAccessFlags srcAccess,
-	VkPipelineStageFlags dstStage, VkAccessFlags dstAccess) noexcept
+	VkAccessFlags srcAccess, VkAccessFlags dstAccess) noexcept
 {
 	VkImageMemoryBarrier barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
 	barrier.srcAccessMask = srcAccess;
@@ -575,7 +574,7 @@ void RecordImageBarrier(const Bridge& b, VkCommandBuffer cmd, VkImage img,
 	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.image = img;
 	barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-	b.vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+	return barrier;
 }
 
 void RecordCopyImage(const Bridge& b, VkCommandBuffer cmd, VkImage src, VkImage dst, uint32_t w, uint32_t h) noexcept
@@ -689,30 +688,39 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 	bool execOk = false;
 	if (xvk::BeginRecording(gBridge.xvkDevice.Get(), cmd))
 	{
-		// Copy D3D12 shared inputs into xvk's GENERAL-layout textures.
-		auto copyInput = [&](SharedImport* imp) {
-			if (!imp)
-				return;
-			VkImage xvkImg = xvk::ImageOf(imp->xvkResource.Get());
-			RecordImageBarrier(gBridge, cmd, imp->vkImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-				VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-			RecordImageBarrier(gBridge, cmd, xvkImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
-				VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-			RecordCopyImage(gBridge, cmd, imp->vkImage, xvkImg, imp->width, imp->height);
-			RecordImageBarrier(gBridge, cmd, xvkImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-				VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-		};
-
-		copyInput(prevBB);
-		copyInput(prevD);
-		copyInput(prevMV);
-		copyInput(prevHL);
-		copyInput(nextBB);
-		copyInput(nextD);
-		copyInput(nextMV);
-		copyInput(nextHL);
+		// Copy D3D12 shared inputs into xvk's GENERAL-layout textures with batched barriers (24 -> 2 barriers).
+		SharedImport* const inputs[8] = { prevBB, prevD, prevMV, prevHL, nextBB, nextD, nextMV, nextHL };
+		VkImageMemoryBarrier preIn[16]{};
+		VkImageMemoryBarrier postIn[8]{};
+		VkImage xvkInImgs[8]{};
+		uint32_t preInCount = 0;
+		uint32_t postInCount = 0;
+		for (uint32_t i = 0; i < 8; ++i)
+		{
+			if (!inputs[i])
+				continue;
+			VkImage xvkImg = xvk::ImageOf(inputs[i]->xvkResource.Get());
+			xvkInImgs[i] = xvkImg;
+			preIn[preInCount++] = MakeImageBarrier(inputs[i]->vkImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+				0, VK_ACCESS_TRANSFER_READ_BIT);
+			preIn[preInCount++] = MakeImageBarrier(xvkImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+				VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+			postIn[postInCount++] = MakeImageBarrier(xvkImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+				VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+		}
+		if (preInCount)
+			gBridge.vkCmdPipelineBarrier(cmd,
+				VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, preInCount, preIn);
+		for (uint32_t i = 0; i < 8; ++i)
+		{
+			if (inputs[i])
+				RecordCopyImage(gBridge, cmd, inputs[i]->vkImage, xvkInImgs[i], inputs[i]->width, inputs[i]->height);
+		}
+		if (postInCount)
+			gBridge.vkCmdPipelineBarrier(cmd,
+				VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				0, 0, nullptr, 0, nullptr, postInCount, postIn);
 
 		// Record the entire XeFG batch (all 28 layers, with 17 INT8 layers on hardware VK_KHR_cooperative_matrix).
 		xefgd_exec_params_t vkParams{};
@@ -764,20 +772,33 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 		return;
 	}
 
-	// Copy xvk outputs back into the shared D3D12 output textures.
+	// Copy xvk outputs back into the shared D3D12 output textures with batched barriers (3*N -> 2 barriers).
+	VkImageMemoryBarrier preOut[kMaxFrames * 2]{};
+	VkImageMemoryBarrier postOut[kMaxFrames]{};
+	VkImage xvkOutImgs[kMaxFrames]{};
+	uint32_t preOutCount = 0;
+	uint32_t postOutCount = 0;
 	for (uint32_t i = 0; i < batch.frameCount; ++i)
 	{
 		VkImage xvkOut = xvk::ImageOf(outImports[i]->xvkResource.Get());
-		RecordImageBarrier(gBridge, cmd, xvkOut, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-		RecordImageBarrier(gBridge, cmd, outImports[i]->vkImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-		RecordCopyImage(gBridge, cmd, xvkOut, outImports[i]->vkImage, outImports[i]->width, outImports[i]->height);
-		RecordImageBarrier(gBridge, cmd, outImports[i]->vkImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-			VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0);
+		xvkOutImgs[i] = xvkOut;
+		preOut[preOutCount++] = MakeImageBarrier(xvkOut, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+			VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+		preOut[preOutCount++] = MakeImageBarrier(outImports[i]->vkImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+			0, VK_ACCESS_TRANSFER_WRITE_BIT);
+		postOut[postOutCount++] = MakeImageBarrier(outImports[i]->vkImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+			VK_ACCESS_TRANSFER_WRITE_BIT, 0);
 	}
+	if (preOutCount)
+		gBridge.vkCmdPipelineBarrier(cmd,
+			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, preOutCount, preOut);
+	for (uint32_t i = 0; i < batch.frameCount; ++i)
+		RecordCopyImage(gBridge, cmd, xvkOutImgs[i], outImports[i]->vkImage, outImports[i]->width, outImports[i]->height);
+	if (postOutCount)
+		gBridge.vkCmdPipelineBarrier(cmd,
+			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+			0, 0, nullptr, 0, nullptr, postOutCount, postOut);
 
 	if (gBridge.vkEndCommandBuffer(cmd) != VK_SUCCESS)
 	{

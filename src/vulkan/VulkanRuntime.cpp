@@ -365,12 +365,6 @@ namespace
 		d.vkCmdPipelineBarrier(command, srcStage, dstStage, 0, 1, &memory, 0, nullptr, 0, nullptr);
 	}
 
-	void FullBarrier(const Device& d, VkCommandBuffer command)
-	{
-		StageBarrier(d, command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
-			VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
-	}
-
 	void CopyImage(const Device& d, VkCommandBuffer command, VkImage source, VkImageLayout sourceLayout, VkImage target,
 		VkImageLayout targetLayout, uint32_t width, uint32_t height, const NgxResource* sourceResource = nullptr,
 		const NgxResource* targetResource = nullptr)
