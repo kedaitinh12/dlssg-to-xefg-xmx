@@ -163,14 +163,16 @@ uint RequantFloat(int acc, float s, float b, int lo)
 }
 #else
 // Exact port of Flow requantization from src/MfgPort/Cuda/xefg_cuda_layers.cu lines 533-538
-uint RequantFlow(int a, int ib, int neg, int lim, uint posMul, uint s1, uint s2)
+// Uses hoisted uniform rounding constants and single-multiply branchless select (bit-exact for s1, s2 in [1, 31])
+uint RequantFlow(int a, int ib, int neg, int lim, uint posMul, uint s1, uint s2, uint roundPos, uint roundNeg)
 {
     int clamped = clamp(a + ib, -lim, lim - 1);
-    uint roundPos = 1u << ((s1 + 31u) & 31u);
-    uint roundNeg = 1u << ((s2 + 31u) & 31u);
-    int pp = int(uint(max(clamped, 0)) * posMul + roundPos) >> int(s1);
-    int nn = int(uint(min(clamped, 0)) * uint(neg) + roundNeg) >> int(s2);
-    return uint(clamp(pp + nn, -128, 127)) & 0xFFu;
+    bool isPos  = clamped >= 0;
+    uint mul    = isPos ? posMul   : uint(neg);
+    uint rnd    = isPos ? roundPos : roundNeg;
+    int  sh     = int(isPos ? s1   : s2);
+    int  val    = int(uint(clamped) * mul + rnd) >> sh;
+    return uint(clamp(val, -128, 127)) & 0xFFu;
 }
 #endif
 
@@ -571,6 +573,9 @@ void main(uint3 groupID : SV_GroupID, uint tid : SV_GroupIndex)
         nvCache[w] = tBias[ch4 >> 2];
     }
 
+    const uint roundPos = 1u << ((sh1 + 31u) & 31u);
+    const uint roundNeg = 1u << ((sh2 + 31u) & 31u);
+
     // Barrier-free Wave32 epilogue using WaveReadLaneAt
     [unroll]
     for (int r = 0; r < ROWS; ++r)
@@ -588,7 +593,7 @@ void main(uint3 groupID : SV_GroupID, uint tid : SV_GroupIndex)
             for (int c = 0; c < 4; ++c)
             {
                 int a = acc[r][w * 4 + c];
-                packed |= RequantFlow(a, ib[c], ng[c], lim, posMul, sh1, sh2) << uint(c * 8);
+                packed |= RequantFlow(a, ib[c], ng[c], lim, posMul, sh1, sh2, roundPos, roundNeg) << uint(c * 8);
             }
             if (w == 0)      halfWords.x = packed;
             else if (w == 1) halfWords.y = packed;
