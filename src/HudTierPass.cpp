@@ -97,21 +97,31 @@ bool IsHudDiff(int2 p)
     return max(d.r, max(d.g, d.b)) > Tolerance;
 }
 
+// 10x10 shared tile for 8x8 group + 1-pixel halo (200 vs 1152 texture loads per group = 5.76x fewer VRAM reads)
+groupshared uint g_sDiff[100];
+
 [numthreads(8, 8, 1)]
-void HudDiffCompositeCS(uint3 id : SV_DispatchThreadID)
+void HudDiffCompositeCS(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID, uint gidx : SV_GroupIndex)
 {
+    int2 maxCoord = int2(Width - 1u, Height - 1u);
+    int2 tileOrigin = int2(gid.xy * 8u) - int2(1, 1);
+
+    for (uint idx = gidx; idx < 100u; idx += 64u)
+    {
+        int tx = int(idx % 10u);
+        int ty = int(idx / 10u);
+        int2 q = clamp(tileOrigin + int2(tx, ty), int2(0, 0), maxCoord);
+        g_sDiff[idx] = IsHudDiff(q) ? 1u : 0u;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
     if (id.x >= Width || id.y >= Height) return;
 
-    int2 maxCoord = int2(Width - 1u, Height - 1u);
-    bool hud = false;
-    [unroll] for (int dy = -1; dy <= 1; ++dy)
-    {
-        [unroll] for (int dx = -1; dx <= 1; ++dx)
-        {
-            int2 q = clamp(int2(id.xy) + int2(dx, dy), int2(0, 0), maxCoord);
-            hud = hud || IsHudDiff(q);
-        }
-    }
+    uint base = gtid.y * 10u + gtid.x;
+    uint mask = g_sDiff[base + 0u]  | g_sDiff[base + 1u]  | g_sDiff[base + 2u]
+              | g_sDiff[base + 10u] | g_sDiff[base + 11u] | g_sDiff[base + 12u]
+              | g_sDiff[base + 20u] | g_sDiff[base + 21u] | g_sDiff[base + 22u];
+    bool hud = (mask != 0u);
 
     if ((Flags & 1u) != 0u && hud && (id.x & 3u) == 0u && (id.y & 3u) == 0u)
     {
@@ -219,22 +229,31 @@ bool IsHudDiffHybrid(int2 p)
     return max(d.r, max(d.g, d.b)) > Tolerance;
 }
 
+// 10x10 shared tile for 8x8 group + 1-pixel halo (5.76x fewer TexA/TexB VRAM reads)
+groupshared uint g_sDiffHybrid[100];
+
 [numthreads(8, 8, 1)]
-void HybridHudCompositeCS(uint3 id : SV_DispatchThreadID)
+void HybridHudCompositeCS(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID, uint gidx : SV_GroupIndex)
 {
+    int2 maxCoord = int2(Width - 1u, Height - 1u);
+    int2 tileOrigin = int2(gid.xy * 8u) - int2(1, 1);
+
+    for (uint idx = gidx; idx < 100u; idx += 64u)
+    {
+        int tx = int(idx % 10u);
+        int ty = int(idx / 10u);
+        int2 q = clamp(tileOrigin + int2(tx, ty), int2(0, 0), maxCoord);
+        g_sDiffHybrid[idx] = IsHudDiffHybrid(q) ? 1u : 0u;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
     if (id.x >= Width || id.y >= Height) return;
 
-    int2 p = int2(id.xy);
-    int2 maxCoord = int2(Width - 1u, Height - 1u);
-    bool hudDiff = false;
-    [unroll] for (int dy = -1; dy <= 1; ++dy)
-    {
-        [unroll] for (int dx = -1; dx <= 1; ++dx)
-        {
-            int2 q = clamp(p + int2(dx, dy), int2(0, 0), maxCoord);
-            hudDiff = hudDiff || IsHudDiffHybrid(q);
-        }
-    }
+    uint base = gtid.y * 10u + gtid.x;
+    uint mask = g_sDiffHybrid[base + 0u]  | g_sDiffHybrid[base + 1u]  | g_sDiffHybrid[base + 2u]
+              | g_sDiffHybrid[base + 10u] | g_sDiffHybrid[base + 11u] | g_sDiffHybrid[base + 12u]
+              | g_sDiffHybrid[base + 20u] | g_sDiffHybrid[base + 21u] | g_sDiffHybrid[base + 22u];
+    bool hudDiff = (mask != 0u);
 
     if ((Flags & 1u) != 0u && hudDiff && (id.x & 3u) == 0u && (id.y & 3u) == 0u)
     {
@@ -242,6 +261,7 @@ void HybridHudCompositeCS(uint3 id : SV_DispatchThreadID)
         Counter.InterlockedAdd(0, 1u, dummy);
     }
 
+    int2 p = int2(id.xy);
     bool isStatic = StaticCount[p] >= 4u;
     if (hudDiff || isStatic)
     {
