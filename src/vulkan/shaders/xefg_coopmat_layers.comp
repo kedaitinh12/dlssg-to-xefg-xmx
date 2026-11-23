@@ -28,6 +28,17 @@
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_EXT_samplerless_texture_functions : enable
 
+// Optional Linux Mesa RADV Wave32 register-only accumulator epilogue (zero sAcc LDS, zero subgroupBarrier).
+// Relies on RADV's fixed 16x16x16 Wave32 layout (radv_nir_lower_cooperative_matrix.c):
+//   invocation (g = lane >> 4, p = lane & 15) owns C[g + i * 2][p] in matC[i] (i = 0..7).
+// Strictly gated at runtime in xvk_coopmat.cpp to Wine/Proton + VK_DRIVER_ID_MESA_RADV + Wave32.
+#ifndef RADV_REG_ONLY
+#define RADV_REG_ONLY 0
+#endif
+#if RADV_REG_ONLY != 0
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#endif
+
 layout(constant_id = 0) const uint COOP_M = 16;
 layout(constant_id = 1) const uint COOP_N = 16;
 layout(constant_id = 2) const uint COOP_K = 16;
@@ -122,7 +133,9 @@ const int ROWS   = LAYER_TILE_H / 4;
 // Flow stages one 16-channel input step at a time and 2 x (9 taps x 16x16 col-major) weight tiles (NT = 4 tiles of 8 ch = 32 ch)
 shared uint winWords[WIN * 4];
 shared uint wsmWords[2 * 9 * 64];
+#if RADV_REG_ONLY == 0
 shared int  sAcc[4 * 256]; // Phased half-emission: 4 KB instead of 8 KB (-50% Flow accumulator LDS)
+#endif
 #else
 const int ZPER = LAYER_OUT / LAYER_ZSPLIT;
 #if (LAYER_OUT / LAYER_ZSPLIT) == 1 && LAYER_IN > 1
@@ -133,7 +146,9 @@ shared uint winWords[WIN * 4];
 shared uint winWords[LAYER_IN * WIN * 4];
 #endif
 shared uint wsmWords[9 * 64];
+#if RADV_REG_ONLY == 0
 shared int  sAcc[4 * PY * 256];
+#endif
 #endif
 
 int sbyte(uint w, uint k)
@@ -150,6 +165,25 @@ uint uvec4Comp(uvec4 v, int k)
 {
 	return k == 0 ? v.x : (k == 1 ? v.y : (k == 2 ? v.z : v.w));
 }
+
+#if RADV_REG_ONLY != 0
+// Packs 16 8-bit channels held across lanes [gBase + 0 .. gBase + 15] into 4 uint words on lane gBase + 0.
+// Must be called uniformly by all 32 lanes in the subgroup.
+uvec4 radvPack16Ch(uint q, uint lane)
+{
+	uint b1 = subgroupShuffleXor(q, 1u);
+	uint b2 = subgroupShuffleXor(q, 2u);
+	uint b3 = subgroupShuffleXor(b1, 2u);
+	uint word = q | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
+	uint gBase = lane & 16u;
+	return uvec4(
+		subgroupShuffle(word, gBase + 0u),
+		subgroupShuffle(word, gBase + 4u),
+		subgroupShuffle(word, gBase + 8u),
+		subgroupShuffle(word, gBase + 12u)
+	);
+}
+#endif
 
 // Hardware clamp-to-border (0,0,0,0) equivalent for samplerless texelFetch (sz hoisted by caller)
 uvec4 fetchInput(int x, int y, int slice, ivec3 sz)
@@ -210,6 +244,7 @@ void stagePoolWeights(int block, uint tid)
 	}
 }
 
+#if RADV_REG_ONLY == 0
 void emitPoolRow(int r, int z, int X0, int Y0, int limitW, int limitH, uint warp, uint lane,
                  float s[16], float bi[16], int lo)
 {
@@ -272,6 +307,43 @@ void emitPoolRow(int r, int z, int X0, int Y0, int limitW, int limitH, uint warp
 	}
 #endif
 }
+#else
+#if LAYER_POOL != 0
+void emitPoolRowRadv(int r, int z, int X0, int Y0, int limitW, int limitH,
+                     uint warp, uint lane, float sLane, float biLane, int lo,
+                     coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC0,
+                     coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC1)
+{
+	int Y = Y0 + int(warp) + r * 4;
+	for (int i = 0; i < 8; ++i)
+	{
+		int vy = max(matC0[i], matC1[i]);
+		int vPeer = subgroupShuffleXor(vy, 16u);
+		int pooled = max(vy, vPeer);
+		uint q = requantFloat(pooled, sLane, biLane, lo);
+		uvec4 words = radvPack16Ch(q, lane);
+		if (lane == 0u && Y < limitH && (X0 + i) < limitW)
+			imageStore(uDst, ivec3(X0 + i, Y, z), words);
+	}
+}
+#else
+void emitPoolRowRadv(int r, int z, int X0, int Y0, int limitW, int limitH,
+                     uint warp, uint lane, float sLane, float biLane, int lo,
+                     coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC0)
+{
+	int Y = Y0 + int(warp) + r * 4;
+	uint g = lane >> 4u;
+	for (int i = 0; i < 8; ++i)
+	{
+		uint q = requantFloat(matC0[i], sLane, biLane, lo);
+		uvec4 words = radvPack16Ch(q, lane);
+		int X = X0 + int(g) + i * 2;
+		if ((lane & 15u) == 0u && Y < limitH && X < limitW)
+			imageStore(uDst, ivec3(X, Y, z), words);
+	}
+}
+#endif
+#endif
 #else
 // Exact port of Flow requantization from src/MfgPort/Cuda/xefg_cuda_layers.cu lines 533-538
 // Uses hoisted uniform rounding constants and single-multiply branchless select (bit-exact for s1, s2 in [1, 31])
@@ -336,6 +408,7 @@ void stageFlowWeights(int step, int n0, uint tid)
 	}
 }
 
+#if RADV_REG_ONLY == 0
 void emitFlowHalf(int r, int h, int n0, int X0, int Y0, int limitW, int limitH,
                   int lim, uint posMul, uint s1, uint s2, uint roundPos, uint roundNeg,
                   uint warp, uint lane, uvec4 flowScale[8], uvec4 flowBias[8])
@@ -373,6 +446,31 @@ void emitFlowHalf(int r, int h, int n0, int X0, int Y0, int limitW, int limitH,
 	imageStore(uDst, ivec3(x, y + 1, (n0 / 2) + h), uvec4(words[0], words[1], words[2], words[3]));
 #endif
 }
+#else
+void emitFlowHalfRadv(int r, int h, int n0, int X0, int Y0, int limitW, int limitH,
+                      int lim, uint posMul, uint s1, uint s2, uint roundPos, uint roundNeg,
+                      uint warp, uint lane, int ibLane, int ngLane,
+                      coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC)
+{
+	int y = Y0 + int(warp) + r * 4;
+	uint g = lane >> 4u;
+	for (int i = 0; i < 8; ++i)
+	{
+		uint q = requantFlow(matC[i], ibLane, ngLane, lim, posMul, s1, s2, roundPos, roundNeg);
+		uvec4 words = radvPack16Ch(q, lane);
+		int x = X0 + int(g) + i * 2;
+		if ((lane & 15u) == 0u && y < limitH && x < limitW)
+		{
+#if LAYER_OUT == 8
+			imageStore(uDst, ivec3(x, y + 1, n0 + h * 2 + 0), uvec4(words.x, words.y, words.x, words.x));
+			imageStore(uDst, ivec3(x, y + 1, n0 + h * 2 + 1), uvec4(words.z, words.w, words.z, words.z));
+#else
+			imageStore(uDst, ivec3(x, y + 1, (n0 / 2) + h), words);
+#endif
+		}
+	}
+}
+#endif
 #endif
 
 void main()
@@ -591,6 +689,32 @@ void main()
 			barrier();
 		}
 
+#if RADV_REG_ONLY != 0
+		const uint pCh = lane & 15u;
+		const uvec4 sv = uScale.data[uint(z * 4) + (pCh >> 2u)];
+		const uvec4 bv = uBias.data[uint(z * 4) + (pCh >> 2u)];
+		const float sLane  = uintBitsToFloat(uvec4Comp(sv, int(pCh & 3u)));
+		const float biLane = uintBitsToFloat(uvec4Comp(bv, int(pCh & 3u)));
+#if LAYER_POOL != 0
+		emitPoolRowRadv(0, z, X0, Y0, limitW, limitH, warp, lane, sLane, biLane, lo, matC0_0, matC0_1);
+#if LAYER_TILE_H >= 8
+		emitPoolRowRadv(1, z, X0, Y0, limitW, limitH, warp, lane, sLane, biLane, lo, matC1_0, matC1_1);
+#endif
+#if LAYER_TILE_H >= 16
+		emitPoolRowRadv(2, z, X0, Y0, limitW, limitH, warp, lane, sLane, biLane, lo, matC2_0, matC2_1);
+		emitPoolRowRadv(3, z, X0, Y0, limitW, limitH, warp, lane, sLane, biLane, lo, matC3_0, matC3_1);
+#endif
+#else
+		emitPoolRowRadv(0, z, X0, Y0, limitW, limitH, warp, lane, sLane, biLane, lo, matC0_0);
+#if LAYER_TILE_H >= 8
+		emitPoolRowRadv(1, z, X0, Y0, limitW, limitH, warp, lane, sLane, biLane, lo, matC1_0);
+#endif
+#if LAYER_TILE_H >= 16
+		emitPoolRowRadv(2, z, X0, Y0, limitW, limitH, warp, lane, sLane, biLane, lo, matC2_0);
+		emitPoolRowRadv(3, z, X0, Y0, limitW, limitH, warp, lane, sLane, biLane, lo, matC3_0);
+#endif
+#endif
+#else
 		float s[16];
 		float bi[16];
 		for (int w = 0; w < 4; ++w)
@@ -653,6 +777,7 @@ void main()
 		subgroupBarrier();
 		emitPoolRow(3, z, X0, Y0, limitW, limitH, warp, lane, s, bi, lo);
 #endif
+#endif
 	}
 
 #else
@@ -711,6 +836,22 @@ void main()
 		barrier();
 	}
 
+	const uint roundPos = 1u << ((s1 + 31u) & 31u);
+	const uint roundNeg = 1u << ((s2 + 31u) & 31u);
+
+#if RADV_REG_ONLY != 0
+	const int pCh = int(lane & 15u);
+	const int ch0 = n0 * 8 + pCh;
+	const int ch1 = n0 * 8 + 16 + pCh;
+	const int ib0 = int(uvec4Comp(uScale.data[uint(ch0 >> 2)], ch0 & 3));
+	const int ng0 = int(uvec4Comp(uBias.data[uint(ch0 >> 2)],  ch0 & 3));
+	const int ib1 = int(uvec4Comp(uScale.data[uint(ch1 >> 2)], ch1 & 3));
+	const int ng1 = int(uvec4Comp(uBias.data[uint(ch1 >> 2)],  ch1 & 3));
+	emitFlowHalfRadv(0, 0, n0, X0, Y0, limitW, limitH, lim, posMul, s1, s2, roundPos, roundNeg, warp, lane, ib0, ng0, matC0_0);
+	emitFlowHalfRadv(0, 1, n0, X0, Y0, limitW, limitH, lim, posMul, s1, s2, roundPos, roundNeg, warp, lane, ib1, ng1, matC0_1);
+	emitFlowHalfRadv(1, 0, n0, X0, Y0, limitW, limitH, lim, posMul, s1, s2, roundPos, roundNeg, warp, lane, ib0, ng0, matC1_0);
+	emitFlowHalfRadv(1, 1, n0, X0, Y0, limitW, limitH, lim, posMul, s1, s2, roundPos, roundNeg, warp, lane, ib1, ng1, matC1_1);
+#else
 	uvec4 flowScale[8];
 	uvec4 flowBias[8];
 	for (int h = 0; h < 2; ++h)
@@ -723,8 +864,6 @@ void main()
 		}
 	}
 
-	const uint roundPos = 1u << ((s1 + 31u) & 31u);
-	const uint roundNeg = 1u << ((s2 + 31u) & 31u);
 
 	// Emit r = 0, phased by half h = 0, 1 so sAcc stays 4 KB (per-warp subgroup sync)
 	coopMatStore(matC0_0, sAcc, warp * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
@@ -753,5 +892,6 @@ void main()
 	subgroupMemoryBarrierShared();
 	subgroupBarrier();
 	emitFlowHalf(1, 1, n0, X0, Y0, limitW, limitH, lim, posMul, s1, s2, roundPos, roundNeg, warp, lane, flowScale, flowBias);
+#endif
 #endif
 }
