@@ -1,6 +1,6 @@
-From 13e12cfb7c90579e74ae7811410982650aac141a Mon Sep 17 00:00:00 2001
+From ff21b198a94b2d6f3f178782fba27180219fcd67 Mon Sep 17 00:00:00 2001
 From: dlssg-to-xefg <dev@local>
-Date: Mon, 23 Nov 2026 04:26:22 +0000
+Date: Mon, 23 Nov 2026 04:55:14 +0000
 Subject: [PATCH] Add Linux/Wine/Proton support, RADV-only register WMMA
  shaders, Save Settings menu notices, and downstream Vulkan ICD hooks with
  swapchain/present diagnostics
@@ -13,9 +13,11 @@ Subject: [PATCH] Add Linux/Wine/Proton support, RADV-only register WMMA
  src/vulkan/xvk_coopmat.cpp                  |  35 +-
  src/vulkan/xvk_dxgi.cpp                     |  12 +-
  src/vulkan/xvk_queue.cpp                    |  11 +-
+ tests/vulkan_runtime/stubs/Windows.h        |  21 ++
+ tests/vulkan_runtime/stubs/vulkan/vulkan.h  |   2 +
  tools/CheckXeFgCoopMat.py                   |   3 +
  tools/GenerateXeFgCoopMat.py                |   6 +-
- 9 files changed, 535 insertions(+), 96 deletions(-)
+ 11 files changed, 558 insertions(+), 96 deletions(-)
  create mode 100644 src/WineCompat.h
 
 diff --git a/src/Plugin.cpp b/src/Plugin.cpp
@@ -1133,6 +1135,58 @@ index 47a8111..7e749d1 100644
      }
      {
          static std::atomic<int> logged{0};
+diff --git a/tests/vulkan_runtime/stubs/Windows.h b/tests/vulkan_runtime/stubs/Windows.h
+index 5266798..c7e360a 100644
+--- a/tests/vulkan_runtime/stubs/Windows.h
++++ b/tests/vulkan_runtime/stubs/Windows.h
+@@ -99,7 +99,28 @@ extern "C++"
+ 	void OutputDebugStringA(const char* lpOutputString);
+ 	DWORD GetLastError();
+ 	DWORD GetCurrentProcessId();
++	DWORD GetCurrentThreadId();
+ 	HANDLE GetCurrentProcess();
++	#define MEM_COMMIT 0x00001000u
++	#define PAGE_NOACCESS 0x01u
++	#define PAGE_READONLY 0x02u
++	#define PAGE_READWRITE 0x04u
++	#define PAGE_WRITECOPY 0x08u
++	#define PAGE_EXECUTE_READ 0x20u
++	#define PAGE_EXECUTE_READWRITE 0x40u
++	#define PAGE_EXECUTE_WRITECOPY 0x80u
++	#define PAGE_GUARD 0x100u
++	struct MEMORY_BASIC_INFORMATION
++	{
++		void* BaseAddress;
++		void* AllocationBase;
++		DWORD AllocationProtect;
++		size_t RegionSize;
++		DWORD State;
++		DWORD Protect;
++		DWORD Type;
++	};
++	size_t VirtualQuery(const void* lpAddress, MEMORY_BASIC_INFORMATION* lpBuffer, size_t dwLength);
+ 	HANDLE CreateMutexW(void* lpMutexAttributes, BOOL bInitialOwner, LPCWSTR lpName);
+ 	union LARGE_INTEGER { int64_t QuadPart; };
+ 	BOOL QueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCount);
+diff --git a/tests/vulkan_runtime/stubs/vulkan/vulkan.h b/tests/vulkan_runtime/stubs/vulkan/vulkan.h
+index 6140591..930d53f 100644
+--- a/tests/vulkan_runtime/stubs/vulkan/vulkan.h
++++ b/tests/vulkan_runtime/stubs/vulkan/vulkan.h
+@@ -1049,12 +1049,14 @@ typedef struct VkSurfaceCapabilitiesKHR
+ } VkSurfaceCapabilitiesKHR;
+ typedef VkResult(VKAPI_PTR* PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)(VkPhysicalDevice physicalDevice,
+ 	VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR* pSurfaceCapabilities);
++typedef struct VkExtent2D { uint32_t width; uint32_t height; } VkExtent2D;
+ typedef struct VkSwapchainCreateInfoKHR
+ {
+ 	VkStructureType sType;
+ 	const void* pNext;
+ 	VkSurfaceKHR surface;
+ 	uint32_t minImageCount;
++	VkExtent2D imageExtent;
+ 	VkPresentModeKHR presentMode;
+ } VkSwapchainCreateInfoKHR;
+ typedef struct VkPresentInfoKHR
 diff --git a/tools/CheckXeFgCoopMat.py b/tools/CheckXeFgCoopMat.py
 index 911c5de..1f51888 100644
 --- a/tools/CheckXeFgCoopMat.py
