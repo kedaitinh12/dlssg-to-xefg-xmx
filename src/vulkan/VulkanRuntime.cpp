@@ -147,6 +147,10 @@ namespace
 		VkPipelineLayout hudPipelineLayout = VK_NULL_HANDLE;
 		VkPipeline hudPipelines[4][2] = {};
 		bool hudPipelinesReady = false;
+		VkDescriptorSetLayout hudHybridSetLayout = VK_NULL_HANDLE;
+		VkPipelineLayout hudHybridPipelineLayout = VK_NULL_HANDLE;
+		VkPipeline hudHybridPipelines[2] = {};
+		bool hudHybridReady = false;
 
 		// Tier 3 Hybrid Tone-Map Matcher pipelines (clear, accumulate, median, fill, apply[rgba8/rgb10a2])
 		VkDescriptorSetLayout hudTmSetLayout = VK_NULL_HANDLE;
@@ -259,6 +263,7 @@ namespace
 		bool batchReady = false;
 		bool cameraLogged = false;
 		uint64_t batches = 0, failures = 0, evaluations = 0, realCopies = 0, paused = 0;
+		VkImage lastCopiedRealImage = VK_NULL_HANDLE;
 		std::string fault;
 		std::string initFault; // permanent missing-program failure for the current input configuration
 
@@ -506,6 +511,40 @@ namespace
 		d.vkCmdDispatch(command, (width + 7u) / 8u, (height + 7u) / 8u, 1u);
 	}
 
+	void RecordHudHybridDispatch(const Device& d, VkCommandBuffer command, VkPipeline pipeline,
+		VkImageView realView, VkImageView hudlessView, VkImageView outView, VkBuffer counterBuf,
+		VkImageView staticCountView, uint32_t width, uint32_t height, float tolerance, uint32_t flags) noexcept
+	{
+		if (!pipeline || !realView || !hudlessView || !outView || !counterBuf || !staticCountView)
+			return;
+
+		d.vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+
+		VkDescriptorImageInfo img0{ VK_NULL_HANDLE, realView, VK_IMAGE_LAYOUT_GENERAL };
+		VkDescriptorImageInfo img1{ VK_NULL_HANDLE, hudlessView, VK_IMAGE_LAYOUT_GENERAL };
+		VkDescriptorImageInfo img2{ VK_NULL_HANDLE, outView, VK_IMAGE_LAYOUT_GENERAL };
+		VkDescriptorBufferInfo buf3{ counterBuf, 0, 16 };
+		VkDescriptorImageInfo img4{ VK_NULL_HANDLE, staticCountView, VK_IMAGE_LAYOUT_GENERAL };
+
+		VkWriteDescriptorSet writes[5] = {
+			{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1,
+				VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &img0, nullptr, nullptr },
+			{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1,
+				VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &img1, nullptr, nullptr },
+			{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 2, 0, 1,
+				VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &img2, nullptr, nullptr },
+			{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 3, 0, 1,
+				VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &buf3, nullptr },
+			{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 4, 0, 1,
+				VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &img4, nullptr, nullptr },
+		};
+
+		d.vkCmdPushDescriptorSetKHR(command, VK_PIPELINE_BIND_POINT_COMPUTE, d.hudHybridPipelineLayout, 0, 5, writes);
+		const VkHudPushConstants pc{ width, height, tolerance, flags };
+		d.vkCmdPushConstants(command, d.hudHybridPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+		d.vkCmdDispatch(command, (width + 7u) / 8u, (height + 7u) / 8u, 1u);
+	}
+
 	bool LoadSpirvFileBytes(const std::filesystem::path& path, std::vector<uint32_t>& outWords) noexcept
 	{
 		try
@@ -595,6 +634,56 @@ namespace
 
 		d.hudPipelinesReady = true;
 		Log::Info("Vulkan 3-tier HUD compute pipelines ready (8/8 SPIR-V from {})", hudDir.string());
+
+		// Optional fused Tier 3 Hybrid Composite pipelines (2 SPIR-V files in hud/ directory)
+		d.hudHybridReady = false;
+		VkDescriptorSetLayoutBinding hybridBindings[5] = {
+			{ 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+			{ 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+			{ 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+			{ 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+			{ 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+		};
+		VkDescriptorSetLayoutCreateInfo hybridSetInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr,
+			VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, 5, hybridBindings };
+		if (d.vkCreateDescriptorSetLayout(d.device, &hybridSetInfo, nullptr, &d.hudHybridSetLayout) == VK_SUCCESS)
+		{
+			VkPipelineLayoutCreateInfo hybridLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1,
+				&d.hudHybridSetLayout, 1, &push };
+			if (d.vkCreatePipelineLayout(d.device, &hybridLayoutInfo, nullptr, &d.hudHybridPipelineLayout) == VK_SUCCESS)
+			{
+				static constexpr const char* kHybridNames[2] = {
+					"hud_hybrid_composite_rgba8.spv", "hud_hybrid_composite_rgb10a2.spv"
+				};
+				bool hybridOk = true;
+				for (int f = 0; f < 2 && hybridOk; ++f)
+				{
+					if (!LoadSpirvFileBytes(hudDir / kHybridNames[f], words))
+					{
+						hybridOk = false;
+						break;
+					}
+					VkShaderModuleCreateInfo modInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0,
+						words.size() * sizeof(uint32_t), words.data() };
+					VkShaderModule mod = VK_NULL_HANDLE;
+					if (d.vkCreateShaderModule(d.device, &modInfo, nullptr, &mod) != VK_SUCCESS)
+					{
+						hybridOk = false;
+						break;
+					}
+					VkComputePipelineCreateInfo pipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+					pipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+						VK_SHADER_STAGE_COMPUTE_BIT, mod, "main", nullptr };
+					pipeInfo.layout = d.hudHybridPipelineLayout;
+					const VkResult res = d.vkCreateComputePipelines(d.device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr,
+						&d.hudHybridPipelines[f]);
+					d.vkDestroyShaderModule(d.device, mod, nullptr);
+					if (res != VK_SUCCESS)
+						hybridOk = false;
+				}
+				d.hudHybridReady = hybridOk;
+			}
+		}
 
 		// Optional Tier 3 Hybrid Tone-Map Matcher pipelines (6 SPIR-V files in the same hud/ directory).
 		struct VkToneMatchPushConstants {
@@ -1586,8 +1675,11 @@ namespace
 
 				const bool useMatched = f.hudDecision.runToneMapMatch && curSlot.matchedHudlessView != VK_NULL_HANDLE;
 				VkImageView compositeHudlessView = useMatched ? curSlot.matchedHudlessView : curSlot.hudlessView;
-				if (f.hudDecision.runHudDiffComposite && curSlot.bbView && compositeHudlessView)
+				const bool canRunDiff = f.hudDecision.runHudDiffComposite && curSlot.bbView && compositeHudlessView;
+				const bool canRunStatic = f.hudDecision.runStaticHudComposite && curSlot.bbView && f.staticCountView;
+				if (canRunDiff && canRunStatic && d.hudHybridReady)
 				{
+					// Single fused Tier 3 Hybrid pass: 1/2 VRAM bandwidth, 0 intermediate compute barrier per generated frame.
 					const bool updateCounter = (outIdx == 0);
 					if (updateCounter)
 					{
@@ -1596,9 +1688,9 @@ namespace
 							VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 					}
 					const uint32_t flags = (updateCounter ? 1u : 0u) | (debugMagenta ? 2u : 0u);
-					RecordHudDispatch(d, command, d.hudPipelines[1][fmtIdx],
+					RecordHudHybridDispatch(d, command, d.hudHybridPipelines[fmtIdx],
 						curSlot.bbView, compositeHudlessView, f.outputViews[outIdx], f.hudCounterGpuBuf,
-						f.width, f.height, 0.02f, flags);
+						f.staticCountView, f.width, f.height, 0.02f, flags);
 					dispatched = true;
 					if (updateCounter)
 					{
@@ -1610,19 +1702,46 @@ namespace
 						f.hudReadbackDiffFromToneMatch[f.hudReadbackSlot] = useMatched;
 					}
 				}
-				// In Tier 3 Hybrid, Static HUD Mask runs alongside Tone-Map Match to lock fixed UI (crosshairs/text) sharp.
-				if (f.hudDecision.runStaticHudComposite && curSlot.bbView && f.staticCountView)
+				else
 				{
-					if (dispatched)
+					if (canRunDiff)
 					{
-						StageBarrier(d, command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-							VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+						const bool updateCounter = (outIdx == 0);
+						if (updateCounter)
+						{
+							d.vkCmdFillBuffer(command, f.hudCounterGpuBuf, 0, 4, 0u);
+							StageBarrier(d, command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+								VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+						}
+						const uint32_t flags = (updateCounter ? 1u : 0u) | (debugMagenta ? 2u : 0u);
+						RecordHudDispatch(d, command, d.hudPipelines[1][fmtIdx],
+							curSlot.bbView, compositeHudlessView, f.outputViews[outIdx], f.hudCounterGpuBuf,
+							f.width, f.height, 0.02f, flags);
+						dispatched = true;
+						if (updateCounter)
+						{
+							StageBarrier(d, command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+								VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+							const VkBufferCopy copy{ 0, 0, 4 };
+							d.vkCmdCopyBuffer(command, f.hudCounterGpuBuf, f.hudCounterReadbackBuf[f.hudReadbackSlot], 1, &copy);
+							f.hudReadbackHasDiff[f.hudReadbackSlot] = true;
+							f.hudReadbackDiffFromToneMatch[f.hudReadbackSlot] = useMatched;
+						}
 					}
-					const uint32_t flags = debugMagenta ? 2u : 0u;
-					RecordHudDispatch(d, command, d.hudPipelines[3][fmtIdx],
-						curSlot.bbView, f.staticCountView, f.outputViews[outIdx], f.hudCounterGpuBuf,
-						f.width, f.height, 0.008f, flags);
-					dispatched = true;
+					// In Tier 3 Hybrid fallback, Static HUD Mask runs alongside Tone-Map Match to lock fixed UI sharp.
+					if (canRunStatic)
+					{
+						if (dispatched)
+						{
+							StageBarrier(d, command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+								VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+						}
+						const uint32_t flags = debugMagenta ? 2u : 0u;
+						RecordHudDispatch(d, command, d.hudPipelines[3][fmtIdx],
+							curSlot.bbView, f.staticCountView, f.outputViews[outIdx], f.hudCounterGpuBuf,
+							f.width, f.height, 0.008f, flags);
+						dispatched = true;
+					}
 				}
 			}
 
@@ -1649,12 +1768,13 @@ namespace
 		in.motion = ImageParameter(parameters, "DLSSG.MVecs");
 
 		const NgxResource* rawGameHudless = ImageParameter(parameters, "DLSSG.HUDLess");
+		const NgxResource* rawGameUi = ImageParameter(parameters, "DLSSG.UI");
 		const auto vkHudMode = static_cast<HudTier::Mode>(
 			std::clamp(Plugin::options.hudTierMode.load(std::memory_order_relaxed), 0, 3));
 		if (Plugin::options.hudlessUi)
 		{
 			in.hudless = rawGameHudless;
-			in.ui = ImageParameter(parameters, "DLSSG.UI");
+			in.ui = rawGameUi;
 		}
 
 		if (!in.backbuffer || !in.depth || !in.motion)
@@ -1850,10 +1970,10 @@ namespace
 		f.prevSubrects = curSubrects;
 		f.hasPrevSubrects = true;
 
-		// Camera Cut & Teleport Detector + GhostBuster anti-ghosting
+		// Camera Cut & Teleport Detector + GhostBuster anti-ghosting (respects ignoreGameReset)
 		const bool camCutOn = Plugin::options.cameraCutDetection.load(std::memory_order_relaxed);
 		const bool ghostBusterOn = Plugin::options.ghostBuster.load(std::memory_order_relaxed);
-		if (camCutOn || ghostBusterOn)
+		if (!ignoreGameReset && (camCutOn || ghostBusterOn))
 		{
 			auto finiteOr = [](float v, float fallback) noexcept { return std::isfinite(v) ? v : fallback; };
 			const float px = finiteOr(parameters.GetOr<float>("DLSSG.CameraPosX", 0.0f), 0.0f);
@@ -1886,7 +2006,7 @@ namespace
 					: 1.0f;
 
 				constexpr float kCutThresholdSq = 4.5f * 4.5f;
-				if (camCutOn && !reset && (distSq > kCutThresholdSq || fwdDot < -0.5f))
+				if (camCutOn && !reset && (distSq > kCutThresholdSq || (!ghostBusterOn && fwdDot < -0.5f)))
 					reset = true;
 			}
 
@@ -1917,9 +2037,9 @@ namespace
 			}
 		}
 
-		// UI / HUD-less transition cooldown (DLSS Enabler XeFG): skip 10 batches on HUD-less/UI toggle
-		const bool curUiState = (in.hudless && f.hudlessFormat != DXGI_FORMAT_UNKNOWN) ||
-			(in.ui && f.uiFormat != DXGI_FORMAT_UNKNOWN);
+		// UI / HUD-less transition cooldown (DLSS Enabler XeFG): track raw game HUD-less/UI presence
+		// so internal HudTierPolicy Tier 1 <-> Tier 3 switches never trigger a 10-batch FG dropout.
+		const bool curUiState = (rawGameHudless != nullptr) || (rawGameUi != nullptr);
 		if (f.hasPrevUiState && curUiState != f.prevUiState &&
 			Plugin::options.uiTransitionCooldown.load(std::memory_order_relaxed))
 		{
@@ -1986,38 +2106,45 @@ namespace
 				RecordVkToneMapMatch(d, f, command, slot, toneMatchHudless->imageView, in.backbuffer->imageView);
 			}
 
-			if (f.hudDecision.runHudDiffGuard && !f.hudDecision.runHudDiffComposite && slot.hasHudless && slot.bbView && slot.hudlessView)
+			const bool doDiffGuard = f.hudDecision.runHudDiffGuard && !f.hudDecision.runHudDiffComposite &&
+				slot.hasHudless && slot.bbView && slot.hudlessView;
+			const bool doStaticUpdate = f.hudDecision.runStaticHudUpdate && slot.bbView && f.staticCountView;
+			if (doDiffGuard || doStaticUpdate)
 			{
-				d.vkCmdFillBuffer(command, f.hudCounterGpuBuf, 0, 4, 0u);
+				const VkDeviceSize fillOffset = doDiffGuard ? 0 : 4;
+				const VkDeviceSize fillSize = (doDiffGuard && doStaticUpdate) ? 8 : 4;
+				d.vkCmdFillBuffer(command, f.hudCounterGpuBuf, fillOffset, fillSize, 0u);
 				StageBarrier(d, command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
 					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-				RecordHudDispatch(d, command, d.hudPipelines[0][fmtIdx],
-					slot.bbView, slot.hudlessView, slot.bbView, f.hudCounterGpuBuf,
-					f.width, f.height, 0.02f, 1u);
-				StageBarrier(d, command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-					VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-				const VkBufferCopy copy{ 0, 0, 4 };
-				d.vkCmdCopyBuffer(command, f.hudCounterGpuBuf, f.hudCounterReadbackBuf[f.hudReadbackSlot], 1, &copy);
-				f.hudReadbackHasDiff[f.hudReadbackSlot] = true;
-				f.hudReadbackDiffFromToneMatch[f.hudReadbackSlot] = false;
-			}
 
-			if (f.hudDecision.runStaticHudUpdate && slot.bbView && f.staticCountView)
-			{
-				const Slot& prevSlot = f.slots[f.current ^ 1];
-				const bool staticReset = !f.havePrevious || reset || !prevSlot.bbView;
-				d.vkCmdFillBuffer(command, f.hudCounterGpuBuf, 4, 4, 0u);
-				StageBarrier(d, command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-				RecordHudDispatch(d, command, d.hudPipelines[2][fmtIdx],
-					slot.bbView, staticReset ? slot.bbView : prevSlot.bbView, f.staticCountView, f.hudCounterGpuBuf,
-					f.width, f.height, 0.008f, staticReset ? 1u : 0u);
+				if (doDiffGuard)
+				{
+					RecordHudDispatch(d, command, d.hudPipelines[0][fmtIdx],
+						slot.bbView, slot.hudlessView, slot.bbView, f.hudCounterGpuBuf,
+						f.width, f.height, 0.02f, 1u);
+					f.hudReadbackHasDiff[f.hudReadbackSlot] = true;
+					f.hudReadbackDiffFromToneMatch[f.hudReadbackSlot] = false;
+				}
+				if (doStaticUpdate)
+				{
+					const Slot& prevSlot = f.slots[f.current ^ 1];
+					const bool staticReset = !f.havePrevious || reset || !prevSlot.bbView;
+					RecordHudDispatch(d, command, d.hudPipelines[2][fmtIdx],
+						slot.bbView, staticReset ? slot.bbView : prevSlot.bbView, f.staticCountView, f.hudCounterGpuBuf,
+						f.width, f.height, 0.008f, staticReset ? 1u : 0u);
+					f.hudReadbackHasStatic[f.hudReadbackSlot] = true;
+				}
+
+				const VkPipelineStageFlags dstStages = doStaticUpdate
+					? static_cast<VkPipelineStageFlags>(VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+					: static_cast<VkPipelineStageFlags>(VK_PIPELINE_STAGE_TRANSFER_BIT);
+				const VkAccessFlags dstAccess = doStaticUpdate
+					? static_cast<VkAccessFlags>(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT)
+					: static_cast<VkAccessFlags>(VK_ACCESS_TRANSFER_READ_BIT);
 				StageBarrier(d, command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-					VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-					VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
-				const VkBufferCopy copy{ 4, 4, 4 };
+					dstStages, dstAccess);
+				const VkBufferCopy copy{ fillOffset, fillOffset, fillSize };
 				d.vkCmdCopyBuffer(command, f.hudCounterGpuBuf, f.hudCounterReadbackBuf[f.hudReadbackSlot], 1, &copy);
-				f.hudReadbackHasStatic[f.hudReadbackSlot] = true;
 			}
 		}
 
@@ -2268,6 +2395,7 @@ namespace
 				f.batchReady = false;
 				f.havePrevious = false;
 				f.generatedThrough = 0;
+				f.lastCopiedRealImage = VK_NULL_HANDLE;
 				f.consecutiveFailures = 0;
 				f.stallCooldownBatches = 0;
 				f.uiTransitionCooldown = 0;
@@ -2290,6 +2418,7 @@ namespace
 				f.batchCount = effectiveCount;
 				f.fault.clear();
 				f.generatedThrough = 0;
+				f.lastCopiedRealImage = VK_NULL_HANDLE;
 
 				// Stall circuit breaker (dlssg-0.4.2): after 3 consecutive Execute failures, bypass XeFG for 60 batches
 				// and copy the real frame cleanly so the game never freezes or flickers.
@@ -2333,7 +2462,9 @@ namespace
 				else
 				{
 					f.consecutiveFailures = 0;
-					VulkanHost::NotifyBatchStart(effectiveCount);
+					// Streamline still submits `count` presents per real frame even when VRAM Guard clamps
+					// extra slots to real-frame copies, so pass `count` to keep PresentPacer aligned.
+					VulkanHost::NotifyBatchStart(count);
 					if (f.batches == 1 || f.batches % 6000 == 0)
 					{
 						Log::Info("Vulkan: {} batches of {} generated frames, {} evaluations, {} failures, {} paused", f.batches,
@@ -2367,7 +2498,8 @@ namespace
 
 			const bool copied = f.batchReady && index <= f.generatedThrough && index <= f.batchCount &&
 				f.outputs[index - 1];
-			const bool copyReal = real && !SameSubresource(*real, *backbuffer);
+			const bool copyReal = real && !SameSubresource(*real, *backbuffer) &&
+				(real->image != f.lastCopiedRealImage);
 			const bool copyFallback = !copied && backbuffer && !SameSubresource(*output, *backbuffer) &&
 				VulkanPolicy::CopyCompatible(output->format, backbuffer->format);
 			const bool anyCopy = copyReal || copied || copyFallback;
@@ -2394,6 +2526,7 @@ namespace
 				else
 					CopyImage(d, command, backbuffer->image, GameLayout, real->image, GameLayout,
 						std::min(backbuffer->width, real->width), std::min(backbuffer->height, real->height), backbuffer, real);
+				f.lastCopiedRealImage = real->image;
 				f.realCopies++;
 			}
 
@@ -2413,7 +2546,8 @@ namespace
 			{
 				StageBarrier(d, command,
 					VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-					VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+					VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+					VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
 			}
 
 			xvk::EndRecording(d.d3d.Get());

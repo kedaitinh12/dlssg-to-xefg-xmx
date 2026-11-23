@@ -22,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -107,6 +108,9 @@ namespace
 		VulkanPolicy::PresentPacer pacer;
 		std::atomic_bool hwPacingActive = false;
 		std::atomic_bool pacingLogged = false;
+		std::atomic_bool autoSleepSpin = false;
+		std::atomic_uint32_t cpuOverrunStreak = 0;
+		std::atomic_uint32_t cpuCleanStreak = 0;
 		std::atomic_bool translationSkipLogged = false;
 		std::atomic_bool selfSkipLogged = false;
 	};
@@ -205,7 +209,13 @@ namespace
 			return;
 
 		const uint64_t deadline = NowNs() + waitNs;
-		const bool sleepSpin = Plugin::options.pacingSpinlockSleep.load(std::memory_order_relaxed);
+		static const bool lowCoreCpu = []() noexcept {
+			const unsigned hc = std::thread::hardware_concurrency();
+			return hc > 0u && hc <= 6u;
+		}();
+		State& s = S();
+		const bool userSleepSpin = Plugin::options.pacingSpinlockSleep.load(std::memory_order_relaxed);
+		const bool sleepSpin = userSleepSpin || lowCoreCpu || s.autoSleepSpin.load(std::memory_order_relaxed);
 		const uint64_t SpinTailNs = sleepSpin ? 250'000ull : 1'200'000ull; // 0.25 ms sleep-friendly tail vs 1.2 ms QPC spin tail
 
 		using CreateWaitableTimerExWFn = HANDLE(WINAPI*)(void*, LPCWSTR, DWORD, DWORD);
@@ -254,6 +264,29 @@ namespace
 				SwitchToThread();
 			else
 				YieldProcessor();
+		}
+
+		// Auto-adaptive CPU-bound detection: if wait overshoots deadline by >0.75 ms for 6 consecutive presents
+		// (OS scheduler starvation), automatically engage sleep-friendly 0.25 ms tail to yield CPU back to the game.
+		if (!userSleepSpin && !lowCoreCpu)
+		{
+			const uint64_t endNs = NowNs();
+			if (endNs > deadline + 750'000ull)
+			{
+				s.cpuCleanStreak.store(0, std::memory_order_relaxed);
+				if (s.cpuOverrunStreak.fetch_add(1, std::memory_order_relaxed) + 1u >= 6u)
+					s.autoSleepSpin.store(true, std::memory_order_relaxed);
+			}
+			else if (endNs <= deadline + 250'000ull)
+			{
+				s.cpuOverrunStreak.store(0, std::memory_order_relaxed);
+				if (s.autoSleepSpin.load(std::memory_order_relaxed) &&
+					s.cpuCleanStreak.fetch_add(1, std::memory_order_relaxed) + 1u >= 60u)
+				{
+					s.autoSleepSpin.store(false, std::memory_order_relaxed);
+					s.cpuCleanStreak.store(0, std::memory_order_relaxed);
+				}
+			}
 		}
 	}
 
@@ -916,11 +949,12 @@ namespace
 				edit->record.coopMatrixExtensions = true;
 			}
 
-			// Detect native NVIDIA hardware pacing extensions (e.g. VK_NV_present_metering / VK_NV_low_latency2)
-			// so the CPU present pacer automatically yields to hardware flip metering on NVIDIA GPUs.
-			edit->record.hwPacing =
-				(offered("VK_NV_present_metering") && enabled("VK_NV_present_metering")) ||
-				(offered("VK_NV_low_latency2") && enabled("VK_NV_low_latency2"));
+			// Only treat VK_NV_present_metering as hardware flip metering on Blackwell+ GPUs (deviceID >= 0x2B00).
+			// Do NOT treat VK_NV_low_latency2 (NVIDIA Reflex) or pre-Blackwell VK_NV_present_metering exposure as
+			// hardware MFG pacing, or the CPU present pacer would be falsely bypassed on RTX 20/30/40 Vulkan games.
+			const bool isBlackwellOrNewer = (edit->record.vendor == 0x10DE && properties.properties.deviceID >= 0x2B00u);
+			edit->record.hwPacing = isBlackwellOrNewer &&
+				offered("VK_NV_present_metering") && enabled("VK_NV_present_metering");
 
 			edit->info = *info;
 			edit->info.enabledExtensionCount = static_cast<uint32_t>(edit->extensions.size());
