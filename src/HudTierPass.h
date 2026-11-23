@@ -79,10 +79,19 @@ public:
 		ID3D12Resource* outputTex, D3D12_RESOURCE_STATES outputState,
 		bool debugMagenta) noexcept;
 
+	// Fused Tier 3 Hybrid Composite: combines 3x3 dilated |Real - Hudless| diff and Static-HUD Mask (staticCount >= 4)
+	// in a single compute pass (1/2 VRAM bandwidth, 0 intermediate UAV barrier).
+	bool HasHybridComposite() const noexcept { return hybridRootSig_.Get() != nullptr && psoHybridComposite_.Get() != nullptr; }
+	void RecordHybridHudComposite(ID3D12GraphicsCommandList* cmdList,
+		ID3D12Resource* realTex, D3D12_RESOURCE_STATES realState,
+		ID3D12Resource* hudlessTex, D3D12_RESOURCE_STATES hudlessState,
+		ID3D12Resource* outputTex, D3D12_RESOURCE_STATES outputState,
+		bool updateCounter, bool debugMagenta, bool fromToneMatched = false) noexcept;
+
 private:
 	static constexpr uint32_t kReadbackSlots = 2;
-	static constexpr uint32_t kDescriptorBlocks = 8; // 8 dispatches * 4 descriptors = 32 descriptors per frame
-	static constexpr uint32_t kDescriptorsPerBlock = 4; // t0, t1, u0, u1
+	static constexpr uint32_t kDescriptorBlocks = 8; // 8 dispatches * 5 descriptors = 40 descriptors per frame
+	static constexpr uint32_t kDescriptorsPerBlock = 5; // t0, t1, [t2], u0, u1
 
 	bool CreatePipelines(ID3D12Device* device) noexcept;
 	bool CreateResources(ID3D12Device* device, uint32_t width, uint32_t height) noexcept;
@@ -97,6 +106,8 @@ private:
 	Microsoft::WRL::ComPtr<ID3D12PipelineState> psoDiffComposite_;
 	Microsoft::WRL::ComPtr<ID3D12PipelineState> psoStaticUpdate_;
 	Microsoft::WRL::ComPtr<ID3D12PipelineState> psoStaticComposite_;
+	Microsoft::WRL::ComPtr<ID3D12RootSignature> hybridRootSig_;
+	Microsoft::WRL::ComPtr<ID3D12PipelineState> psoHybridComposite_;
 
 	Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> srvUavHeap_;
 	uint32_t descSize_ = 0;

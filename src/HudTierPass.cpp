@@ -198,6 +198,61 @@ void StaticHudCompositeCS(uint3 id : SV_DispatchThreadID)
 }
 )";
 
+	constexpr char kHybridHudCompositeHlsl[] = R"(
+cbuffer Params : register(b0)
+{
+    uint Width;
+    uint Height;
+    float Tolerance;
+    uint Flags; // bit 0: count 1/16 diff pixels, bit 1: debug magenta
+};
+
+Texture2D<float4> TexA : register(t0);
+Texture2D<float4> TexB : register(t1);
+Texture2D<uint> StaticCount : register(t2);
+RWTexture2D<float4> OutColor : register(u0);
+RWByteAddressBuffer Counter : register(u1);
+
+bool IsHudDiffHybrid(int2 p)
+{
+    float3 d = abs(TexA[p].rgb - TexB[p].rgb);
+    return max(d.r, max(d.g, d.b)) > Tolerance;
+}
+
+[numthreads(8, 8, 1)]
+void HybridHudCompositeCS(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= Width || id.y >= Height) return;
+
+    int2 p = int2(id.xy);
+    int2 maxCoord = int2(Width - 1u, Height - 1u);
+    bool hudDiff = false;
+    [unroll] for (int dy = -1; dy <= 1; ++dy)
+    {
+        [unroll] for (int dx = -1; dx <= 1; ++dx)
+        {
+            int2 q = clamp(p + int2(dx, dy), int2(0, 0), maxCoord);
+            hudDiff = hudDiff || IsHudDiffHybrid(q);
+        }
+    }
+
+    if ((Flags & 1u) != 0u && hudDiff && (id.x & 3u) == 0u && (id.y & 3u) == 0u)
+    {
+        uint dummy;
+        Counter.InterlockedAdd(0, 1u, dummy);
+    }
+
+    bool isStatic = StaticCount[p] >= 4u;
+    if (hudDiff || isStatic)
+    {
+        if ((Flags & 2u) != 0u)
+            OutColor[id.xy] = float4(1.0f, 0.0f, 1.0f, 1.0f);
+        else
+            OutColor[id.xy] = TexA[p];
+    }
+}
+)";
+
 
 	// Tier 4 Tone-Map Match (ported from MFG-Unlocker V1.7.2 hudless_match.cpp):
 	// Lazy-compiled only when Tier 4 activates on a color/format-mismatched HUDLess (0 cost on normal games).
@@ -505,6 +560,44 @@ bool HudTierPass::CreatePipelines(ID3D12Device* device) noexcept
 		!makePso(kStaticHudCompositeHlsl, sizeof(kStaticHudCompositeHlsl) - 1, "StaticHudCompositeCS", psoStaticComposite_))
 	{
 		return false;
+	}
+
+	// Optional fused Tier 3 Hybrid root signature (t0..t2, u0..u1) + PSO
+	D3D12_DESCRIPTOR_RANGE hybridRanges[2]{};
+	hybridRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+	hybridRanges[0].NumDescriptors = 3;
+	hybridRanges[0].BaseShaderRegister = 0;
+	hybridRanges[0].OffsetInDescriptorsFromTableStart = 0;
+	hybridRanges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+	hybridRanges[1].NumDescriptors = 2;
+	hybridRanges[1].BaseShaderRegister = 0;
+	hybridRanges[1].OffsetInDescriptorsFromTableStart = 3;
+
+	D3D12_ROOT_PARAMETER hybridParams[2]{};
+	hybridParams[0] = params[0];
+	hybridParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	hybridParams[1].DescriptorTable.NumDescriptorRanges = 2;
+	hybridParams[1].DescriptorTable.pDescriptorRanges = hybridRanges;
+	hybridParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+	D3D12_ROOT_SIGNATURE_DESC hybridRsDesc{};
+	hybridRsDesc.NumParameters = 2;
+	hybridRsDesc.pParameters = hybridParams;
+
+	Microsoft::WRL::ComPtr<ID3DBlob> hybridSigBlob, hybridErrBlob;
+	if (SUCCEEDED(D3D12SerializeRootSignature(&hybridRsDesc, D3D_ROOT_SIGNATURE_VERSION_1, &hybridSigBlob, &hybridErrBlob)) &&
+		hybridSigBlob &&
+		SUCCEEDED(device->CreateRootSignature(0, hybridSigBlob->GetBufferPointer(), hybridSigBlob->GetBufferSize(), IID_PPV_ARGS(&hybridRootSig_))))
+	{
+		Microsoft::WRL::ComPtr<ID3DBlob> cs;
+		if (CompileCs(compile, kHybridHudCompositeHlsl, sizeof(kHybridHudCompositeHlsl) - 1, "HybridHudCompositeCS", cs))
+		{
+			D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+			desc.pRootSignature = hybridRootSig_.Get();
+			desc.CS.pShaderBytecode = cs->GetBufferPointer();
+			desc.CS.BytecodeLength = cs->GetBufferSize();
+			device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&psoHybridComposite_));
+		}
 	}
 
 	descSize_ = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -989,6 +1082,96 @@ void HudTierPass::RecordStaticHudComposite(ID3D12GraphicsCommandList* cmdList,
 	UavBarrier(cmdList, outputTex);
 
 	Barrier(cmdList, currRealTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, currState);
+	Barrier(cmdList, staticCountTex_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	Barrier(cmdList, outputTex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outputState);
+}
+
+void HudTierPass::RecordHybridHudComposite(ID3D12GraphicsCommandList* cmdList,
+	ID3D12Resource* realTex, D3D12_RESOURCE_STATES realState,
+	ID3D12Resource* hudlessTex, D3D12_RESOURCE_STATES hudlessState,
+	ID3D12Resource* outputTex, D3D12_RESOURCE_STATES outputState,
+	bool updateCounter, bool debugMagenta, bool fromToneMatched) noexcept
+{
+	if (!Available() || !HasHybridComposite() || !cmdList || !realTex || !hudlessTex || !outputTex || !staticCountTex_)
+		return;
+
+	const DXGI_FORMAT outUavFmt = UavFormat(outputTex->GetDesc().Format);
+	if (outUavFmt == DXGI_FORMAT_UNKNOWN)
+		return;
+
+	const uint32_t block = AllocDescriptorBlock();
+	D3D12_CPU_DESCRIPTOR_HANDLE cpu = srvUavHeap_->GetCPUDescriptorHandleForHeapStart();
+	cpu.ptr += static_cast<SIZE_T>(block) * kDescriptorsPerBlock * descSize_;
+	D3D12_GPU_DESCRIPTOR_HANDLE gpu = srvUavHeap_->GetGPUDescriptorHandleForHeapStart();
+	gpu.ptr += static_cast<SIZE_T>(block) * kDescriptorsPerBlock * descSize_;
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+	srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	srv.Texture2D.MipLevels = 1;
+
+	srv.Format = SrvFormat(realTex->GetDesc().Format);
+	device_->CreateShaderResourceView(realTex, &srv, cpu);
+	cpu.ptr += descSize_;
+
+	srv.Format = SrvFormat(hudlessTex->GetDesc().Format);
+	device_->CreateShaderResourceView(hudlessTex, &srv, cpu);
+	cpu.ptr += descSize_;
+
+	srv.Format = DXGI_FORMAT_R8_UINT;
+	device_->CreateShaderResourceView(staticCountTex_.Get(), &srv, cpu);
+	cpu.ptr += descSize_;
+
+	D3D12_UNORDERED_ACCESS_VIEW_DESC uavOut{};
+	uavOut.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+	uavOut.Format = outUavFmt;
+	device_->CreateUnorderedAccessView(outputTex, nullptr, &uavOut, cpu);
+	cpu.ptr += descSize_;
+
+	D3D12_UNORDERED_ACCESS_VIEW_DESC uavBuf{};
+	uavBuf.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+	uavBuf.Format = DXGI_FORMAT_R32_TYPELESS;
+	uavBuf.Buffer.NumElements = 4;
+	uavBuf.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+	device_->CreateUnorderedAccessView(counterGpu_.Get(), nullptr, &uavBuf, cpu);
+
+	if (updateCounter)
+	{
+		Barrier(cmdList, counterGpu_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+		cmdList->CopyBufferRegion(counterGpu_.Get(), 0, counterZeroUpload_.Get(), 0, 4);
+		Barrier(cmdList, counterGpu_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	}
+
+	Barrier(cmdList, realTex, realState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	Barrier(cmdList, hudlessTex, hudlessState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	Barrier(cmdList, staticCountTex_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	Barrier(cmdList, outputTex, outputState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+	ID3D12DescriptorHeap* heaps[] = { srvUavHeap_.Get() };
+	cmdList->SetDescriptorHeaps(1, heaps);
+	cmdList->SetComputeRootSignature(hybridRootSig_.Get());
+	cmdList->SetPipelineState(psoHybridComposite_.Get());
+
+	const uint32_t flags = (updateCounter ? 1u : 0u) | (debugMagenta ? 2u : 0u);
+	const RootConstants rc{ width_, height_, 0.02f, flags };
+	cmdList->SetComputeRoot32BitConstants(0, 4, &rc, 0);
+	cmdList->SetComputeRootDescriptorTable(1, gpu);
+	cmdList->Dispatch((width_ + 7u) / 8u, (height_ + 7u) / 8u, 1u);
+
+	UavBarrier(cmdList, outputTex);
+
+	if (updateCounter)
+	{
+		UavBarrier(cmdList, counterGpu_.Get());
+		Barrier(cmdList, counterGpu_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		cmdList->CopyBufferRegion(counterReadback_[readbackSlot_].Get(), 0, counterGpu_.Get(), 0, 4);
+		Barrier(cmdList, counterGpu_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		readbackHasDiff_[readbackSlot_] = true;
+		readbackDiffFromToneMatch_[readbackSlot_] = fromToneMatched;
+	}
+
+	Barrier(cmdList, realTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, realState);
+	Barrier(cmdList, hudlessTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, hudlessState);
 	Barrier(cmdList, staticCountTex_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 	Barrier(cmdList, outputTex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outputState);
 }

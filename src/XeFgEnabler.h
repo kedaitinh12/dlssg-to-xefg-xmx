@@ -36,7 +36,9 @@ namespace XeFgEnabler
 		if (hasPrevFov && curFovRad > 0.01f && prevFovRad > 0.01f && std::abs(curFovRad - prevFovRad) > 0.25f)
 			return true;
 
-		if (!cameraMotionIncluded && hasCamera && hasPrevCamera && (distSq > 0.25f || fwdDot < 0.985f))
+		// Require a substantial jump (>2m) or sharp snap (>30 deg, cos(30 deg) ~= 0.866) when CameraMotionIncluded == 0
+		// so ordinary mouse panning never triggers per-frame history resets that disable interpolation.
+		if (!cameraMotionIncluded && hasCamera && hasPrevCamera && (distSq > 4.0f || fwdDot < 0.866f))
 			return true;
 
 		return false;

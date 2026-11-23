@@ -85,6 +85,8 @@ private:
 
 		// UI / HUD-less transition cooldown (DLSS Enabler XeFG: skip 10 real frames on state toggle)
 		uint32_t uiTransitionCooldown = 0;
+		bool hasPrevRawHudless = false;
+		bool prevRawHudless = false;
 
 		// Stall circuit breaker (dlssg-0.4.2): bypass XeFG temporarily after 3 consecutive Execute failures
 		uint32_t consecutiveExecuteFailures = 0;

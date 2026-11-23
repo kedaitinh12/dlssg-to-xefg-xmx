@@ -1445,10 +1445,10 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 		}
 	}
 
-	// Camera Cut & Teleport Detector + GhostBuster anti-ghosting
+	// Camera Cut & Teleport Detector + GhostBuster anti-ghosting (respects ignoreGameReset)
 	const bool camCutOn = Plugin::options.cameraCutDetection.load(std::memory_order_relaxed);
 	const bool ghostBusterOn = Plugin::options.ghostBuster.load(std::memory_order_relaxed);
-	if (camCutOn || ghostBusterOn)
+	if (!ignoreGameReset && (camCutOn || ghostBusterOn))
 	{
 		const XMFLOAT3 curPos = GetVector(params, "DLSSG.CameraPosX", "DLSSG.CameraPosY", "DLSSG.CameraPosZ");
 		const XMFLOAT3 curFwd = GetVector(params, "DLSSG.CameraFwdX", "DLSSG.CameraFwdY", "DLSSG.CameraFwdZ");
@@ -1479,7 +1479,8 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 				: 1.0f;
 
 			constexpr float kCutThresholdSq = 4.5f * 4.5f;
-			if (camCutOn && !reset && (distSq > kCutThresholdSq || fwdDot < -0.5f))
+			// GhostBuster already checks sharper rotation snaps (fwdDot < 0.707); only check 120-deg flip when GhostBuster is off.
+			if (camCutOn && !reset && (distSq > kCutThresholdSq || (!ghostBusterOn && fwdDot < -0.5f)))
 				reset = true;
 		}
 
@@ -1510,16 +1511,24 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 		}
 	}
 
-	// Force history reset + 10-frame UI transition cooldown if HUD-less presence toggles (DLSS Enabler XeFG_Dx12)
-	if (captured && previous.valid && (frame.hudless != nullptr) != (previous.hudless != nullptr))
+	// Force history reset + 10-frame UI transition cooldown only when the game's raw HUD-less presence toggles
+	// (not when HudTierPolicy internally switches between Tier 1 Native and Tier 3 Static Mask).
+	const bool curRawHudless = (params.GetOr<ID3D12Resource*>("DLSSG.HUDLess", nullptr) != nullptr);
+	if (captured && context->hasPrevRawHudless && curRawHudless != context->prevRawHudless)
 	{
-		reset = true;
+		if (!ignoreGameReset)
+			reset = true;
 		if (Plugin::options.uiTransitionCooldown.load(std::memory_order_relaxed))
 		{
 			context->uiTransitionCooldown = 10u;
 			Log::Info("HUD-less state changed ({} -> {}), skipping interpolation for 10 frames",
-				previous.hudless != nullptr, frame.hudless != nullptr);
+				context->prevRawHudless, curRawHudless);
 		}
+	}
+	if (captured)
+	{
+		context->prevRawHudless = curRawHudless;
+		context->hasPrevRawHudless = true;
 	}
 
 	bool inUiCooldown = false;
@@ -1834,18 +1843,28 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 				{
 					ID3D12Resource* compositeHudless = (hudDecision.runToneMapMatch && curFrame.matchedHudless)
 						? curFrame.matchedHudless : curFrame.hudless.Get();
-					if (runTier2 && compositeHudless)
+					if (runTier2 && runTier3 && compositeHudless && hudTierPass.HasHybridComposite())
 					{
-						hudTierPass.RecordHudDiffComposite(cmdList, curFrame.backbuffer.Get(), BackbufferState,
+						// Single fused compute pass for Tier 3 Hybrid (1/2 VRAM bandwidth, 0 intermediate UAV barrier).
+						hudTierPass.RecordHybridHudComposite(cmdList, curFrame.backbuffer.Get(), BackbufferState,
 							compositeHudless, InputState, compositeTarget, OutputState,
 							frameIndex == 1, debugMagenta, hudDecision.runToneMapMatch && curFrame.matchedHudless != nullptr);
 					}
-					// In Tier 3 Hybrid, Static HUD Mask runs alongside Tone-Map Match to lock fixed UI (crosshairs/text)
-					// sharp, and takes over completely when HUDLess is missing or Tone-Map Match is unavailable.
-					if (runTier3)
+					else
 					{
-						hudTierPass.RecordStaticHudComposite(cmdList, curFrame.backbuffer.Get(), BackbufferState,
-							compositeTarget, OutputState, debugMagenta);
+						if (runTier2 && compositeHudless)
+						{
+							hudTierPass.RecordHudDiffComposite(cmdList, curFrame.backbuffer.Get(), BackbufferState,
+								compositeHudless, InputState, compositeTarget, OutputState,
+								frameIndex == 1, debugMagenta, hudDecision.runToneMapMatch && curFrame.matchedHudless != nullptr);
+						}
+						// In Tier 3 Hybrid, Static HUD Mask runs alongside Tone-Map Match to lock fixed UI (crosshairs/text)
+						// sharp, and takes over completely when HUDLess is missing or Tone-Map Match is unavailable.
+						if (runTier3)
+						{
+							hudTierPass.RecordStaticHudComposite(cmdList, curFrame.backbuffer.Get(), BackbufferState,
+								compositeTarget, OutputState, debugMagenta);
+						}
 					}
 					if (compositeTarget != output)
 						context->directOutput = false;
