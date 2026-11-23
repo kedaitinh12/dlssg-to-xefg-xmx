@@ -9,6 +9,7 @@
 //   1 = Tier 2 Diff Composite (3x3 dilated |Real - Hudless| > Tolerance -> OutColor + optional 1/16 counter)
 //   2 = Tier 3 Static HUD Update (compare CurrReal vs PrevReal -> update r8ui StaticCount + 1/16 counter)
 //   3 = Tier 3 Static HUD Composite (copy CurrReal where StaticCount >= 4 -> OutColor)
+//   4 = Tier 3 Hybrid Fused Composite (3x3 dilated |Real - Hudless| > Tolerance OR StaticCount >= 4 -> OutColor in 1 pass)
 
 #ifndef HUD_MODE
 #define HUD_MODE 0
@@ -44,6 +45,10 @@ layout(set = 0, binding = 2, COLOR_FMT) uniform writeonly image2D OutColor;
 layout(set = 0, binding = 3, std430) buffer CounterBuf {
     uint Counts[4]; // [0] = diffCount (1/16 sample), [1] = staticCount (1/16 sample)
 };
+
+#if HUD_MODE == 4
+layout(set = 0, binding = 4, r8ui) uniform readonly uimage2D StaticCountHybrid;
+#endif
 
 #if HUD_MODE == 0
 void main() {
@@ -115,6 +120,38 @@ void main() {
 
     ivec2 p = ivec2(id);
     if (imageLoad(StaticCountIn, p).r >= 4u) {
+        if ((Flags & 2u) != 0u)
+            imageStore(OutColor, p, vec4(1.0, 0.0, 1.0, 1.0));
+        else
+            imageStore(OutColor, p, imageLoad(TexA, p));
+    }
+}
+#elif HUD_MODE == 4
+bool isHudDiffHybrid(ivec2 p) {
+    vec3 d = abs(imageLoad(TexA, p).rgb - imageLoad(TexB, p).rgb);
+    return max(d.r, max(d.g, d.b)) > Tolerance;
+}
+
+void main() {
+    uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= Width || id.y >= Height) return;
+
+    ivec2 p = ivec2(id);
+    ivec2 maxCoord = ivec2(int(Width) - 1, int(Height) - 1);
+    bool hudDiff = false;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), maxCoord);
+            hudDiff = hudDiff || isHudDiffHybrid(q);
+        }
+    }
+
+    if ((Flags & 1u) != 0u && hudDiff && (id.x & 3u) == 0u && (id.y & 3u) == 0u) {
+        atomicAdd(Counts[0], 1u);
+    }
+
+    bool isStatic = imageLoad(StaticCountHybrid, p).r >= 4u;
+    if (hudDiff || isStatic) {
         if ((Flags & 2u) != 0u)
             imageStore(OutColor, p, vec4(1.0, 0.0, 1.0, 1.0));
         else
