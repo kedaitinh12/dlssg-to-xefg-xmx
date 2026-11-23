@@ -1,6 +1,7 @@
 #include "Plugin.h"
 #include "HudTierPolicy.h"
 #include "AmdFlipMeterReg.h"
+#include "WineCompat.h"
 #include "Log.h"
 #include "Util.h"
 #include "VulkanPrograms.h"
@@ -33,6 +34,17 @@ namespace
 	{
 		try
 		{
+			if (WineCompat::IsWineOrProton())
+			{
+				std::scoped_lock lock(amdFlipMeterMutex);
+				if (!amdFlipMeterScanned)
+				{
+					Log::Info("AMD RDNA 4 FlipMeter: skipped under Wine/Proton (Windows Adrenalin registry only)");
+					amdFlipMeterScanned = true;
+				}
+				return;
+			}
+
 			auto scan = AmdFlipMeterReg::ScanRdna4Adapters();
 			if (tryAutoApply && !scan.rdna4Adapters.empty() && !scan.allConfigured)
 			{
@@ -531,11 +543,12 @@ namespace
 		api->Section("Settings");
 
 		// Immediate per-click notifications (OptiScaler-style):
-		// - Live settings: confirm immediate activation & remind to click 'Save INI' for next launch
-		// - Game-restart settings: remind to click 'Save INI' and restart the game
+		// - Live settings: confirm immediate change & remind to click 'Save Settings' for next launch
+		// - Game-restart settings: remind to click 'Save Settings' and restart the game (both ON and OFF)
 		// - PC-restart settings: remind to restart Windows
 		const bool gameRestartNeeded = initialVkWmmaCaptured &&
 			(Plugin::options.d3d12VulkanWmmaBridge.load(std::memory_order_relaxed) != initialVkWmmaBridge);
+		const bool showRestartGameNotice = gameRestartNeeded || lastNoticeKind == NoticeKind::RestartGame;
 		bool pcRestartNeeded = false;
 		{
 			std::scoped_lock lock(amdFlipMeterMutex);
@@ -544,15 +557,15 @@ namespace
 
 		if (lastNoticeKind == NoticeKind::LiveSaved && !lastNoticeFeature.empty())
 		{
-			Green(std::format("{}: applied immediately! Click 'Save INI' to keep for next launch.", lastNoticeFeature).c_str());
+			Green(std::format("{}: applied immediately! Click 'Save Settings' to keep for next launch.", lastNoticeFeature).c_str());
 		}
 		else if (lastNoticeKind == NoticeKind::LiveTemp && !lastNoticeFeature.empty())
 		{
 			Green(std::format("{}: applied immediately (temporary test mode, not saved).", lastNoticeFeature).c_str());
 		}
 
-		if (gameRestartNeeded)
-			Yellow("D3D12->Vulkan WMMA bridge: click 'Save INI' and restart the game to activate.");
+		if (showRestartGameNotice)
+			Yellow("D3D12->Vulkan WMMA bridge: click 'Save Settings' and restart the game to apply.");
 		if (pcRestartNeeded)
 			Yellow("AMD RDNA 4 Flip Meter: updated — restart your PC (Windows) to activate.");
 
@@ -664,18 +677,15 @@ namespace
 		{
 			Plugin::options.d3d12VulkanWmmaBridge = vkWmmaBridge;
 			api->SetBool(self, "D3D12VulkanWmmaBridge", vkWmmaBridge);
-			if (initialVkWmmaCaptured && vkWmmaBridge != initialVkWmmaBridge)
-				NotifySettingChanged(NoticeKind::RestartGame, "D3D12->Vulkan WMMA bridge");
-			else
-				NotifySettingChanged(NoticeKind::None, "");
+			NotifySettingChanged(NoticeKind::RestartGame, "D3D12->Vulkan WMMA bridge");
 		}
 		HelpMarker("Lets DirectX 12 games use faster hardware AI acceleration (WMMA) on AMD cards.\n"
 				   "Keep ON for best speed; turn OFF if a specific game freezes or crashes.\n"
-				   "Requires saving INI and restarting the game.");
-		if (gameRestartNeeded)
+				   "Requires clicking 'Save Settings' and restarting the game.");
+		if (showRestartGameNotice)
 		{
 			api->SameLine();
-			Yellow("(Save INI & restart game)");
+			Yellow("(Save Settings & restart game)");
 		}
 
 		bool uiCooldown = Plugin::options.uiTransitionCooldown;
