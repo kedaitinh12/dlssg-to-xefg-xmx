@@ -88,7 +88,7 @@ def main() -> int:
         print(f"error: shader source not found: {args.source}", file=sys.stderr)
         return 1
 
-    def build_set(src_path: pathlib.Path, out_dir: pathlib.Path, label: str) -> int:
+    def build_set(src_path: pathlib.Path, out_dir: pathlib.Path, label: str, extra_defines: list[str] | None = None) -> int:
         out_dir.mkdir(parents=True, exist_ok=True)
         manifest = out_dir / "coopmat_layers.tsv"
         alias_manifest = out_dir / "coopmat_programs.tsv"
@@ -116,6 +116,7 @@ def main() -> int:
                 f"-DLAYER_ZSPLIT={zsplit}",
                 f"-DLAYER_ACC_BITS={acc_bits}",
                 f"-DLAYER_NT={nt}",
+                *(extra_defines or []),
                 "-o", str(out_spv),
                 str(src_path),
             ]
@@ -152,6 +153,9 @@ def main() -> int:
         return 0
 
     rc = build_set(args.source, args.output, "16x16x16")
+    if rc != 0:
+        return rc
+    rc = build_set(args.source, args.output / "radv_reg", "16x16x16-radv-reg", ["-DRADV_REG_ONLY=1"])
     if rc != 0:
         return rc
     xmx_source = args.source.parent / "xefg_coopmat_layers_xmx8x8x32.comp"

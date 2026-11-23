@@ -61,5 +61,8 @@ if __name__ == '__main__':
         xmx_dir = args.directory / 'xmx_8x8x32'
         if xmx_dir.is_dir():
             check(xmx_dir)
+        radv_dir = args.directory / 'radv_reg'
+        if radv_dir.is_dir():
+            check(radv_dir)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         parser.exit(1, f'error: {exc}\n')
