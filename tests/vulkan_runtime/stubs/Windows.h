@@ -99,7 +99,28 @@ extern "C++"
 	void OutputDebugStringA(const char* lpOutputString);
 	DWORD GetLastError();
 	DWORD GetCurrentProcessId();
+	DWORD GetCurrentThreadId();
 	HANDLE GetCurrentProcess();
+	#define MEM_COMMIT 0x00001000u
+	#define PAGE_NOACCESS 0x01u
+	#define PAGE_READONLY 0x02u
+	#define PAGE_READWRITE 0x04u
+	#define PAGE_WRITECOPY 0x08u
+	#define PAGE_EXECUTE_READ 0x20u
+	#define PAGE_EXECUTE_READWRITE 0x40u
+	#define PAGE_EXECUTE_WRITECOPY 0x80u
+	#define PAGE_GUARD 0x100u
+	struct MEMORY_BASIC_INFORMATION
+	{
+		void* BaseAddress;
+		void* AllocationBase;
+		DWORD AllocationProtect;
+		size_t RegionSize;
+		DWORD State;
+		DWORD Protect;
+		DWORD Type;
+	};
+	size_t VirtualQuery(const void* lpAddress, MEMORY_BASIC_INFORMATION* lpBuffer, size_t dwLength);
 	HANDLE CreateMutexW(void* lpMutexAttributes, BOOL bInitialOwner, LPCWSTR lpName);
 	union LARGE_INTEGER { int64_t QuadPart; };
 	BOOL QueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCount);
