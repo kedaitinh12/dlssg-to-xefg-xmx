@@ -1049,12 +1049,14 @@ typedef struct VkSurfaceCapabilitiesKHR
 } VkSurfaceCapabilitiesKHR;
 typedef VkResult(VKAPI_PTR* PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)(VkPhysicalDevice physicalDevice,
 	VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR* pSurfaceCapabilities);
+typedef struct VkExtent2D { uint32_t width; uint32_t height; } VkExtent2D;
 typedef struct VkSwapchainCreateInfoKHR
 {
 	VkStructureType sType;
 	const void* pNext;
 	VkSurfaceKHR surface;
 	uint32_t minImageCount;
+	VkExtent2D imageExtent;
 	VkPresentModeKHR presentMode;
 } VkSwapchainCreateInfoKHR;
 typedef struct VkPresentInfoKHR
