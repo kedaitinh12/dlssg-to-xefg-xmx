@@ -557,6 +557,8 @@ DEVI void Flow(const XefgCudaParams& p)
     const int limitW = min(int(p.limitW), Wout), limitH = min(int(p.limitH), Hout);
     // words[r][n]: this lane's word of n tile n (word (t>>1) of the tile's 8 channels) for its position.
     uint32_t words[ROWS][NT];
+    const uint32_t roundPos = 1u << ((s1 + 31u) & 31u);
+    const uint32_t roundNeg = 1u << ((s2 + 31u) & 31u);
 #pragma unroll
     for (int n = 0; n < NT; ++n)
     {
@@ -566,9 +568,12 @@ DEVI void Flow(const XefgCudaParams& p)
         const int ng0 = int(Component(nv, ch & 3)), ng1 = int(Component(nv, (ch & 3) + 1));
         auto requant = [&](int a, int ib, int neg) -> uint32_t {
             a = min(max(a + ib, -lim), lim - 1);
-            const int pp = int(uint32_t(max(a, 0))*posMul + (1u << ((s1 + 31u) & 31u))) >> s1;
-            const int nn = int(uint32_t(min(a, 0))*uint32_t(neg) + (1u << ((s2 + 31u) & 31u))) >> s2;
-            return uint32_t(min(max(pp + nn, -128), 127)) & 0xffu;
+            const bool isPos = (a >= 0);
+            const uint32_t mul = isPos ? posMul : uint32_t(neg);
+            const uint32_t rnd = isPos ? roundPos : roundNeg;
+            const uint32_t sh  = isPos ? s1 : s2;
+            const int val = int(uint32_t(a)*mul + rnd) >> sh;
+            return uint32_t(min(max(val, -128), 127)) & 0xffu;
         };
 #pragma unroll
         for (int r = 0; r < ROWS; ++r)
