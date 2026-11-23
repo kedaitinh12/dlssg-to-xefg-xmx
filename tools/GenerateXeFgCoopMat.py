@@ -172,6 +172,8 @@ def main() -> int:
             ("hud_static_update_rgb10a2.spv", 2, "rgb10_a2"),
             ("hud_static_composite_rgba8.spv", 3, "rgba8"),
             ("hud_static_composite_rgb10a2.spv", 3, "rgb10_a2"),
+            ("hud_hybrid_composite_rgba8.spv", 4, "rgba8"),
+            ("hud_hybrid_composite_rgb10a2.spv", 4, "rgb10_a2"),
         ]
         for fname, mode, fmt in hud_variants:
             out_spv = hud_dir / fname
