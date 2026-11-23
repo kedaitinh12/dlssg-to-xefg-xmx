@@ -63,23 +63,36 @@ void main() {
     }
 }
 #elif HUD_MODE == 1
+// 10x10 shared tile for 8x8 workgroup + 1-pixel halo (200 vs 1152 texture loads per workgroup = 5.76x fewer VRAM reads)
+shared uint sDiff[100];
+
 bool isHudDiff(ivec2 p) {
     vec3 d = abs(imageLoad(TexA, p).rgb - imageLoad(TexB, p).rgb);
     return max(d.r, max(d.g, d.b)) > Tolerance;
 }
 
 void main() {
+    ivec2 maxCoord = ivec2(int(Width) - 1, int(Height) - 1);
+    ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy * 8u) - ivec2(1, 1);
+
+    // Cooperative halo load (all 64 threads participate before barrier for uniform control flow)
+    for (uint idx = gl_LocalInvocationIndex; idx < 100u; idx += 64u) {
+        int tx = int(idx % 10u);
+        int ty = int(idx / 10u);
+        ivec2 q = clamp(tileOrigin + ivec2(tx, ty), ivec2(0), maxCoord);
+        sDiff[idx] = isHudDiff(q) ? 1u : 0u;
+    }
+    memoryBarrierShared();
+    barrier();
+
     uvec2 id = gl_GlobalInvocationID.xy;
     if (id.x >= Width || id.y >= Height) return;
 
-    ivec2 maxCoord = ivec2(int(Width) - 1, int(Height) - 1);
-    bool hud = false;
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            ivec2 q = clamp(ivec2(id) + ivec2(dx, dy), ivec2(0), maxCoord);
-            hud = hud || isHudDiff(q);
-        }
-    }
+    uint base = gl_LocalInvocationID.y * 10u + gl_LocalInvocationID.x;
+    uint mask = sDiff[base + 0u]  | sDiff[base + 1u]  | sDiff[base + 2u]
+              | sDiff[base + 10u] | sDiff[base + 11u] | sDiff[base + 12u]
+              | sDiff[base + 20u] | sDiff[base + 21u] | sDiff[base + 22u];
+    bool hud = (mask != 0u);
 
     if ((Flags & 1u) != 0u && hud && (id.x & 3u) == 0u && (id.y & 3u) == 0u) {
         atomicAdd(Counts[0], 1u);
@@ -127,29 +140,41 @@ void main() {
     }
 }
 #elif HUD_MODE == 4
+// 10x10 shared tile for 8x8 workgroup + 1-pixel halo (5.76x fewer TexA/TexB VRAM reads)
+shared uint sDiffHybrid[100];
+
 bool isHudDiffHybrid(ivec2 p) {
     vec3 d = abs(imageLoad(TexA, p).rgb - imageLoad(TexB, p).rgb);
     return max(d.r, max(d.g, d.b)) > Tolerance;
 }
 
 void main() {
+    ivec2 maxCoord = ivec2(int(Width) - 1, int(Height) - 1);
+    ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy * 8u) - ivec2(1, 1);
+
+    for (uint idx = gl_LocalInvocationIndex; idx < 100u; idx += 64u) {
+        int tx = int(idx % 10u);
+        int ty = int(idx / 10u);
+        ivec2 q = clamp(tileOrigin + ivec2(tx, ty), ivec2(0), maxCoord);
+        sDiffHybrid[idx] = isHudDiffHybrid(q) ? 1u : 0u;
+    }
+    memoryBarrierShared();
+    barrier();
+
     uvec2 id = gl_GlobalInvocationID.xy;
     if (id.x >= Width || id.y >= Height) return;
 
-    ivec2 p = ivec2(id);
-    ivec2 maxCoord = ivec2(int(Width) - 1, int(Height) - 1);
-    bool hudDiff = false;
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), maxCoord);
-            hudDiff = hudDiff || isHudDiffHybrid(q);
-        }
-    }
+    uint base = gl_LocalInvocationID.y * 10u + gl_LocalInvocationID.x;
+    uint mask = sDiffHybrid[base + 0u]  | sDiffHybrid[base + 1u]  | sDiffHybrid[base + 2u]
+              | sDiffHybrid[base + 10u] | sDiffHybrid[base + 11u] | sDiffHybrid[base + 12u]
+              | sDiffHybrid[base + 20u] | sDiffHybrid[base + 21u] | sDiffHybrid[base + 22u];
+    bool hudDiff = (mask != 0u);
 
     if ((Flags & 1u) != 0u && hudDiff && (id.x & 3u) == 0u && (id.y & 3u) == 0u) {
         atomicAdd(Counts[0], 1u);
     }
 
+    ivec2 p = ivec2(id);
     bool isStatic = imageLoad(StaticCountHybrid, p).r >= 4u;
     if (hudDiff || isStatic) {
         if ((Flags & 2u) != 0u)

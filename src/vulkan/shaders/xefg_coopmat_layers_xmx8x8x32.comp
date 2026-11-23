@@ -107,7 +107,7 @@ shared uint winWords[WIN * 4 + 4];
 // 2 output halves (h = 0, 1) x 6 K=32 steps x 16 cols x 8 uint32 words/col
 shared uint wsmWords[2 * 6 * 128];
 // 8 subgroups x 2 output halves (h = 0, 1) x 8 pixels x 16 channels
-shared int  sAcc[8 * 2 * 128];
+shared int  sAcc[8 * 128]; // Phased half-emission: 4 KB instead of 8 KB (-50% Flow accumulator SLM)
 #else
 const int ZPER = LAYER_OUT / LAYER_ZSPLIT;
 #if (LAYER_OUT / LAYER_ZSPLIT) == 1 && LAYER_IN > 1
@@ -262,14 +262,15 @@ void emitPoolRow(int r, int z, int X0, int Y0, int limitW, int limitH, uint sg, 
 #endif
 }
 #else
-uint requantFlow(int a, int ib, int neg, int lim, uint posMul, uint s1, uint s2)
+uint requantFlow(int a, int ib, int neg, int lim, uint posMul, uint s1, uint s2, uint roundPos, uint roundNeg)
 {
 	int clamped = clamp(a + ib, -lim, lim - 1);
-	uint roundPos = 1u << ((s1 + 31u) & 31u);
-	uint roundNeg = 1u << ((s2 + 31u) & 31u);
-	int pp = int(uint(max(clamped, 0)) * posMul + roundPos) >> int(s1);
-	int nn = int(uint(min(clamped, 0)) * uint(neg) + roundNeg) >> int(s2);
-	return uint(clamp(pp + nn, -128, 127)) & 0xFFu;
+	bool isPos  = clamped >= 0;
+	uint mul    = isPos ? posMul   : uint(neg);
+	uint rnd    = isPos ? roundPos : roundNeg;
+	int  sh     = int(isPos ? s1   : s2);
+	int  val    = int(uint(clamped) * mul + rnd) >> sh;
+	return uint(clamp(val, -128, 127)) & 0xFFu;
 }
 
 void fillFlowWindow(int step, int X0, int Y0, int Wd, int Hd, ivec3 inSz, uint tid)
@@ -333,9 +334,10 @@ void stageFlowWeights(int step, int n0, uint tid)
 	}
 }
 
-void emitFlowRow(int r, int n0, int X0, int Y0, int limitW, int limitH,
-                 int lim, uint posMul, uint s1, uint s2, uint sg, uint rowSlot, uint xHalf, uint lane,
-                 uvec4 flowScale[8], uvec4 flowBias[8])
+void emitFlowHalf(int r, int h, int n0, int X0, int Y0, int limitW, int limitH,
+                  int lim, uint posMul, uint s1, uint s2, uint roundPos, uint roundNeg,
+                  uint sg, uint rowSlot, uint xHalf, uint lane,
+                  uvec4 flowScale[8], uvec4 flowBias[8])
 {
 	int y = Y0 + int(rowSlot) + r * 4;
 	if (lane >= 8u || y >= limitH)
@@ -346,39 +348,28 @@ void emitFlowRow(int r, int n0, int X0, int Y0, int limitW, int limitH,
 	if (x >= limitW)
 		return;
 
-	uint words[8];
-	for (int h = 0; h < 2; ++h)
+	uint baseAcc = sg * 128u + uint(px) * 16u;
+	uint words[4];
+	for (int w = 0; w < 4; ++w)
 	{
-		uint baseAcc = (sg * 2u + uint(h)) * 128u + uint(px) * 16u;
-		for (int w = 0; w < 4; ++w)
+		uvec4 bv = flowScale[h * 4 + w];
+		uvec4 nv = flowBias[h * 4 + w];
+		int ib[4] = { int(bv.x), int(bv.y), int(bv.z), int(bv.w) };
+		int ng[4] = { int(nv.x), int(nv.y), int(nv.z), int(nv.w) };
+		uint packed = 0u;
+		for (int c = 0; c < 4; ++c)
 		{
-			uvec4 bv = flowScale[h * 4 + w];
-			uvec4 nv = flowBias[h * 4 + w];
-			int ib[4] = { int(bv.x), int(bv.y), int(bv.z), int(bv.w) };
-			int ng[4] = { int(nv.x), int(nv.y), int(nv.z), int(nv.w) };
-			uint packed = 0u;
-			for (int c = 0; c < 4; ++c)
-			{
-				int a = sAcc[baseAcc + uint(w * 4 + c)];
-				packed |= requantFlow(a, ib[c], ng[c], lim, posMul, s1, s2) << uint(c * 8);
-			}
-			words[h * 4 + w] = packed;
+			int a = sAcc[baseAcc + uint(w * 4 + c)];
+			packed |= requantFlow(a, ib[c], ng[c], lim, posMul, s1, s2, roundPos, roundNeg) << uint(c * 8);
 		}
+		words[w] = packed;
 	}
 
 #if LAYER_OUT == 8
-	for (int nt = 0; nt < 4; ++nt)
-	{
-		uint w0 = words[2 * nt + 0];
-		uint w1 = words[2 * nt + 1];
-		imageStore(uDst, ivec3(x, y + 1, n0 + nt), uvec4(w0, w1, w0, w0));
-	}
+	imageStore(uDst, ivec3(x, y + 1, n0 + h * 2 + 0), uvec4(words[0], words[1], words[0], words[0]));
+	imageStore(uDst, ivec3(x, y + 1, n0 + h * 2 + 1), uvec4(words[2], words[3], words[2], words[2]));
 #else
-	for (int h = 0; h < 2; ++h)
-	{
-		imageStore(uDst, ivec3(x, y + 1, (n0 / 2) + h),
-		           uvec4(words[4 * h + 0], words[4 * h + 1], words[4 * h + 2], words[4 * h + 3]));
-	}
+	imageStore(uDst, ivec3(x, y + 1, (n0 / 2) + h), uvec4(words[0], words[1], words[2], words[3]));
 #endif
 }
 #endif
@@ -773,24 +764,39 @@ void main()
 		}
 	}
 
-	// Emit r = 0
-	coopMatStore(matC0_0_lo, sAcc, (sg * 2u + 0u) * 128u + 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-	coopMatStore(matC0_0_hi, sAcc, (sg * 2u + 0u) * 128u + 8u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-	coopMatStore(matC0_1_lo, sAcc, (sg * 2u + 1u) * 128u + 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-	coopMatStore(matC0_1_hi, sAcc, (sg * 2u + 1u) * 128u + 8u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+	const uint roundPos = 1u << ((s1 + 31u) & 31u);
+	const uint roundNeg = 1u << ((s2 + 31u) & 31u);
+
+	// Emit r = 0, phased by half h = 0, 1 so sAcc stays 4 KB (per-subgroup sync)
+	coopMatStore(matC0_0_lo, sAcc, sg * 128u + 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+	coopMatStore(matC0_0_hi, sAcc, sg * 128u + 8u, 16u, gl_CooperativeMatrixLayoutRowMajor);
 	subgroupMemoryBarrierShared();
 	subgroupBarrier();
-	emitFlowRow(0, n0, X0, Y0, limitW, limitH, lim, posMul, s1, s2, sg, rowSlot, xHalf, lane, flowScale, flowBias);
+	emitFlowHalf(0, 0, n0, X0, Y0, limitW, limitH, lim, posMul, s1, s2, roundPos, roundNeg, sg, rowSlot, xHalf, lane, flowScale, flowBias);
 	subgroupMemoryBarrierShared();
 	subgroupBarrier();
 
-	// Emit r = 1
-	coopMatStore(matC1_0_lo, sAcc, (sg * 2u + 0u) * 128u + 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-	coopMatStore(matC1_0_hi, sAcc, (sg * 2u + 0u) * 128u + 8u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-	coopMatStore(matC1_1_lo, sAcc, (sg * 2u + 1u) * 128u + 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-	coopMatStore(matC1_1_hi, sAcc, (sg * 2u + 1u) * 128u + 8u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+	coopMatStore(matC0_1_lo, sAcc, sg * 128u + 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+	coopMatStore(matC0_1_hi, sAcc, sg * 128u + 8u, 16u, gl_CooperativeMatrixLayoutRowMajor);
 	subgroupMemoryBarrierShared();
 	subgroupBarrier();
-	emitFlowRow(1, n0, X0, Y0, limitW, limitH, lim, posMul, s1, s2, sg, rowSlot, xHalf, lane, flowScale, flowBias);
+	emitFlowHalf(0, 1, n0, X0, Y0, limitW, limitH, lim, posMul, s1, s2, roundPos, roundNeg, sg, rowSlot, xHalf, lane, flowScale, flowBias);
+	subgroupMemoryBarrierShared();
+	subgroupBarrier();
+
+	// Emit r = 1, phased by half h = 0, 1
+	coopMatStore(matC1_0_lo, sAcc, sg * 128u + 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+	coopMatStore(matC1_0_hi, sAcc, sg * 128u + 8u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+	subgroupMemoryBarrierShared();
+	subgroupBarrier();
+	emitFlowHalf(1, 0, n0, X0, Y0, limitW, limitH, lim, posMul, s1, s2, roundPos, roundNeg, sg, rowSlot, xHalf, lane, flowScale, flowBias);
+	subgroupMemoryBarrierShared();
+	subgroupBarrier();
+
+	coopMatStore(matC1_1_lo, sAcc, sg * 128u + 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+	coopMatStore(matC1_1_hi, sAcc, sg * 128u + 8u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+	subgroupMemoryBarrierShared();
+	subgroupBarrier();
+	emitFlowHalf(1, 1, n0, X0, Y0, limitW, limitH, lim, posMul, s1, s2, roundPos, roundNeg, sg, rowSlot, xHalf, lane, flowScale, flowBias);
 #endif
 }
