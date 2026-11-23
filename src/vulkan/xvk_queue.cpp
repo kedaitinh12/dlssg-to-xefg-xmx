@@ -102,7 +102,16 @@ HRESULT STDMETHODCALLTYPE Fence::SetEventOnCompletion(UINT64 value, HANDLE event
     }
     if (!event) {
         VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, nullptr, 0, 1, &semaphore_, &value};
-        return device_->vk().vkWaitSemaphores(device_->vkDevice(), &wait, UINT64_MAX) == VK_SUCCESS ? S_OK : E_FAIL;
+        constexpr uint64_t kStepNs = 1'000'000'000ull;
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            const VkResult res = device_->vk().vkWaitSemaphores(device_->vkDevice(), &wait, kStepNs);
+            if (res == VK_SUCCESS) return S_OK;
+            if (res != VK_TIMEOUT) return E_FAIL;
+            if (attempt == 0)
+                Log("Fence::SetEventOnCompletion: synchronous semaphore wait stalled >1s (value %llu)", value);
+        }
+        Log("Fence::SetEventOnCompletion: synchronous semaphore wait timed out after 10s (value %llu)", value);
+        return E_FAIL;
     }
     {
         static std::atomic<int> logged{0};

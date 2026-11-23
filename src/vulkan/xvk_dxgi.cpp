@@ -898,17 +898,25 @@ HRESULT SwapChain::CreateBackbuffers()
 
 void SwapChain::WaitIdle()
 {
+    constexpr uint64_t kIdleWaitTimeoutNs = 5'000'000'000ull;
     const auto& vk = device_->vk();
     for (auto& f : frames_)
-        if (f.fence) vk.vkWaitForFences(device_->vkDevice(), 1, &f.fence, VK_TRUE, UINT64_MAX);
+    {
+        if (f.fence && vk.vkWaitForFences(device_->vkDevice(), 1, &f.fence, VK_TRUE, kIdleWaitTimeoutNs) == VK_TIMEOUT)
+            Log("SwapChain::WaitIdle: frame fence timed out after 5s (avoiding hang)");
+    }
     WaitThreadIdle();
 }
 
 void SwapChain::WaitThreadIdle()
 {
+    constexpr uint64_t kIdleWaitTimeoutNs = 5'000'000'000ull;
     const auto& vk = device_->vk();
     for (auto& f : threadFrames_)
-        if (f.fence) vk.vkWaitForFences(device_->vkDevice(), 1, &f.fence, VK_TRUE, UINT64_MAX);
+    {
+        if (f.fence && vk.vkWaitForFences(device_->vkDevice(), 1, &f.fence, VK_TRUE, kIdleWaitTimeoutNs) == VK_TIMEOUT)
+            Log("SwapChain::WaitThreadIdle: present-thread fence timed out after 5s (avoiding hang)");
+    }
 }
 
 HRESULT STDMETHODCALLTYPE SwapChain::GetParent(REFIID riid, void** parent) { return factory_->QueryInterface(riid, parent); }

@@ -1,5 +1,6 @@
 #include "xvk_coopmat.h"
 #include "xvk_internal.h"
+#include "../WineCompat.h"
 #include "../MfgPort/Cuda/cuda_layers.h"
 #include "../MfgPort/Sha256.h"
 #include <algorithm>
@@ -197,8 +198,10 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
 
         VkPhysicalDeviceSubgroupSizeControlProperties subgroupCtrl{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+        VkPhysicalDeviceDriverProperties driverProps{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES, &subgroupCtrl};
         VkPhysicalDeviceSubgroupProperties subgroup{
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, &subgroupCtrl};
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, &driverProps};
         VkPhysicalDeviceProperties2 devProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &subgroup};
         props2(desc.physicalDevice, &devProps);
 
@@ -242,9 +245,26 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
             return false;
         }
 
+        // Enable register-only (zero-sAcc) WMMA shaders strictly on Linux Mesa RADV Wave32 16x16x16.
+        // Never enabled on Windows (AMDVLK/NVIDIA/Intel) because matC[i] lane mapping is RADV-specific.
+        bool allowRadvReg = true;
+        {
+            wchar_t envBuf[16]{};
+            const DWORD n = GetEnvironmentVariableW(L"XEFG_COOP_MATRIX_RADV_REG", envBuf, static_cast<DWORD>(std::size(envBuf)));
+            if (n > 0 && n < std::size(envBuf) && (envBuf[0] == L'0' || envBuf[0] == L'f' || envBuf[0] == L'F' || envBuf[0] == L'n' || envBuf[0] == L'N'))
+                allowRadvReg = false;
+        }
+        const std::filesystem::path radvRegDir = moduleDir / L"radv_reg";
+        std::error_code dirEc;
+        const bool useRadvReg = allowRadvReg &&
+            WineCompat::IsWineOrProton() &&
+            driverProps.driverID == VK_DRIVER_ID_MESA_RADV &&
+            tileM_ == 16u && tileN_ == 16u && tileK_ == 16u && subgroupSize_ == 32u &&
+            std::filesystem::is_directory(radvRegDir, dirEc);
+
         const std::filesystem::path spvDir = (tileM_ == 8u && tileN_ == 8u && tileK_ == 32u)
             ? (moduleDir / L"xmx_8x8x32")
-            : moduleDir;
+            : (useRadvReg ? radvRegDir : moduleDir);
         uint32_t loadedCount = 0;
         for (size_t i = 0; i < std::size(xefg_cuda::kLayers); ++i)
         {
@@ -252,6 +272,12 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
             auto words = LoadSpirvFile(spvDir / (std::string(layer.info.program) + ".spv"));
             if (words.empty())
                 words = LoadSpirvFile(spvDir / (std::string(layer.info.kernel) + ".spv"));
+            if (words.empty() && useRadvReg)
+            {
+                words = LoadSpirvFile(moduleDir / (std::string(layer.info.program) + ".spv"));
+                if (words.empty())
+                    words = LoadSpirvFile(moduleDir / (std::string(layer.info.kernel) + ".spv"));
+            }
 
             if (!words.empty())
             {
@@ -278,8 +304,9 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
                 std::error_code ec;
                 std::filesystem::create_directories(cacheDir, ec);
                 char fname[96]{};
-                std::snprintf(fname, sizeof(fname), "vk_coopmat_cache_%04x_%04x_%ux%ux%u.bin",
-                    devProps.properties.vendorID, devProps.properties.deviceID, tileM_, tileN_, tileK_);
+                std::snprintf(fname, sizeof(fname), "vk_coopmat_cache_%04x_%04x_%ux%ux%u%s.bin",
+                    devProps.properties.vendorID, devProps.properties.deviceID, tileM_, tileN_, tileK_,
+                    useRadvReg ? "_radvreg" : "");
                 cachePath_ = cacheDir / fname;
                 const auto sz = std::filesystem::file_size(cachePath_, ec);
                 if (!ec && sz > 0 && sz <= 32 * 1024 * 1024)

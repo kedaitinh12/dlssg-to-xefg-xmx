@@ -3,6 +3,7 @@
 #include "../Log.h"
 #include "../Plugin.h"
 #include "VulkanCoopMat.h"
+#include "../WineCompat.h"
 #include "VulkanPolicy.h"
 #include "VulkanFeatureChain.h"
 #include "VulkanTensor.h"
@@ -96,6 +97,9 @@ namespace
 		void* hookedIcdCreateSwap = nullptr;
 		void* hookedIcdDestroySwap = nullptr;
 		void* hookedIcdQueuePresent = nullptr;
+		std::atomic_bool icdCreateSwapActive = false;
+		std::atomic_bool icdDestroySwapActive = false;
+		std::atomic_bool icdQueuePresentActive = false;
 		HMODULE loaderModule = nullptr;
 		bool gipaHooked = false;
 		bool gdpaHooked = false;
@@ -113,6 +117,15 @@ namespace
 		std::atomic_uint32_t cpuCleanStreak = 0;
 		std::atomic_bool translationSkipLogged = false;
 		std::atomic_bool selfSkipLogged = false;
+
+		// Lightweight present-pacing diagnostics (atomic counters; logged once + every 5s up to 12 times)
+		std::atomic_bool firstPresentLogged = false;
+		std::atomic_uint64_t diagPresentCalls = 0;
+		std::atomic_uint64_t diagPresentPaced = 0;
+		std::atomic_uint64_t diagPresentFifo = 0;
+		std::atomic_uint64_t diagPresentWaitSumUs = 0;
+		std::atomic_uint64_t diagLastLogNs = 0;
+		std::atomic_uint32_t diagLogCount = 0;
 	};
 
 	// Leaked on purpose: a game's thread can call the hooks while the process exits, after the static destructors
@@ -214,8 +227,9 @@ namespace
 			return hc > 0u && hc <= 6u;
 		}();
 		State& s = S();
+		const bool underWine = WineCompat::IsWineOrProton();
 		const bool userSleepSpin = Plugin::options.pacingSpinlockSleep.load(std::memory_order_relaxed);
-		const bool sleepSpin = userSleepSpin || lowCoreCpu || s.autoSleepSpin.load(std::memory_order_relaxed);
+		const bool sleepSpin = userSleepSpin || lowCoreCpu || underWine || s.autoSleepSpin.load(std::memory_order_relaxed);
 		const uint64_t SpinTailNs = sleepSpin ? 250'000ull : 1'200'000ull; // 0.25 ms sleep-friendly tail vs 1.2 ms QPC spin tail
 
 		using CreateWaitableTimerExWFn = HANDLE(WINAPI*)(void*, LPCWSTR, DWORD, DWORD);
@@ -268,7 +282,7 @@ namespace
 
 		// Auto-adaptive CPU-bound detection: if wait overshoots deadline by >0.75 ms for 6 consecutive presents
 		// (OS scheduler starvation), automatically engage sleep-friendly 0.25 ms tail to yield CPU back to the game.
-		if (!userSleepSpin && !lowCoreCpu)
+		if (!userSleepSpin && !lowCoreCpu && !underWine)
 		{
 			const uint64_t endNs = NowNs();
 			if (endNs > deadline + 750'000ull)
@@ -384,6 +398,107 @@ namespace
 				reinterpret_cast<LPCWSTR>(caller), &mod) || !mod)
 			return false;
 		return mod == self;
+	}
+
+	std::string DescribeModuleOfAddress(const void* addr) noexcept
+	{
+		if (!addr)
+			return "null";
+		HMODULE mod = nullptr;
+		if (!GetModuleHandleExW(
+				GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				reinterpret_cast<LPCWSTR>(addr), &mod) || !mod)
+			return "unknown";
+		wchar_t path[MAX_PATH]{};
+		const DWORD len = GetModuleFileNameW(mod, path, MAX_PATH);
+		if (len == 0 || len >= MAX_PATH)
+			return "unknown";
+		const wchar_t* base = path;
+		for (DWORD i = 0; i < len; ++i)
+		{
+			if (path[i] == L'\\' || path[i] == L'/')
+				base = path + i + 1;
+		}
+		std::string out;
+		out.reserve(64);
+		for (const wchar_t* p = base; *p; ++p)
+			out.push_back((*p >= 0x20 && *p < 0x7F) ? static_cast<char>(*p) : '?');
+		return out.empty() ? std::string("unknown") : out;
+	}
+
+	bool IsReadableMemory(const void* ptr, size_t bytes) noexcept
+	{
+		if (!ptr || bytes == 0)
+			return false;
+		MEMORY_BASIC_INFORMATION mbi{};
+		if (VirtualQuery(ptr, &mbi, sizeof(mbi)) != sizeof(mbi))
+			return false;
+		if (mbi.State != MEM_COMMIT)
+			return false;
+		if ((mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0)
+			return false;
+		const DWORD baseProt = mbi.Protect & 0xFFu;
+		const bool readable =
+			baseProt == PAGE_READONLY ||
+			baseProt == PAGE_READWRITE ||
+			baseProt == PAGE_WRITECOPY ||
+			baseProt == PAGE_EXECUTE_READ ||
+			baseProt == PAGE_EXECUTE_READWRITE ||
+			baseProt == PAGE_EXECUTE_WRITECOPY;
+		if (!readable)
+			return false;
+		const uintptr_t start = reinterpret_cast<uintptr_t>(ptr);
+		const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+		return start <= regionEnd && (regionEnd - start) >= bytes;
+	}
+
+	bool IsUnsafeShortStub(const void* proc) noexcept
+	{
+		if (!IsReadableMemory(proc, 14u))
+			return true;
+		const auto* b = reinterpret_cast<const uint8_t*>(proc);
+		// Already detoured by OptiScaler/overlay (JMP rel32, JMP rel8, or JMP [rip+disp32]).
+		if (b[0] == 0xE9 || b[0] == 0xEB || (b[0] == 0xFF && b[1] == 0x25))
+			return true;
+		// Short loader device-dispatch trampoline: mov rax, [rcx] (48 8B 01) + jmp [rax+disp8/disp32] (FF 60 / FF A0).
+		// Safe only when followed by INT3/NOP padding out to >= 14 bytes; tightly packed stubs risk corrupting
+		// adjacent functions if MinHook falls back to an absolute jump (e.g. Longshot / custom loaders).
+		if (b[0] == 0x48 && b[1] == 0x8B && b[2] == 0x01 && b[3] == 0xFF && (b[4] == 0x60 || b[4] == 0xA0))
+		{
+			const size_t stubLen = (b[4] == 0x60) ? 6u : 9u;
+			for (size_t i = stubLen; i < 14u; ++i)
+			{
+				if (b[i] != 0xCC && b[i] != 0x90)
+					return true;
+			}
+		}
+		return false;
+	}
+
+	// Reads VkLayerDispatchTable::GetDeviceProcAddr (slot 0 of the dispatch table stored at *(void***)device).
+	// This bypasses OptiScaler's Detours hooks on vulkan-1.dll exports so device-level hooks attach downstream of
+	// OptiScaler and Streamline (sl.dlss_g), directly on the ICD / bottom Vulkan layer.
+	PFN_vkGetDeviceProcAddr ResolveDispatchTableGdpa(const State& s, VkDevice device, std::string& moduleOut) noexcept
+	{
+		if (!device || !IsReadableMemory(device, sizeof(void*)))
+			return nullptr;
+		void* const* dispatchTable = *reinterpret_cast<void* const* const*>(device);
+		if (!dispatchTable || !IsReadableMemory(dispatchTable, sizeof(void*)))
+			return nullptr;
+		void* fn0 = dispatchTable[0];
+		if (!fn0 || fn0 == s.rawGetDeviceProcAddr || IsSelfModuleCaller(fn0))
+			return nullptr;
+		HMODULE mod = nullptr;
+		if (!GetModuleHandleExW(
+				GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				reinterpret_cast<LPCWSTR>(fn0), &mod) || !mod)
+			return nullptr;
+		auto candidate = reinterpret_cast<PFN_vkGetDeviceProcAddr>(fn0);
+		// Sanity-probe with mandatory core device command vkDestroyDevice before trusting slot 0.
+		if (!candidate(device, "vkDestroyDevice"))
+			return nullptr;
+		moduleOut = DescribeModuleOfAddress(fn0);
+		return candidate;
 	}
 
 	bool IsInternalBridgeInstance(const VkInstanceCreateInfo* info) noexcept
@@ -1205,7 +1320,8 @@ namespace
 	}
 
 	VkResult CreateSwapchainImpl(PFN_vkCreateSwapchainKHR next, VkDevice device,
-		const VkSwapchainCreateInfoKHR* info, const VkAllocationCallbacks* allocator, VkSwapchainKHR* swapchain)
+		const VkSwapchainCreateInfoKHR* info, const VkAllocationCallbacks* allocator, VkSwapchainKHR* swapchain,
+		const void* caller)
 	{
 		if (!next)
 			return VK_ERROR_INITIALIZATION_FAILED;
@@ -1222,8 +1338,8 @@ namespace
 		bool boosted = false;
 
 		const uint32_t targetBuffers = GetSwapchainBufferTarget();
-		if (targetBuffers >= 6u && info && info->minImageCount >= 6u && info->minImageCount < targetBuffers &&
-			info->surface && S().prepared.load(std::memory_order_relaxed) > 0)
+		const bool devicePrepared = S().prepared.load(std::memory_order_relaxed) > 0;
+		if (info && info->surface && devicePrepared)
 		{
 			VulkanHost::DeviceRecord record{};
 			bool foundDevice = false;
@@ -1246,14 +1362,17 @@ namespace
 				{
 					capMin = caps.minImageCount;
 					capMax = caps.maxImageCount;
-					const uint32_t recommended = VulkanPolicy::RecommendSwapchainImageCount(
-						info->minImageCount, capMin, capMax, targetBuffers);
-					if (recommended > info->minImageCount)
+					if (targetBuffers >= 6u && info->minImageCount >= 6u && info->minImageCount < targetBuffers)
 					{
-						edited = *info;
-						edited.minImageCount = recommended;
-						usedInfo = &edited;
-						boosted = true;
+						const uint32_t recommended = VulkanPolicy::RecommendSwapchainImageCount(
+							info->minImageCount, capMin, capMax, targetBuffers);
+						if (recommended > info->minImageCount)
+						{
+							edited = *info;
+							edited.minImageCount = recommended;
+							usedInfo = &edited;
+							boosted = true;
+						}
 					}
 				}
 			}
@@ -1265,8 +1384,9 @@ namespace
 		{
 			if (result == VK_SUCCESS)
 			{
-				Log::Info("Vulkan swapchain: raised minImageCount {} -> {} (surface caps {}..{}, presentMode {})",
-					info->minImageCount, edited.minImageCount, capMin, capMax, static_cast<int>(info->presentMode));
+				Log::Info("Vulkan swapchain: raised minImageCount {} -> {} ({}x{}, surface caps {}..{}, presentMode {}, caller {})",
+					info->minImageCount, edited.minImageCount, info->imageExtent.width, info->imageExtent.height,
+					capMin, capMax, static_cast<int>(info->presentMode), DescribeModuleOfAddress(caller));
 			}
 			else
 			{
@@ -1275,8 +1395,14 @@ namespace
 				result = next(device, info, allocator, swapchain);
 			}
 		}
+		else if (result == VK_SUCCESS && info && devicePrepared)
+		{
+			Log::Info("Vulkan swapchain: created {}x{} minImageCount={} (target {}, surface caps {}..{}, presentMode {}, caller {})",
+				info->imageExtent.width, info->imageExtent.height, info->minImageCount, targetBuffers,
+				capMin, capMax, static_cast<int>(info->presentMode), DescribeModuleOfAddress(caller));
+		}
 
-		if (result == VK_SUCCESS && info && swapchain && *swapchain && S().prepared.load(std::memory_order_relaxed) > 0)
+		if (result == VK_SUCCESS && info && swapchain && *swapchain && devicePrepared)
 		{
 			State& s = S();
 			std::lock_guard lock(s.mutex);
@@ -1317,7 +1443,7 @@ namespace
 		next(device, swapchain, allocator);
 	}
 
-	VkResult QueuePresentImpl(PFN_vkQueuePresentKHR next, VkQueue queue, const VkPresentInfoKHR* info)
+	VkResult QueuePresentImpl(PFN_vkQueuePresentKHR next, VkQueue queue, const VkPresentInfoKHR* info, const void* caller)
 	{
 		if (!next)
 			return VK_ERROR_INITIALIZATION_FAILED;
@@ -1329,9 +1455,15 @@ namespace
 		ReentryGuard guard(inQueuePresent);
 
 		State& s = S();
-		if (s.prepared.load(std::memory_order_relaxed) > 0 && PacingActive(s))
+		const bool prepared = s.prepared.load(std::memory_order_relaxed) > 0;
+		const bool pacingActive = prepared && PacingActive(s);
+		bool vsyncFifo = false;
+		uint64_t waitNs = 0;
+		uint64_t diagTargetStepNs = 0;
+		uint32_t diagGenCount = 0;
+
+		if (pacingActive)
 		{
-			bool vsyncFifo = false;
 			if (info && info->swapchainCount > 0 && info->pSwapchains)
 			{
 				std::lock_guard lock(s.mutex);
@@ -1340,7 +1472,6 @@ namespace
 					vsyncFifo = IsFifoMode(it->second);
 			}
 
-			uint64_t waitNs = 0;
 			{
 				std::lock_guard lock(s.pacerMutex);
 				const bool autoVrr = Plugin::options.autoVrrPacing.load(std::memory_order_relaxed);
@@ -1348,6 +1479,8 @@ namespace
 				if (autoVrr && s.pacer.displayRefreshHz == 0)
 					s.pacer.SetDisplayRefreshHz(QueryDisplayRefreshHz());
 				waitNs = s.pacer.ComputePresentWaitNs(NowNs(), vsyncFifo);
+				diagTargetStepNs = s.pacer.targetStepNs;
+				diagGenCount = s.pacer.generatedCount;
 			}
 
 			if (waitNs > 0)
@@ -1358,24 +1491,79 @@ namespace
 			}
 		}
 
+		if (prepared)
+		{
+			s.diagPresentCalls.fetch_add(1, std::memory_order_relaxed);
+			if (vsyncFifo)
+				s.diagPresentFifo.fetch_add(1, std::memory_order_relaxed);
+			if (waitNs > 0)
+			{
+				s.diagPresentPaced.fetch_add(1, std::memory_order_relaxed);
+				s.diagPresentWaitSumUs.fetch_add(waitNs / 1000ull, std::memory_order_relaxed);
+			}
+
+			if (!s.firstPresentLogged.exchange(true, std::memory_order_relaxed))
+			{
+				Log::Info("Vulkan present hook: first call intercepted (tid={}, caller={}, swapchains={}, vsyncFifo={}, pacingActive={})",
+					GetCurrentThreadId(), DescribeModuleOfAddress(caller),
+					info ? info->swapchainCount : 0u, vsyncFifo, pacingActive);
+			}
+
+			if (s.diagLogCount.load(std::memory_order_relaxed) < 12u)
+			{
+				const uint64_t nowDiagNs = NowNs();
+				uint64_t lastNs = s.diagLastLogNs.load(std::memory_order_relaxed);
+				if (lastNs == 0)
+				{
+					s.diagLastLogNs.compare_exchange_strong(lastNs, nowDiagNs, std::memory_order_relaxed);
+				}
+				else if (nowDiagNs >= lastNs + 5'000'000'000ull &&
+					s.diagLastLogNs.compare_exchange_strong(lastNs, nowDiagNs, std::memory_order_relaxed))
+				{
+					const uint64_t calls = s.diagPresentCalls.exchange(0, std::memory_order_relaxed);
+					const uint64_t paced = s.diagPresentPaced.exchange(0, std::memory_order_relaxed);
+					const uint64_t fifo = s.diagPresentFifo.exchange(0, std::memory_order_relaxed);
+					const uint64_t waitSumUs = s.diagPresentWaitSumUs.exchange(0, std::memory_order_relaxed);
+					const uint64_t avgWaitUs = paced ? (waitSumUs / paced) : 0ull;
+					s.diagLogCount.fetch_add(1, std::memory_order_relaxed);
+					Log::Info("Vulkan present diag [5s]: calls={}, paced={}, fifoSkipped={}, avgWaitUs={}, targetStepUs={}, genCount={}, tid={}, caller={}",
+						calls, paced, fifo, avgWaitUs, diagTargetStepNs / 1000ull, diagGenCount,
+						GetCurrentThreadId(), DescribeModuleOfAddress(caller));
+				}
+			}
+		}
+
 		return next(queue, info);
 	}
 
 	VKAPI_ATTR VkResult VKAPI_CALL HookCreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* info,
 		const VkAllocationCallbacks* allocator, VkSwapchainKHR* swapchain)
 	{
-		return CreateSwapchainImpl(S().createSwapchain, device, info, allocator, swapchain);
+		State& s = S();
+		if (s.icdCreateSwapActive.load(std::memory_order_acquire))
+			return s.createSwapchain ? s.createSwapchain(device, info, allocator, swapchain) : VK_ERROR_INITIALIZATION_FAILED;
+		return CreateSwapchainImpl(s.createSwapchain, device, info, allocator, swapchain, XEFG_RETURN_ADDRESS());
 	}
 
 	VKAPI_ATTR void VKAPI_CALL HookDestroySwapchain(VkDevice device, VkSwapchainKHR swapchain,
 		const VkAllocationCallbacks* allocator)
 	{
-		DestroySwapchainImpl(S().destroySwapchain, device, swapchain, allocator);
+		State& s = S();
+		if (s.icdDestroySwapActive.load(std::memory_order_acquire))
+		{
+			if (s.destroySwapchain)
+				s.destroySwapchain(device, swapchain, allocator);
+			return;
+		}
+		DestroySwapchainImpl(s.destroySwapchain, device, swapchain, allocator);
 	}
 
 	VKAPI_ATTR VkResult VKAPI_CALL HookQueuePresent(VkQueue queue, const VkPresentInfoKHR* info)
 	{
-		return QueuePresentImpl(S().queuePresent, queue, info);
+		State& s = S();
+		if (s.icdQueuePresentActive.load(std::memory_order_acquire))
+			return s.queuePresent ? s.queuePresent(queue, info) : VK_ERROR_INITIALIZATION_FAILED;
+		return QueuePresentImpl(s.queuePresent, queue, info, XEFG_RETURN_ADDRESS());
 	}
 
 	VKAPI_ATTR VkResult VKAPI_CALL HookCreateSwapchainViaGdpa(VkDevice device, const VkSwapchainCreateInfoKHR* info,
@@ -1383,7 +1571,10 @@ namespace
 	{
 		State& s = S();
 		PFN_vkCreateSwapchainKHR next = s.gdpaCreateSwapchain.load(std::memory_order_acquire);
-		return CreateSwapchainImpl(next ? next : s.createSwapchain, device, info, allocator, swapchain);
+		PFN_vkCreateSwapchainKHR target = next ? next : s.createSwapchain;
+		if (s.icdCreateSwapActive.load(std::memory_order_acquire))
+			return target ? target(device, info, allocator, swapchain) : VK_ERROR_INITIALIZATION_FAILED;
+		return CreateSwapchainImpl(target, device, info, allocator, swapchain, XEFG_RETURN_ADDRESS());
 	}
 
 	VKAPI_ATTR void VKAPI_CALL HookDestroySwapchainViaGdpa(VkDevice device, VkSwapchainKHR swapchain,
@@ -1391,14 +1582,24 @@ namespace
 	{
 		State& s = S();
 		PFN_vkDestroySwapchainKHR next = s.gdpaDestroySwapchain.load(std::memory_order_acquire);
-		DestroySwapchainImpl(next ? next : s.destroySwapchain, device, swapchain, allocator);
+		PFN_vkDestroySwapchainKHR target = next ? next : s.destroySwapchain;
+		if (s.icdDestroySwapActive.load(std::memory_order_acquire))
+		{
+			if (target)
+				target(device, swapchain, allocator);
+			return;
+		}
+		DestroySwapchainImpl(target, device, swapchain, allocator);
 	}
 
 	VKAPI_ATTR VkResult VKAPI_CALL HookQueuePresentViaGdpa(VkQueue queue, const VkPresentInfoKHR* info)
 	{
 		State& s = S();
 		PFN_vkQueuePresentKHR next = s.gdpaQueuePresent.load(std::memory_order_acquire);
-		return QueuePresentImpl(next ? next : s.queuePresent, queue, info);
+		PFN_vkQueuePresentKHR target = next ? next : s.queuePresent;
+		if (s.icdQueuePresentActive.load(std::memory_order_acquire))
+			return target ? target(queue, info) : VK_ERROR_INITIALIZATION_FAILED;
+		return QueuePresentImpl(target, queue, info, XEFG_RETURN_ADDRESS());
 	}
 
 	VKAPI_ATTR VkResult VKAPI_CALL HookCreateSwapchainViaGipa(VkDevice device, const VkSwapchainCreateInfoKHR* info,
@@ -1406,7 +1607,10 @@ namespace
 	{
 		State& s = S();
 		PFN_vkCreateSwapchainKHR next = s.gipaCreateSwapchain.load(std::memory_order_acquire);
-		return CreateSwapchainImpl(next ? next : s.createSwapchain, device, info, allocator, swapchain);
+		PFN_vkCreateSwapchainKHR target = next ? next : s.createSwapchain;
+		if (s.icdCreateSwapActive.load(std::memory_order_acquire))
+			return target ? target(device, info, allocator, swapchain) : VK_ERROR_INITIALIZATION_FAILED;
+		return CreateSwapchainImpl(target, device, info, allocator, swapchain, XEFG_RETURN_ADDRESS());
 	}
 
 	VKAPI_ATTR void VKAPI_CALL HookDestroySwapchainViaGipa(VkDevice device, VkSwapchainKHR swapchain,
@@ -1414,14 +1618,24 @@ namespace
 	{
 		State& s = S();
 		PFN_vkDestroySwapchainKHR next = s.gipaDestroySwapchain.load(std::memory_order_acquire);
-		DestroySwapchainImpl(next ? next : s.destroySwapchain, device, swapchain, allocator);
+		PFN_vkDestroySwapchainKHR target = next ? next : s.destroySwapchain;
+		if (s.icdDestroySwapActive.load(std::memory_order_acquire))
+		{
+			if (target)
+				target(device, swapchain, allocator);
+			return;
+		}
+		DestroySwapchainImpl(target, device, swapchain, allocator);
 	}
 
 	VKAPI_ATTR VkResult VKAPI_CALL HookQueuePresentViaGipa(VkQueue queue, const VkPresentInfoKHR* info)
 	{
 		State& s = S();
 		PFN_vkQueuePresentKHR next = s.gipaQueuePresent.load(std::memory_order_acquire);
-		return QueuePresentImpl(next ? next : s.queuePresent, queue, info);
+		PFN_vkQueuePresentKHR target = next ? next : s.queuePresent;
+		if (s.icdQueuePresentActive.load(std::memory_order_acquire))
+			return target ? target(queue, info) : VK_ERROR_INITIALIZATION_FAILED;
+		return QueuePresentImpl(target, queue, info, XEFG_RETURN_ADDRESS());
 	}
 
 	VKAPI_ATTR VkResult VKAPI_CALL HookCreateSwapchainViaIcd(VkDevice device, const VkSwapchainCreateInfoKHR* info,
@@ -1429,7 +1643,7 @@ namespace
 	{
 		State& s = S();
 		PFN_vkCreateSwapchainKHR next = s.icdCreateSwapchain.load(std::memory_order_acquire);
-		return CreateSwapchainImpl(next ? next : s.createSwapchain, device, info, allocator, swapchain);
+		return CreateSwapchainImpl(next ? next : s.createSwapchain, device, info, allocator, swapchain, XEFG_RETURN_ADDRESS());
 	}
 
 	VKAPI_ATTR void VKAPI_CALL HookDestroySwapchainViaIcd(VkDevice device, VkSwapchainKHR swapchain,
@@ -1444,14 +1658,15 @@ namespace
 	{
 		State& s = S();
 		PFN_vkQueuePresentKHR next = s.icdQueuePresent.load(std::memory_order_acquire);
-		return QueuePresentImpl(next ? next : s.queuePresent, queue, info);
+		return QueuePresentImpl(next ? next : s.queuePresent, queue, info, XEFG_RETURN_ADDRESS());
 	}
 
 	// When vulkan-1.dll's short dispatch stubs (vkGetDeviceProcAddr, vkCreateSwapchainKHR, vkQueuePresentKHR) were
 	// already detoured by OptiScaler/overlays and skipped during InstallLoader, Streamline (sl.dlss_g) resolves the
-	// ICD/layer device functions directly via vkGetDeviceProcAddr and bypasses our GIPA wrapper. Hooking the resolved
-	// device-level ICD functions here avoids vulkan-1.dll's tiny trampolines while intercepting Streamline's real
-	// swapchain creation (for 8-buffer MFG) and per-frame vkQueuePresentKHR calls (for burst pacing).
+	// ICD/layer device functions directly and bypasses our upstream GIPA/GDPA wrappers. Reading slot 0 of VkDevice's
+	// VkLayerDispatchTable bypasses OptiScaler's detoured vkGetDeviceProcAddr so we hook the true downstream ICD /
+	// bottom-layer functions, intercepting Streamline's 6-buffer swapchain creation (raising 6->8) and every
+	// generated/real vkQueuePresentKHR from sl.dlss_g's pacer thread.
 	void InstallDeviceLevelHooks(State& s, const VulkanHost::DeviceRecord& record, VkDevice device) noexcept
 	{
 		try
@@ -1460,18 +1675,29 @@ namespace
 				return;
 
 			std::lock_guard lock(s.install);
-			if (s.presentHooked.load(std::memory_order_relaxed) && (s.createSwapchain || s.hookedIcdCreateSwap))
+			if (s.hookedIcdCreateSwap && s.hookedIcdDestroySwap && s.hookedIcdQueuePresent)
 				return;
 
-			PFN_vkGetDeviceProcAddr gdpa = s.loaderGdpa;
+			std::string gdpaMod;
+			const char* gdpaSource = "dispatch-table";
+			PFN_vkGetDeviceProcAddr gdpa = ResolveDispatchTableGdpa(s, device, gdpaMod);
 			if (!gdpa)
-				gdpa = s.gipaGetDeviceProcAddr.load(std::memory_order_acquire);
-			if (!gdpa && record.gipa && record.instance)
-				gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(record.gipa(record.instance, "vkGetDeviceProcAddr"));
-			if (!gdpa && s.loaderModule)
-				gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(GetProcAddress(s.loaderModule, "vkGetDeviceProcAddr"));
+			{
+				gdpaSource = "fallback";
+				gdpa = s.loaderGdpa;
+				if (!gdpa)
+					gdpa = s.gipaGetDeviceProcAddr.load(std::memory_order_acquire);
+				if (!gdpa && record.gipa && record.instance)
+					gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(record.gipa(record.instance, "vkGetDeviceProcAddr"));
+				if (!gdpa && s.loaderModule)
+					gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(GetProcAddress(s.loaderModule, "vkGetDeviceProcAddr"));
+				if (gdpa)
+					gdpaMod = DescribeModuleOfAddress(reinterpret_cast<const void*>(gdpa));
+			}
 			if (!gdpa)
 				return;
+
+			Log::Info("Vulkan hooks: resolved device proc resolver via {} ({})", gdpaSource, gdpaMod);
 
 			auto isLoaderAddr = [&](void* addr) -> bool {
 				if (!addr || !s.loaderModule)
@@ -1498,12 +1724,18 @@ namespace
 					addr == reinterpret_cast<void*>(&HookQueuePresentViaIcd);
 			};
 
-			auto hookIcdFn = [&](const char* name, void* detour, void* rawExport, void*& hookedSlot, auto& atomicTramp) -> bool {
+			auto hookIcdFn = [&](const char* name, void* detour, void* rawExport, void*& hookedSlot,
+				auto& atomicTramp, std::atomic_bool& activeFlag, std::string& modOut) -> bool {
 				if (hookedSlot != nullptr)
+				{
+					modOut = DescribeModuleOfAddress(hookedSlot);
 					return true;
+				}
 				PFN_vkVoidFunction fn = gdpa(device, name);
 				void* target = reinterpret_cast<void*>(fn);
-				if (!target || target == rawExport || isOwnHook(target) || isLoaderAddr(target))
+				if (!target || target == rawExport || isOwnHook(target))
+					return false;
+				if (isLoaderAddr(target) && IsUnsafeShortStub(target))
 					return false;
 				using FnType = decltype(atomicTramp.load());
 				FnType tramp = nullptr;
@@ -1517,26 +1749,29 @@ namespace
 					return false;
 				}
 				hookedSlot = target;
+				activeFlag.store(true, std::memory_order_release);
+				modOut = DescribeModuleOfAddress(target);
 				return true;
 			};
 
-			const bool hookedCreate = s.createSwapchain != nullptr ||
-				hookIcdFn("vkCreateSwapchainKHR", reinterpret_cast<void*>(&HookCreateSwapchainViaIcd),
-					s.rawCreateSwapchain, s.hookedIcdCreateSwap, s.icdCreateSwapchain);
-			const bool hookedDestroy = s.destroySwapchain != nullptr ||
-				hookIcdFn("vkDestroySwapchainKHR", reinterpret_cast<void*>(&HookDestroySwapchainViaIcd),
-					s.rawDestroySwapchain, s.hookedIcdDestroySwap, s.icdDestroySwapchain);
-			const bool hookedPresent = s.presentHooked.load(std::memory_order_relaxed) ||
-				hookIcdFn("vkQueuePresentKHR", reinterpret_cast<void*>(&HookQueuePresentViaIcd),
-					s.rawQueuePresent, s.hookedIcdQueuePresent, s.icdQueuePresent);
+			std::string createMod = "none";
+			std::string destroyMod = "none";
+			std::string presentMod = "none";
+
+			const bool hookedCreate = hookIcdFn("vkCreateSwapchainKHR", reinterpret_cast<void*>(&HookCreateSwapchainViaIcd),
+				s.rawCreateSwapchain, s.hookedIcdCreateSwap, s.icdCreateSwapchain, s.icdCreateSwapActive, createMod);
+			const bool hookedDestroy = hookIcdFn("vkDestroySwapchainKHR", reinterpret_cast<void*>(&HookDestroySwapchainViaIcd),
+				s.rawDestroySwapchain, s.hookedIcdDestroySwap, s.icdDestroySwapchain, s.icdDestroySwapActive, destroyMod);
+			const bool hookedPresent = hookIcdFn("vkQueuePresentKHR", reinterpret_cast<void*>(&HookQueuePresentViaIcd),
+				s.rawQueuePresent, s.hookedIcdQueuePresent, s.icdQueuePresent, s.icdQueuePresentActive, presentMod);
 
 			if (hookedPresent)
 				s.presentHooked.store(true, std::memory_order_relaxed);
 
 			if (s.hookedIcdCreateSwap || s.hookedIcdDestroySwap || s.hookedIcdQueuePresent)
 			{
-				Log::Info("Vulkan hooks: installed device-level hooks (createSwapchain={}, destroySwapchain={}, queuePresent={}) for 8-buffer MFG & present pacing",
-					hookedCreate, hookedDestroy, hookedPresent);
+				Log::Info("Vulkan hooks: installed device-level hooks (createSwapchain={} [{}], destroySwapchain={} [{}], queuePresent={} [{}]) for 8-buffer MFG & present pacing",
+					hookedCreate, createMod, hookedDestroy, destroyMod, hookedPresent, presentMod);
 			}
 		}
 		catch (...)
@@ -1584,6 +1819,8 @@ namespace
 		void* addr = reinterpret_cast<void*>(fn);
 		if (isCreateSwap)
 		{
+			if (s.icdCreateSwapActive.load(std::memory_order_acquire))
+				return fn;
 			if (addr != s.rawCreateSwapchain &&
 				addr != reinterpret_cast<void*>(&HookCreateSwapchain) &&
 				addr != reinterpret_cast<void*>(&HookCreateSwapchainViaGdpa) &&
@@ -1596,6 +1833,8 @@ namespace
 		}
 		else if (isDestroySwap)
 		{
+			if (s.icdDestroySwapActive.load(std::memory_order_acquire))
+				return fn;
 			if (addr != s.rawDestroySwapchain &&
 				addr != reinterpret_cast<void*>(&HookDestroySwapchain) &&
 				addr != reinterpret_cast<void*>(&HookDestroySwapchainViaGdpa) &&
@@ -1608,6 +1847,8 @@ namespace
 		}
 		else if (isPresent)
 		{
+			if (s.icdQueuePresentActive.load(std::memory_order_acquire))
+				return fn;
 			if (addr != s.rawQueuePresent &&
 				addr != reinterpret_cast<void*>(&HookQueuePresent) &&
 				addr != reinterpret_cast<void*>(&HookQueuePresentViaGdpa) &&
@@ -1824,32 +2065,12 @@ namespace
 		// Device-level Vulkan loader exports (vkCreateSwapchainKHR, vkDestroySwapchainKHR, vkQueuePresentKHR) are tiny
 		// dispatch stubs (mov rax, [rcx]; jmp [rax+off]). If OptiScaler/Detours already patched a stub (0xE9/0xEB/0xFF 0x25),
 		// layering MinHook over the detoured short stub can corrupt the trampoline and crash during swapchain creation.
-		auto isUnsafeShortStub = [](FARPROC proc) -> bool {
-			const auto* b = reinterpret_cast<const uint8_t*>(proc);
-			// Already detoured by OptiScaler/overlay (JMP rel32, JMP rel8, or JMP [rip+disp32]).
-			if (b[0] == 0xE9 || b[0] == 0xEB || (b[0] == 0xFF && b[1] == 0x25))
-				return true;
-			// Short loader device-dispatch trampoline: mov rax, [rcx] (48 8B 01) + jmp [rax+disp8/disp32] (FF 60 / FF A0).
-			// Safe only when followed by INT3/NOP padding out to >= 14 bytes; tightly packed stubs risk corrupting
-			// adjacent functions if MinHook falls back to an absolute jump (e.g. Longshot / custom loaders).
-			if (b[0] == 0x48 && b[1] == 0x8B && b[2] == 0x01 && b[3] == 0xFF && (b[4] == 0x60 || b[4] == 0xA0))
-			{
-				const size_t stubLen = (b[4] == 0x60) ? 6u : 9u;
-				for (size_t i = stubLen; i < 14u; ++i)
-				{
-					if (b[i] != 0xCC && b[i] != 0x90)
-						return true;
-				}
-			}
-			return false;
-		};
-
 		auto tryHook = [&](HMODULE mod, const char* name, void* detour, void** rawOut, auto& trampolineOut, bool skipUnsafeStub) -> bool {
 			FARPROC proc = GetProcAddress(mod, name);
 			if (!proc)
 				return false;
 			*rawOut = reinterpret_cast<void*>(proc);
-			if (skipUnsafeStub && isUnsafeShortStub(proc))
+			if (skipUnsafeStub && IsUnsafeShortStub(reinterpret_cast<const void*>(proc)))
 			{
 				Log::Info("Vulkan hooks: skipping inline hook on {} (short/already-detoured dispatch stub)", name);
 				return false;
