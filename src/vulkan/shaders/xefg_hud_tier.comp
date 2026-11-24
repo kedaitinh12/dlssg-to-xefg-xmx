@@ -58,8 +58,8 @@ void main() {
     memoryBarrierShared();
     barrier();
 
-    uvec2 id = gl_GlobalInvocationID.xy;
-    if (id.x < Width && id.y < Height && (id.x & 3u) == 0u && (id.y & 3u) == 0u) {
+    uvec2 id = gl_GlobalInvocationID.xy * 4u;
+    if (id.x < Width && id.y < Height) {
         ivec2 p = ivec2(id);
         vec3 d = abs(imageLoad(TexA, p).rgb - imageLoad(TexB, p).rgb);
         if (max(d.r, max(d.g, d.b)) > Tolerance) {
@@ -103,7 +103,7 @@ void main() {
         ivec2 q = clamp(tileOrigin + ivec2(tx, ty), ivec2(0), maxCoord);
         uint d = isHudDiff(q) ? 1u : 0u;
         sDiff[idx] = d;
-        if (d != 0u) sTileHasAnyDiff = 1u;
+        if (d != 0u) atomicOr(sTileHasAnyDiff, 1u);
     }
     memoryBarrierShared();
     barrier();

@@ -28,38 +28,17 @@ namespace XeFgEnabler
 		uint32_t sampleCount = 0;
 		uint32_t writeIndex = 0;
 		float baselineStep = 0.0f;
+		// Startup consistency buffer: detects sustained large-unit movement (e.g. 12+ cm/frame in UE)
+		// that exceeds the initial 10-unit meter-scale teleport threshold, while still rejecting isolated jumps.
+		float startupConsistentSteps[5]{};
+		uint32_t startupConsistentCount = 0;
 
-		void Reset() noexcept
+		static float Median5(const float (&vals)[5]) noexcept
 		{
-			for (float& s : recentSteps)
-				s = 0.0f;
-			sampleCount = 0;
-			writeIndex = 0;
-			baselineStep = 0.0f;
-		}
-
-		// Record a non-zero camera step distance and update the robust baseline.
-		// Call AFTER evaluating cut/GhostBuster for the current frame so a sudden teleport
-		// is judged against prior frames first.
-		void Observe(float dist) noexcept
-		{
-			if (!std::isfinite(dist) || dist <= 1e-3f)
-				return;
-
-			recentSteps[writeIndex] = dist;
-			writeIndex = (writeIndex + 1u) % 5u;
-			if (sampleCount < 5u)
-			{
-				++sampleCount;
-				// Wait until all 5 normal-motion samples are collected so a single early spike cannot poison the baseline.
-				if (sampleCount < 5u)
-					return;
-			}
-
 			float sorted[5];
-			for (uint32_t i = 0; i < sampleCount; ++i)
-				sorted[i] = recentSteps[i];
-			for (uint32_t i = 1; i < sampleCount; ++i)
+			for (uint32_t i = 0; i < 5u; ++i)
+				sorted[i] = vals[i];
+			for (uint32_t i = 1; i < 5u; ++i)
 			{
 				const float key = sorted[i];
 				uint32_t j = i;
@@ -70,7 +49,40 @@ namespace XeFgEnabler
 				}
 				sorted[j] = key;
 			}
-			const float median = sorted[sampleCount / 2u];
+			return sorted[2];
+		}
+
+		void Reset() noexcept
+		{
+			for (float& s : recentSteps)
+				s = 0.0f;
+			for (float& s : startupConsistentSteps)
+				s = 0.0f;
+			sampleCount = 0;
+			writeIndex = 0;
+			baselineStep = 0.0f;
+			startupConsistentCount = 0;
+		}
+
+		// Record a non-zero normal-motion camera step distance and update the robust baseline.
+		// Call AFTER evaluating cut/GhostBuster for the current frame.
+		void Observe(float dist) noexcept
+		{
+			if (!std::isfinite(dist) || dist <= 1e-3f)
+				return;
+
+			startupConsistentCount = 0;
+			recentSteps[writeIndex] = dist;
+			writeIndex = (writeIndex + 1u) % 5u;
+			if (sampleCount < 5u)
+			{
+				++sampleCount;
+				// Wait until all 5 normal-motion samples are collected so a single early spike cannot poison the baseline.
+				if (sampleCount < 5u)
+					return;
+			}
+
+			const float median = Median5(recentSteps);
 
 			// Rise immediately when sustained motion reveals a larger world-unit scale (e.g. UE cm),
 			// decay slowly (~0.998/moving frame) when slowing down so brief combat pauses keep the learned scale.
@@ -80,6 +92,46 @@ namespace XeFgEnabler
 			{
 				const float decayed = baselineStep * 0.998f;
 				baselineStep = (decayed > median) ? decayed : median;
+			}
+		}
+
+		// Unified per-frame observer: normal non-reset frames feed Observe(); during uncalibrated startup
+		// (sampleCount < 5), 5 consecutive consistent reset-triggering steps (within 0.5x..2.0x of each other)
+		// bootstrap the world-unit scale so cm-scale games (e.g. 12+ cm/frame) never deadlock in continuous resets,
+		// while isolated teleports (e.g. 1000 followed by 1, 1, ...) are discarded cleanly.
+		void ObserveCandidate(float dist, bool wasReset) noexcept
+		{
+			if (!std::isfinite(dist) || dist <= 1e-3f)
+				return;
+
+			if (!wasReset)
+			{
+				Observe(dist);
+				return;
+			}
+
+			if (sampleCount >= 5u)
+			{
+				startupConsistentCount = 0;
+				return;
+			}
+
+			if (startupConsistentCount > 0u)
+			{
+				const float prev = startupConsistentSteps[startupConsistentCount - 1u];
+				if (dist < prev * 0.5f || dist > prev * 2.0f)
+					startupConsistentCount = 0;
+			}
+
+			startupConsistentSteps[startupConsistentCount++] = dist;
+			if (startupConsistentCount >= 5u)
+			{
+				for (uint32_t i = 0; i < 5u; ++i)
+					recentSteps[i] = startupConsistentSteps[i];
+				sampleCount = 5u;
+				writeIndex = 0;
+				baselineStep = Median5(recentSteps);
+				startupConsistentCount = 0;
 			}
 		}
 

@@ -159,7 +159,7 @@ void HudDiffCompositeCS(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThr
         int2 q = clamp(tileOrigin + int2(tx, ty), int2(0, 0), maxCoord);
         uint d = IsHudDiff(q) ? 1u : 0u;
         g_sDiff[idx] = d;
-        if (d != 0u) g_tileHasAnyDiff = 1u;
+        if (d != 0u) InterlockedOr(g_tileHasAnyDiff, 1u);
     }
     GroupMemoryBarrierWithGroupSync();
 

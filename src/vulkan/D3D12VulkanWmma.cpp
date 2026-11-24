@@ -184,6 +184,7 @@ struct PostCopyRing
 	X(vkDestroySemaphore)                        \
 	X(vkImportSemaphoreWin32HandleKHR)           \
 	X(vkWaitSemaphores)                          \
+	X(vkGetSemaphoreCounterValue)                \
 	X(vkCreateFence)                             \
 	X(vkDestroyFence)                            \
 	X(vkWaitForFences)                           \
@@ -291,6 +292,11 @@ struct Bridge
 	std::atomic<uint64_t> fallbacks{ 0 };
 	std::atomic<uint64_t> totalCpuWaitUs{ 0 };
 	std::atomic<uint64_t> cpuWaitSamples{ 0 };
+	std::atomic<uint64_t> totalSlotWaitUs{ 0 };
+	std::atomic<uint64_t> slotWaitSamples{ 0 };
+	std::atomic<uint64_t> paceTimeouts{ 0 };
+	std::atomic<bool> lastSkipCpuPaceWait{ false };
+	std::atomic<uint32_t> paceWaitActive{ 0 };
 };
 
 constexpr uint32_t kMaxRecoveryAttempts = 3u;
@@ -972,30 +978,71 @@ bool RecordVulkanBatchLocked(PendingBatch& batch) noexcept
 		xvkOutPtrs[i] = outImports[i]->xvkResource.Get();
 	}
 
-	// Select an unreserved Vulkan command buffer slot and ensure previous submission on this slot finished.
-	uint32_t vkSlot = kRingSize;
-	for (uint32_t probe = 0; probe < kRingSize; ++probe)
+	// Query completed timeline value once, prefer an unowned slot that is ALREADY completed (0 ms wait),
+	// and only fall back to waiting on the earliest-finishing unowned slot if all slots are still in flight.
+	uint64_t completedVal = 0;
+	bool haveCompletedVal = false;
+	if (gBridge.device && gBridge.sharedSemaphore && gBridge.vkGetSemaphoreCounterValue)
 	{
-		const uint32_t candidate = (gBridge.vkCursor + probe) % kRingSize;
-		if (gBridge.vkSlotOwner[candidate] == 0)
+		haveCompletedVal = (gBridge.vkGetSemaphoreCounterValue(gBridge.device, gBridge.sharedSemaphore, &completedVal) == VK_SUCCESS);
+	}
+
+	uint32_t vkSlot = kRingSize;
+	if (haveCompletedVal)
+	{
+		for (uint32_t probe = 0; probe < kRingSize; ++probe)
 		{
-			vkSlot = candidate;
-			break;
+			const uint32_t candidate = (gBridge.vkCursor + probe) % kRingSize;
+			if (gBridge.vkSlotOwner[candidate] == 0 && gBridge.vkSlotDoneFence[candidate] <= completedVal)
+			{
+				vkSlot = candidate;
+				break;
+			}
+		}
+	}
+	if (vkSlot >= kRingSize)
+	{
+		uint64_t bestFence = UINT64_MAX;
+		for (uint32_t probe = 0; probe < kRingSize; ++probe)
+		{
+			const uint32_t candidate = (gBridge.vkCursor + probe) % kRingSize;
+			if (gBridge.vkSlotOwner[candidate] == 0 && gBridge.vkSlotDoneFence[candidate] < bestFence)
+			{
+				bestFence = gBridge.vkSlotDoneFence[candidate];
+				vkSlot = candidate;
+			}
 		}
 	}
 	if (vkSlot >= kRingSize)
 		return false;
 	gBridge.vkCursor = (vkSlot + 1u) % kRingSize;
-	if (gBridge.vkSlotDoneFence[vkSlot])
+	if (gBridge.vkSlotDoneFence[vkSlot] && (!haveCompletedVal || gBridge.vkSlotDoneFence[vkSlot] > completedVal))
 	{
 		VkSemaphoreWaitInfo waitInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
 		waitInfo.semaphoreCount = 1;
 		waitInfo.pSemaphores = &gBridge.sharedSemaphore;
 		waitInfo.pValues = &gBridge.vkSlotDoneFence[vkSlot];
-		const VkResult waitRes = gBridge.vkWaitSemaphores(gBridge.device, &waitInfo, 1'000'000'000ull);
-		if (waitRes != VK_SUCCESS)
+		const auto slotWaitStart = std::chrono::steady_clock::now();
+		const VkResult waitRes = gBridge.vkWaitSemaphores(gBridge.device, &waitInfo, 250'000'000ull);
+		const auto slotWaitUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now() - slotWaitStart).count());
+		gBridge.totalSlotWaitUs.fetch_add(slotWaitUs, std::memory_order_relaxed);
+		gBridge.slotWaitSamples.fetch_add(1u, std::memory_order_relaxed);
+		if (waitRes == VK_ERROR_DEVICE_LOST)
 		{
 			MarkBridgeFaultLocked("vkWaitSemaphores", static_cast<int>(waitRes));
+			return false;
+		}
+		if (waitRes != VK_SUCCESS)
+		{
+			// Transient VK_TIMEOUT: keep the live Vulkan device and in-flight submissions intact;
+			// simply fall back to D3D12 for this frame instead of tearing down an active device.
+			static std::atomic<uint64_t> lastTimeoutLogMs{ 0 };
+			const uint64_t nowMs = GetTickCount64();
+			const uint64_t prevMs = lastTimeoutLogMs.load(std::memory_order_relaxed);
+			if (nowMs - prevMs >= 5000u && lastTimeoutLogMs.compare_exchange_strong(prevMs, nowMs, std::memory_order_relaxed))
+				Log::Warn("D3D12->Vulkan WMMA bridge: slot fence wait timed out (result {}), falling back to D3D12 for this frame without device teardown",
+					static_cast<int>(waitRes));
 			return false;
 		}
 	}
@@ -1427,14 +1474,22 @@ bool WantsSharedTextures() noexcept
 
 void TeardownVulkanLocked() noexcept
 {
+	gBridge.contextReady.store(false, std::memory_order_release);
+	gBridge.active.store(false, std::memory_order_release);
+
+	// Wait (bounded) for any ScheduleBatch thread currently inside outside-mutex vkWaitSemaphores
+	// before destroying gBridge.sharedSemaphore or gBridge.device.
+	for (uint32_t i = 0; i < 150u && gBridge.paceWaitActive.load(std::memory_order_acquire) > 0u; ++i)
+		Sleep(1);
+
+	// Drain in-flight Vulkan submissions (bounded) before destroying imports, command pool, and device.
+	(void)DrainVulkanQueueLocked(500'000'000ull);
+
 	{
 		std::lock_guard plock(gBridge.pendingMutex);
 		gBridge.pending.clear();
 		gBridge.pendingCount.store(0, std::memory_order_release);
 	}
-
-	gBridge.contextReady.store(false, std::memory_order_release);
-	gBridge.active.store(false, std::memory_order_release);
 
 	for (auto& kv : gBridge.imports)
 	{
@@ -2332,20 +2387,42 @@ bool ScheduleBatch(
 		}
 	}
 
-	// Overlap-preserving 1-batch-in-flight pacing (outside gBridge.mutex): wait for Batch N after
-	// Batch N+1 is already recorded into its own ring slot, capping queue depth without stalling recording.
-	if (prevVkFence && gBridge.device && gBridge.sharedSemaphore && gBridge.vkWaitSemaphores)
+	gBridge.lastSkipCpuPaceWait.store(skipCpuPaceWait, std::memory_order_relaxed);
+
+	// Overlap-preserving 1-frame-in-flight pacing (outside gBridge.mutex): wait for Batch N-1 after
+	// Batch N+1 is already recorded. Bracket with paceWaitActive so TeardownVulkanLocked never destroys
+	// the Vulkan device or timeline semaphore while this wait is executing.
+	if (prevVkFence)
 	{
-		VkSemaphoreWaitInfo paceWait{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
-		paceWait.semaphoreCount = 1;
-		paceWait.pSemaphores = &gBridge.sharedSemaphore;
-		paceWait.pValues = &prevVkFence;
-		const auto waitStart = std::chrono::steady_clock::now();
-		(void)gBridge.vkWaitSemaphores(gBridge.device, &paceWait, 50'000'000ull);
-		const auto waitUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-			std::chrono::steady_clock::now() - waitStart).count());
-		gBridge.totalCpuWaitUs.fetch_add(waitUs, std::memory_order_relaxed);
-		gBridge.cpuWaitSamples.fetch_add(1u, std::memory_order_relaxed);
+		VkDevice waitDev = VK_NULL_HANDLE;
+		VkSemaphore waitSem = VK_NULL_HANDLE;
+		PFN_vkWaitSemaphores waitFn = nullptr;
+		{
+			std::lock_guard lock(gBridge.mutex);
+			if (gBridge.active.load(std::memory_order_acquire) && gBridge.device && gBridge.sharedSemaphore && gBridge.vkWaitSemaphores)
+			{
+				waitDev = gBridge.device;
+				waitSem = gBridge.sharedSemaphore;
+				waitFn = gBridge.vkWaitSemaphores;
+				gBridge.paceWaitActive.fetch_add(1u, std::memory_order_acq_rel);
+			}
+		}
+		if (waitFn)
+		{
+			struct PaceWaitGuard { ~PaceWaitGuard() { gBridge.paceWaitActive.fetch_sub(1u, std::memory_order_release); } } guard;
+			VkSemaphoreWaitInfo paceWait{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+			paceWait.semaphoreCount = 1;
+			paceWait.pSemaphores = &waitSem;
+			paceWait.pValues = &prevVkFence;
+			const auto waitStart = std::chrono::steady_clock::now();
+			const VkResult paceRes = waitFn(waitDev, &paceWait, 50'000'000ull);
+			const auto waitUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+				std::chrono::steady_clock::now() - waitStart).count());
+			gBridge.totalCpuWaitUs.fetch_add(waitUs, std::memory_order_relaxed);
+			gBridge.cpuWaitSamples.fetch_add(1u, std::memory_order_relaxed);
+			if (paceRes == VK_TIMEOUT)
+				gBridge.paceTimeouts.fetch_add(1u, std::memory_order_relaxed);
+		}
 	}
 
 	{
@@ -2458,6 +2535,10 @@ Status Snapshot() noexcept
 	s.fallbacks = gBridge.fallbacks.load(std::memory_order_relaxed);
 	const uint64_t waitSamples = gBridge.cpuWaitSamples.load(std::memory_order_relaxed);
 	s.avgCpuWaitMs = waitSamples ? (static_cast<float>(gBridge.totalCpuWaitUs.load(std::memory_order_relaxed)) / (1000.0f * static_cast<float>(waitSamples))) : 0.0f;
+	const uint64_t slotSamples = gBridge.slotWaitSamples.load(std::memory_order_relaxed);
+	s.avgSlotWaitMs = slotSamples ? (static_cast<float>(gBridge.totalSlotWaitUs.load(std::memory_order_relaxed)) / (1000.0f * static_cast<float>(slotSamples))) : 0.0f;
+	s.paceTimeouts = gBridge.paceTimeouts.load(std::memory_order_relaxed);
+	s.lastSkipCpuPaceWait = gBridge.lastSkipCpuPaceWait.load(std::memory_order_relaxed);
 	{
 		std::lock_guard lock(gBridge.reasonMutex);
 		s.reason = gBridge.reason;

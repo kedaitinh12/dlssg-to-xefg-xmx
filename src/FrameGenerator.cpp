@@ -1104,6 +1104,9 @@ bool FrameGenerator::CreateContext()
 	routeLaunches = UseWmma(settings.model) ? xefg_wmma::Snapshot().launches : xefg_cuda::Snapshot().launches;
 	routeFrames = 0;
 	routeReported = false;
+	lastExecRoute = ActiveExecRoute::None;
+	currentExecRoute = ActiveExecRoute::None;
+	currentExecRouteReason = "";
 	return true;
 }
 
@@ -1474,6 +1477,9 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 		routeLaunches = UseWmma(settings.model) ? xefg_wmma::Snapshot().launches : xefg_cuda::Snapshot().launches;
 		routeFrames = 0;
 		routeReported = false;
+		lastExecRoute = ActiveExecRoute::None;
+		currentExecRoute = ActiveExecRoute::None;
+		currentExecRouteReason = "";
 	}
 
 	const bool wantShared = UseWmma(settings.model) && D3D12VulkanWmma::WantsSharedTextures();
@@ -1685,8 +1691,8 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 			}
 		}
 
-		if (!reset && hasCamera && context->hasPrevCamera)
-			context->cameraMotionScale.Observe(std::sqrt(distSq));
+		if (hasCamera && context->hasPrevCamera)
+			context->cameraMotionScale.ObserveCandidate(std::sqrt(distSq), reset);
 
 		if (hasCamera)
 		{
@@ -1906,6 +1912,8 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 			reinterpret_cast<ID3D12Resource* const*>(context->outputs), context->outputBases, frameCount,
 			output, OutputState, callerRecording))
 		{
+			currentExecRoute = ActiveExecRoute::VulkanWmma;
+			currentExecRouteReason = "hardware_wmma";
 			context->batchGeneratedThrough = frameCount;
 			context->directOutput = true;
 			return InterpolateResult::Interpolated;
@@ -1913,11 +1921,32 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 		context->wmmaFallbackTouchedShared = true;
 	}
 
-	// Execute records the provider's dispatches into the caller's list; make sure that list's table is hooked too
+	// Record the actual execution route for this frame so HUD composite / split-screen / fallback switches log truthfully.
 	if (UseCuda(settings.model))
+	{
+		currentExecRoute = ActiveExecRoute::Cuda;
+		currentExecRouteReason = "cuda";
 		xefg_cuda::Adopt(cmdList);
-	else if (UseWmma(settings.model) || UseSharedTileXmxPort(settings.model))
+	}
+	else if (UseWmma(settings.model))
+	{
+		currentExecRoute = ActiveExecRoute::D3D12WmmaFallback;
+		currentExecRouteReason = needsSplitCompare ? "hud_split_compare"
+			: (needsPostHudComposite ? "hud_post_composite"
+			: (customInterpTime ? "custom_interp_time" : "vk_bridge_fallback"));
 		xefg_wmma::Adopt(cmdList);
+	}
+	else if (UseSharedTileXmxPort(settings.model))
+	{
+		currentExecRoute = ActiveExecRoute::D3D12SharedTile;
+		currentExecRouteReason = "xmx_port_shared_tile";
+		xefg_wmma::Adopt(cmdList);
+	}
+	else
+	{
+		currentExecRoute = ActiveExecRoute::D3D12Dxil;
+		currentExecRouteReason = "d3d12_dxil";
+	}
 
 	auto result = XeFG::Execute(context->handle, cmdList, params, interpolationTime);
 
@@ -2184,13 +2213,37 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 			const auto vkWmma = D3D12VulkanWmma::Snapshot();
 			const auto route = xefg_wmma::Snapshot();
 
-			if (vkWmma.active && vkWmma.batches > 0)
-				Log::Info("WMMA hardware route: {} Vulkan VK_KHR_cooperative_matrix ({}x{}x{}) batches executed ({} hardware WMMA shaders, {} fallbacks)",
-					vkWmma.batches, vkWmma.tileM, vkWmma.tileN, vkWmma.tileK, vkWmma.coopLayers, vkWmma.fallbacks);
+			if (currentExecRoute == ActiveExecRoute::VulkanWmma)
+				Log::Info("WMMA hardware route: {} Vulkan VK_KHR_cooperative_matrix ({}x{}x{}) batches executed ({} hardware WMMA shaders, {} fallbacks, paceWait {:.2f} ms, slotWait {:.2f} ms, skipPace={})",
+					vkWmma.batches, vkWmma.tileM, vkWmma.tileN, vkWmma.tileK, vkWmma.coopLayers, vkWmma.fallbacks,
+					vkWmma.avgCpuWaitMs, vkWmma.avgSlotWaitMs, vkWmma.lastSkipCpuPaceWait ? "true" : "false");
 			else if (route.launches > routeLaunches)
-				Log::Info("WMMA D3D12 fallback route: {} cs_6_6 INT8 dispatches accelerated ({} layer binds, {} layers recognized)",
-					route.launches - routeLaunches, route.binds, route.layers);
+				Log::Info("WMMA D3D12 route ({}): {} cs_6_6 INT8 dispatches accelerated ({} layer binds, {} layers recognized)",
+					currentExecRouteReason, route.launches - routeLaunches, route.binds, route.layers);
 		}
+	}
+
+	// Log whenever the actual per-frame execution route changes (e.g. Vulkan WMMA <-> D3D12 fallback when HUD composite toggles).
+	if (result == InterpolateResult::Interpolated && frameIndex == 1 && currentExecRoute != ActiveExecRoute::None &&
+		currentExecRoute != lastExecRoute)
+	{
+		if (lastExecRoute != ActiveExecRoute::None)
+		{
+			auto routeLabel = [](ActiveExecRoute r) -> const char* {
+				switch (r)
+				{
+				case ActiveExecRoute::VulkanWmma: return "Vulkan hardware WMMA";
+				case ActiveExecRoute::D3D12WmmaFallback: return "D3D12 WMMA fallback (cs_6_6)";
+				case ActiveExecRoute::D3D12SharedTile: return "D3D12 XMX Port (3x3 shared-tile)";
+				case ActiveExecRoute::D3D12Dxil: return "D3D12 DXIL";
+				case ActiveExecRoute::Cuda: return "CUDA tensor cores";
+				default: return "none";
+				}
+			};
+			Log::Info("Active FG execution route changed: {} -> {} (reason: {})",
+				routeLabel(lastExecRoute), routeLabel(currentExecRoute), currentExecRouteReason);
+		}
+		lastExecRoute = currentExecRoute;
 	}
 
 	// Without a usable pair (first frame, reset) the real frame is shown again, that's not an error

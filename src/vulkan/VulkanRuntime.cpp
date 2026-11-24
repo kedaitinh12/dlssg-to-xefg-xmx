@@ -520,7 +520,7 @@ namespace
 
 	void RecordHudDispatch(const Device& d, VkCommandBuffer command, VkPipeline pipeline,
 		VkImageView view0, VkImageView view1, VkImageView view2, VkBuffer counterBuf,
-		uint32_t width, uint32_t height, float tolerance, uint32_t flags) noexcept
+		uint32_t width, uint32_t height, float tolerance, uint32_t flags, uint32_t sampleStride = 1u) noexcept
 	{
 		if (!pipeline || !view0 || !view1 || !view2 || !counterBuf)
 			return;
@@ -546,7 +546,10 @@ namespace
 		d.vkCmdPushDescriptorSetKHR(command, VK_PIPELINE_BIND_POINT_COMPUTE, d.hudPipelineLayout, 0, 4, writes);
 		const VkHudPushConstants pc{ width, height, tolerance, flags };
 		d.vkCmdPushConstants(command, d.hudPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-		d.vkCmdDispatch(command, (width + 7u) / 8u, (height + 7u) / 8u, 1u);
+		const uint32_t stride = sampleStride ? sampleStride : 1u;
+		const uint32_t gridW = (width + stride - 1u) / stride;
+		const uint32_t gridH = (height + stride - 1u) / stride;
+		d.vkCmdDispatch(command, (gridW + 7u) / 8u, (gridH + 7u) / 8u, 1u);
 	}
 
 	void RecordHudHybridDispatch(const Device& d, VkCommandBuffer command, VkPipeline pipeline,
@@ -2341,8 +2344,8 @@ namespace
 				}
 			}
 
-			if (!reset && hasCamera && f.hasPrevCamera)
-				f.cameraMotionScale.Observe(std::sqrt(distSq));
+			if (hasCamera && f.hasPrevCamera)
+				f.cameraMotionScale.ObserveCandidate(std::sqrt(distSq), reset);
 
 			if (hasCamera)
 			{
@@ -2445,7 +2448,7 @@ namespace
 				{
 					RecordHudDispatch(d, command, d.hudPipelines[0][fmtIdx],
 						slot.bbView, slot.hudlessView, slot.bbView, f.hudCounterGpuBuf,
-						f.width, f.height, 0.02f, 1u);
+						f.width, f.height, 0.02f, 1u, 4u);
 					f.hudReadbackHasDiff[f.hudReadbackSlot] = true;
 					f.hudReadbackDiffFromToneMatch[f.hudReadbackSlot] = false;
 				}

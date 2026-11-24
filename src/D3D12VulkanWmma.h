@@ -32,6 +32,9 @@ namespace D3D12VulkanWmma
 		uint64_t batches = 0;
 		uint64_t fallbacks = 0;
 		float avgCpuWaitMs = 0.0f;
+		float avgSlotWaitMs = 0.0f;
+		uint64_t paceTimeouts = 0;
+		bool lastSkipCpuPaceWait = false;
 		std::string reason;
 	};
 

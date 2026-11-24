@@ -6,6 +6,8 @@
 #include "vulkan/VulkanPolicy.h"
 
 #include <cmath>
+#include "XeFgEnabler.h"
+#include <cmath>
 #include <cstdio>
 #include <limits>
 #include <set>
@@ -599,6 +601,52 @@ int main()
 		p.OnBatchStart(t, 3u);
 		CHECK(!p.skipBatch);
 		CHECK(p.emaBatchNs >= 16'000'000ull && p.emaBatchNs <= 17'000'000ull);
+	}
+
+	// CameraMotionScale + DX12/Vulkan reset-decision loop regression tests:
+	// 1) Isolated teleport (1000) followed by 100 normal steps (1.0) must NOT poison threshold (stays <= 12.0).
+	// 2) Consistent cm-scale movement (12.0/frame for 100 frames) must bootstrap in 5 frames instead of 100 resets.
+	{
+		auto simulateLoop = [](const float* steps, size_t count, uint32_t& outResets, float& outCutThresh) {
+			XeFgEnabler::CameraMotionScale scale;
+			uint32_t quiet = 0u;
+			outResets = 0u;
+			for (size_t i = 0; i < count; ++i)
+			{
+				bool reset = false;
+				if (quiet > 0u)
+					--quiet;
+				const float dist = steps[i];
+				const float distSq = dist * dist;
+				const float cutSq = scale.CutThresholdSq();
+				const float hardSq = scale.HardTeleportThresholdSq();
+				if (distSq > hardSq || (quiet == 0u && distSq > cutSq))
+				{
+					reset = true;
+					quiet = 4u;
+					++outResets;
+				}
+				scale.ObserveCandidate(dist, reset);
+			}
+			outCutThresh = std::sqrt(scale.CutThresholdSq());
+		};
+
+		float seqJump[101]{};
+		seqJump[0] = 1000.0f;
+		for (size_t i = 1; i < 101; ++i) seqJump[i] = 1.0f;
+		uint32_t resetsJump = 0;
+		float cutJump = 0.0f;
+		simulateLoop(seqJump, 101, resetsJump, cutJump);
+		CHECK(resetsJump == 1u);
+		CHECK(cutJump <= 12.01f);
+
+		float seqCm[100]{};
+		for (size_t i = 0; i < 100; ++i) seqCm[i] = 12.0f;
+		uint32_t resetsCm = 0;
+		float cutCm = 0.0f;
+		simulateLoop(seqCm, 100, resetsCm, cutCm);
+		CHECK(resetsCm == 5u);
+		CHECK(cutCm >= 143.9f && cutCm <= 144.1f);
 	}
 
 	std::printf("%d checks, %d failed\n", checks, failures);

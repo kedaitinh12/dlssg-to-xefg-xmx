@@ -139,6 +139,10 @@ private:
 	uint64_t routeLaunches = 0;
 	uint32_t routeFrames = 0;
 	bool routeReported = false;
+	enum class ActiveExecRoute : uint8_t { None, VulkanWmma, D3D12WmmaFallback, D3D12SharedTile, D3D12Dxil, Cuda };
+	ActiveExecRoute lastExecRoute = ActiveExecRoute::None;
+	ActiveExecRoute currentExecRoute = ActiveExecRoute::None;
+	const char* currentExecRouteReason = "";
 
 	// Adaptive VRAM Guard: cached IDXGIAdapter3 + hysteresis state (zero per-frame factory overhead)
 	ComPtr<IDXGIAdapter3> vramAdapter;
