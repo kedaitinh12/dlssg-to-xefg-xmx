@@ -153,7 +153,7 @@ private:
 	// Opt-in Per-Stage GPU Time Profiler (lazy-allocated ONLY when Plugin::options.gpuProfiler is enabled; 0% overhead when off)
 	struct GpuProfiler
 	{
-		static constexpr uint32_t kSlots = 2;
+		static constexpr uint32_t kSlots = 4; // 4-slot ring prevents reading an in-flight GPU slot on 3+ frame DLSS-G pacer queues
 		static constexpr uint32_t kQueriesPerSlot = 6; // [0]=start, [1]=afterCapture, [2]=beforeInterp, [3]=afterInterp, [4]=beforePostHud, [5]=end
 		ComPtr<ID3D12QueryHeap> queryHeap;
 		ComPtr<ID3D12Resource> readback;
@@ -162,6 +162,7 @@ private:
 		uint32_t slot = 0;
 		uint32_t framesRecorded = 0;
 		bool slotValid[kSlots]{};
+		uint64_t lastConsumedEnd[kSlots]{};
 		bool initAttempted = false;
 		bool ready = false;
 		bool hasReading = false;

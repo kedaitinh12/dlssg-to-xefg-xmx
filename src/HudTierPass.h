@@ -198,6 +198,7 @@ private:
 
 	uint32_t readbackSlot_ = 0;
 	uint64_t realFrameCount_ = 0;
+	uint64_t staticReadbackFrameCounter_ = 0;
 
 	uint32_t width_ = 0;
 	uint32_t height_ = 0;

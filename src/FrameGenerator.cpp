@@ -1198,7 +1198,8 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	}
 
 	Settings wanted;
-	auto outputDesc = output->GetDesc();
+	ID3D12Resource* const targetForDesc = output ? output : backbuffer;
+	auto outputDesc = targetForDesc->GetDesc();
 	wanted.width = (uint32_t)outputDesc.Width;
 	wanted.height = outputDesc.Height;
 	wanted.format = TypedFormat(outputDesc.Format);
@@ -1535,7 +1536,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 
 	const bool camCutOn = Plugin::options.cameraCutDetection.load(std::memory_order_relaxed);
 	const bool ghostBusterOn = Plugin::options.ghostBuster.load(std::memory_order_relaxed);
-	if (!ignoreGameReset && (camCutOn || ghostBusterOn))
+	if (camCutOn || ghostBusterOn)
 	{
 		const XMFLOAT3 curPos = GetVector(params, "DLSSG.CameraPosX", "DLSSG.CameraPosY", "DLSSG.CameraPosZ");
 		const XMFLOAT3 curFwd = GetVector(params, "DLSSG.CameraFwdX", "DLSSG.CameraFwdY", "DLSSG.CameraFwdZ");
@@ -1675,7 +1676,14 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 		D3D12VulkanWmma::TryRecoverAsync(vkSettings);
 	}
 
-	const bool useVulkanWmma = !customInterpTime && UseWmma(settings.model) && D3D12VulkanWmma::Active();
+	const bool needsPostHudComposite = hudTierPass.Available() &&
+		(hudDecision.runHudDiffComposite || hudDecision.runStaticHudComposite);
+	const bool needsSplitCompare = hudTierPass.Available() &&
+		Plugin::options.hudSplitCompare.load(std::memory_order_relaxed);
+	// WMMA bridge runs Vulkan + output copy AFTER the game's cmdList executes, which would overwrite any
+	// post-HUD composite or split-screen pass recorded on cmdList; use native DX12 when either is active.
+	const bool useVulkanWmma = !customInterpTime && !needsPostHudComposite && !needsSplitCompare &&
+		UseWmma(settings.model) && D3D12VulkanWmma::Active();
 
 	// Multi-frame batch reuse (D3D12->Vulkan WMMA bridge only): when ScheduleBatch already generated 1..frameCount
 	// at frameIndex == 1 to keep a single D3D12<->Vulkan fence bounce, subsequent calls copy the pre-generated output.
@@ -1697,8 +1705,6 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 	}
 
 	// Zero-copy in-place UAV fast-path for 2x FG (frameCount == 1) when the game's output texture is directly UAV-compatible
-	const bool needsPostHudComposite = hudTierPass.Available() &&
-		(hudDecision.runHudDiffComposite || hudDecision.runStaticHudComposite);
 	const bool canWriteDirect = !useVulkanWmma && frameCount == 1 && frameIndex == 1 && output != nullptr &&
 		outputDesc.Format == settings.format &&
 		(outputDesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0 &&
@@ -1888,10 +1894,14 @@ void FrameGenerator::GpuProfiler::PollAndAdvance() noexcept
 {
 	if (!ready || !mapped || freqHz == 0)
 		return;
-	slot ^= 1u;
+	slot = (slot + 1u) % kSlots;
 	if (framesRecorded >= kSlots && slotValid[slot])
 	{
 		const uint64_t* q = mapped + static_cast<size_t>(slot) * kQueriesPerSlot;
+		// Verify the GPU actually finished resolving this 4-frame-old slot (new monotonic end timestamp > start)
+		if (q[5] == 0 || q[5] == lastConsumedEnd[slot] || q[5] <= q[0])
+			return;
+		lastConsumedEnd[slot] = q[5];
 		const double tickToMs = 1000.0 / static_cast<double>(freqHz);
 		auto spanMs = [tickToMs](uint64_t a, uint64_t b) noexcept -> float {
 			return (b > a) ? static_cast<float>(static_cast<double>(b - a) * tickToMs) : 0.0f;

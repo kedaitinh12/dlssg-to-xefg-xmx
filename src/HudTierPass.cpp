@@ -97,17 +97,28 @@ bool IsHudDiffPair(float3 a, float3 b)
     return (lumaD > Tolerance * 0.65f) || (max(d.r, max(d.g, d.b)) > Tolerance * 1.15f);
 }
 
-// Tier 1 Guard: analyze-only 1/16 pixel sampling using Rec.709 Luma + RGB guard (rejects faint RT chroma noise).
-[numthreads(8, 8, 1)]
-void HudDiffGuardCS(uint3 id : SV_DispatchThreadID)
-{
-    if (id.x >= Width || id.y >= Height) return;
-    if ((id.x & 3u) != 0u || (id.y & 3u) != 0u) return;
+// Tier 1 Guard: analyze-only 1/16 strided pixel sampling (id.xy * 4 -> 16x fewer thread groups, identical sampled pixels)
+// with groupshared per-group reduction (up to 64x less global L2 atomic contention).
+groupshared uint g_guardGroupCount;
 
-    if (IsHudDiffPair(TexA[int2(id.xy)].rgb, TexB[int2(id.xy)].rgb))
+[numthreads(8, 8, 1)]
+void HudDiffGuardCS(uint3 id : SV_DispatchThreadID, uint gidx : SV_GroupIndex)
+{
+    if (gidx == 0u) g_guardGroupCount = 0u;
+    GroupMemoryBarrierWithGroupSync();
+
+    const uint2 p = id.xy * 4u;
+    if (p.x < Width && p.y < Height && IsHudDiffPair(TexA[int2(p)].rgb, TexB[int2(p)].rgb))
     {
         uint dummy;
-        InterlockedAdd(Counter[0], 1u, dummy);
+        InterlockedAdd(g_guardGroupCount, 1u, dummy);
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+    if (gidx == 0u && g_guardGroupCount != 0u)
+    {
+        uint dummy;
+        InterlockedAdd(Counter[0], g_guardGroupCount, dummy);
     }
 }
 
@@ -120,10 +131,12 @@ bool IsHudDiff(int2 p)
 
 // 10x10 shared tile for 8x8 group + 1-pixel halo (200 vs 1152 texture loads per group = 5.76x fewer VRAM reads)
 groupshared uint g_sDiff[100];
+groupshared uint g_diffGroupCount;
 
 [numthreads(8, 8, 1)]
 void HudDiffCompositeCS(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID, uint gidx : SV_GroupIndex)
 {
+    if (gidx == 0u) g_diffGroupCount = 0u;
     int2 maxCoord = int2(Width - 1u, Height - 1u);
     int2 tileOrigin = int2(gid.xy * 8u) - int2(1, 1);
 
@@ -136,30 +149,41 @@ void HudDiffCompositeCS(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThr
     }
     GroupMemoryBarrierWithGroupSync();
 
-    if (id.x >= Width || id.y >= Height) return;
-
-    uint base = gtid.y * 10u + gtid.x;
-    uint mask = g_sDiff[base + 0u]  | g_sDiff[base + 1u]  | g_sDiff[base + 2u]
-              | g_sDiff[base + 10u] | g_sDiff[base + 11u] | g_sDiff[base + 12u]
-              | g_sDiff[base + 20u] | g_sDiff[base + 21u] | g_sDiff[base + 22u];
-    bool hud = (mask != 0u);
-
-    if ((Flags & 1u) != 0u && hud && (id.x & 3u) == 0u && (id.y & 3u) == 0u)
+    if (id.x < Width && id.y < Height)
     {
-        uint dummy;
-        InterlockedAdd(Counter[0], 1u, dummy);
+        uint base = gtid.y * 10u + gtid.x;
+        uint mask = g_sDiff[base + 0u]  | g_sDiff[base + 1u]  | g_sDiff[base + 2u]
+                  | g_sDiff[base + 10u] | g_sDiff[base + 11u] | g_sDiff[base + 12u]
+                  | g_sDiff[base + 20u] | g_sDiff[base + 21u] | g_sDiff[base + 22u];
+        bool hud = (mask != 0u);
+
+        if ((Flags & 1u) != 0u && hud && (id.x & 3u) == 0u && (id.y & 3u) == 0u)
+        {
+            uint dummy;
+            InterlockedAdd(g_diffGroupCount, 1u, dummy);
+        }
+
+        if (hud)
+        {
+            if ((Flags & 2u) != 0u)
+            {
+                OutColor[id.xy] = float4(1.0f, 0.0f, 1.0f, 1.0f);
+            }
+            else
+            {
+                float4 src = TexA[int2(id.xy)];
+                OutColor[id.xy] = float4(SanitizeRgb(src.rgb), isfinite(src.a) ? src.a : 1.0f);
+            }
+        }
     }
 
-    if (hud)
+    if ((Flags & 1u) != 0u)
     {
-        if ((Flags & 2u) != 0u)
+        GroupMemoryBarrierWithGroupSync();
+        if (gidx == 0u && g_diffGroupCount != 0u)
         {
-            OutColor[id.xy] = float4(1.0f, 0.0f, 1.0f, 1.0f);
-        }
-        else
-        {
-            float4 src = TexA[int2(id.xy)];
-            OutColor[id.xy] = float4(SanitizeRgb(src.rgb), isfinite(src.a) ? src.a : 1.0f);
+            uint dummy;
+            InterlockedAdd(Counter[0], g_diffGroupCount, dummy);
         }
     }
 }
@@ -190,7 +214,7 @@ cbuffer Params : register(b0)
     uint Width;
     uint Height;
     float Tolerance;
-    uint Flags; // bit 0: reset history
+    uint Flags; // bit 0: reset history, bit 1: update Counter[1] readback
 };
 
 Texture2D<float4> CurrReal : register(t0);
@@ -198,31 +222,50 @@ Texture2D<float4> PrevReal : register(t1);
 RWTexture2D<uint> StaticCount : register(u0);
 RWStructuredBuffer<uint> Counter : register(u1);
 
-[numthreads(8, 8, 1)]
-void StaticHudUpdateCS(uint3 id : SV_DispatchThreadID)
-{
-    if (id.x >= Width || id.y >= Height) return;
+groupshared uint g_staticGroupCount;
 
-    uint count = 0u;
-    if ((Flags & 1u) == 0u)
+[numthreads(8, 8, 1)]
+void StaticHudUpdateCS(uint3 id : SV_DispatchThreadID, uint gidx : SV_GroupIndex)
+{
+    if ((Flags & 2u) != 0u)
     {
-        float3 cA = CurrReal[int2(id.xy)].rgb;
-        float3 cB = PrevReal[int2(id.xy)].rgb;
-        cA = float3(isfinite(cA.r) ? max(cA.r, 0.0f) : 0.0f, isfinite(cA.g) ? max(cA.g, 0.0f) : 0.0f, isfinite(cA.b) ? max(cA.b, 0.0f) : 0.0f);
-        cB = float3(isfinite(cB.r) ? max(cB.r, 0.0f) : 0.0f, isfinite(cB.g) ? max(cB.g, 0.0f) : 0.0f, isfinite(cB.b) ? max(cB.b, 0.0f) : 0.0f);
-        float3 d = abs(cA - cB);
-        bool unchanged = max(d.r, max(d.g, d.b)) <= Tolerance;
-        uint prev = StaticCount[id.xy];
-        count = unchanged ? min(prev + 1u, 8u) : 0u;
+        if (gidx == 0u) g_staticGroupCount = 0u;
+        GroupMemoryBarrierWithGroupSync();
     }
 
-    StaticCount[id.xy] = count;
-
-    // Count 1/16 sampled pixels that reached the static-HUD threshold (>= 4 consecutive real frames).
-    if (count >= 4u && (id.x & 3u) == 0u && (id.y & 3u) == 0u)
+    if (id.x < Width && id.y < Height)
     {
-        uint dummy;
-        InterlockedAdd(Counter[1], 1u, dummy);
+        uint count = 0u;
+        if ((Flags & 1u) == 0u)
+        {
+            float3 cA = CurrReal[int2(id.xy)].rgb;
+            float3 cB = PrevReal[int2(id.xy)].rgb;
+            cA = float3(isfinite(cA.r) ? max(cA.r, 0.0f) : 0.0f, isfinite(cA.g) ? max(cA.g, 0.0f) : 0.0f, isfinite(cA.b) ? max(cA.b, 0.0f) : 0.0f);
+            cB = float3(isfinite(cB.r) ? max(cB.r, 0.0f) : 0.0f, isfinite(cB.g) ? max(cB.g, 0.0f) : 0.0f, isfinite(cB.b) ? max(cB.b, 0.0f) : 0.0f);
+            float3 d = abs(cA - cB);
+            bool unchanged = max(d.r, max(d.g, d.b)) <= Tolerance;
+            uint prev = StaticCount[id.xy];
+            count = unchanged ? min(prev + 1u, 8u) : 0u;
+        }
+
+        StaticCount[id.xy] = count;
+
+        // Count 1/16 sampled pixels that reached the static-HUD threshold (>= 4 consecutive real frames).
+        if ((Flags & 2u) != 0u && count >= 4u && (id.x & 3u) == 0u && (id.y & 3u) == 0u)
+        {
+            uint dummy;
+            InterlockedAdd(g_staticGroupCount, 1u, dummy);
+        }
+    }
+
+    if ((Flags & 2u) != 0u)
+    {
+        GroupMemoryBarrierWithGroupSync();
+        if (gidx == 0u && g_staticGroupCount != 0u)
+        {
+            uint dummy;
+            InterlockedAdd(Counter[1], g_staticGroupCount, dummy);
+        }
     }
 }
 )";
@@ -299,10 +342,12 @@ bool IsHudDiffHybrid(int2 p)
 
 // 10x10 shared tile for 8x8 group + 1-pixel halo (5.76x fewer TexA/TexB VRAM reads)
 groupshared uint g_sDiffHybrid[100];
+groupshared uint g_hybridGroupCount;
 
 [numthreads(8, 8, 1)]
 void HybridHudCompositeCS(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID, uint gidx : SV_GroupIndex)
 {
+    if (gidx == 0u) g_hybridGroupCount = 0u;
     int2 maxCoord = int2(Width - 1u, Height - 1u);
     int2 tileOrigin = int2(gid.xy * 8u) - int2(1, 1);
 
@@ -315,32 +360,43 @@ void HybridHudCompositeCS(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupT
     }
     GroupMemoryBarrierWithGroupSync();
 
-    if (id.x >= Width || id.y >= Height) return;
-
-    uint base = gtid.y * 10u + gtid.x;
-    uint mask = g_sDiffHybrid[base + 0u]  | g_sDiffHybrid[base + 1u]  | g_sDiffHybrid[base + 2u]
-              | g_sDiffHybrid[base + 10u] | g_sDiffHybrid[base + 11u] | g_sDiffHybrid[base + 12u]
-              | g_sDiffHybrid[base + 20u] | g_sDiffHybrid[base + 21u] | g_sDiffHybrid[base + 22u];
-    bool hudDiff = (mask != 0u);
-
-    if ((Flags & 1u) != 0u && hudDiff && (id.x & 3u) == 0u && (id.y & 3u) == 0u)
+    if (id.x < Width && id.y < Height)
     {
-        uint dummy;
-        InterlockedAdd(Counter[0], 1u, dummy);
+        uint base = gtid.y * 10u + gtid.x;
+        uint mask = g_sDiffHybrid[base + 0u]  | g_sDiffHybrid[base + 1u]  | g_sDiffHybrid[base + 2u]
+                  | g_sDiffHybrid[base + 10u] | g_sDiffHybrid[base + 11u] | g_sDiffHybrid[base + 12u]
+                  | g_sDiffHybrid[base + 20u] | g_sDiffHybrid[base + 21u] | g_sDiffHybrid[base + 22u];
+        bool hudDiff = (mask != 0u);
+
+        if ((Flags & 1u) != 0u && hudDiff && (id.x & 3u) == 0u && (id.y & 3u) == 0u)
+        {
+            uint dummy;
+            InterlockedAdd(g_hybridGroupCount, 1u, dummy);
+        }
+
+        int2 p = int2(id.xy);
+        bool isStatic = StaticCount[p] >= 4u;
+        if (hudDiff || isStatic)
+        {
+            if ((Flags & 2u) != 0u)
+            {
+                OutColor[id.xy] = float4(1.0f, 0.0f, 1.0f, 1.0f);
+            }
+            else
+            {
+                float4 src = TexA[p];
+                OutColor[id.xy] = float4(SanitizeHybridRgb(src.rgb), isfinite(src.a) ? src.a : 1.0f);
+            }
+        }
     }
 
-    int2 p = int2(id.xy);
-    bool isStatic = StaticCount[p] >= 4u;
-    if (hudDiff || isStatic)
+    if ((Flags & 1u) != 0u)
     {
-        if ((Flags & 2u) != 0u)
+        GroupMemoryBarrierWithGroupSync();
+        if (gidx == 0u && g_hybridGroupCount != 0u)
         {
-            OutColor[id.xy] = float4(1.0f, 0.0f, 1.0f, 1.0f);
-        }
-        else
-        {
-            float4 src = TexA[p];
-            OutColor[id.xy] = float4(SanitizeHybridRgb(src.rgb), isfinite(src.a) ? src.a : 1.0f);
+            uint dummy;
+            InterlockedAdd(Counter[0], g_hybridGroupCount, dummy);
         }
     }
 }
@@ -797,6 +853,31 @@ void BilateralApplyCS(uint3 id : SV_DispatchThreadID)
 		cmdList->ResourceBarrier(1, &b);
 	}
 
+	void AddTransition(D3D12_RESOURCE_BARRIER* arr, UINT& count, ID3D12Resource* res,
+		D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) noexcept
+	{
+		if (!res || before == after)
+			return;
+		for (UINT i = 0; i < count; ++i)
+		{
+			if (arr[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && arr[i].Transition.pResource == res)
+				return;
+		}
+		D3D12_RESOURCE_BARRIER& b = arr[count++];
+		b = {};
+		b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		b.Transition.pResource = res;
+		b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		b.Transition.StateBefore = before;
+		b.Transition.StateAfter = after;
+	}
+
+	void FlushBarriers(ID3D12GraphicsCommandList* cmdList, const D3D12_RESOURCE_BARRIER* arr, UINT count) noexcept
+	{
+		if (count > 0)
+			cmdList->ResourceBarrier(count, arr);
+	}
+
 	bool CompileCs(D3DCompileFn compile, const char* src, size_t len, const char* entry,
 		Microsoft::WRL::ComPtr<ID3DBlob>& outBlob) noexcept
 	{
@@ -1062,6 +1143,7 @@ bool HudTierPass::CreateResources(ID3D12Device* device, uint32_t width, uint32_t
 	width_ = width;
 	height_ = height;
 	realFrameCount_ = 0;
+	staticReadbackFrameCounter_ = 0;
 	readbackSlot_ = 0;
 	descBlockCursor_ = 0;
 	resourcesReady_ = true;
@@ -1229,13 +1311,15 @@ void HudTierPass::RecordHudDiffGuard(ID3D12GraphicsCommandList* cmdList,
 	uavBuf.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
 	device_->CreateUnorderedAccessView(counterGpu_.Get(), nullptr, &uavBuf, cpu);
 
-	// Zero counter[0] via CopyBufferRegion
+	// Zero counter[0] via CopyBufferRegion, batching texture transitions with counter transition
 	TransitionBarrier(cmdList, counterGpu_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
 	cmdList->CopyBufferRegion(counterGpu_.Get(), 0, counterZeroUpload_.Get(), 0, 4);
-	TransitionBarrier(cmdList, counterGpu_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-	TransitionBarrier(cmdList, realTex, realState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-	TransitionBarrier(cmdList, hudlessTex, hudlessState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	D3D12_RESOURCE_BARRIER pre[3]{};
+	UINT preCount = 0;
+	AddTransition(pre, preCount, counterGpu_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	AddTransition(pre, preCount, realTex, realState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	AddTransition(pre, preCount, hudlessTex, hudlessState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	FlushBarriers(cmdList, pre, preCount);
 
 	ID3D12DescriptorHeap* heaps[] = { srvUavHeap_.Get() };
 	cmdList->SetDescriptorHeaps(1, heaps);
@@ -1245,17 +1329,22 @@ void HudTierPass::RecordHudDiffGuard(ID3D12GraphicsCommandList* cmdList,
 	const RootConstants rc{ width_, height_, 0.02f, 1u };
 	cmdList->SetComputeRoot32BitConstants(0, 4, &rc, 0);
 	cmdList->SetComputeRootDescriptorTable(1, gpu);
-	cmdList->Dispatch((width_ + 7u) / 8u, (height_ + 7u) / 8u, 1u);
+	const uint32_t sampleW = (width_ + 3u) / 4u;
+	const uint32_t sampleH = (height_ + 3u) / 4u;
+	cmdList->Dispatch((sampleW + 7u) / 8u, (sampleH + 7u) / 8u, 1u);
 
-	UavBarrier(cmdList, counterGpu_.Get());
+	// UAV -> COPY_SOURCE already flushes UAV writes (no redundant UavBarrier needed).
 	TransitionBarrier(cmdList, counterGpu_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
 	cmdList->CopyBufferRegion(counterReadback_[readbackSlot_].Get(), 0, counterGpu_.Get(), 0, 4);
-	TransitionBarrier(cmdList, counterGpu_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 	readbackHasDiff_[readbackSlot_] = true;
 	readbackDiffFromToneMatch_[readbackSlot_] = false;
 
-	TransitionBarrier(cmdList, realTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, realState);
-	TransitionBarrier(cmdList, hudlessTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, hudlessState);
+	D3D12_RESOURCE_BARRIER post[3]{};
+	UINT postCount = 0;
+	AddTransition(post, postCount, counterGpu_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	AddTransition(post, postCount, realTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, realState);
+	AddTransition(post, postCount, hudlessTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, hudlessState);
+	FlushBarriers(cmdList, post, postCount);
 }
 
 void HudTierPass::RecordHudDiffComposite(ID3D12GraphicsCommandList* cmdList,
@@ -1304,16 +1393,18 @@ void HudTierPass::RecordHudDiffComposite(ID3D12GraphicsCommandList* cmdList,
 	uavBuf.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
 	device_->CreateUnorderedAccessView(counterGpu_.Get(), nullptr, &uavBuf, cpu);
 
+	D3D12_RESOURCE_BARRIER pre[4]{};
+	UINT preCount = 0;
 	if (updateCounter)
 	{
 		TransitionBarrier(cmdList, counterGpu_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
 		cmdList->CopyBufferRegion(counterGpu_.Get(), 0, counterZeroUpload_.Get(), 0, 4);
-		TransitionBarrier(cmdList, counterGpu_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		AddTransition(pre, preCount, counterGpu_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 	}
-
-	TransitionBarrier(cmdList, realTex, realState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-	TransitionBarrier(cmdList, hudlessTex, hudlessState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-	TransitionBarrier(cmdList, outputTex, outputState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	AddTransition(pre, preCount, realTex, realState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	AddTransition(pre, preCount, hudlessTex, hudlessState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	AddTransition(pre, preCount, outputTex, outputState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	FlushBarriers(cmdList, pre, preCount);
 
 	ID3D12DescriptorHeap* heaps[] = { srvUavHeap_.Get() };
 	cmdList->SetDescriptorHeaps(1, heaps);
@@ -1326,21 +1417,32 @@ void HudTierPass::RecordHudDiffComposite(ID3D12GraphicsCommandList* cmdList,
 	cmdList->SetComputeRootDescriptorTable(1, gpu);
 	cmdList->Dispatch((width_ + 7u) / 8u, (height_ + 7u) / 8u, 1u);
 
-	UavBarrier(cmdList, outputTex);
-
 	if (updateCounter)
 	{
-		UavBarrier(cmdList, counterGpu_.Get());
-		TransitionBarrier(cmdList, counterGpu_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		D3D12_RESOURCE_BARRIER mid[2]{};
+		UINT midCount = 0;
+		mid[midCount].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+		mid[midCount].UAV.pResource = outputTex;
+		++midCount;
+		AddTransition(mid, midCount, counterGpu_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		FlushBarriers(cmdList, mid, midCount);
 		cmdList->CopyBufferRegion(counterReadback_[readbackSlot_].Get(), 0, counterGpu_.Get(), 0, 4);
-		TransitionBarrier(cmdList, counterGpu_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 		readbackHasDiff_[readbackSlot_] = true;
 		readbackDiffFromToneMatch_[readbackSlot_] = fromToneMatched;
 	}
+	else
+	{
+		UavBarrier(cmdList, outputTex);
+	}
 
-	TransitionBarrier(cmdList, realTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, realState);
-	TransitionBarrier(cmdList, hudlessTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, hudlessState);
-	TransitionBarrier(cmdList, outputTex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outputState);
+	D3D12_RESOURCE_BARRIER post[4]{};
+	UINT postCount = 0;
+	if (updateCounter)
+		AddTransition(post, postCount, counterGpu_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	AddTransition(post, postCount, realTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, realState);
+	AddTransition(post, postCount, hudlessTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, hudlessState);
+	AddTransition(post, postCount, outputTex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outputState);
+	FlushBarriers(cmdList, post, postCount);
 }
 
 void HudTierPass::RecordStaticHudUpdate(ID3D12GraphicsCommandList* cmdList,
@@ -1387,36 +1489,62 @@ void HudTierPass::RecordStaticHudUpdate(ID3D12GraphicsCommandList* cmdList,
 	uavBuf.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
 	device_->CreateUnorderedAccessView(counterGpu_.Get(), nullptr, &uavBuf, cpu);
 
-	// Zero counter[1] (byte offset 4) via CopyBufferRegion
-	TransitionBarrier(cmdList, counterGpu_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-	cmdList->CopyBufferRegion(counterGpu_.Get(), 4, counterZeroUpload_.Get(), 4, 4);
-	TransitionBarrier(cmdList, counterGpu_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	// Keep staticCountTex_ updated 100% every frame (identical HUD quality), but throttle the diagnostic
+	// coverage counter readback (6 barriers + 2 buffer copies) to 1 in 16 real frames after the first 8 frames.
+	if (resetHistory)
+		staticReadbackFrameCounter_ = 0;
+	const uint64_t staticFrame = ++staticReadbackFrameCounter_;
+	const bool updateCounter = resetHistory || (staticFrame <= 8u) || ((staticFrame % 16u) == 0u);
 
-	TransitionBarrier(cmdList, currRealTex, currState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	D3D12_RESOURCE_BARRIER pre[3]{};
+	UINT preCount = 0;
+	if (updateCounter)
+	{
+		TransitionBarrier(cmdList, counterGpu_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+		cmdList->CopyBufferRegion(counterGpu_.Get(), 4, counterZeroUpload_.Get(), 4, 4);
+		AddTransition(pre, preCount, counterGpu_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	}
+	AddTransition(pre, preCount, currRealTex, currState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 	if (prevRealTex && prevRealTex != currRealTex)
-		TransitionBarrier(cmdList, prevRealTex, prevState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+		AddTransition(pre, preCount, prevRealTex, prevState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	FlushBarriers(cmdList, pre, preCount);
 
 	ID3D12DescriptorHeap* heaps[] = { srvUavHeap_.Get() };
 	cmdList->SetDescriptorHeaps(1, heaps);
 	cmdList->SetComputeRootSignature(rootSig_.Get());
 	cmdList->SetPipelineState(psoStaticUpdate_.Get());
 
-	const RootConstants rc{ width_, height_, 0.008f, resetHistory ? 1u : 0u };
+	const uint32_t flags = (resetHistory ? 1u : 0u) | (updateCounter ? 2u : 0u);
+	const RootConstants rc{ width_, height_, 0.008f, flags };
 	cmdList->SetComputeRoot32BitConstants(0, 4, &rc, 0);
 	cmdList->SetComputeRootDescriptorTable(1, gpu);
 	cmdList->Dispatch((width_ + 7u) / 8u, (height_ + 7u) / 8u, 1u);
 
-	UavBarrier(cmdList, staticCountTex_.Get());
-	UavBarrier(cmdList, counterGpu_.Get());
+	if (updateCounter)
+	{
+		D3D12_RESOURCE_BARRIER mid[2]{};
+		UINT midCount = 0;
+		mid[midCount].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+		mid[midCount].UAV.pResource = staticCountTex_.Get();
+		++midCount;
+		AddTransition(mid, midCount, counterGpu_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		FlushBarriers(cmdList, mid, midCount);
+		cmdList->CopyBufferRegion(counterReadback_[readbackSlot_].Get(), 4, counterGpu_.Get(), 4, 4);
+		readbackHasStatic_[readbackSlot_] = true;
+	}
+	else
+	{
+		UavBarrier(cmdList, staticCountTex_.Get());
+	}
 
-	TransitionBarrier(cmdList, counterGpu_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-	cmdList->CopyBufferRegion(counterReadback_[readbackSlot_].Get(), 4, counterGpu_.Get(), 4, 4);
-	TransitionBarrier(cmdList, counterGpu_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-	readbackHasStatic_[readbackSlot_] = true;
-
-	TransitionBarrier(cmdList, currRealTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, currState);
+	D3D12_RESOURCE_BARRIER post[3]{};
+	UINT postCount = 0;
+	if (updateCounter)
+		AddTransition(post, postCount, counterGpu_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	AddTransition(post, postCount, currRealTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, currState);
 	if (prevRealTex && prevRealTex != currRealTex)
-		TransitionBarrier(cmdList, prevRealTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, prevState);
+		AddTransition(post, postCount, prevRealTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, prevState);
+	FlushBarriers(cmdList, post, postCount);
 }
 
 void HudTierPass::RecordStaticHudComposite(ID3D12GraphicsCommandList* cmdList,
@@ -1535,17 +1663,19 @@ void HudTierPass::RecordHybridHudComposite(ID3D12GraphicsCommandList* cmdList,
 	uavBuf.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
 	device_->CreateUnorderedAccessView(counterGpu_.Get(), nullptr, &uavBuf, cpu);
 
+	D3D12_RESOURCE_BARRIER pre[5]{};
+	UINT preCount = 0;
 	if (updateCounter)
 	{
 		TransitionBarrier(cmdList, counterGpu_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
 		cmdList->CopyBufferRegion(counterGpu_.Get(), 0, counterZeroUpload_.Get(), 0, 4);
-		TransitionBarrier(cmdList, counterGpu_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		AddTransition(pre, preCount, counterGpu_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 	}
-
-	TransitionBarrier(cmdList, realTex, realState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-	TransitionBarrier(cmdList, hudlessTex, hudlessState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-	TransitionBarrier(cmdList, staticCountTex_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-	TransitionBarrier(cmdList, outputTex, outputState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	AddTransition(pre, preCount, realTex, realState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	AddTransition(pre, preCount, hudlessTex, hudlessState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	AddTransition(pre, preCount, staticCountTex_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	AddTransition(pre, preCount, outputTex, outputState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	FlushBarriers(cmdList, pre, preCount);
 
 	ID3D12DescriptorHeap* heaps[] = { srvUavHeap_.Get() };
 	cmdList->SetDescriptorHeaps(1, heaps);
@@ -1558,22 +1688,33 @@ void HudTierPass::RecordHybridHudComposite(ID3D12GraphicsCommandList* cmdList,
 	cmdList->SetComputeRootDescriptorTable(1, gpu);
 	cmdList->Dispatch((width_ + 7u) / 8u, (height_ + 7u) / 8u, 1u);
 
-	UavBarrier(cmdList, outputTex);
-
 	if (updateCounter)
 	{
-		UavBarrier(cmdList, counterGpu_.Get());
-		TransitionBarrier(cmdList, counterGpu_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		D3D12_RESOURCE_BARRIER mid[2]{};
+		UINT midCount = 0;
+		mid[midCount].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+		mid[midCount].UAV.pResource = outputTex;
+		++midCount;
+		AddTransition(mid, midCount, counterGpu_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		FlushBarriers(cmdList, mid, midCount);
 		cmdList->CopyBufferRegion(counterReadback_[readbackSlot_].Get(), 0, counterGpu_.Get(), 0, 4);
-		TransitionBarrier(cmdList, counterGpu_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 		readbackHasDiff_[readbackSlot_] = true;
 		readbackDiffFromToneMatch_[readbackSlot_] = fromToneMatched;
 	}
+	else
+	{
+		UavBarrier(cmdList, outputTex);
+	}
 
-	TransitionBarrier(cmdList, realTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, realState);
-	TransitionBarrier(cmdList, hudlessTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, hudlessState);
-	TransitionBarrier(cmdList, staticCountTex_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-	TransitionBarrier(cmdList, outputTex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outputState);
+	D3D12_RESOURCE_BARRIER post[5]{};
+	UINT postCount = 0;
+	if (updateCounter)
+		AddTransition(post, postCount, counterGpu_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	AddTransition(post, postCount, realTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, realState);
+	AddTransition(post, postCount, hudlessTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, hudlessState);
+	AddTransition(post, postCount, staticCountTex_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	AddTransition(post, postCount, outputTex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outputState);
+	FlushBarriers(cmdList, post, postCount);
 }
 
 bool HudTierPass::IsToneMapMatchSupported(DXGI_FORMAT backbufferFormat) noexcept

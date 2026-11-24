@@ -31,6 +31,7 @@ namespace D3D12VulkanWmma
 		uint32_t coopLayers = 0;
 		uint64_t batches = 0;
 		uint64_t fallbacks = 0;
+		float avgCpuWaitMs = 0.0f;
 		std::string reason;
 	};
 
