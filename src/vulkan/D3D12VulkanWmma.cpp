@@ -153,12 +153,28 @@ struct PendingBatch
 	uint64_t contextEpoch = 0;
 };
 
+struct ParkedPostCopyAlloc
+{
+	ComPtr<ID3D12CommandAllocator> alloc;
+	ComPtr<ID3D12CommandQueue> queue;
+	ComPtr<ID3D12Fence> fence;
+	uint64_t doneValue = 0;
+	bool signalPending = false;
+	std::vector<ComPtr<ID3D12Resource>> resources;
+	std::vector<std::shared_ptr<SharedImport>> imports;
+};
+
 struct PostCopyRing
 {
 	ComPtr<ID3D12CommandAllocator> alloc[kRingSize];
 	ComPtr<ID3D12GraphicsCommandList> list[kRingSize];
+	ComPtr<ID3D12CommandQueue> slotQueue[kRingSize];
+	ComPtr<ID3D12Fence> slotFence[kRingSize];
 	uint64_t doneFence[kRingSize]{};
-	std::vector<ComPtr<ID3D12CommandAllocator>> parkedAllocs; // busy allocators parked on fence timeout (never reset in-flight)
+	bool slotSignalPending[kRingSize]{};
+	std::vector<ComPtr<ID3D12Resource>> slotResources[kRingSize];
+	std::vector<std::shared_ptr<SharedImport>> slotImports[kRingSize];
+	std::vector<ParkedPostCopyAlloc> parkedAllocs; // busy allocators parked with their owning queue + private fence + copy resources/imports
 	uint32_t cursor = 0;
 	bool ready = false;
 };
@@ -210,6 +226,15 @@ struct Bridge
 	PostCopyRing computeRing;
 	PostCopyRing nativeDirectRing;
 	PostCopyRing nativeComputeRing;
+	struct QueueFenceEntry
+	{
+		ComPtr<ID3D12Fence> fence;
+		uint64_t nextValue = 0;
+		uint64_t lastSignaled = 0;
+	};
+	// Dedicated private completion fence per ID3D12CommandQueue so out-of-order Direct vs Compute
+	// completion can never mask an in-flight post-copy on another queue.
+	std::unordered_map<ID3D12CommandQueue*, QueueFenceEntry> queueFences;
 
 	// Vulkan side
 	HMODULE vulkanDll = nullptr;
@@ -266,6 +291,11 @@ struct Bridge
 		uint64_t retireFence = 0;
 		xefgd_handle_t handle = nullptr;
 	};
+	struct PendingInitUpload
+	{
+		VkFence fence = VK_NULL_HANDLE;
+		xefgd_handle_t ctx = nullptr;
+	};
 
 	// Cached D3D12 -> Vulkan shared imports keyed by ID3D12Resource*
 	std::unordered_map<ID3D12Resource*, std::shared_ptr<SharedImport>> imports;
@@ -273,6 +303,7 @@ struct Bridge
 	// Deferred retirement queues for contexts/imports whose 500ms drain timed out (never destroy while GPU may still read them)
 	std::vector<RetiredImport> retiredImports;
 	std::vector<RetiredContext> retiredContexts;
+	std::vector<PendingInitUpload> pendingInitUploads;
 	std::atomic<size_t> importCount{ 0 };
 	std::atomic<uint64_t> directZeroCopyOuts{ 0 };
 
@@ -459,16 +490,51 @@ bool WaitFenceCpu(ID3D12Fence* fence, HANDLE ev, uint64_t target, DWORD timeoutM
 }
 
 // Bounded timeline-semaphore drain (replaces unbounded vkQueueWaitIdle so a stalled queue can never freeze the game).
-bool DrainVulkanQueueLocked(uint64_t timeoutNs) noexcept
+bool DrainVulkanQueueLocked(uint64_t timeoutNs, bool* outDeviceLost = nullptr) noexcept
 {
-	const uint64_t target = gBridge.lastSubmittedVkFence.load(std::memory_order_acquire);
+	if (outDeviceLost)
+		*outDeviceLost = false;
+
+	// 1) Drain any timed-out XeFG::Init weight-upload submissions (private VkFence separate from timeline semaphore).
+	if (!gBridge.pendingInitUploads.empty() && gBridge.device && gBridge.vkWaitForFences)
+	{
+		auto it = gBridge.pendingInitUploads.begin();
+		while (it != gBridge.pendingInitUploads.end())
+		{
+			if (it->fence)
+			{
+				const VkResult fres = gBridge.vkWaitForFences(gBridge.device, 1, &it->fence, VK_TRUE, timeoutNs);
+				if (fres == VK_ERROR_DEVICE_LOST)
+				{
+					if (outDeviceLost)
+						*outDeviceLost = true;
+					return false;
+				}
+				if (fres != VK_SUCCESS)
+					return false;
+				if (gBridge.vkDestroyFence)
+					gBridge.vkDestroyFence(gBridge.device, it->fence, nullptr);
+			}
+			if (it->ctx)
+				XeFG::Destroy(it->ctx);
+			it = gBridge.pendingInitUploads.erase(it);
+		}
+	}
+
+	// 2) Drain both Vulkan batch submissions and any later D3D12 PostCopyRing fence on the shared timeline semaphore.
+	const uint64_t target = std::max(
+		gBridge.lastSubmittedVkFence.load(std::memory_order_acquire),
+		gBridge.lastSignaledBridgeFence.load(std::memory_order_acquire));
 	if (!target || !gBridge.device || !gBridge.sharedSemaphore || !gBridge.vkWaitSemaphores)
 		return true;
 	VkSemaphoreWaitInfo waitInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
 	waitInfo.semaphoreCount = 1;
 	waitInfo.pSemaphores = &gBridge.sharedSemaphore;
 	waitInfo.pValues = &target;
-	return gBridge.vkWaitSemaphores(gBridge.device, &waitInfo, timeoutNs) == VK_SUCCESS;
+	const VkResult res = gBridge.vkWaitSemaphores(gBridge.device, &waitInfo, timeoutNs);
+	if (res == VK_ERROR_DEVICE_LOST && outDeviceLost)
+		*outDeviceLost = true;
+	return res == VK_SUCCESS;
 }
 
 uint32_t FindMemoryType(const VkPhysicalDeviceMemoryProperties& props, uint32_t typeBits, VkMemoryPropertyFlags required) noexcept
@@ -486,13 +552,130 @@ uint32_t FindMemoryType(const VkPhysicalDeviceMemoryProperties& props, uint32_t 
 	return UINT32_MAX;
 }
 
+Bridge::QueueFenceEntry* EnsureQueueFenceLocked(ID3D12CommandQueue* queue, ID3D12Device* ringDev) noexcept
+{
+	if (!queue || !ringDev)
+		return nullptr;
+	auto it = gBridge.queueFences.find(queue);
+	if (it != gBridge.queueFences.end() && it->second.fence)
+		return &it->second;
+	Bridge::QueueFenceEntry entry{};
+	if (FAILED(ringDev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&entry.fence))) || !entry.fence)
+		return nullptr;
+	auto [inserted, _] = gBridge.queueFences.emplace(queue, std::move(entry));
+	return &inserted->second;
+}
+
+// If a private per-queue Signal() failed after origExec(), retry signaling a fresh milestone on that exact queue.
+// Returns true only when a valid per-queue fence milestone is established (never falls back to the shared fence).
+bool RetryPendingQueueSignalLocked(ID3D12CommandQueue* queue, ID3D12Fence* fence, uint64_t& doneValue, bool& signalPending) noexcept
+{
+	if (!signalPending)
+		return true;
+	if (!queue || !fence)
+		return false;
+	uint64_t qVal = doneValue + 1u;
+	if (auto it = gBridge.queueFences.find(queue); it != gBridge.queueFences.end())
+		qVal = ++it->second.nextValue;
+	if (SUCCEEDED(queue->Signal(fence, qVal)))
+	{
+		doneValue = qVal;
+		signalPending = false;
+		if (auto it = gBridge.queueFences.find(queue); it != gBridge.queueFences.end() && qVal > it->second.lastSignaled)
+			it->second.lastSignaled = qVal;
+		return true;
+	}
+	return false;
+}
+
+bool WaitSlotOrParkedReadyLocked(ID3D12CommandQueue* queue, ID3D12Fence* fence, uint64_t& doneValue, bool& signalPending, uint32_t timeoutMs) noexcept
+{
+	if (signalPending)
+	{
+		if (!RetryPendingQueueSignalLocked(queue, fence, doneValue, signalPending))
+			return false;
+	}
+	if (!fence || doneValue == 0)
+		return true;
+	return WaitFenceCpu(fence, gBridge.fenceEvent, doneValue, timeoutMs);
+}
+
+void ReapCompletedParkedAllocsLocked(PostCopyRing& ring) noexcept
+{
+	// Non-blocking release of slot copy resources/imports once their owning queue's private fence completes.
+	for (uint32_t i = 0; i < kRingSize; ++i)
+	{
+		if (ring.slotResources[i].empty() && ring.slotImports[i].empty())
+			continue;
+		if (ring.slotSignalPending[i] &&
+			!RetryPendingQueueSignalLocked(ring.slotQueue[i].Get(), ring.slotFence[i].Get(), ring.doneFence[i], ring.slotSignalPending[i]))
+			continue;
+		if (!ring.slotSignalPending[i] && (!ring.slotFence[i] || ring.doneFence[i] == 0 || ring.slotFence[i]->GetCompletedValue() >= ring.doneFence[i]))
+		{
+			ring.slotResources[i].clear();
+			ring.slotImports[i].clear();
+		}
+	}
+	for (auto it = ring.parkedAllocs.begin(); it != ring.parkedAllocs.end();)
+	{
+		if (it->signalPending && !RetryPendingQueueSignalLocked(it->queue.Get(), it->fence.Get(), it->doneValue, it->signalPending))
+		{
+			++it;
+			continue;
+		}
+		if (!it->signalPending && (!it->fence || it->doneValue == 0 || it->fence->GetCompletedValue() >= it->doneValue))
+			it = ring.parkedAllocs.erase(it);
+		else
+			++it;
+	}
+}
+
+void ReapAllCompletedPostCopyRingsLocked() noexcept
+{
+	ReapCompletedParkedAllocsLocked(gBridge.directRing);
+	ReapCompletedParkedAllocsLocked(gBridge.computeRing);
+	ReapCompletedParkedAllocsLocked(gBridge.nativeDirectRing);
+	ReapCompletedParkedAllocsLocked(gBridge.nativeComputeRing);
+}
+
+bool DrainPostCopyRingLocked(PostCopyRing& ring, uint32_t timeoutMs) noexcept
+{
+	for (uint32_t i = 0; i < kRingSize; ++i)
+	{
+		if (ring.slotSignalPending[i] || (ring.slotFence[i] && ring.doneFence[i]))
+		{
+			if (!WaitSlotOrParkedReadyLocked(ring.slotQueue[i].Get(), ring.slotFence[i].Get(),
+				ring.doneFence[i], ring.slotSignalPending[i], timeoutMs))
+				return false;
+		}
+		ring.slotResources[i].clear();
+		ring.slotImports[i].clear();
+	}
+	for (auto it = ring.parkedAllocs.begin(); it != ring.parkedAllocs.end();)
+	{
+		if (it->signalPending || (it->fence && it->doneValue))
+		{
+			if (!WaitSlotOrParkedReadyLocked(it->queue.Get(), it->fence.Get(),
+				it->doneValue, it->signalPending, timeoutMs))
+				return false;
+		}
+		it = ring.parkedAllocs.erase(it);
+	}
+	return true;
+}
+
 void ResetPostCopyRing(PostCopyRing& ring) noexcept
 {
 	for (uint32_t i = 0; i < kRingSize; ++i)
 	{
 		ring.list[i].Reset();
 		ring.alloc[i].Reset();
+		ring.slotQueue[i].Reset();
+		ring.slotFence[i].Reset();
 		ring.doneFence[i] = 0;
+		ring.slotSignalPending[i] = false;
+		ring.slotResources[i].clear();
+		ring.slotImports[i].clear();
 	}
 	ring.parkedAllocs.clear();
 	ring.cursor = 0;
@@ -551,6 +734,11 @@ bool FenceValueCompletedLocked(uint64_t value) noexcept
 
 void ReapRetiredLocked(bool forceAll = false) noexcept
 {
+	// Release post-copy slot/parked resource & import refs only for queues whose own private fence completed.
+	// Any still-in-flight post-copy keeps imp.use_count() >= 2, preventing premature DestroyImport even if sharedFence advanced.
+	if (!forceAll)
+		ReapAllCompletedPostCopyRingsLocked();
+
 	if (!gBridge.retiredImports.empty())
 	{
 		auto it = gBridge.retiredImports.begin();
@@ -878,11 +1066,33 @@ void RunRealFrameFallbackLocked(ID3D12CommandQueue* queue, ExecuteCommandListsFn
 		: ((useType == D3D12_COMMAND_LIST_TYPE_COMPUTE) ? gBridge.computeRing : gBridge.directRing);
 	if (!useFence || !ringDev || !EnsurePostCopyRing(ringDev, useType, ring))
 		return;
+	ReapCompletedParkedAllocsLocked(ring);
+	// Acquire the queue's private completion fence BEFORE submitting any post-copy command list.
+	auto* qf = EnsureQueueFenceLocked(queue, ringDev);
+	if (!qf || !qf->fence)
+		return;
 	const uint32_t slot = ring.cursor++ % kRingSize;
-	if (WaitFenceCpu(useFence, gBridge.fenceEvent, ring.doneFence[slot], 500u) &&
+	if (WaitSlotOrParkedReadyLocked(ring.slotQueue[slot].Get(), ring.slotFence[slot].Get(),
+		ring.doneFence[slot], ring.slotSignalPending[slot], 500u) &&
 		SUCCEEDED(ring.alloc[slot]->Reset()) &&
 		SUCCEEDED(ring.list[slot]->Reset(ring.alloc[slot].Get(), nullptr)))
 	{
+		ring.slotResources[slot].clear();
+		ring.slotImports[slot].clear();
+		ring.slotResources[slot].reserve(1u + fallbackCopies.size());
+		ring.slotResources[slot].push_back(realFrame);
+		for (const auto& cp : fallbackCopies)
+			ring.slotResources[slot].push_back(cp.gameOutput);
+		auto keepImpIfImported = [&](ID3D12Resource* r) {
+			if (!r) return;
+			if (auto it = gBridge.imports.find(r); it != gBridge.imports.end() && it->second)
+				ring.slotImports[slot].push_back(it->second);
+		};
+		keepImpIfImported(realFrame);
+		for (const auto& cp : fallbackCopies)
+			keepImpIfImported(cp.gameOutput.Get());
+		for (const auto& imp : batch.keptImports)
+			if (imp) ring.slotImports[slot].push_back(imp);
 		RecordD3D12RealFrameFallbackCopies(ring.list[slot].Get(), realFrame, batch.fallbackRealFrameState, fallbackCopies);
 		ring.list[slot]->Close();
 		ID3D12CommandList* postLists[1] = { ring.list[slot].Get() };
@@ -890,7 +1100,22 @@ void RunRealFrameFallbackLocked(ID3D12CommandQueue* queue, ExecuteCommandListsFn
 		const uint64_t doneVal = gBridge.fenceValue.fetch_add(1, std::memory_order_acq_rel) + 1;
 		if (SUCCEEDED(queue->Signal(useFence, doneVal)))
 			gBridge.lastSignaledBridgeFence.store(doneVal, std::memory_order_release);
-		ring.doneFence[slot] = doneVal;
+		const uint64_t qVal = ++qf->nextValue;
+		ring.slotQueue[slot] = queue;
+		ring.slotFence[slot] = qf->fence;
+		if (SUCCEEDED(queue->Signal(qf->fence.Get(), qVal)))
+		{
+			qf->lastSignaled = qVal;
+			ring.doneFence[slot] = qVal;
+			ring.slotSignalPending[slot] = false;
+		}
+		else
+		{
+			// Private signal failed after submit: never fall back to shared useFence.
+			// Block slot reuse and teardown until a retry signal on this exact queue succeeds and completes.
+			ring.doneFence[slot] = qVal;
+			ring.slotSignalPending[slot] = true;
+		}
 	}
 }
 
@@ -1347,41 +1572,83 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 
 		if (EnsurePostCopyRing(ringDev, useType, ring))
 		{
-			const uint32_t slot = ring.cursor++ % kRingSize;
-			bool slotReady = WaitFenceCpu(useFence, gBridge.fenceEvent, ring.doneFence[slot], 500u);
-			if (!slotReady)
+			ReapCompletedParkedAllocsLocked(ring);
+			// Acquire the queue's private completion fence BEFORE submitting any post-copy command list.
+			auto* qf = EnsureQueueFenceLocked(queue, ringDev);
+			if (qf && qf->fence)
 			{
-				// Never reset a command allocator that the GPU may still be reading (f5low-fg ROBUSTNESS.md):
-				// park the busy allocator and swap in a fresh spare allocator to avoid TDR / device removal.
-				ComPtr<ID3D12CommandAllocator> spare;
-				if (ring.parkedAllocs.size() < 16u &&
-					SUCCEEDED(ringDev->CreateCommandAllocator(useType, IID_PPV_ARGS(&spare))) && spare)
+				const uint32_t slot = ring.cursor++ % kRingSize;
+				bool slotReady = WaitSlotOrParkedReadyLocked(ring.slotQueue[slot].Get(), ring.slotFence[slot].Get(),
+					ring.doneFence[slot], ring.slotSignalPending[slot], 500u);
+				if (!slotReady)
 				{
-					ring.parkedAllocs.push_back(std::move(ring.alloc[slot]));
-					ring.alloc[slot] = std::move(spare);
-					ring.doneFence[slot] = 0;
-					slotReady = true;
-					Log::Warn("D3D12->Vulkan WMMA bridge: post-copy fence timed out (500 ms), parked busy allocator (parked={})",
-						ring.parkedAllocs.size());
+					// Never reset a command allocator that the GPU may still be reading (f5low-fg ROBUSTNESS.md):
+					// park the busy allocator TOGETHER with its owning queue, private fence, doneValue, and signalPending state.
+					ComPtr<ID3D12CommandAllocator> spare;
+					if (ring.parkedAllocs.size() < 16u &&
+						SUCCEEDED(ringDev->CreateCommandAllocator(useType, IID_PPV_ARGS(&spare))) && spare)
+					{
+						ring.parkedAllocs.push_back({
+							std::move(ring.alloc[slot]),
+							std::move(ring.slotQueue[slot]),
+							std::move(ring.slotFence[slot]),
+							ring.doneFence[slot],
+							ring.slotSignalPending[slot],
+							std::move(ring.slotResources[slot]),
+							std::move(ring.slotImports[slot])
+						});
+						ring.alloc[slot] = std::move(spare);
+						ring.doneFence[slot] = 0;
+						ring.slotSignalPending[slot] = false;
+						slotReady = true;
+						Log::Warn("D3D12->Vulkan WMMA bridge: post-copy fence timed out (500 ms), parked busy allocator (parked={})",
+							ring.parkedAllocs.size());
+					}
 				}
-			}
-			if (slotReady &&
-				SUCCEEDED(ring.alloc[slot]->Reset()) &&
-				SUCCEEDED(ring.list[slot]->Reset(ring.alloc[slot].Get(), nullptr)))
-			{
-				RecordD3D12CopiesBatched(ring.list[slot].Get(), batch.copies);
-				ring.list[slot]->Close();
-
-				ID3D12CommandList* postLists[1] = { ring.list[slot].Get() };
-				origExec(queue, 1, postLists);
-
-				const uint64_t doneVal = gBridge.fenceValue.fetch_add(1, std::memory_order_acq_rel) + 1;
-				if (SUCCEEDED(queue->Signal(useFence, doneVal)))
+				if (slotReady &&
+					SUCCEEDED(ring.alloc[slot]->Reset()) &&
+					SUCCEEDED(ring.list[slot]->Reset(ring.alloc[slot].Get(), nullptr)))
 				{
-					gBridge.lastSignaledBridgeFence.store(doneVal, std::memory_order_release);
-					batchDoneFence = doneVal;
+					ring.slotResources[slot].clear();
+					ring.slotImports[slot].clear();
+					ring.slotResources[slot].reserve(batch.copies.size() * 2u);
+					for (const auto& cp : batch.copies)
+					{
+						ring.slotResources[slot].push_back(cp.sharedOutput);
+						ring.slotResources[slot].push_back(cp.gameOutput);
+					}
+					// Keep all batch SharedImports alive until THIS queue's private post-copy fence completes
+					// so ReapRetiredLocked(false) can never destroy an evicted import while Direct/Compute copy is still running.
+					ring.slotImports[slot] = batch.keptImports;
+					RecordD3D12CopiesBatched(ring.list[slot].Get(), batch.copies);
+					ring.list[slot]->Close();
+
+					ID3D12CommandList* postLists[1] = { ring.list[slot].Get() };
+					origExec(queue, 1, postLists);
+
+					const uint64_t doneVal = gBridge.fenceValue.fetch_add(1, std::memory_order_acq_rel) + 1;
+					if (SUCCEEDED(queue->Signal(useFence, doneVal)))
+					{
+						gBridge.lastSignaledBridgeFence.store(doneVal, std::memory_order_release);
+						batchDoneFence = doneVal;
+					}
+					const uint64_t qVal = ++qf->nextValue;
+					ring.slotQueue[slot] = queue;
+					ring.slotFence[slot] = qf->fence;
+					if (SUCCEEDED(queue->Signal(qf->fence.Get(), qVal)))
+					{
+						qf->lastSignaled = qVal;
+						ring.doneFence[slot] = qVal;
+						ring.slotSignalPending[slot] = false;
+					}
+					else
+					{
+						// Private signal failed after submit: never fall back to shared useFence.
+						// Block slot reuse and teardown until a retry signal on this exact queue succeeds and completes.
+						ring.doneFence[slot] = qVal;
+						ring.slotSignalPending[slot] = true;
+					}
 				}
-				ring.doneFence[slot] = doneVal;
 			}
 		}
 	}
@@ -1472,7 +1739,7 @@ bool WantsSharedTextures() noexcept
 		gBridge.recoveryInFlight.load(std::memory_order_acquire);
 }
 
-void TeardownVulkanLocked() noexcept
+bool TeardownVulkanLocked() noexcept
 {
 	gBridge.contextReady.store(false, std::memory_order_release);
 	gBridge.active.store(false, std::memory_order_release);
@@ -1481,9 +1748,41 @@ void TeardownVulkanLocked() noexcept
 	// before destroying gBridge.sharedSemaphore or gBridge.device.
 	for (uint32_t i = 0; i < 150u && gBridge.paceWaitActive.load(std::memory_order_acquire) > 0u; ++i)
 		Sleep(1);
+	if (gBridge.paceWaitActive.load(std::memory_order_acquire) > 0u)
+		return false;
 
-	// Drain in-flight Vulkan submissions (bounded) before destroying imports, command pool, and device.
-	(void)DrainVulkanQueueLocked(500'000'000ull);
+	// Drain in-flight Vulkan submissions (including any pending XeFG::Init upload fence and PostCopyRing timeline value).
+	// If the device is still alive (not VK_ERROR_DEVICE_LOST) and the queue did not finish draining, abort teardown
+	// and defer retry instead of freeing in-use resources.
+	bool deviceLost = false;
+	const bool drained = DrainVulkanQueueLocked(500'000'000ull, &deviceLost);
+	if (!drained && !deviceLost)
+		return false;
+
+	// Explicitly verify EVERY D3D12 PostCopyRing (all active slots AND parked allocators) and EVERY
+	// tracked ID3D12CommandQueue's own private completion fence finished before resetting rings or freeing imports.
+	// Using per-queue fences guarantees a faster Compute queue can never mask an in-flight Direct queue copy.
+	if (!DrainPostCopyRingLocked(gBridge.directRing, 500u) ||
+		!DrainPostCopyRingLocked(gBridge.computeRing, 500u) ||
+		!DrainPostCopyRingLocked(gBridge.nativeDirectRing, 500u) ||
+		!DrainPostCopyRingLocked(gBridge.nativeComputeRing, 500u))
+		return false;
+	for (const auto& kv : gBridge.queueFences)
+	{
+		if (kv.second.fence && kv.second.lastSignaled &&
+			!WaitFenceCpu(kv.second.fence.Get(), gBridge.fenceEvent, kv.second.lastSignaled, 500u))
+			return false;
+	}
+
+	// Clean up any remaining pendingInitUploads (only reachable here if deviceLost == true).
+	for (auto& pi : gBridge.pendingInitUploads)
+	{
+		if (pi.fence && gBridge.device && gBridge.vkDestroyFence)
+			gBridge.vkDestroyFence(gBridge.device, pi.fence, nullptr);
+		if (pi.ctx)
+			XeFG::Destroy(pi.ctx);
+	}
+	gBridge.pendingInitUploads.clear();
 
 	{
 		std::lock_guard plock(gBridge.pendingMutex);
@@ -1555,10 +1854,12 @@ void TeardownVulkanLocked() noexcept
 	ResetPostCopyRing(gBridge.computeRing);
 	ResetPostCopyRing(gBridge.nativeDirectRing);
 	ResetPostCopyRing(gBridge.nativeComputeRing);
+	gBridge.queueFences.clear();
 
 	gBridge.contextFailed = false;
 	gBridge.contextFailCount = 0;
 	++gBridge.contextEpoch;
+	return true;
 }
 
 bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
@@ -2111,9 +2412,11 @@ bool EnsureContext(const ContextSettings& settings) noexcept
 	const VkResult waitRes = gBridge.vkWaitForFences(gBridge.device, 1, &initFence, VK_TRUE, 2'000'000'000ull);
 	if (waitRes != VK_SUCCESS)
 	{
-		// Do not destroy initFence while the GPU submission may still be in flight.
+		// Retain initFence + ctx on the bridge so DrainVulkanQueueLocked / TeardownVulkanLocked
+		// waits for this upload submission before destroying the command pool or Vulkan device.
 		{
 			std::lock_guard lock(gBridge.mutex);
+			gBridge.pendingInitUploads.push_back({ initFence, ctx });
 			MarkBridgeFaultLocked("XeFG::Init vkWaitForFences", static_cast<int>(waitRes));
 		}
 		return markFailed();
@@ -2224,12 +2527,29 @@ bool TryRecoverAsync(const ContextSettings& settings) noexcept
 	{
 		std::thread([d3dDev, settings, attempt]() noexcept {
 			std::string reason;
+			bool deferred = false;
 			bool installed = false;
 			{
 				std::lock_guard lock(gBridge.mutex);
-				TeardownVulkanLocked();
-				gBridge.attempted = false;
-				installed = InstallLocked(d3dDev.Get(), reason);
+				if (!TeardownVulkanLocked())
+				{
+					deferred = true;
+					gBridge.lastFaultAt = std::chrono::steady_clock::now();
+					if (gBridge.recoveryAttempts > 0u)
+						--gBridge.recoveryAttempts;
+					gBridge.recoveryNeeded.store(true, std::memory_order_release);
+				}
+				else
+				{
+					gBridge.attempted = false;
+					installed = InstallLocked(d3dDev.Get(), reason);
+				}
+			}
+			if (deferred)
+			{
+				Log::Warn("D3D12->Vulkan WMMA bridge: recovery teardown deferred (active paceWait or queue still busy); will retry safely");
+				gBridge.recoveryInFlight.store(false, std::memory_order_release);
+				return;
 			}
 			if (installed)
 			{
