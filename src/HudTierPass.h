@@ -96,6 +96,15 @@ public:
 
 	// Fused Tier 3 Hybrid Composite: combines 3x3 dilated |Real - Hudless| diff and Static-HUD Mask (staticCount >= 4)
 	// in a single compute pass (1/2 VRAM bandwidth, 0 intermediate UAV barrier).
+	// Software motion-vector unjitter for XMX Port / CUDA / WMMA (model 16) when game submits jittered MVs:
+	// removes (prevJitter - curJitter) / mvecScale in-place on our private mvecs copy so model 16 never needs
+	// unported XEFGD_INIT_FLAG_JITTERED_MV shaders (e.g. key 35112441167526893749578).
+	bool CanUnjitterMotionVectors(DXGI_FORMAT format) const noexcept;
+	void RecordUnjitterMotionVectors(ID3D12GraphicsCommandList* cmdList,
+		ID3D12Resource* mvecsTex, D3D12_RESOURCE_STATES mvecsState,
+		uint32_t baseX, uint32_t baseY, uint32_t sizeX, uint32_t sizeY,
+		float deltaRawX, float deltaRawY) noexcept;
+
 	bool HasHybridComposite() const noexcept { return hybridRootSig_.Get() != nullptr && psoHybridComposite_.Get() != nullptr; }
 	void RecordHybridHudComposite(ID3D12GraphicsCommandList* cmdList,
 		ID3D12Resource* realTex, D3D12_RESOURCE_STATES realState,
@@ -143,6 +152,10 @@ private:
 	Microsoft::WRL::ComPtr<ID3D12PipelineState> psoDiffComposite_;
 	Microsoft::WRL::ComPtr<ID3D12PipelineState> psoStaticUpdate_;
 	Microsoft::WRL::ComPtr<ID3D12PipelineState> psoStaticComposite_;
+	Microsoft::WRL::ComPtr<ID3D12RootSignature> unjitterRootSig_;
+	Microsoft::WRL::ComPtr<ID3D12PipelineState> psoUnjitterMv2_;
+	Microsoft::WRL::ComPtr<ID3D12PipelineState> psoUnjitterMv4_;
+	bool typedUavLoadSupported_ = false;
 	Microsoft::WRL::ComPtr<ID3D12PipelineState> psoSplitCompare_;
 	Microsoft::WRL::ComPtr<ID3D12RootSignature> hybridRootSig_;
 	Microsoft::WRL::ComPtr<ID3D12PipelineState> psoHybridComposite_;

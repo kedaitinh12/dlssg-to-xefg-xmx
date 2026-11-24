@@ -1,10 +1,12 @@
 #include "HudTierPass.h"
 #include "Log.h"
 #include "Util.h"
+#include "D3D12VulkanWmma.h"
 
 #include <d3dcompiler.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace
@@ -62,6 +64,8 @@ namespace
 	//   t0, t1: 2 SRV textures
 	//   u0, u1: 2 UAVs (texture + RWByteAddressBuffer counter)
 	constexpr char kHudTierHlsl[] = R"(
+bool IsFiniteF(float v) { return (asuint(v) & 0x7F800000u) != 0x7F800000u; }
+bool3 IsFiniteF3(float3 v) { return (asuint(v) & 0x7F800000u) != 0x7F800000u; }
 cbuffer Params : register(b0)
 {
     uint Width;
@@ -78,9 +82,9 @@ RWStructuredBuffer<uint> Counter : register(u1);
 float3 SanitizeRgb(float3 c)
 {
     return float3(
-        isfinite(c.r) ? max(c.r, 0.0f) : 0.0f,
-        isfinite(c.g) ? max(c.g, 0.0f) : 0.0f,
-        isfinite(c.b) ? max(c.b, 0.0f) : 0.0f);
+        IsFiniteF(c.r) ? max(c.r, 0.0f) : 0.0f,
+        IsFiniteF(c.g) ? max(c.g, 0.0f) : 0.0f,
+        IsFiniteF(c.b) ? max(c.b, 0.0f) : 0.0f);
 }
 
 float Rec709Luma(float3 c)
@@ -172,7 +176,7 @@ void HudDiffCompositeCS(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThr
             else
             {
                 float4 src = TexA[int2(id.xy)];
-                OutColor[id.xy] = float4(SanitizeRgb(src.rgb), isfinite(src.a) ? src.a : 1.0f);
+                OutColor[id.xy] = float4(SanitizeRgb(src.rgb), IsFiniteF(src.a) ? src.a : 1.0f);
             }
         }
     }
@@ -198,7 +202,7 @@ void SplitCompareCS(uint3 id : SV_DispatchThreadID)
     if (id.x < splitX)
     {
         float4 src = TexA[int2(id.xy)];
-        OutColor[id.xy] = float4(SanitizeRgb(src.rgb), isfinite(src.a) ? src.a : 1.0f);
+        OutColor[id.xy] = float4(SanitizeRgb(src.rgb), IsFiniteF(src.a) ? src.a : 1.0f);
     }
     else if (id.x == splitX || id.x == splitX + 1u)
     {
@@ -209,6 +213,8 @@ void SplitCompareCS(uint3 id : SV_DispatchThreadID)
 
 	// Separate HLSL block for Tier 3 so u0 can be RWTexture2D<uint> in UpdateCS and RWTexture2D<float4> in CompositeCS.
 	constexpr char kStaticHudUpdateHlsl[] = R"(
+bool IsFiniteF(float v) { return (asuint(v) & 0x7F800000u) != 0x7F800000u; }
+bool3 IsFiniteF3(float3 v) { return (asuint(v) & 0x7F800000u) != 0x7F800000u; }
 cbuffer Params : register(b0)
 {
     uint Width;
@@ -240,8 +246,8 @@ void StaticHudUpdateCS(uint3 id : SV_DispatchThreadID, uint gidx : SV_GroupIndex
         {
             float3 cA = CurrReal[int2(id.xy)].rgb;
             float3 cB = PrevReal[int2(id.xy)].rgb;
-            cA = float3(isfinite(cA.r) ? max(cA.r, 0.0f) : 0.0f, isfinite(cA.g) ? max(cA.g, 0.0f) : 0.0f, isfinite(cA.b) ? max(cA.b, 0.0f) : 0.0f);
-            cB = float3(isfinite(cB.r) ? max(cB.r, 0.0f) : 0.0f, isfinite(cB.g) ? max(cB.g, 0.0f) : 0.0f, isfinite(cB.b) ? max(cB.b, 0.0f) : 0.0f);
+            cA = float3(IsFiniteF(cA.r) ? max(cA.r, 0.0f) : 0.0f, IsFiniteF(cA.g) ? max(cA.g, 0.0f) : 0.0f, IsFiniteF(cA.b) ? max(cA.b, 0.0f) : 0.0f);
+            cB = float3(IsFiniteF(cB.r) ? max(cB.r, 0.0f) : 0.0f, IsFiniteF(cB.g) ? max(cB.g, 0.0f) : 0.0f, IsFiniteF(cB.b) ? max(cB.b, 0.0f) : 0.0f);
             float3 d = abs(cA - cB);
             bool unchanged = max(d.r, max(d.g, d.b)) <= Tolerance;
             uint prev = StaticCount[id.xy];
@@ -271,6 +277,8 @@ void StaticHudUpdateCS(uint3 id : SV_DispatchThreadID, uint gidx : SV_GroupIndex
 )";
 
 	constexpr char kStaticHudCompositeHlsl[] = R"(
+bool IsFiniteF(float v) { return (asuint(v) & 0x7F800000u) != 0x7F800000u; }
+bool3 IsFiniteF3(float3 v) { return (asuint(v) & 0x7F800000u) != 0x7F800000u; }
 cbuffer Params : register(b0)
 {
     uint Width;
@@ -299,16 +307,18 @@ void StaticHudCompositeCS(uint3 id : SV_DispatchThreadID)
         {
             float4 src = CurrReal[int2(id.xy)];
             float3 safeRgb = float3(
-                isfinite(src.r) ? max(src.r, 0.0f) : 0.0f,
-                isfinite(src.g) ? max(src.g, 0.0f) : 0.0f,
-                isfinite(src.b) ? max(src.b, 0.0f) : 0.0f);
-            OutColor[id.xy] = float4(safeRgb, isfinite(src.a) ? src.a : 1.0f);
+                IsFiniteF(src.r) ? max(src.r, 0.0f) : 0.0f,
+                IsFiniteF(src.g) ? max(src.g, 0.0f) : 0.0f,
+                IsFiniteF(src.b) ? max(src.b, 0.0f) : 0.0f);
+            OutColor[id.xy] = float4(safeRgb, IsFiniteF(src.a) ? src.a : 1.0f);
         }
     }
 }
 )";
 
 	constexpr char kHybridHudCompositeHlsl[] = R"(
+bool IsFiniteF(float v) { return (asuint(v) & 0x7F800000u) != 0x7F800000u; }
+bool3 IsFiniteF3(float3 v) { return (asuint(v) & 0x7F800000u) != 0x7F800000u; }
 cbuffer Params : register(b0)
 {
     uint Width;
@@ -326,9 +336,9 @@ RWStructuredBuffer<uint> Counter : register(u1);
 float3 SanitizeHybridRgb(float3 c)
 {
     return float3(
-        isfinite(c.r) ? max(c.r, 0.0f) : 0.0f,
-        isfinite(c.g) ? max(c.g, 0.0f) : 0.0f,
-        isfinite(c.b) ? max(c.b, 0.0f) : 0.0f);
+        IsFiniteF(c.r) ? max(c.r, 0.0f) : 0.0f,
+        IsFiniteF(c.g) ? max(c.g, 0.0f) : 0.0f,
+        IsFiniteF(c.b) ? max(c.b, 0.0f) : 0.0f);
 }
 
 bool IsHudDiffHybrid(int2 p)
@@ -385,7 +395,7 @@ void HybridHudCompositeCS(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupT
             else
             {
                 float4 src = TexA[p];
-                OutColor[id.xy] = float4(SanitizeHybridRgb(src.rgb), isfinite(src.a) ? src.a : 1.0f);
+                OutColor[id.xy] = float4(SanitizeHybridRgb(src.rgb), IsFiniteF(src.a) ? src.a : 1.0f);
             }
         }
     }
@@ -414,6 +424,8 @@ void HybridHudCompositeCS(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupT
 	constexpr uint32_t kToneMatchStride = 4u;
 
 	constexpr char kToneMatchHlsl[] = R"(
+bool IsFiniteF(float v) { return (asuint(v) & 0x7F800000u) != 0x7F800000u; }
+bool3 IsFiniteF3(float3 v) { return (asuint(v) & 0x7F800000u) != 0x7F800000u; }
 #define STRIDE 4
 #define OUTLIER (32.0 / 1023.0)
 cbuffer Match : register(b0)
@@ -548,9 +560,9 @@ void apply(uint3 id : SV_DispatchThreadID)
         o[c] = lerp(asfloat(lut.Load((c * bins + i) * 4)), asfloat(lut.Load((c * bins + i + 1) * 4)), t);
     }
     o = float3(
-        isfinite(o.r) ? saturate(o.r) : 0.0f,
-        isfinite(o.g) ? saturate(o.g) : 0.0f,
-        isfinite(o.b) ? saturate(o.b) : 0.0f);
+        IsFiniteF(o.r) ? saturate(o.r) : 0.0f,
+        IsFiniteF(o.g) ? saturate(o.g) : 0.0f,
+        IsFiniteF(o.b) ? saturate(o.b) : 0.0f);
     output[id.xy] = float4(o, 1.0);
 }
 )";
@@ -565,7 +577,53 @@ void apply(uint3 id : SV_DispatchThreadID)
 	constexpr uint32_t kBilateralFitInterval = 4u;
 	constexpr float kBilateralLambda = 1e-3f;
 
+	constexpr char kUnjitterMVecsHlsl[] = R"(
+bool IsFiniteF(float v) { return (asuint(v) & 0x7F800000u) != 0x7F800000u; }
+
+cbuffer UnjitterCB : register(b0)
+{
+    uint  BaseX;
+    uint  BaseY;
+    uint  SizeX;
+    uint  SizeY;
+    float DeltaX;
+    float DeltaY;
+    uint  Pad0;
+    uint  Pad1;
+};
+
+RWTexture2D<float2> MVec2 : register(u0);
+RWTexture2D<float4> MVec4 : register(u0);
+
+[numthreads(8, 8, 1)]
+void UnjitterMVecs2CS(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= SizeX || id.y >= SizeY)
+        return;
+    uint2 p = uint2(BaseX + id.x, BaseY + id.y);
+    float2 mv = MVec2[p];
+    if (IsFiniteF(mv.x) && IsFiniteF(mv.y))
+        MVec2[p] = mv + float2(DeltaX, DeltaY);
+}
+
+[numthreads(8, 8, 1)]
+void UnjitterMVecs4CS(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= SizeX || id.y >= SizeY)
+        return;
+    uint2 p = uint2(BaseX + id.x, BaseY + id.y);
+    float4 mv = MVec4[p];
+    if (IsFiniteF(mv.x) && IsFiniteF(mv.y))
+    {
+        mv.xy += float2(DeltaX, DeltaY);
+        MVec4[p] = mv;
+    }
+}
+)";
+
 	constexpr char kBilateralToneMatchHlsl[] = R"(
+bool IsFiniteF(float v) { return (asuint(v) & 0x7F800000u) != 0x7F800000u; }
+bool3 IsFiniteF3(float3 v) { return (asuint(v) & 0x7F800000u) != 0x7F800000u; }
 #define B_STRIDE 4
 #define B_SCALE 1024.0f
 #define B_INV_SCALE (1.0f / 1024.0f)
@@ -588,9 +646,9 @@ RWByteAddressBuffer modelBuf : register(u2);
 float3 SafeSaturateRgb(float3 c)
 {
     return float3(
-        isfinite(c.r) ? saturate(c.r) : 0.0f,
-        isfinite(c.g) ? saturate(c.g) : 0.0f,
-        isfinite(c.b) ? saturate(c.b) : 0.0f);
+        IsFiniteF(c.r) ? saturate(c.r) : 0.0f,
+        IsFiniteF(c.g) ? saturate(c.g) : 0.0f,
+        IsFiniteF(c.b) ? saturate(c.b) : 0.0f);
 }
 
 float Luma709(float3 c)
@@ -733,7 +791,7 @@ void BilateralSolveCS(uint3 id : SV_DispatchThreadID)
         float3 k1 = cross(r2, r0);
         float3 k2 = cross(r0, r1);
         float det = dot(r0, k0);
-        if (isfinite(det) && abs(det) > 1e-9f)
+        if (IsFiniteF(det) && abs(det) > 1e-9f)
         {
             float3x3 invCxx = transpose(float3x3(k0, k1, k2)) / det;
             float3x3 a = mul(invCxx, cxy);
@@ -743,7 +801,7 @@ void BilateralSolveCS(uint3 id : SV_DispatchThreadID)
             float4 cand0 = float4(w0, my.x - dot(mx, w0));
             float4 cand1 = float4(w1, my.y - dot(mx, w1));
             float4 cand2 = float4(w2, my.z - dot(mx, w2));
-            if (all(isfinite(cand0)) && all(isfinite(cand1)) && all(isfinite(cand2)))
+            if (all(IsFiniteF3(cand0)) && all(IsFiniteF3(cand1)) && all(IsFiniteF3(cand2)))
             {
                 row0 = cand0;
                 row1 = cand1;
@@ -1011,6 +1069,51 @@ bool HudTierPass::CreatePipelines(ID3D12Device* device) noexcept
 		return false;
 	}
 	(void)makePso(kHudTierHlsl, sizeof(kHudTierHlsl) - 1, "SplitCompareCS", psoSplitCompare_);
+
+	// Check TypedUAVLoadAdditionalFormats for in-place float2/float4 motion-vector unjittering
+	D3D12_FEATURE_DATA_D3D12_OPTIONS d3dOpts{};
+	typedUavLoadSupported_ = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &d3dOpts, sizeof(d3dOpts))) &&
+		d3dOpts.TypedUAVLoadAdditionalFormats != FALSE;
+	if (typedUavLoadSupported_)
+	{
+		D3D12_DESCRIPTOR_RANGE uRange{};
+		uRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+		uRange.NumDescriptors = 1;
+		uRange.BaseShaderRegister = 0;
+		uRange.OffsetInDescriptorsFromTableStart = 0;
+
+		D3D12_ROOT_PARAMETER uParams[2]{};
+		uParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+		uParams[0].Constants.ShaderRegister = 0;
+		uParams[0].Constants.Num32BitValues = 8;
+		uParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		uParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		uParams[1].DescriptorTable.NumDescriptorRanges = 1;
+		uParams[1].DescriptorTable.pDescriptorRanges = &uRange;
+		uParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+		D3D12_ROOT_SIGNATURE_DESC uRsDesc{};
+		uRsDesc.NumParameters = 2;
+		uRsDesc.pParameters = uParams;
+		Microsoft::WRL::ComPtr<ID3DBlob> uSigBlob, uSigErr;
+		if (SUCCEEDED(D3D12SerializeRootSignature(&uRsDesc, D3D_ROOT_SIGNATURE_VERSION_1, &uSigBlob, &uSigErr)) &&
+			SUCCEEDED(device->CreateRootSignature(0, uSigBlob->GetBufferPointer(), uSigBlob->GetBufferSize(),
+				IID_PPV_ARGS(&unjitterRootSig_))))
+		{
+			auto makeUnjitterPso = [&](const char* entry, Microsoft::WRL::ComPtr<ID3D12PipelineState>& outPso) {
+				Microsoft::WRL::ComPtr<ID3DBlob> cs;
+				if (!CompileCs(compile, kUnjitterMVecsHlsl, sizeof(kUnjitterMVecsHlsl) - 1, entry, cs))
+					return;
+				D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+				desc.pRootSignature = unjitterRootSig_.Get();
+				desc.CS.pShaderBytecode = cs->GetBufferPointer();
+				desc.CS.BytecodeLength = cs->GetBufferSize();
+				(void)device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&outPso));
+			};
+			makeUnjitterPso("UnjitterMVecs2CS", psoUnjitterMv2_);
+			makeUnjitterPso("UnjitterMVecs4CS", psoUnjitterMv4_);
+		}
+	}
 
 	// Optional fused Tier 3 Hybrid root signature (t0..t2, u0..u1) + PSO
 	D3D12_DESCRIPTOR_RANGE hybridRanges[2]{};
@@ -1769,6 +1872,10 @@ void HudTierPass::StopBilateralCompile() noexcept
 
 void HudTierPass::ReleaseToneMapMatchResources() noexcept
 {
+	if (toneMatchOutput_[0])
+		D3D12VulkanWmma::ForgetResource(toneMatchOutput_[0].Get());
+	if (toneMatchOutput_[1])
+		D3D12VulkanWmma::ForgetResource(toneMatchOutput_[1].Get());
 	DeferRelease(toneMatchOutput_[0]);
 	DeferRelease(toneMatchOutput_[1]);
 	DeferRelease(toneMatchHistogram_);
@@ -2461,3 +2568,99 @@ ID3D12Resource* HudTierPass::RecordToneMapMatch(ID3D12GraphicsCommandList* cmdLi
 	return outTex;
 }
 
+static DXGI_FORMAT MotionVectorUavFormat(DXGI_FORMAT fmt, bool& is4Channel) noexcept
+{
+	switch (fmt)
+	{
+	case DXGI_FORMAT_R16G16_FLOAT:
+	case DXGI_FORMAT_R16G16_TYPELESS:
+		is4Channel = false;
+		return DXGI_FORMAT_R16G16_FLOAT;
+	case DXGI_FORMAT_R32G32_FLOAT:
+	case DXGI_FORMAT_R32G32_TYPELESS:
+		is4Channel = false;
+		return DXGI_FORMAT_R32G32_FLOAT;
+	case DXGI_FORMAT_R16G16B16A16_FLOAT:
+	case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+		is4Channel = true;
+		return DXGI_FORMAT_R16G16B16A16_FLOAT;
+	case DXGI_FORMAT_R32G32B32A32_FLOAT:
+	case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+		is4Channel = true;
+		return DXGI_FORMAT_R32G32B32A32_FLOAT;
+	default:
+		is4Channel = false;
+		return DXGI_FORMAT_UNKNOWN;
+	}
+}
+
+bool HudTierPass::CanUnjitterMotionVectors(DXGI_FORMAT format) const noexcept
+{
+	if (!Available() || !typedUavLoadSupported_ || !unjitterRootSig_)
+		return false;
+	bool is4Ch = false;
+	if (MotionVectorUavFormat(format, is4Ch) == DXGI_FORMAT_UNKNOWN)
+		return false;
+	return is4Ch ? (psoUnjitterMv4_.Get() != nullptr) : (psoUnjitterMv2_.Get() != nullptr);
+}
+
+void HudTierPass::RecordUnjitterMotionVectors(ID3D12GraphicsCommandList* cmdList,
+	ID3D12Resource* mvecsTex, D3D12_RESOURCE_STATES mvecsState,
+	uint32_t baseX, uint32_t baseY, uint32_t sizeX, uint32_t sizeY,
+	float deltaRawX, float deltaRawY) noexcept
+{
+	if (!Available() || !cmdList || !mvecsTex || !unjitterRootSig_ || sizeX == 0u || sizeY == 0u)
+		return;
+	if (std::abs(deltaRawX) <= 1e-7f && std::abs(deltaRawY) <= 1e-7f)
+		return;
+
+	const auto desc = mvecsTex->GetDesc();
+	if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0)
+		return;
+
+	bool is4Ch = false;
+	const DXGI_FORMAT uavFmt = MotionVectorUavFormat(desc.Format, is4Ch);
+	ID3D12PipelineState* pso = is4Ch ? psoUnjitterMv4_.Get() : psoUnjitterMv2_.Get();
+	if (uavFmt == DXGI_FORMAT_UNKNOWN || !pso)
+		return;
+
+	const uint32_t maxW = static_cast<uint32_t>(desc.Width);
+	const uint32_t maxH = desc.Height;
+	if (baseX >= maxW || baseY >= maxH)
+		return;
+	const uint32_t clampedW = std::min(sizeX, maxW - baseX);
+	const uint32_t clampedH = std::min(sizeY, maxH - baseY);
+	if (clampedW == 0u || clampedH == 0u)
+		return;
+
+	const uint32_t block = AllocDescriptorBlock();
+	D3D12_CPU_DESCRIPTOR_HANDLE cpu = srvUavHeap_->GetCPUDescriptorHandleForHeapStart();
+	cpu.ptr += static_cast<SIZE_T>(block) * kDescriptorsPerBlock * descSize_;
+	D3D12_GPU_DESCRIPTOR_HANDLE gpu = srvUavHeap_->GetGPUDescriptorHandleForHeapStart();
+	gpu.ptr += static_cast<SIZE_T>(block) * kDescriptorsPerBlock * descSize_;
+
+	D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+	uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+	uav.Format = uavFmt;
+	device_->CreateUnorderedAccessView(mvecsTex, nullptr, &uav, cpu);
+
+	TransitionBarrier(cmdList, mvecsTex, mvecsState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+	ID3D12DescriptorHeap* heaps[] = { srvUavHeap_.Get() };
+	cmdList->SetDescriptorHeaps(1, heaps);
+	cmdList->SetComputeRootSignature(unjitterRootSig_.Get());
+	cmdList->SetPipelineState(pso);
+
+	struct UnjitterConstants
+	{
+		uint32_t baseX, baseY, sizeX, sizeY;
+		float deltaX, deltaY;
+		uint32_t pad0, pad1;
+	} rc{ baseX, baseY, clampedW, clampedH, deltaRawX, deltaRawY, 0u, 0u };
+	cmdList->SetComputeRoot32BitConstants(0, 8, &rc, 0);
+	cmdList->SetComputeRootDescriptorTable(1, gpu);
+	cmdList->Dispatch((clampedW + 7u) / 8u, (clampedH + 7u) / 8u, 1u);
+
+	UavBarrier(cmdList, mvecsTex);
+	TransitionBarrier(cmdList, mvecsTex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, mvecsState);
+}

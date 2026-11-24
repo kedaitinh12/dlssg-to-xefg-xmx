@@ -40,6 +40,7 @@ private:
 		uint32_t initFlags = 0;
 		uint32_t uiMode = XEFGD_UI_MODE_AUTO;
 		int32_t model = 0;
+		bool softwareUnjitterMvecs = false;
 
 		bool operator==(const Settings&) const = default;
 	};
@@ -104,6 +105,8 @@ private:
 		uint32_t stallCooldownEvaluations = 0;
 		uint64_t stallCooldownUntilMs = 0;
 		bool deviceLostLatched = false;
+		// Set when retired via DeferredDestroy upon context replacement so ~Context() does not reset the new live bridge
+		bool retiredForReplacement = false;
 
 		~Context();
 	};

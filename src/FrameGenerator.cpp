@@ -140,8 +140,11 @@ FrameGenerator::Context::~Context()
 		D3D12VulkanWmma::ForgetResource(f.mvecs.Get());
 		D3D12VulkanWmma::ForgetResource(f.spareMotion.Get());
 	}
-	D3D12VulkanWmma::ResetContext();
-	xefg_cuda::InvalidateCache();
+	if (!retiredForReplacement)
+	{
+		D3D12VulkanWmma::ResetContext();
+		xefg_cuda::InvalidateCache();
+	}
 
 	if (handle)
 	{
@@ -412,7 +415,7 @@ static bool PrepareCapture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdL
 	D3D12_RESOURCE_STATES sourceState, ComPtr<ID3D12Resource>& copy, const char* purpose,
 	PendingCaptureCopy* pending, UINT& pendingCount, bool wantShared = false,
 	bool isDepth = false, ComPtr<ID3D12Resource>* depthScratch = nullptr,
-	ComPtr<ID3D12Resource>* spare = nullptr)
+	ComPtr<ID3D12Resource>* spare = nullptr, bool allowUav = false)
 {
 	if (!source)
 	{
@@ -447,6 +450,8 @@ static bool PrepareCapture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdL
 		desc.MipLevels = 1;
 
 	desc.Flags &= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+	if (allowUav && !isDepth && desc.SampleDesc.Count == 1)
+		desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 	desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 
 	if (isDepth)
@@ -1036,6 +1041,11 @@ bool FrameGenerator::CreateContext()
 	}
 
 	newContext->sharedTexturesMode = UseWmma(settings.model) && D3D12VulkanWmma::WantsSharedTextures();
+	if (context)
+	{
+		context->retiredForReplacement = true;
+		DeferredDestroy::Add(std::move(context));
+	}
 	context = std::move(newContext);
 
 	// Warm up the Vulkan WMMA bridge context asynchronously on a background thread so CreateContext
@@ -1209,7 +1219,8 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	const auto requestedHudMode = static_cast<HudTier::Mode>(
 		std::clamp(Plugin::options.hudTierMode.load(std::memory_order_relaxed), 0, 4));
 	const bool needHudCompute = (requestedHudMode != HudTier::Mode::Off) ||
-		Plugin::options.hudSplitCompare.load(std::memory_order_relaxed);
+		Plugin::options.hudSplitCompare.load(std::memory_order_relaxed) ||
+		mvecJittered;
 	const bool hudComputeReady = needHudCompute && hudTierPass.EnsureInitialized(device.Get(), wanted.width, wanted.height);
 	if (hudComputeReady && requestedHudMode != HudTier::Mode::Off)
 	{
@@ -1257,6 +1268,15 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	if (portedModelInitFailed && wanted.model != MfgKernels::Dp4aModel)
 		wanted.model = MfgKernels::Dp4aModel;
 
+	// XMX Port / CUDA / WMMA (model 16) payload omits JitteredMV reconstruction shader variants (e.g. 35112441167526893749578).
+	// Unjitter motion vectors in-place on our private mvecs copy and clear XEFGD_INIT_FLAG_JITTERED_MV so model 16 works cleanly.
+	if (mvecJittered && wanted.model == MfgKernels::PortedModel && hudComputeReady &&
+		mvecs && hudTierPass.CanUnjitterMotionVectors(mvecs->GetDesc().Format))
+	{
+		wanted.initFlags &= ~XEFGD_INIT_FLAG_JITTERED_MV;
+		wanted.softwareUnjitterMvecs = true;
+	}
+
 	// The menu path can change without a context change: XMX Port, CUDA, and WMMA all run the ported model (16), only the
 	// route that executes its programs differs. Log the switch, and say whether it took effect below
 	const auto path = Plugin::options.path.load();
@@ -1293,11 +1313,21 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 			Log::Warn("HUD-less color is {}, but the back buffer is {}, XeFG's HDR path needs every input in the same "
 				"HDR10 format", FormatName(hudlessFormat), FormatName(backbufferFormat));
 
+		if (wanted.softwareUnjitterMvecs && !settings.softwareUnjitterMvecs)
+			Log::Info("XMX Port: software motion-vector unjitter active (clearing XEFGD_INIT_FLAG_JITTERED_MV for model 16)");
+
 		settings = wanted;
 		createFailed = false;
 
 		if (context)
+		{
+			// Reset global WMMA/CUDA context state now (before new context creation) so the old context's
+			// deferred destructor 32 evaluations later never wipes the new active context's bridge/cache.
+			D3D12VulkanWmma::ResetContext();
+			xefg_cuda::InvalidateCache();
+			context->retiredForReplacement = true;
 			DeferredDestroy::Add(std::move(context));
+		}
 	}
 
 	if (!IsSupportedXeFGColorFormat(settings.format) || !IsSupportedXeFGColorFormat(backbufferFormat) ||
@@ -1422,7 +1452,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	UINT pendingCopyCount = 0;
 	bool captured = PrepareCapture(device.Get(), cmdList, backbuffer, BackbufferState, frame.backbuffer, "Backbuffer", pendingCopies, pendingCopyCount, wantShared);
 	captured &= PrepareCapture(device.Get(), cmdList, depth, InputState, frame.depth, "Depth copy", pendingCopies, pendingCopyCount, wantShared, true, &frame.depthScratch, &frame.spareDepth);
-	captured &= PrepareCapture(device.Get(), cmdList, mvecs, InputState, frame.mvecs, "MVecs copy", pendingCopies, pendingCopyCount, wantShared, false, nullptr, &frame.spareMotion);
+	captured &= PrepareCapture(device.Get(), cmdList, mvecs, InputState, frame.mvecs, "MVecs copy", pendingCopies, pendingCopyCount, wantShared, false, nullptr, &frame.spareMotion, settings.softwareUnjitterMvecs);
 	const bool hudlessCaptured = hudless &&
 		PrepareCapture(device.Get(), cmdList, hudless, InputState, frame.hudless, "HUDLess copy", pendingCopies, pendingCopyCount, wantShared);
 	if (!hudlessCaptured && frame.hudless)
@@ -1631,6 +1661,21 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 		--context->uiTransitionCooldown;
 		inUiCooldown = true;
 		reset = true;
+	}
+
+	if (captured && settings.softwareUnjitterMvecs && frame.mvecs && previous.valid && !reset)
+	{
+		const float dpx = previous.data.jitterOffset[0] - data.jitterOffset[0];
+		const float dpy = previous.data.jitterOffset[1] - data.jitterOffset[1];
+		const float deltaRawX = dpx / data.motionVectorScale[0];
+		const float deltaRawY = dpy / data.motionVectorScale[1];
+		if (std::isfinite(deltaRawX) && std::isfinite(deltaRawY))
+		{
+			hudTierPass.RecordUnjitterMotionVectors(cmdList, frame.mvecs.Get(), XeFGInputState,
+				data.motionVectors.base.x, data.motionVectors.base.y,
+				data.motionVectors.size.x, data.motionVectors.size.y,
+				deltaRawX, deltaRawY);
+		}
 	}
 
 	if (reset)
