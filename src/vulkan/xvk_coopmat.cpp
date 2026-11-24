@@ -232,14 +232,14 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
         LOAD_FN(destroyPipelineCache_, vkDestroyPipelineCache);
         LOAD_FN(getPipelineCacheData_, vkGetPipelineCacheData);
         LOAD_FN(bindPipeline_, vkCmdBindPipeline);
-        LOAD_FN(pushDescriptorSet_, vkCmdPushDescriptorSetKHR);
+        LOAD_FN(bindDescriptorSets_, vkCmdBindDescriptorSets);
         LOAD_FN(pushConstants_, vkCmdPushConstants);
         LOAD_FN(dispatch_, vkCmdDispatch);
         LOAD_FN(barrier_, vkCmdPipelineBarrier2);
 #undef LOAD_FN
 
         if (!createShaderModule_ || !destroyShaderModule_ || !createComputePipelines_ || !destroyPipeline_ ||
-            !bindPipeline_ || !pushDescriptorSet_ || !pushConstants_ || !dispatch_ || !barrier_)
+            !bindPipeline_ || !bindDescriptorSets_ || !pushConstants_ || !dispatch_ || !barrier_)
         {
             reason = "device_functions";
             return false;
@@ -506,66 +506,13 @@ bool CoopMatrixRoute::TryLaunch(Device& device, VkCommandBuffer buffer, uint8_t 
         if (!EnsureLayerPipeline(device, id, basePso))
             return fallback("no_coopmat_module");
 
-        const auto& ranges = basePso.ranges();
-        // Avoid zero-initializing 6 KB of stack memory on every WMMA Dispatch; only [0..count) are written and passed.
-        std::array<VkWriteDescriptorSet, 64> writes;
-        std::array<VkDescriptorImageInfo, 64> images;
-        std::array<VkDescriptorBufferInfo, 64> buffers;
-        if (ranges.size() > writes.size())
-            return fallback("bindings_overflow");
-
-        for (size_t i = 0; i < ranges.size(); ++i)
+        VkDescriptorSet ds = VK_NULL_HANDLE;
+        if (!basePso.ranges().empty() || !basePso.staticSamplers().empty())
         {
-            const BoundRange& r = ranges[i];
-            const Descriptor* table = tables[r.parameter];
-            if (!table)
-                return fallback("bindings_incomplete");
-
-            const Descriptor& d = table[r.offset];
-            VkWriteDescriptorSet& w = writes[i];
-            w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, r.binding, 0, 1, r.type};
-            switch (r.type)
-            {
-            case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
-                if (d.kind != DescriptorKind::SrvImage) return fallback("view_type");
-                images[i] = d.image;
-                w.pImageInfo = &images[i];
-                break;
-            case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
-                if (d.kind != DescriptorKind::UavImage) return fallback("view_type");
-                images[i] = d.image;
-                w.pImageInfo = &images[i];
-                break;
-            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
-                if (d.kind != DescriptorKind::SrvBuffer && d.kind != DescriptorKind::UavBuffer) return fallback("view_type");
-                buffers[i] = d.buffer;
-                w.pBufferInfo = &buffers[i];
-                break;
-            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
-                if (d.kind != DescriptorKind::Cbv) return fallback("view_type");
-                buffers[i] = d.buffer;
-                w.pBufferInfo = &buffers[i];
-                break;
-            case VK_DESCRIPTOR_TYPE_SAMPLER:
-                if (d.kind != DescriptorKind::Sampler) return fallback("view_type");
-                images[i] = d.image;
-                w.pImageInfo = &images[i];
-                break;
-            default:
-                return fallback("view_type");
-            }
-        }
-
-        size_t count = ranges.size();
-        const auto& samplers = basePso.staticSamplers();
-        if (count + samplers.size() > writes.size())
-            return fallback("bindings_overflow");
-
-        for (size_t s = 0; s < samplers.size(); ++s, ++count)
-        {
-            images[count] = {samplers[s], VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
-            writes[count] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE,
-                             basePso.staticBindings()[s], 0, 1, VK_DESCRIPTOR_TYPE_SAMPLER, &images[count]};
+            const char* failReason = nullptr;
+            ds = device.AcquireDescriptorSet(basePso, tables, &failReason);
+            if (!ds)
+                return fallback(failReason ? failReason : "descriptor_set");
         }
 
         if (!seen_[id - 1].exchange(true))
@@ -575,8 +522,8 @@ bool CoopMatrixRoute::TryLaunch(Device& device, VkCommandBuffer buffer, uint8_t 
         }
 
         bindPipeline_(buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines_[id - 1]);
-        if (count)
-            pushDescriptorSet_(buffer, VK_PIPELINE_BIND_POINT_COMPUTE, basePso.layout(), 0, uint32_t(count), writes.data());
+        if (ds)
+            bindDescriptorSets_(buffer, VK_PIPELINE_BIND_POINT_COMPUTE, basePso.layout(), 0, 1, &ds, 0, nullptr);
 
         if (basePso.pushConstantBytes() && basePso.constantsParameter() >= 0)
         {

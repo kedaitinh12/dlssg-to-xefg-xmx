@@ -22,6 +22,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -54,13 +55,15 @@ void Unimplemented(const char* what);          // logged once per name
     X(vkCreateImageView) X(vkDestroyImageView)               \
     X(vkCreateSampler) X(vkDestroySampler)                   \
     X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) \
+    X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool)     \
+    X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets)    \
     X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout)     \
     X(vkCreateShaderModule) X(vkDestroyShaderModule)         \
     X(vkCreateComputePipelines) X(vkDestroyPipeline)         \
     X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkResetCommandPool) \
     X(vkAllocateCommandBuffers) X(vkFreeCommandBuffers)      \
     X(vkBeginCommandBuffer) X(vkEndCommandBuffer)            \
-    X(vkCmdBindPipeline) X(vkCmdPushDescriptorSetKHR) X(vkCmdPushConstants) \
+    X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushDescriptorSetKHR) X(vkCmdPushConstants) \
     X(vkCmdDispatch) X(vkCmdPipelineBarrier2)                \
     X(vkCmdCopyBuffer) X(vkCmdCopyImage) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) \
     X(vkCmdFillBuffer) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) \
@@ -395,6 +398,7 @@ public:
     uint8_t tensorLayer() const noexcept { return tensorLayer_; }
     VkPipeline pipeline() const { return pipeline_; }
     VkPipelineLayout layout() const { return layout_; }
+    VkDescriptorSetLayout setLayout() const { return setLayout_; }
     const std::vector<BoundRange>& ranges() const { return ranges_; }
     const std::vector<VkSampler>& staticSamplers() const { return samplers_; }
     const std::vector<uint32_t>& staticBindings() const { return staticBindings_; }
@@ -625,6 +629,8 @@ private:
     PipelineState* pso_ = nullptr;
     RootSignature* rootSignature_ = nullptr;
     VkPipeline boundPipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout boundLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSet boundDescriptorSet_ = VK_NULL_HANDLE;
     std::array<const Descriptor*, 64> tables_{};
     std::array<std::array<uint32_t, 64>, 16> constants_{};
     std::array<uint32_t, 16> constantMasks_{};
@@ -752,6 +758,10 @@ public:
     VkInstance instance() const { return instance_; }
     // Samplers are cached by their create info (descriptor samplers and static samplers).
     VkSampler Sampler(const VkSamplerCreateInfo& info);
+    // Cached VkDescriptorSet lookup/allocation for compute dispatches (replaces per-dispatch vkCmdPushDescriptorSetKHR).
+    VkDescriptorSet AcquireDescriptorSet(const PipelineState& pso, const std::array<const Descriptor*, 64>& tables,
+                                         const char** failReason = nullptr);
+    void InvalidateDescriptorCache();
     // Swap chains present from their own thread on this queue; D3D12 queues never map to it (when there are two or more).
     QueueSlot* PresentSlot() const { return slots_.back().get(); }
     // VK_NV_low_latency2's functions came with the device (its swap chains can take low latency mode), and
@@ -832,6 +842,7 @@ private:
     struct Grave { std::vector<uint64_t> targets; std::function<void()> destroy; };
     std::mutex graveMutex_;
     std::vector<Grave> graves_;
+    std::atomic<bool> hasGraves_{false};
 
     // vkprov.1: recorded mode. One queue-less slot carries the progress timeline; each ended recording is an epoch
     // whose event, set by the GPU at the end of the caller's command buffer, moves the timeline to its value.
@@ -846,6 +857,23 @@ private:
 
     std::mutex samplerMutex_;
     std::map<std::array<uint8_t, sizeof(VkSamplerCreateInfo)>, VkSampler> samplers_;
+
+    static constexpr uint32_t kDescCacheTableSize = 8192u;
+    static constexpr uint32_t kMaxCachedDescSets = 4096u;
+    struct DescKeyItem { uint64_t a = 0; uint64_t b = 0; uint64_t c = 0; };
+    struct DescCacheSlot {
+        uint64_t hash = 0;
+        const PipelineState* pso = nullptr;
+        uint32_t itemOffset = 0;
+        uint16_t itemCount = 0;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+    };
+    VkDescriptorPool CreateDescriptorCachePoolLocked();
+    std::mutex descCacheMutex_;
+    VkDescriptorPool descPool_ = VK_NULL_HANDLE;
+    uint32_t descPoolUsed_ = 0;
+    std::vector<DescCacheSlot> descTable_;
+    std::vector<DescKeyItem> descItemsArena_;
 
     std::mutex waitMutex_;
     std::condition_variable waitChanged_;

@@ -61,6 +61,7 @@ Resource::Resource(Device* device, const D3D12_RESOURCE_DESC& desc, const D3D12_
 
 Resource::~Resource()
 {
+    device_->InvalidateDescriptorCache();
     if (va_) device_->FreeVa(va_);
     std::vector<VkImageView> views;
     for (auto& [key, view] : views_) views.push_back(view);

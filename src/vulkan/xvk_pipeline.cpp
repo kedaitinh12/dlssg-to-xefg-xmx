@@ -39,6 +39,7 @@ VkBorderColor StaticBorder(D3D12_STATIC_BORDER_COLOR color)
 PipelineState::~PipelineState()
 {
     Device* owner = device_;
+    owner->InvalidateDescriptorCache();
     const VkPipeline pipeline = pipeline_;
     const VkPipelineLayout layout = layout_;
     const VkDescriptorSetLayout setLayout = setLayout_;
@@ -116,7 +117,7 @@ HRESULT PipelineState::Init(RootSignature* rootSignature, const Program& program
         bindings.push_back(b);
     }
     VkDescriptorSetLayoutCreateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    setInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    setInfo.flags = 0;
     setInfo.bindingCount = uint32_t(bindings.size());
     setInfo.pBindings = bindings.data();
     if (vk.vkCreateDescriptorSetLayout(device, &setInfo, nullptr, &setLayout_) != VK_SUCCESS) return fail("descriptor set layout");

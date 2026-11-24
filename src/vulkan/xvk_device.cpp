@@ -15,6 +15,15 @@ HRESULT Hand(T* object, HRESULT init, REFIID riid, void** out)
     return hr;
 }
 
+template <class T>
+uint64_t HandleKey(T h) noexcept
+{
+    if constexpr (std::is_pointer_v<T>)
+        return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(h));
+    else
+        return static_cast<uint64_t>(h);
+}
+
 VkSamplerAddressMode Address(D3D12_TEXTURE_ADDRESS_MODE mode)
 {
     switch (mode) {
@@ -82,6 +91,12 @@ Device::~Device()
         for (const Epoch& epoch : epochs_) vk_.vkDestroyEvent(device_, epoch.event, nullptr);
         for (VkEvent event : freeEvents_) vk_.vkDestroyEvent(device_, event, nullptr);
     }
+    if (descPool_) {
+        vk_.vkDestroyDescriptorPool(device_, descPool_, nullptr);
+        descPool_ = VK_NULL_HANDLE;
+    }
+    descTable_.clear();
+    descItemsArena_.clear();
     if (initPool_) vk_.vkDestroyCommandPool(device_, initPool_, nullptr);
     if (initSemaphore_) vk_.vkDestroySemaphore(device_, initSemaphore_, nullptr);
     if (wakeSemaphore_) vk_.vkDestroySemaphore(device_, wakeSemaphore_, nullptr);
@@ -361,12 +376,14 @@ void Device::DeferDestroy(std::function<void()> destroy)
     {
         std::lock_guard lock(graveMutex_);
         graves_.push_back(std::move(grave));
+        hasGraves_.store(true, std::memory_order_release);
     }
     Collect();
 }
 
 void Device::Collect()
 {
+    if (!hasGraves_.load(std::memory_order_acquire)) return;
     std::vector<uint64_t> done(slots_.size());
     for (size_t i = 0; i < slots_.size(); ++i) vk_.vkGetSemaphoreCounterValue(device_, slots_[i]->timeline, &done[i]);
     std::vector<std::function<void()>> ready;
@@ -378,6 +395,7 @@ void Device::Collect()
             if (finished) { ready.push_back(std::move(it->destroy)); it = graves_.erase(it); }
             else ++it;
         }
+        if (graves_.empty()) hasGraves_.store(false, std::memory_order_release);
     }
     for (auto& destroy : ready) destroy();
 }
@@ -553,6 +571,204 @@ void Device::WaiterThread()
             ++it;
         }
     }
+}
+
+VkDescriptorPool Device::CreateDescriptorCachePoolLocked()
+{
+    const std::array<VkDescriptorPoolSize, 5> poolSizes{{
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 16384u},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16384u},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32768u},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 8192u},
+        {VK_DESCRIPTOR_TYPE_SAMPLER, 8192u},
+    }};
+    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    poolInfo.maxSets = kMaxCachedDescSets;
+    poolInfo.poolSizeCount = uint32_t(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    if (vk_.vkCreateDescriptorPool(device_, &poolInfo, nullptr, &pool) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    return pool;
+}
+
+void Device::InvalidateDescriptorCache()
+{
+    VkDescriptorPool oldPool = VK_NULL_HANDLE;
+    {
+        std::lock_guard lock(descCacheMutex_);
+        if (!descPool_ && descPoolUsed_ == 0) return;
+        oldPool = descPool_;
+        descPool_ = VK_NULL_HANDLE;
+        descPoolUsed_ = 0;
+        std::fill(descTable_.begin(), descTable_.end(), DescCacheSlot{});
+        descItemsArena_.clear();
+    }
+    if (oldPool) {
+        Device* owner = this;
+        DeferDestroy([owner, oldPool] {
+            owner->vk().vkDestroyDescriptorPool(owner->vkDevice(), oldPool, nullptr);
+        });
+    }
+}
+
+VkDescriptorSet Device::AcquireDescriptorSet(const PipelineState& pso, const std::array<const Descriptor*, 64>& tables,
+                                             const char** failReason)
+{
+    const auto& ranges = pso.ranges();
+    const auto& samplers = pso.staticSamplers();
+    if (ranges.size() + samplers.size() > 64) {
+        if (failReason) *failReason = "bindings_overflow";
+        return VK_NULL_HANDLE;
+    }
+    std::array<DescKeyItem, 64> items;
+    uint64_t hash = 14695981039346656037ull;
+    auto mix = [&hash](uint64_t v) {
+        hash ^= v;
+        hash *= 1099511628211ull;
+    };
+    mix(reinterpret_cast<uintptr_t>(&pso));
+    mix(ranges.size());
+    for (size_t i = 0; i < ranges.size(); ++i) {
+        const BoundRange& r = ranges[i];
+        const Descriptor* table = tables[r.parameter];
+        if (!table) {
+            if (failReason) *failReason = "bindings_incomplete";
+            return VK_NULL_HANDLE;
+        }
+        const Descriptor& d = table[r.offset];
+        DescKeyItem& it = items[i];
+        switch (r.type) {
+        case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+            if (d.kind != DescriptorKind::SrvImage) { if (failReason) *failReason = "view_type"; return VK_NULL_HANDLE; }
+            it = {HandleKey(d.image.imageView), HandleKey(d.image.sampler), static_cast<uint64_t>(d.image.imageLayout)};
+            break;
+        case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+            if (d.kind != DescriptorKind::UavImage) { if (failReason) *failReason = "view_type"; return VK_NULL_HANDLE; }
+            it = {HandleKey(d.image.imageView), HandleKey(d.image.sampler), static_cast<uint64_t>(d.image.imageLayout)};
+            break;
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+            if (d.kind != DescriptorKind::SrvBuffer && d.kind != DescriptorKind::UavBuffer) { if (failReason) *failReason = "view_type"; return VK_NULL_HANDLE; }
+            it = {HandleKey(d.buffer.buffer), static_cast<uint64_t>(d.buffer.offset), static_cast<uint64_t>(d.buffer.range)};
+            break;
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+            if (d.kind != DescriptorKind::Cbv) { if (failReason) *failReason = "view_type"; return VK_NULL_HANDLE; }
+            it = {HandleKey(d.buffer.buffer), static_cast<uint64_t>(d.buffer.offset), static_cast<uint64_t>(d.buffer.range)};
+            break;
+        case VK_DESCRIPTOR_TYPE_SAMPLER:
+            if (d.kind != DescriptorKind::Sampler) { if (failReason) *failReason = "view_type"; return VK_NULL_HANDLE; }
+            it = {HandleKey(d.image.imageView), HandleKey(d.image.sampler), static_cast<uint64_t>(d.image.imageLayout)};
+            break;
+        default:
+            if (failReason) *failReason = "view_type";
+            return VK_NULL_HANDLE;
+        }
+        mix(it.a);
+        mix(it.b);
+        mix(it.c);
+    }
+    const uint16_t itemCount = static_cast<uint16_t>(ranges.size());
+    constexpr uint32_t kMask = kDescCacheTableSize - 1u;
+    VkDescriptorPool retiredPools[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
+    uint32_t retiredCount = 0;
+    VkDescriptorSet result = VK_NULL_HANDLE;
+    {
+        std::lock_guard lock(descCacheMutex_);
+        if (descTable_.empty()) {
+            descTable_.resize(kDescCacheTableSize);
+            descItemsArena_.reserve(16384u);
+        }
+        uint32_t idx = static_cast<uint32_t>(hash) & kMask;
+        for (uint32_t probe = 0; probe < kDescCacheTableSize; ++probe) {
+            const DescCacheSlot& slot = descTable_[idx];
+            if (slot.set == VK_NULL_HANDLE) break;
+            if (slot.hash == hash && slot.pso == &pso && slot.itemCount == itemCount &&
+                (itemCount == 0 || memcmp(descItemsArena_.data() + slot.itemOffset, items.data(), size_t(itemCount) * sizeof(DescKeyItem)) == 0)) {
+                return slot.set;
+            }
+            idx = (idx + 1u) & kMask;
+        }
+        auto rotatePoolLocked = [&]() {
+            if (descPool_) {
+                if (retiredCount < 2u)
+                    retiredPools[retiredCount++] = descPool_;
+                descPool_ = VK_NULL_HANDLE;
+            }
+            descPoolUsed_ = 0;
+            std::fill(descTable_.begin(), descTable_.end(), DescCacheSlot{});
+            descItemsArena_.clear();
+        };
+        if (!descPool_ || descPoolUsed_ >= kMaxCachedDescSets) {
+            if (descPool_) rotatePoolLocked();
+            descPool_ = CreateDescriptorCachePoolLocked();
+            if (!descPool_) {
+                if (failReason) *failReason = "descriptor_pool";
+                return VK_NULL_HANDLE;
+            }
+        }
+        VkDescriptorSetLayout layout = pso.setLayout();
+        VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocInfo.descriptorPool = descPool_;
+        allocInfo.descriptorSetCount = 1;
+        allocInfo.pSetLayouts = &layout;
+        VkResult allocRes = vk_.vkAllocateDescriptorSets(device_, &allocInfo, &result);
+        if (allocRes == VK_ERROR_OUT_OF_POOL_MEMORY || allocRes == VK_ERROR_FRAGMENTED_POOL) {
+            rotatePoolLocked();
+            descPool_ = CreateDescriptorCachePoolLocked();
+            if (!descPool_) {
+                if (failReason) *failReason = "descriptor_pool";
+                return VK_NULL_HANDLE;
+            }
+            allocInfo.descriptorPool = descPool_;
+            allocRes = vk_.vkAllocateDescriptorSets(device_, &allocInfo, &result);
+        }
+        if (allocRes != VK_SUCCESS || !result) {
+            if (failReason) *failReason = "descriptor_alloc";
+            result = VK_NULL_HANDLE;
+        } else {
+            std::array<VkWriteDescriptorSet, 64> writes;
+            std::array<VkDescriptorImageInfo, 64> images;
+            std::array<VkDescriptorBufferInfo, 64> buffers;
+            for (size_t i = 0; i < ranges.size(); ++i) {
+                const BoundRange& r = ranges[i];
+                const Descriptor& d = tables[r.parameter][r.offset];
+                VkWriteDescriptorSet& w = writes[i];
+                w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, result, r.binding, 0, 1, r.type};
+                if (r.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || r.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
+                    buffers[i] = d.buffer;
+                    w.pBufferInfo = &buffers[i];
+                } else {
+                    images[i] = d.image;
+                    w.pImageInfo = &images[i];
+                }
+            }
+            size_t count = ranges.size();
+            for (size_t s = 0; s < samplers.size(); ++s, ++count) {
+                images[count] = {samplers[s], VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+                writes[count] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, result, pso.staticBindings()[s], 0, 1,
+                                 VK_DESCRIPTOR_TYPE_SAMPLER, &images[count]};
+            }
+            if (count)
+                vk_.vkUpdateDescriptorSets(device_, uint32_t(count), writes.data(), 0, nullptr);
+            // Re-find empty slot (in case pool rotated above)
+            idx = static_cast<uint32_t>(hash) & kMask;
+            while (descTable_[idx].set != VK_NULL_HANDLE)
+                idx = (idx + 1u) & kMask;
+            const uint32_t offset = static_cast<uint32_t>(descItemsArena_.size());
+            if (itemCount)
+                descItemsArena_.insert(descItemsArena_.end(), items.begin(), items.begin() + itemCount);
+            descTable_[idx] = {hash, &pso, offset, itemCount, result};
+            ++descPoolUsed_;
+        }
+    }
+    for (uint32_t i = 0; i < retiredCount; ++i) {
+        Device* owner = this;
+        VkDescriptorPool oldPool = retiredPools[i];
+        DeferDestroy([owner, oldPool] {
+            owner->vk().vkDestroyDescriptorPool(owner->vkDevice(), oldPool, nullptr);
+        });
+    }
+    return result;
 }
 
 VkSampler Device::Sampler(const VkSamplerCreateInfo& info)

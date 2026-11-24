@@ -608,8 +608,13 @@ SharedImport* GetOrImportLocked(Bridge& b, ID3D12Resource* d3dRes, bool isOutput
 	imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
 	imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
 	imgInfo.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+	// Mirror D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS onto VK_IMAGE_USAGE_STORAGE_BIT even for inputs
+	// (e.g. Tier 4 Tone-Map Matcher outputs and software-unjittered motion vectors). On AMD RDNA 3,
+	// ALLOW_UNORDERED_ACCESS changes surface tiling/DCC metadata; omitting STORAGE_BIT causes a
+	// D3D12<->Vulkan layout mismatch and DXGI_ERROR_DEVICE_HUNG on the first Vulkan WMMA batch.
+	const bool needsStorageBit = isOutput || ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0);
 	imgInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-		(isOutput ? VK_IMAGE_USAGE_STORAGE_BIT : 0u);
+		(needsStorageBit ? VK_IMAGE_USAGE_STORAGE_BIT : 0u);
 	imgInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 	imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 

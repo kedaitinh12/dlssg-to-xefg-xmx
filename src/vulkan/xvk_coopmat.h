@@ -71,7 +71,7 @@ private:
     std::filesystem::path cachePath_;
     std::atomic<bool> cacheDirty_{false};
     PFN_vkCmdBindPipeline bindPipeline_{};
-    PFN_vkCmdPushDescriptorSetKHR pushDescriptorSet_{};
+    PFN_vkCmdBindDescriptorSets bindDescriptorSets_{};
     PFN_vkCmdPushConstants pushConstants_{};
     PFN_vkCmdDispatch dispatch_{};
     PFN_vkCmdPipelineBarrier2 barrier_{};
