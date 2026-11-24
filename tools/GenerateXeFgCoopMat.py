@@ -216,6 +216,11 @@ def main() -> int:
             ("tonemap_fill.spv", 3, "rgba8"),
             ("tonemap_apply_rgba8.spv", 4, "rgba8"),
             ("tonemap_apply_rgb10a2.spv", 4, "rgb10_a2"),
+            ("tonemap_bg_clear.spv", 5, "rgba8"),
+            ("tonemap_bg_accum.spv", 6, "rgba8"),
+            ("tonemap_bg_solve.spv", 7, "rgba8"),
+            ("tonemap_bg_apply_rgba8.spv", 8, "rgba8"),
+            ("tonemap_bg_apply_rgb10a2.spv", 8, "rgb10_a2"),
         ]
         for fname, tm_pass, fmt in tm_variants:
             out_spv = hud_dir / fname

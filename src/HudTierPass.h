@@ -9,7 +9,10 @@
 #include <d3d12.h>
 #include <wrl/client.h>
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
+#include <thread>
 
 class HudTierPass
 {
@@ -55,15 +58,27 @@ public:
 		ID3D12Resource* outputTex, D3D12_RESOURCE_STATES outputState,
 		bool updateCounter, bool debugMagenta, bool fromToneMatched = false) noexcept;
 
-	// Tier 4 Tone-Map Match (lazy-allocated, 0 VRAM/cost when unused):
-	// Builds a per-channel 256-bin log-luminance median LUT from (hudlessTex -> realTex) and writes the tone-matched
-	// HUD-less texture into ping-pong slot (0 or 1), leaving it in outputState (NON_PIXEL|PIXEL_SHADER_RESOURCE).
+	// Tier 4 Tone-Map Match (lazy-allocated, 0 VRAM/cost when unused; async PSO compile = zero 500ms timeout):
+	// toneMapMode: 0 = Auto (1D 256-bin LUT, auto-promotes to 3D Bilateral Grid on residual spatial mismatch),
+	//              1 = 1D 256-bin LUT only, 2 = 3D Bilateral Grid (amortized fit every 4 real frames or on forceRefit).
+	// Writes the tone-matched HUD-less texture into ping-pong slot (0 or 1), leaving it in matchedOutputState.
 	// Returns the matched texture pointer on success, or nullptr if unavailable/unsupported.
 	ID3D12Resource* RecordToneMapMatch(ID3D12GraphicsCommandList* cmdList,
 		uint32_t frameSlot, bool wantShared,
 		ID3D12Resource* realTex, D3D12_RESOURCE_STATES realState,
 		ID3D12Resource* hudlessTex, D3D12_RESOURCE_STATES hudlessState,
-		D3D12_RESOURCE_STATES matchedOutputState) noexcept;
+		D3D12_RESOURCE_STATES matchedOutputState,
+		int32_t toneMapMode = 0, bool forceRefit = false) noexcept;
+
+	// Active Tone-Map Matcher mode for UI telemetry: 0 = Off, 1 = 1D LUT, 2 = 3D Bilateral Grid.
+	int32_t ActiveToneMapMode() const noexcept { return activeToneMapMode_; }
+
+	// Opt-in split-screen debug comparison (0% overhead when not called):
+	// Left of splitPos shows realTex (original frame), divider is cyan, right keeps outputTex.
+	void RecordSplitCompare(ID3D12GraphicsCommandList* cmdList,
+		ID3D12Resource* realTex, D3D12_RESOURCE_STATES realState,
+		ID3D12Resource* outputTex, D3D12_RESOURCE_STATES outputState,
+		float splitPos) noexcept;
 
 	// Tier 3 Update: compares CurrReal vs PrevReal on each real frame, updating the R8_UINT stability texture
 	// and counting 1/16 sampled static-HUD pixels (count >= 4). Preserves resource states.
@@ -89,13 +104,35 @@ public:
 		bool updateCounter, bool debugMagenta, bool fromToneMatched = false) noexcept;
 
 private:
-	static constexpr uint32_t kReadbackSlots = 2;
-	static constexpr uint32_t kDescriptorBlocks = 8; // 8 dispatches * 5 descriptors = 40 descriptors per frame
+	static constexpr uint32_t kReadbackSlots = 4; // 4-frame readback ring prevents races on 3+ frames-in-flight DLSS-G pacer queues
+	static constexpr uint32_t kDescriptorBlocks = 96; // 96-block ring * 5 descriptors = 480 descriptors (safe across 8+ frames in flight at 6x MFG)
 	static constexpr uint32_t kDescriptorsPerBlock = 5; // t0, t1, [t2], u0, u1
+	static constexpr uint32_t kToneMatchDescSlots = 32; // 32-slot ring * 3 descriptors = 96 descriptors (never mutates in-flight descriptors)
 
 	bool CreatePipelines(ID3D12Device* device) noexcept;
 	bool CreateResources(ID3D12Device* device, uint32_t width, uint32_t height) noexcept;
+	struct ToneMatchCompileJob
+	{
+		Microsoft::WRL::ComPtr<ID3D12Device> device;
+		Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSig;
+		Microsoft::WRL::ComPtr<ID3D12PipelineState> pso[5];
+		std::atomic<bool> cancel{ false };
+		std::atomic<uint8_t> state{ 0 }; // 0 = compiling, 1 = ready, 2 = failed
+	};
+
+	struct BilateralCompileJob
+	{
+		Microsoft::WRL::ComPtr<ID3D12Device> device;
+		Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSig;
+		Microsoft::WRL::ComPtr<ID3D12PipelineState> pso[4]; // clear, accum, solve, apply
+		std::atomic<bool> cancel{ false };
+		std::atomic<uint8_t> state{ 0 }; // 0 = compiling, 1 = ready, 2 = failed
+	};
+
 	bool EnsureToneMapMatchReady(ID3D12Device* device, DXGI_FORMAT backbufferFormat, bool wantShared) noexcept;
+	bool EnsureBilateralMatchReady(ID3D12Device* device, DXGI_FORMAT backbufferFormat, bool wantShared) noexcept;
+	void StopToneMatchCompile() noexcept;
+	void StopBilateralCompile() noexcept;
 	void ReleaseToneMapMatchResources() noexcept;
 	void ReleaseResources() noexcept;
 	uint32_t AllocDescriptorBlock() noexcept;
@@ -106,6 +143,7 @@ private:
 	Microsoft::WRL::ComPtr<ID3D12PipelineState> psoDiffComposite_;
 	Microsoft::WRL::ComPtr<ID3D12PipelineState> psoStaticUpdate_;
 	Microsoft::WRL::ComPtr<ID3D12PipelineState> psoStaticComposite_;
+	Microsoft::WRL::ComPtr<ID3D12PipelineState> psoSplitCompare_;
 	Microsoft::WRL::ComPtr<ID3D12RootSignature> hybridRootSig_;
 	Microsoft::WRL::ComPtr<ID3D12PipelineState> psoHybridComposite_;
 
@@ -128,14 +166,36 @@ private:
 	Microsoft::WRL::ComPtr<ID3D12RootSignature> toneMatchRootSig_;
 	Microsoft::WRL::ComPtr<ID3D12PipelineState> toneMatchPso_[5]; // clear, accumulate, median, fill, apply
 	Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> toneMatchHeap_;
+	uint32_t toneMatchDescCursor_ = 0;
 	Microsoft::WRL::ComPtr<ID3D12Resource> toneMatchHistogram_;   // 3 * 256 * 1024 * 4 = 3 MiB
 	Microsoft::WRL::ComPtr<ID3D12Resource> toneMatchLut_;         // 3 * 256 * 4 = 3 KiB
 	Microsoft::WRL::ComPtr<ID3D12Resource> toneMatchOutput_[2];   // Ping-pong matched HUDless (slot 0 / 1)
 	DXGI_FORMAT toneMatchFormat_ = DXGI_FORMAT_UNKNOWN;
 	bool toneMatchShared_ = false;
+	std::shared_ptr<ToneMatchCompileJob> toneMatchCompileJob_;
+	std::thread toneMatchCompileThread_;
 	bool toneMatchPipeAttempted_ = false;
 	bool toneMatchPipeReady_ = false;
 	bool toneMatchResReady_ = false;
+
+	// Tier 4 3D Bilateral-Grid Tone-Map Matcher (async compiled, amortized fit every 4 real frames)
+	Microsoft::WRL::ComPtr<ID3D12RootSignature> bilateralRootSig_;
+	Microsoft::WRL::ComPtr<ID3D12PipelineState> bilateralPso_[4]; // clear, accum, solve, apply
+	Microsoft::WRL::ComPtr<ID3D12Resource> bilateralStats_;       // gridW * gridH * 8 * 22 * 4 bytes (~169 KiB @ 1440p)
+	Microsoft::WRL::ComPtr<ID3D12Resource> bilateralModel_;       // gridW * gridH * 8 * 12 * 4 bytes (~92 KiB @ 1440p)
+	uint32_t bilateralCellsX_ = 0;
+	uint32_t bilateralCellsY_ = 0;
+	std::shared_ptr<BilateralCompileJob> bilateralCompileJob_;
+	std::thread bilateralCompileThread_;
+	bool bilateralPipeAttempted_ = false;
+	bool bilateralPipeReady_ = false;
+	bool bilateralResReady_ = false;
+	bool bilateralHasValidModel_ = false;
+	uint32_t bilateralFrameCounter_ = 0;
+	uint32_t toneMatchHighResidualCount_ = 0;
+	bool autoPromotedBilateral_ = false;
+	int32_t activeToneMapMode_ = 0;
+
 	uint32_t readbackSlot_ = 0;
 	uint64_t realFrameCount_ = 0;
 

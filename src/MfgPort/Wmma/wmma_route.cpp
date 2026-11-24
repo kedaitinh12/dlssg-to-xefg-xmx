@@ -669,7 +669,8 @@ const char* AdoptList(ID3D12GraphicsCommandList* list, D3D12_COMMAND_LIST_TYPE t
     if (!shared && !own)
         return memory.Type == MEM_IMAGE ? "table_runtime_image" : "table_unknown";
 
-    const bool writable = memory.Protect == PAGE_READWRITE || memory.Protect == PAGE_EXECUTE_READWRITE;
+    const bool writable = memory.Protect == PAGE_READWRITE || memory.Protect == PAGE_EXECUTE_READWRITE
+        || memory.Protect == PAGE_WRITECOPY || memory.Protect == PAGE_EXECUTE_WRITECOPY;
     ListTable* record = FindTable(table);
     if (record && record->complete.load(std::memory_order_acquire))
         return shared && record->shared ? nullptr : "table_in_use";

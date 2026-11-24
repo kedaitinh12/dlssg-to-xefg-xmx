@@ -538,6 +538,9 @@ namespace VulkanPolicy
 		uint64_t burstEngageSinceNs = 0;
 		uint64_t burstReleaseSinceNs = 0;
 		uint64_t prevDeltaNs = 0;
+		uint32_t slowShiftStreak = 0;
+		uint32_t fastShiftStreak = 0;
+		uint64_t fastShiftMaxNs = 0;
 		int8_t lastSwingSign = 0;
 		uint32_t altStreak = 0;
 		bool alternationActive = false;
@@ -572,6 +575,9 @@ namespace VulkanPolicy
 			burstEngageSinceNs = 0;
 			burstReleaseSinceNs = 0;
 			prevDeltaNs = 0;
+			slowShiftStreak = 0;
+			fastShiftStreak = 0;
+			fastShiftMaxNs = 0;
 			lastSwingSign = 0;
 			altStreak = 0;
 			alternationActive = false;
@@ -592,6 +598,9 @@ namespace VulkanPolicy
 			burstEngageSinceNs = 0;
 			burstReleaseSinceNs = 0;
 			prevDeltaNs = 0;
+			slowShiftStreak = 0;
+			fastShiftStreak = 0;
+			fastShiftMaxNs = 0;
 			lastSwingSign = 0;
 			altStreak = 0;
 			alternationActive = false;
@@ -616,40 +625,102 @@ namespace VulkanPolicy
 				const uint64_t delta = nowNs - lastBatchNs;
 				if (delta >= MinBatchNs && delta <= MaxBatchNs)
 				{
-					const bool isHitch = emaBatchNs != 0 &&
+					const bool aboveHitch = emaBatchNs != 0 &&
 						delta * HitchThresholdDen > emaBatchNs * HitchThresholdNum;
+					const bool belowFast = emaBatchNs != 0 &&
+						delta * HitchThresholdNum < emaBatchNs * HitchThresholdDen;
 
-					// Post-Hitch Median Window Protection: never let a hitch spike pollute recentDeltas
-					// once steady cadence is established, so back-to-back hitches cannot inflate medianDelta.
-					if (!isHitch)
+					// Asymmetric regime-shift detection (f5low-fg ReadyInterval synergy):
+					// - 1 slow frame > 1.3x EMA: treated as a transient hitch (drains without polluting median/EMA).
+					// - 2 consecutive slow frames > 1.3x EMA: sustained FPS drop (e.g. 120 FPS menu -> 60 FPS play);
+					//   immediately adopt min(prevDeltaNs, delta) so pacing never gets stuck permanently in isHitch.
+					// - 3 consecutive fast frames < EMA / 1.3: sustained FPS rise; adopt max of the 3 so 1-2 frame
+					//   post-stall catch-up bursts never shrink targetStepNs prematurely.
+					bool sustainedSlowShift = false;
+					bool sustainedFastShift = false;
+					if (aboveHitch)
 					{
-						recentDeltas[recentWrite] = delta;
-						recentWrite = (recentWrite + 1u) % MedianWindow;
-						if (recentCount < MedianWindow)
-							++recentCount;
+						++slowShiftStreak;
+						fastShiftStreak = 0;
+						fastShiftMaxNs = 0;
+						if (slowShiftStreak >= 2u && prevDeltaNs != 0)
+							sustainedSlowShift = true;
 					}
-
-					uint64_t sorted[MedianWindow]{};
-					for (uint32_t i = 0; i < recentCount; ++i)
-						sorted[i] = recentDeltas[i];
-					std::sort(sorted, sorted + recentCount);
-					const uint64_t medianDelta = recentCount ? sorted[recentCount / 2u] : delta;
-
-					if (emaBatchNs == 0)
+					else
 					{
-						emaBatchNs = medianDelta;
-					}
-					else if (!isHitch)
-					{
-						if (medianDelta < emaBatchNs || medianDelta > emaBatchNs * 2ull || medianDelta * 2ull < emaBatchNs)
+						slowShiftStreak = 0;
+						if (belowFast)
 						{
-							// Adapt quickly downward (catch-up / higher FPS) or on sustained framerate shifts
-							emaBatchNs = (emaBatchNs + medianDelta) / 2ull;
+							++fastShiftStreak;
+							fastShiftMaxNs = std::max(fastShiftMaxNs, delta);
+							if (fastShiftStreak >= 3u)
+								sustainedFastShift = true;
 						}
 						else
 						{
-							// Smooth 0.25 EMA on the median-filtered cadence
-							emaBatchNs = (emaBatchNs * 3ull + medianDelta) / 4ull;
+							fastShiftStreak = 0;
+							fastShiftMaxNs = 0;
+						}
+					}
+
+					const bool isHitch = aboveHitch && !sustainedSlowShift;
+
+					if (sustainedSlowShift)
+					{
+						const uint64_t shifted = std::min(prevDeltaNs, delta);
+						emaBatchNs = shifted;
+						for (uint32_t i = 0; i < MedianWindow; ++i)
+							recentDeltas[i] = shifted;
+						recentCount = MedianWindow;
+						recentWrite = 0;
+						slowShiftStreak = 0;
+						pressureStreak = 0;
+					}
+					else if (sustainedFastShift)
+					{
+						const uint64_t shifted = fastShiftMaxNs;
+						emaBatchNs = shifted;
+						for (uint32_t i = 0; i < MedianWindow; ++i)
+							recentDeltas[i] = shifted;
+						recentCount = MedianWindow;
+						recentWrite = 0;
+						fastShiftStreak = 0;
+						fastShiftMaxNs = 0;
+					}
+					else
+					{
+						// Post-Hitch Median Window Protection: never let a single hitch spike pollute recentDeltas
+						// once steady cadence is established, so transient hitches cannot inflate medianDelta.
+						if (!isHitch)
+						{
+							recentDeltas[recentWrite] = delta;
+							recentWrite = (recentWrite + 1u) % MedianWindow;
+							if (recentCount < MedianWindow)
+								++recentCount;
+						}
+
+						uint64_t sorted[MedianWindow]{};
+						for (uint32_t i = 0; i < recentCount; ++i)
+							sorted[i] = recentDeltas[i];
+						std::sort(sorted, sorted + recentCount);
+						const uint64_t medianDelta = recentCount ? sorted[recentCount / 2u] : delta;
+
+						if (emaBatchNs == 0)
+						{
+							emaBatchNs = medianDelta;
+						}
+						else if (!isHitch)
+						{
+							if (medianDelta < emaBatchNs || medianDelta > emaBatchNs * 2ull || medianDelta * 2ull < emaBatchNs)
+							{
+								// Adapt quickly downward (higher FPS) or on large framerate shifts
+								emaBatchNs = (emaBatchNs + medianDelta) / 2ull;
+							}
+							else
+							{
+								// Smooth 0.25 EMA on the median-filtered cadence
+								emaBatchNs = (emaBatchNs * 3ull + medianDelta) / 4ull;
+							}
 						}
 					}
 
@@ -688,7 +759,7 @@ namespace VulkanPolicy
 						lastSwingSign = 0;
 						alternationActive = false;
 					}
-					prevDeltaNs = isHitch ? 0ull : delta;
+					prevDeltaNs = delta;
 
 					const uint64_t totalFrames = static_cast<uint64_t>(count) + 1ull;
 					targetStepNs = (effectiveBatchNs * TargetRatioNum) / (totalFrames * TargetRatioDen);
@@ -756,6 +827,9 @@ namespace VulkanPolicy
 					recentCount = 0;
 					recentWrite = 0;
 					prevDeltaNs = 0;
+					slowShiftStreak = 0;
+					fastShiftStreak = 0;
+					fastShiftMaxNs = 0;
 					lastSwingSign = 0;
 					altStreak = 0;
 					alternationActive = false;

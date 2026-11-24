@@ -44,6 +44,7 @@ class ShaderPort
 
 	std::mutex reportedMutex;
 	std::set<std::string> reported;
+	std::set<std::string> missed;
 
 	static void read(uintptr_t p, void* out, size_t count)
 	{
@@ -110,9 +111,14 @@ class ShaderPort
 
 		const auto found = self->programs.find(key);
 
-		// Not ours, XeFG's own decoder runs as always
+		// Not ours, XeFG's own decoder runs as always; log once per key so Linux/VKD3D missing-key vs DXIL failures are clear
 		if (found == self->programs.end())
 		{
+			{
+				std::scoped_lock lock(self->reportedMutex);
+				if (self->missed.size() < 64 && self->missed.insert(key).second)
+					mfg_port::Event("shader_miss", ""key":"" + key + """);
+			}
 			self->decode(store, keyObject, output);
 			return;
 		}
@@ -146,17 +152,22 @@ class ShaderPort
 
 		LONG prior = InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(site + 1), to, from);
 		bool flushed = FlushInstructionCache(GetCurrentProcess(), site, 5) != FALSE;
-		bool restored = VirtualProtect(site, 5, old, &unused) != FALSE;
+		// On Wine/Proton, writing a copy-on-write PAGE_EXECUTE_WRITECOPY image page privatizes it;
+		// restore to PAGE_EXECUTE_READ (re-arming WRITECOPY on a privatized page can fail or report RX).
+		const DWORD restoreProtect = (old == PAGE_EXECUTE_WRITECOPY) ? PAGE_EXECUTE_READ : old;
+		bool restored = VirtualProtect(site, 5, restoreProtect, &unused) != FALSE;
 
 		MEMORY_BASIC_INFORMATION state{};
 
 		// A half applied site is not something to keep running on (same as MFG-Unlocker)
 		if (prior != from || !flushed || !restored || old != protection ||
-			VirtualQuery(site, &state, sizeof(state)) != sizeof(state) || state.Protect != protection ||
+			VirtualQuery(site, &state, sizeof(state)) != sizeof(state) ||
+			(state.Protect != restoreProtect && state.Protect != old) ||
 			get<LONG>(reinterpret_cast<uintptr_t>(site + 1)) != to)
 		{
 			TerminateProcess(GetCurrentProcess(), 101);
 		}
+		protection = state.Protect;
 	}
 
 public:
@@ -178,7 +189,7 @@ public:
 			memcmp(reinterpret_cast<void*>(base + layout.Rva(0x19fda0)), decodeExpected, sizeof(decodeExpected)) ||
 			memcmp(reinterpret_cast<void*>(base + layout.Rva(0x1a09c0)), resizeExpected, sizeof(resizeExpected)) ||
 			VirtualQuery(site, &info, sizeof(info)) != sizeof(info) || info.AllocationBase != module ||
-			info.Type != MEM_IMAGE || info.Protect != PAGE_EXECUTE_READ)
+			info.Type != MEM_IMAGE || (info.Protect != PAGE_EXECUTE_READ && info.Protect != PAGE_EXECUTE_WRITECOPY))
 		{
 			throw std::runtime_error("shader_port_identity");
 		}

@@ -161,7 +161,8 @@ bool LoadNvapi(Nvapi& api, std::string& reason)
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
         reinterpret_cast<LPCWSTR>(dispatcher), &pinned);
     const DWORD stubLength = GetModuleFileNameW(dispatcher, loadedPath.data(), static_cast<DWORD>(loadedPath.size()));
-    if (!stubLength || stubLength >= loadedPath.size() || !NvapiOwnerPath(systemDirectory.data(), loadedPath.data(), true))
+    if (!stubLength || stubLength >= loadedPath.size()
+        || (!NvapiOwnerPath(systemDirectory.data(), loadedPath.data(), true) && !SameFile(loadedPath.data(), stubPath.data())))
     { reason = "nvapi_not_system"; return false; }
     const auto query = reinterpret_cast<NvQuery>(GetProcAddress(dispatcher, "nvapi_QueryInterface"));
     if (!OwnedCode(dispatcher, reinterpret_cast<void*>(query))) { reason = "nvapi_query_owner"; return false; }
@@ -961,7 +962,8 @@ const char* AdoptList(ID3D12GraphicsCommandList* list, D3D12_COMMAND_LIST_TYPE t
     const bool shared = system || runtimeClass || wrapperClass;
     const bool own = memory.Type == MEM_PRIVATE && memory.Protect == PAGE_READWRITE && at > object && at - object < 0x10000;
     if (!shared && !own) return memory.Type == MEM_IMAGE ? "table_runtime_image" : "table_unknown";
-    const bool writable = memory.Protect == PAGE_READWRITE || memory.Protect == PAGE_EXECUTE_READWRITE;
+    const bool writable = memory.Protect == PAGE_READWRITE || memory.Protect == PAGE_EXECUTE_READWRITE
+        || memory.Protect == PAGE_WRITECOPY || memory.Protect == PAGE_EXECUTE_WRITECOPY;
     ListTable* record = FindTable(table);
     if (record && record->complete.load(std::memory_order_acquire))
         return shared && record->shared ? nullptr : "table_in_use"; // a shared table hooked for an earlier list

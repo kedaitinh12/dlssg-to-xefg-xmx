@@ -82,6 +82,7 @@ extern "C++"
 	HMODULE LoadLibraryExW(LPCWSTR name, HANDLE file, DWORD flags);
 	DWORD GetModuleFileNameW(HMODULE module, wchar_t* path, DWORD size);
 	DWORD GetEnvironmentVariableW(LPCWSTR name, LPWSTR value, DWORD size);
+	BOOL SetEnvironmentVariableW(LPCWSTR name, LPCWSTR value);
 	#define ERROR_ALREADY_EXISTS 183L
 	struct SYSTEMTIME
 	{
@@ -129,6 +130,21 @@ extern "C++"
 		void* pfnCompletionRoutine, void* lpArgToCompletionRoutine, BOOL fResume);
 	DWORD WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds);
 	BOOL CloseHandle(HANDLE hObject);
+	#define FILE_SHARE_READ 0x00000001
+	#define FILE_SHARE_WRITE 0x00000002
+	#define FILE_SHARE_DELETE 0x00000004
+	#define FILE_READ_ATTRIBUTES 0x0080
+	#define OPEN_EXISTING 3
+	#define INVALID_HANDLE_VALUE ((HANDLE)(intptr_t)-1)
+	struct BY_HANDLE_FILE_INFORMATION
+	{
+		DWORD dwVolumeSerialNumber;
+		DWORD nFileIndexHigh;
+		DWORD nFileIndexLow;
+	};
+	HANDLE CreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
+		void* lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
+	BOOL GetFileInformationByHandle(HANDLE hFile, BY_HANDLE_FILE_INFORMATION* lpFileInformation);
 	void Sleep(DWORD dwMilliseconds);
 	inline void YieldProcessor() {}
 	inline BOOL SwitchToThread() { return 0; }

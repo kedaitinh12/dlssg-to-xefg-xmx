@@ -61,6 +61,9 @@ namespace D3D12VulkanWmma
 	// True when the D3D12->Vulkan hardware WMMA bridge is ready and can accelerate XeFG batches.
 	bool Active() noexcept;
 
+	// True when the Vulkan-side XeFG context has finished async init and is ready to execute batches.
+	bool ContextReady() noexcept;
+
 	// True when a texture created by FrameGenerator should include D3D12_HEAP_FLAG_SHARED so it can be
 	// imported into Vulkan via VK_KHR_external_memory_win32.
 	bool WantsSharedTextures() noexcept;
@@ -79,6 +82,11 @@ namespace D3D12VulkanWmma
 	// Destroys the Vulkan-side XeFG context (e.g. when FrameGenerator recreates its context).
 	void ResetContext() noexcept;
 
+	// When the Vulkan bridge faulted (e.g. VK_ERROR_DEVICE_LOST after a startup/loading TDR) while
+	// the game's D3D12 device is still healthy, asynchronously tears down and recreates the bridge
+	// after a short cooldown (bounded retries) so WMMA acceleration resumes without restarting.
+	bool TryRecoverAsync(const ContextSettings& settings) noexcept;
+
 	// Schedules a full XeFG batch (all `frameCount` generated frames) on the Vulkan VK_KHR_cooperative_matrix
 	// queue to run immediately when `cmdList` is submitted to ID3D12CommandQueue::ExecuteCommandLists.
 	// `sharedOutputs[0..frameCount-1]` must be D3D12_HEAP_FLAG_SHARED textures; `firstGameOutput` is the
@@ -93,7 +101,8 @@ namespace D3D12VulkanWmma
 		const xefgd_2d_t* outputBases,
 		uint32_t frameCount,
 		ID3D12Resource* firstGameOutput,
-		D3D12_RESOURCE_STATES outputState) noexcept;
+		D3D12_RESOURCE_STATES outputState,
+		bool skipCpuPaceWait = false) noexcept;
 
 	// Appends a post-copy (`sharedOutput` -> `gameOutput`) for `frameIndex > 1` when OptiScaler records
 	// multiple generated frames onto the same `cmdList`. Returns true if `cmdList` has an active pending

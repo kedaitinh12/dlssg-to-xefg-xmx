@@ -28,6 +28,7 @@ namespace HudTier
 		Tier1NativeOnly = 1,    // Strictly Tier 1 (Native XeFG HUDless/UI) or interpolated if unavailable
 		Tier2DiffComposite = 2, // Prefer Tier 2 (Custom HUD-Diff Composite), escalate to Tier 3 if HUDless breaks/missing
 		Tier3Hybrid = 3,        // Force Tier 3 Hybrid (Tone-Map Match for dynamic/HDR HUD + Static Mask for fixed HUD)
+		Off = 4,                // Pure XeFG fast-path: disables all HudTierPass compute/readback passes for maximum FPS
 	};
 
 	// Effective HUD protection tier active on the current frame.
@@ -47,6 +48,7 @@ namespace HudTier
 		case Mode::Tier1NativeOnly: return "Tier 1 (Native HUDless)";
 		case Mode::Tier2DiffComposite: return "Tier 2 (HUD-Diff Composite)";
 		case Mode::Tier3Hybrid: return "Tier 3 (Hybrid: Tone-Match + Static)";
+		case Mode::Off: return "Off (Pure XeFG / Max FPS)";
 		default: return "Auto (3-Tier)";
 		}
 	}
@@ -191,6 +193,23 @@ namespace HudTier
 		Decision Evaluate(const Inputs& in) const noexcept
 		{
 			Decision d{};
+
+			// Pure XeFG fast-path: zero HudTierPass compute passes, barriers, or readbacks (matches Nov 18 baseline speed).
+			if (in.mode == Mode::Off)
+			{
+				if (in.hudlessUiEnabled && in.hasGameHudless && in.hudlessStructurallyValid)
+				{
+					d.activeTier = ActiveTier::Tier1Native;
+					d.useXeFgNativeUi = true;
+					d.reason = "off-pure-xefg-hudless";
+				}
+				else
+				{
+					d.activeTier = ActiveTier::Interpolated;
+					d.reason = "off-pure-xefg";
+				}
+				return d;
+			}
 
 			const bool staticCoverageUsable = !hasStaticSample_ ||
 				(lastStaticFraction_ >= kStaticHudMinFraction && lastStaticFraction_ <= kStaticHudMaxFraction);

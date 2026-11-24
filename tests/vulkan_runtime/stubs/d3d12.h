@@ -167,6 +167,7 @@ struct ID3D12Resource : ID3D12Object
 	virtual void Unmap(UINT, const D3D12_RANGE*) {}
 };
 
+struct ID3D12QueryHeap : ID3D12Object {};
 struct ID3D12Heap : ID3D12Object
 {
 };
@@ -209,4 +210,15 @@ struct ID3D12Device : ID3D12Object
 		const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear, REFIID riid,
 		void** resource) = 0;
 	virtual LUID GetAdapterLuid() { return LUID{}; }
+};
+
+enum D3D12_DRED_ENABLEMENT { D3D12_DRED_ENABLEMENT_FORCED_ON };
+struct ID3D12DeviceRemovedExtendedDataSettings : IUnknown
+{
+    virtual void SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT) = 0;
+    virtual void SetPageFaultEnablement(D3D12_DRED_ENABLEMENT) = 0;
+};
+struct ID3D12DeviceRemovedExtendedDataSettings1 : ID3D12DeviceRemovedExtendedDataSettings
+{
+    virtual void SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT) = 0;
 };

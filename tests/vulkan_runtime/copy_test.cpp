@@ -15,6 +15,7 @@ static void VKAPI_CALL Capture(VkCommandBuffer, VkImage source, VkImageLayout, V
     capturedTarget = target;
 }
 
+bool Log::IsEnabled() noexcept { return true; }
 void Log::Write(std::string_view, std::string_view) {}
 
 static uint64_t gFakeMissingProgramCount = 0;

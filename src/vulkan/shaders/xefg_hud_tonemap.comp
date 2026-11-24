@@ -4,12 +4,16 @@
 // Uses sampler2D + texelFetch for hudless & backBuffer so ANY input format (RGBA8, BGRA8, A2B10G10R10, RGBA16F)
 // works seamlessly without format-combination explosion; only apply writes explicit COLOR_FMT (rgba8 or rgb10_a2).
 //
-// Passes (compile-time -DTM_PASS=0..4):
+// Passes (compile-time -DTM_PASS=0..8):
 //   0 = clear      (zero 3 * 256 * 1024 histogram)
 //   1 = accumulate (1/16 stride 2D histogram per channel: log2(hudless) x backbuffer code)
 //   2 = median     (256-thread groupshared inclusive scan -> per-bin median code)
 //   3 = fill       (5-bin running-median outlier filter + linear fill + monotonic end extrapolation)
 //   4 = apply      (map full HUDless through LUT into OutColor in Backbuffer's format)
+//   5 = bg_clear   (zero 3D Bilateral-Grid fixed-point stats buffer)
+//   6 = bg_accum   (1/16 stride 3D Bilateral-Grid fixed-point atomic accumulation, Rec.709 Luma + NaN/Inf guard)
+//   7 = bg_solve   (3x3 spatial tent regularization + 3x4 local affine ridge regression per cell*bin)
+//   8 = bg_apply   (trilinear 8-corner 3D Bilateral-Grid color mapping into OutColor)
 
 #ifndef TM_PASS
 #define TM_PASS 0
@@ -22,6 +26,7 @@
 #define STRIDE 4u
 #define OUTLIER (32.0 / 1023.0)
 
+#if TM_PASS < 5
 layout(push_constant) uniform MatchParams {
     uint width;
     uint height;
@@ -32,6 +37,18 @@ layout(push_constant) uniform MatchParams {
     uint minimumCount;
     uint unused;
 };
+#else
+layout(push_constant) uniform BilateralParams {
+    uint width;
+    uint height;
+    uint cellsX;
+    uint cellsY;
+    uint cell;
+    uint bins;
+    float lambda;
+    uint totalStatsUints;
+};
+#endif
 
 layout(set = 0, binding = 0) uniform sampler2D hudlessTex;
 layout(set = 0, binding = 1) uniform sampler2D backBufferTex;
@@ -43,10 +60,57 @@ layout(set = 0, binding = 4, std430) buffer LutBuf {
     float lut[];
 };
 
+#if TM_PASS < 5
 uint BinOf(float v) {
     if (!(v > 0.0)) return 0u;
     return uint(clamp((log2(v) - logMin) * binsPerOctave, 0.0, float(bins - 1u)));
 }
+#else
+#define B_SCALE 1024.0
+#define B_INV_SCALE (1.0 / 1024.0)
+
+bool isFiniteFloat(float v) {
+    return !isnan(v) && !isinf(v);
+}
+
+vec3 safeSaturateRgb(vec3 c) {
+    return vec3(
+        isFiniteFloat(c.r) ? clamp(c.r, 0.0, 1.0) : 0.0,
+        isFiniteFloat(c.g) ? clamp(c.g, 0.0, 1.0) : 0.0,
+        isFiniteFloat(c.b) ? clamp(c.b, 0.0, 1.0) : 0.0);
+}
+
+float luma709(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void accumBin(uint cellIdx, uint b, float w, vec3 x, vec3 y) {
+    if (w <= 1e-4) return;
+    uint base = (cellIdx * bins + b) * 22u;
+    atomicAdd(hist[base + 0u], uint(w * B_SCALE + 0.5));
+    atomicAdd(hist[base + 1u], uint(w * x.r * B_SCALE + 0.5));
+    atomicAdd(hist[base + 2u], uint(w * x.g * B_SCALE + 0.5));
+    atomicAdd(hist[base + 3u], uint(w * x.b * B_SCALE + 0.5));
+    atomicAdd(hist[base + 4u], uint(w * x.r * x.r * B_SCALE + 0.5));
+    atomicAdd(hist[base + 5u], uint(w * x.r * x.g * B_SCALE + 0.5));
+    atomicAdd(hist[base + 6u], uint(w * x.r * x.b * B_SCALE + 0.5));
+    atomicAdd(hist[base + 7u], uint(w * x.g * x.g * B_SCALE + 0.5));
+    atomicAdd(hist[base + 8u], uint(w * x.g * x.b * B_SCALE + 0.5));
+    atomicAdd(hist[base + 9u], uint(w * x.b * x.b * B_SCALE + 0.5));
+    atomicAdd(hist[base + 10u], uint(w * x.r * y.r * B_SCALE + 0.5));
+    atomicAdd(hist[base + 11u], uint(w * x.r * y.g * B_SCALE + 0.5));
+    atomicAdd(hist[base + 12u], uint(w * x.r * y.b * B_SCALE + 0.5));
+    atomicAdd(hist[base + 13u], uint(w * x.g * y.r * B_SCALE + 0.5));
+    atomicAdd(hist[base + 14u], uint(w * x.g * y.g * B_SCALE + 0.5));
+    atomicAdd(hist[base + 15u], uint(w * x.g * y.b * B_SCALE + 0.5));
+    atomicAdd(hist[base + 16u], uint(w * x.b * y.r * B_SCALE + 0.5));
+    atomicAdd(hist[base + 17u], uint(w * x.b * y.g * B_SCALE + 0.5));
+    atomicAdd(hist[base + 18u], uint(w * x.b * y.b * B_SCALE + 0.5));
+    atomicAdd(hist[base + 19u], uint(w * y.r * B_SCALE + 0.5));
+    atomicAdd(hist[base + 20u], uint(w * y.g * B_SCALE + 0.5));
+    atomicAdd(hist[base + 21u], uint(w * y.b * B_SCALE + 0.5));
+}
+#endif
 
 #if TM_PASS == 0
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -195,5 +259,174 @@ void main() {
         o[c] = mix(lut[c * bins + i], lut[c * bins + i + 1u], t);
     }
     imageStore(outColor, ivec2(id), vec4(o, 1.0));
+}
+
+#elif TM_PASS == 5
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx < totalStatsUints) {
+        hist[idx] = 0u;
+    }
+}
+
+#elif TM_PASS == 6
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy * STRIDE;
+    if (p.x >= width || p.y >= height) return;
+
+    vec3 x = safeSaturateRgb(texelFetch(hudlessTex, ivec2(p), 0).rgb);
+    vec3 y = safeSaturateRgb(texelFetch(backBufferTex, ivec2(p), 0).rgb);
+    uint cx = min(p.x / cell, cellsX - 1u);
+    uint cy = min(p.y / cell, cellsY - 1u);
+    uint cellIdx = cy * cellsX + cx;
+
+    float z = clamp(luma709(x), 0.0, 1.0) * float(bins - 1u);
+    uint b0 = min(uint(floor(z)), bins - 1u);
+    uint b1 = min(b0 + 1u, bins - 1u);
+    float fz = clamp(z - float(b0), 0.0, 1.0);
+
+    if (b0 == b1) {
+        accumBin(cellIdx, b0, 1.0, x, y);
+    } else {
+        accumBin(cellIdx, b0, 1.0 - fz, x, y);
+        accumBin(cellIdx, b1, fz, x, y);
+    }
+}
+
+#elif TM_PASS == 7
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+void main() {
+    uint totalCells = cellsX * cellsY * bins;
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= totalCells) return;
+
+    uint b = gid % bins;
+    uint xy = gid / bins;
+    int cx = int(xy % cellsX);
+    int cy = int(xy / cellsX);
+
+    float s[22];
+    for (uint k = 0u; k < 22u; ++k) s[k] = 0.0;
+
+    for (int dy = -1; dy <= 1; ++dy) {
+        int ny = cy + dy;
+        if (ny < 0 || ny >= int(cellsY)) continue;
+        for (int dx = -1; dx <= 1; ++dx) {
+            int nx = cx + dx;
+            if (nx < 0 || nx >= int(cellsX)) continue;
+            float w = float((2 - abs(dx)) * (2 - abs(dy)));
+            uint nBase = ((uint(ny) * cellsX + uint(nx)) * bins + b) * 22u;
+            for (uint m = 0u; m < 22u; ++m) {
+                s[m] += w * (float(hist[nBase + m]) * B_INV_SCALE);
+            }
+        }
+    }
+
+    vec4 row0 = vec4(1.0, 0.0, 0.0, 0.0);
+    vec4 row1 = vec4(0.0, 1.0, 0.0, 0.0);
+    vec4 row2 = vec4(0.0, 0.0, 1.0, 0.0);
+
+    float n = s[0];
+    if (n >= 8.0) {
+        float invN = 1.0 / n;
+        vec3 mx = vec3(s[1], s[2], s[3]) * invN;
+        vec3 my = vec3(s[19], s[20], s[21]) * invN;
+
+        // Explicit row vectors (row-major, matching HLSL float3x3 bit-for-bit)
+        vec3 cxx0 = vec3(s[4], s[5], s[6]) * invN - mx.x * mx + vec3(lambda, 0.0, 0.0);
+        vec3 cxx1 = vec3(s[5], s[7], s[8]) * invN - mx.y * mx + vec3(0.0, lambda, 0.0);
+        vec3 cxx2 = vec3(s[6], s[8], s[9]) * invN - mx.z * mx + vec3(0.0, 0.0, lambda);
+
+        vec3 cxy0 = vec3(s[10], s[11], s[12]) * invN - mx.x * my + vec3(lambda, 0.0, 0.0);
+        vec3 cxy1 = vec3(s[13], s[14], s[15]) * invN - mx.y * my + vec3(0.0, lambda, 0.0);
+        vec3 cxy2 = vec3(s[16], s[17], s[18]) * invN - mx.z * my + vec3(0.0, 0.0, lambda);
+
+        vec3 k0 = cross(cxx1, cxx2);
+        vec3 k1 = cross(cxx2, cxx0);
+        vec3 k2 = cross(cxx0, cxx1);
+        float det = dot(cxx0, k0);
+        if (isFiniteFloat(det) && abs(det) > 1e-9) {
+            float invDet = 1.0 / det;
+            vec3 inv0 = vec3(k0.x, k1.x, k2.x) * invDet;
+            vec3 inv1 = vec3(k0.y, k1.y, k2.y) * invDet;
+            vec3 inv2 = vec3(k0.z, k1.z, k2.z) * invDet;
+
+            vec3 colY0 = vec3(cxy0.x, cxy1.x, cxy2.x);
+            vec3 colY1 = vec3(cxy0.y, cxy1.y, cxy2.y);
+            vec3 colY2 = vec3(cxy0.z, cxy1.z, cxy2.z);
+
+            vec3 w0 = vec3(dot(inv0, colY0), dot(inv1, colY0), dot(inv2, colY0));
+            vec3 w1 = vec3(dot(inv0, colY1), dot(inv1, colY1), dot(inv2, colY1));
+            vec3 w2 = vec3(dot(inv0, colY2), dot(inv1, colY2), dot(inv2, colY2));
+
+            vec4 cand0 = vec4(w0, my.x - dot(mx, w0));
+            vec4 cand1 = vec4(w1, my.y - dot(mx, w1));
+            vec4 cand2 = vec4(w2, my.z - dot(mx, w2));
+
+            bool ok = isFiniteFloat(cand0.x) && isFiniteFloat(cand0.y) && isFiniteFloat(cand0.z) && isFiniteFloat(cand0.w)
+                   && isFiniteFloat(cand1.x) && isFiniteFloat(cand1.y) && isFiniteFloat(cand1.z) && isFiniteFloat(cand1.w)
+                   && isFiniteFloat(cand2.x) && isFiniteFloat(cand2.y) && isFiniteFloat(cand2.z) && isFiniteFloat(cand2.w);
+            if (ok) {
+                row0 = cand0;
+                row1 = cand1;
+                row2 = cand2;
+            }
+        }
+    }
+
+    uint mBase = gid * 12u;
+    lut[mBase + 0u] = row0.x; lut[mBase + 1u] = row0.y; lut[mBase + 2u] = row0.z; lut[mBase + 3u] = row0.w;
+    lut[mBase + 4u] = row1.x; lut[mBase + 5u] = row1.y; lut[mBase + 6u] = row1.z; lut[mBase + 7u] = row1.w;
+    lut[mBase + 8u] = row2.x; lut[mBase + 9u] = row2.y; lut[mBase + 10u] = row2.z; lut[mBase + 11u] = row2.w;
+}
+
+#elif TM_PASS == 8
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+void main() {
+    uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= width || id.y >= height) return;
+
+    vec3 h = safeSaturateRgb(texelFetch(hudlessTex, ivec2(id), 0).rgb);
+
+    float gx = (float(id.x) + 0.5) / float(cell) - 0.5;
+    float gy = (float(id.y) + 0.5) / float(cell) - 0.5;
+    float gz = clamp(luma709(h), 0.0, 1.0) * float(bins - 1u);
+
+    int x0 = clamp(int(floor(gx)), 0, int(cellsX) - 1);
+    int y0 = clamp(int(floor(gy)), 0, int(cellsY) - 1);
+    int x1 = min(x0 + 1, int(cellsX) - 1);
+    int y1 = min(y0 + 1, int(cellsY) - 1);
+    uint z0 = min(uint(floor(gz)), bins - 1u);
+    uint z1 = min(z0 + 1u, bins - 1u);
+
+    float fx = clamp(gx - floor(gx), 0.0, 1.0);
+    float fy = clamp(gy - floor(gy), 0.0, 1.0);
+    float fz = clamp(gz - float(z0), 0.0, 1.0);
+
+    vec4 m0 = vec4(0.0);
+    vec4 m1 = vec4(0.0);
+    vec4 m2 = vec4(0.0);
+
+    for (uint corner = 0u; corner < 8u; ++corner) {
+        bool bx = (corner & 1u) != 0u;
+        bool by = (corner & 2u) != 0u;
+        bool bz = (corner & 4u) != 0u;
+        float w = (bx ? fx : (1.0 - fx)) * (by ? fy : (1.0 - fy)) * (bz ? fz : (1.0 - fz));
+        uint cx = uint(bx ? x1 : x0);
+        uint cy = uint(by ? y1 : y0);
+        uint cz = bz ? z1 : z0;
+        uint mBase = ((cy * cellsX + cx) * bins + cz) * 12u;
+        m0 += w * vec4(lut[mBase + 0u], lut[mBase + 1u], lut[mBase + 2u], lut[mBase + 3u]);
+        m1 += w * vec4(lut[mBase + 4u], lut[mBase + 5u], lut[mBase + 6u], lut[mBase + 7u]);
+        m2 += w * vec4(lut[mBase + 8u], lut[mBase + 9u], lut[mBase + 10u], lut[mBase + 11u]);
+    }
+
+    vec3 o = vec3(
+        dot(m0.xyz, h) + m0.w,
+        dot(m1.xyz, h) + m1.w,
+        dot(m2.xyz, h) + m2.w);
+    imageStore(outColor, ivec2(id), vec4(safeSaturateRgb(o), 1.0));
 }
 #endif

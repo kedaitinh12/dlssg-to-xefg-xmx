@@ -505,6 +505,31 @@ inline bool ProbeEnumDisplayDevices(uint32_t expectedVendor, uint32_t& vendorId,
 }
 } // namespace detail
 
+// Wine/Proton + DXVK + OptiScaler + ReShade64 can recurse infinitely inside hkCreateDXGIFactory1
+// (e.g. Wuthering Waves stack overflow at 11.5 MB). On Wine/Proton, CreateDXGIFactory + QueryInterface
+// to IDXGIFactory4 avoids CreateDXGIFactory1 hooks while keeping native Windows behavior unchanged.
+inline HRESULT CreateDxgiFactory4Safe(IDXGIFactory4** outFactory) noexcept
+{
+    if (!outFactory) return E_POINTER;
+    *outFactory = nullptr;
+
+    static const bool underWine = []() noexcept {
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        return ntdll && GetProcAddress(ntdll, "wine_get_version") != nullptr;
+    }();
+
+    if (underWine)
+    {
+        Microsoft::WRL::ComPtr<IDXGIFactory> baseFactory;
+        const HRESULT hr = CreateDXGIFactory(IID_PPV_ARGS(&baseFactory));
+        if (FAILED(hr) || !baseFactory)
+            return FAILED(hr) ? hr : E_FAIL;
+        return baseFactory->QueryInterface(IID_PPV_ARGS(outFactory));
+    }
+
+    return CreateDXGIFactory1(IID_PPV_ARGS(outFactory));
+}
+
 inline ProbeResult Probe(const LUID& luid) noexcept
 {
     ProbeResult result;
@@ -518,7 +543,7 @@ inline ProbeResult Probe(const LUID& luid) noexcept
             ComPtr<IDXGIFactory4> factory;
             ComPtr<IDXGIAdapter1> adapter;
             DXGI_ADAPTER_DESC1 desc{};
-            if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) &&
+            if (SUCCEEDED(CreateDxgiFactory4Safe(&factory)) &&
                 SUCCEEDED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter))) &&
                 SUCCEEDED(adapter->GetDesc1(&desc)))
             {

@@ -52,6 +52,7 @@ static int checks = 0;
 // Log
 static std::vector<std::string> logLines;
 
+bool Log::IsEnabled() noexcept { return true; }
 void Log::Write(std::string_view level, std::string_view message)
 {
 	logLines.push_back(std::string(level) + ": " + std::string(message));

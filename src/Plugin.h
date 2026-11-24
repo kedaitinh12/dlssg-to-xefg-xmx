@@ -36,11 +36,11 @@ namespace Plugin
 		// Experimental D3D12->Vulkan VK_KHR_cooperative_matrix bridge (default on; disable in OptiScaler menu or via
 		// XEFG_D3D12_VULKAN_WMMA=0 to fall back to D3D12 cs_6_6 WMMA overrides if a game freezes or conflicts with hooks)
 		std::atomic_bool d3d12VulkanWmmaBridge = true;
-		// DLSS Enabler 4.10.0.26 RC1 features:
+		// DLSS Enabler 4.10.0.26 RC1 features (opt-in OFF by default for maximum uninterrupted smoothness & FPS):
 		// Skips 10 real frames when HUD-less/UI composition state toggles to prevent glitched menu transitions
-		std::atomic_bool uiTransitionCooldown = true;
+		std::atomic_bool uiTransitionCooldown = false;
 		// GhostBuster anti-ghosting: resets history on sharp snaps (>45 deg), sudden FOV/ADS jumps, or missing camera MV
-		std::atomic_bool ghostBuster = true;
+		std::atomic_bool ghostBuster = false;
 		// Allows Vulkan present pacer spinlock to sleep/yield to reduce CPU usage
 		std::atomic_bool pacingSpinlockSleep = false;
 		// Extended XeFG flag overrides: 0 = Auto (game), 1 = Force Off, 2 = Force On
@@ -48,10 +48,21 @@ namespace Plugin
 		std::atomic<int32_t> jitteredMvOverride = 0;
 		// UI alpha mode for Vulkan separate UI texture: 0 = Auto, 1 = Straight, 2 = Premultiplied (RTX-Encore xefgUiAlpha)
 		std::atomic<int32_t> uiAlphaMode = 0;
-		// 3-Tier Adaptive HUD Protection mode: 0 = Auto (3-Tier), 1 = Tier 1 Native Only, 2 = Tier 2 HUD-Diff Composite, 3 = Tier 3 Static HUD Mask
+		// 3-Tier Adaptive HUD Protection mode: 0 = Auto (3-Tier), 1 = Tier 1 Native Only, 2 = Tier 2 HUD-Diff Composite, 3 = Tier 3 Hybrid, 4 = Off (Pure XeFG / Max FPS)
 		std::atomic<int32_t> hudTierMode = 0;
+		// Tier 4 Tone-Map Matcher mode: 0 = Auto (1D LUT -> 3D Bilateral Grid), 1 = 1D LUT only, 2 = 3D Bilateral Grid
+		std::atomic<int32_t> toneMapMatchMode = 0;
 		// Debug overlay (not saved): paints detected Tier 2 / Tier 3 HUD mask pixels magenta
 		std::atomic_bool hudDebugMagenta = false;
+		// Debug split-screen comparison (not saved; 0% overhead when off): left = original real frame, right = generated/HUD-protected output
+		std::atomic_bool hudSplitCompare = false;
+		std::atomic<float> hudSplitPos = 0.5f;
+		// Enables runtime file logging (dlssg_to_xefg_intel_is_better.log); turn OFF for zero disk I/O
+		std::atomic_bool logging = true;
+		// Opt-in DX12 DRED crash diagnostics (AutoBreadcrumbs + PageFault on TDR; 0% overhead when OFF; requires game restart)
+		std::atomic_bool forceDred = false;
+		// Debug per-stage GPU time profiler (not saved; 0% overhead when off)
+		std::atomic_bool gpuProfiler = false;
 		// Ignores game-supplied DLSSG.Reset (fixes games that spam Reset=1 every frame; internal safety resets still apply)
 		std::atomic_bool ignoreGameReset = false;
 		// Not saved
@@ -59,6 +70,15 @@ namespace Plugin
 	};
 
 	inline Options options;
+
+	enum class ActiveApi : int32_t
+	{
+		Unknown = 0,
+		D3D12 = 1,
+		Vulkan = 2,
+	};
+
+	inline std::atomic<ActiveApi> activeApi{ ActiveApi::Unknown };
 
 	enum class CudaSupport : int32_t
 	{
@@ -113,6 +133,11 @@ namespace Plugin
 		bool vramGuarded = false;     // Adaptive VRAM guard actively clamping MFG multiplier to 2x
 		uint32_t vramUsageMiB = 0;    // local VRAM usage sampled by Adaptive VRAM guard
 		uint32_t vramBudgetMiB = 0;   // local VRAM budget sampled by Adaptive VRAM guard
+		int32_t toneMapActiveMode = 0; // 0 = Off, 1 = 1D LUT, 2 = 3D Bilateral Grid
+		bool profilerActive = false;   // true when opt-in GPU profiler has valid readings
+		float totalGpuMs = 0.0f;       // smoothed total Evaluate GPU time (ms)
+		float interpGpuMs = 0.0f;      // smoothed XeFG interpolation GPU time (ms)
+		float hudGpuMs = 0.0f;         // smoothed HUD / Tone-Map Match GPU time (ms)
 	};
 
 	void Report(const Status& status);

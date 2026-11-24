@@ -574,6 +574,33 @@ int main()
 		CHECK(RecommendSwapchainImageCount(10u, 2u, 16u, 8u) == 10u);
 	}
 
+	// Sustained FPS drop (120 FPS menu -> 60 FPS gameplay): 1st slow frame drains as hitch,
+	// 2nd consecutive slow frame adapts EMA immediately instead of staying trapped in isHitch.
+	{
+		VulkanPolicy::PresentPacer p{};
+		uint64_t t = 1'000'000'000ull;
+		for (int i = 0; i < 6; ++i)
+		{
+			p.OnBatchStart(t, 3u);
+			for (uint32_t k = 0; k < 4u; ++k)
+				p.ComputePresentWaitNs(t + k * 2'000'000ull, false);
+			t += 8'333'333ull; // 120 FPS
+		}
+		CHECK(p.emaBatchNs >= 8'000'000ull && p.emaBatchNs <= 8'700'000ull);
+		// 1st slow frame (16.67 ms): single hitch -> drains without inflating EMA
+		t += 8'333'333ull; // delta = 16.67 ms
+		p.OnBatchStart(t, 3u);
+		for (uint32_t k = 0; k < 4u; ++k)
+			p.ComputePresentWaitNs(t + k * 2'000'000ull, false);
+		CHECK(p.skipBatch);
+		CHECK(p.emaBatchNs < 10'000'000ull);
+		// 2nd consecutive slow frame (16.67 ms): real regime shift -> adopts 16.67 ms & resumes pacing
+		t += 16'666'667ull;
+		p.OnBatchStart(t, 3u);
+		CHECK(!p.skipBatch);
+		CHECK(p.emaBatchNs >= 16'000'000ull && p.emaBatchNs <= 17'000'000ull);
+	}
+
 	std::printf("%d checks, %d failed\n", checks, failures);
 	return failures ? 1 : 0;
 }

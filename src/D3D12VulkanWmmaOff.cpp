@@ -10,14 +10,16 @@ namespace D3D12VulkanWmma
 	}
 
 	bool Active() noexcept { return false; }
+	bool ContextReady() noexcept { return false; }
 	bool WantsSharedTextures() noexcept { return false; }
 	bool CanShareTexture(const D3D12_RESOURCE_DESC&) noexcept { return false; }
 	bool EnsureContext(const ContextSettings&) noexcept { return false; }
 	void WarmupContextAsync(const ContextSettings&) noexcept {}
 	void ResetContext() noexcept {}
+	bool TryRecoverAsync(const ContextSettings&) noexcept { return false; }
 
 	bool ScheduleBatch(ID3D12GraphicsCommandList*, const ContextSettings&, const FrameInputs&, const FrameInputs&,
-		ID3D12Resource* const*, const xefgd_2d_t*, uint32_t, ID3D12Resource*, D3D12_RESOURCE_STATES) noexcept
+		ID3D12Resource* const*, const xefgd_2d_t*, uint32_t, ID3D12Resource*, D3D12_RESOURCE_STATES, bool) noexcept
 	{
 		return false;
 	}

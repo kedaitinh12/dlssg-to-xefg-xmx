@@ -75,6 +75,8 @@ private:
 		bool directOutput = false;
 		// Tracks whether cached frame/output copies were allocated with D3D12_HEAP_FLAG_SHARED for Vulkan WMMA
 		bool sharedTexturesMode = false;
+		// Set if D3D12 XeFG::Execute fallback wrote to shared textures during async Vulkan bridge init
+		bool wmmaFallbackTouchedShared = false;
 
 		// Camera Cut & Teleport Detector + GhostBuster state (prevents smearing/ghosting on cuts, snaps, FOV jumps)
 		float prevCameraPos[3]{};
@@ -82,15 +84,26 @@ private:
 		float prevCameraFov = 0.0f;
 		bool hasPrevCamera = false;
 		bool hasPrevFov = false;
+		// Cooldown window (kQuiet) preventing back-to-back synthetic CameraCut/GhostBuster resets on flashes/shake
+		uint32_t syntheticResetQuietFrames = 0;
 
 		// UI / HUD-less transition cooldown (DLSS Enabler XeFG: skip 10 real frames on state toggle)
 		uint32_t uiTransitionCooldown = 0;
 		bool hasPrevRawHudless = false;
 		bool prevRawHudless = false;
 
-		// Stall circuit breaker (dlssg-0.4.2): bypass XeFG temporarily after 3 consecutive Execute failures
+		// Long-pause / Alt+Tab history reset (NSS-OFG): resets history if real-frame gap exceeds 500 ms
+		uint64_t lastRealFrameTickMs = 0;
+		// Throttles Tier 1 Native HudDiffGuardCS to 1/16 real frames after initial 8-frame probe (>93% less GPU cost)
+		uint64_t hudDiffGuardFrameCounter = 0;
+
+		// Stall circuit breaker & device-loss latch (f5low-fg ROBUSTNESS):
+		// - Real D3D12 DEVICE_REMOVED latches pass-through permanently until feature/device recreation.
+		// - Transient stalls recover only after >= 8 evaluations AND >= 300 ms since the last failure.
 		uint32_t consecutiveExecuteFailures = 0;
 		uint32_t stallCooldownEvaluations = 0;
+		uint64_t stallCooldownUntilMs = 0;
+		bool deviceLostLatched = false;
 
 		~Context();
 	};
@@ -106,12 +119,14 @@ private:
 	bool PollVramGuard() noexcept;
 	void CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const NGXParameter& params);
 	InterpolateResult Interpolate(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* output,
-		D3D12_RESOURCE_DESC outputDesc, uint32_t frameIndex, uint32_t frameCount, float interpolationTime = 0.0f);
+		D3D12_RESOURCE_DESC outputDesc, uint32_t frameIndex, uint32_t frameCount,
+		float interpolationTime = 0.0f, bool callerRecording = false);
 
 	ComPtr<ID3D12Device> device;
 	Settings settings;
 	std::shared_ptr<Context> context;
 	bool createFailed = false; // retried when the settings change
+	bool portedModelInitFailed = false; // auto-fallback to DP4a model 18 if ported model 16 fails XeFG::Init (e.g. VKD3D-Proton)
 
 	// The menu path last seen, and the route launches since the context or the path changed. A few generated frames
 	// later they say whether the selected path really runs on tensor cores
@@ -134,4 +149,36 @@ private:
 	bool hasLoggedHudTier = false;
 	uint32_t vramUsageMiB = 0;
 	uint32_t vramBudgetMiB = 0;
+
+	// Opt-in Per-Stage GPU Time Profiler (lazy-allocated ONLY when Plugin::options.gpuProfiler is enabled; 0% overhead when off)
+	struct GpuProfiler
+	{
+		static constexpr uint32_t kSlots = 2;
+		static constexpr uint32_t kQueriesPerSlot = 6; // [0]=start, [1]=afterCapture, [2]=beforeInterp, [3]=afterInterp, [4]=beforePostHud, [5]=end
+		ComPtr<ID3D12QueryHeap> queryHeap;
+		ComPtr<ID3D12Resource> readback;
+		const uint64_t* mapped = nullptr;
+		uint64_t freqHz = 0;
+		uint32_t slot = 0;
+		uint32_t framesRecorded = 0;
+		bool slotValid[kSlots]{};
+		bool initAttempted = false;
+		bool ready = false;
+		bool hasReading = false;
+		float totalMs = 0.0f;
+		float interpMs = 0.0f;
+		float hudMs = 0.0f;
+
+		~GpuProfiler()
+		{
+			if (readback && mapped)
+				readback->Unmap(0, nullptr);
+		}
+
+		bool EnsureReady(ID3D12Device* dev) noexcept;
+		void PollAndAdvance() noexcept;
+		void Mark(ID3D12GraphicsCommandList* cmdList, uint32_t idx) noexcept;
+		void ResolveSlot(ID3D12GraphicsCommandList* cmdList) noexcept;
+	};
+	GpuProfiler gpuProfiler;
 };

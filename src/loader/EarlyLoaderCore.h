@@ -26,6 +26,8 @@ namespace EarlyLoader
 		std::string fgNvngxReplacement;
 		bool hasVulkanHooks = false;
 		bool vulkanHooks = true;
+		bool hasForceDred = false;
+		bool forceDred = false;
 	};
 
 	struct CandidateSelection
@@ -182,6 +184,15 @@ namespace EarlyLoader
 				{
 					config.hasVulkanHooks = true;
 					config.vulkanHooks = parsed;
+				}
+			}
+			else if (key == "forcedred")
+			{
+				bool parsed = false;
+				if (detail::ParseIniBool(value, parsed))
+				{
+					config.hasForceDred = true;
+					config.forceDred = parsed;
 				}
 			}
 		}

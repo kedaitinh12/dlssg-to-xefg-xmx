@@ -158,6 +158,17 @@ namespace
 		VkPipeline hudTmPipelines[4] = {};      // 0=clear, 1=accumulate, 2=median, 3=fill
 		VkPipeline hudTmApplyPipelines[2] = {}; // 0=rgba8, 1=rgb10a2
 		bool hudToneMatchReady = false;
+		VkPipeline hudBgPipelines[3] = {};      // 0=clear, 1=accum, 2=solve
+		VkPipeline hudBgApplyPipelines[2] = {}; // 0=rgba8, 1=rgb10a2
+		bool hudBgReady = false;
+
+		// Optional per-stage GPU timestamp profiler (zero overhead when off)
+		PFN_vkCreateQueryPool vkCreateQueryPool = nullptr;
+		PFN_vkDestroyQueryPool vkDestroyQueryPool = nullptr;
+		PFN_vkCmdResetQueryPool vkCmdResetQueryPool = nullptr;
+		PFN_vkCmdWriteTimestamp vkCmdWriteTimestamp = nullptr;
+		PFN_vkGetQueryPoolResults vkGetQueryPoolResults = nullptr;
+		float timestampPeriodNs = 0.0f;
 	};
 
 	// The game owns the VkDevice and destroys it before the CRT is torn down. The layer's device is kept for the life of
@@ -242,12 +253,31 @@ namespace
 		bool hudResourcesReady = false;
 		uint32_t activeBatchSlot = 0;
 
-		// Tier 3 Hybrid Tone-Map Matcher lazy buffers (0 VRAM allocated unless Tier 3 Tone-Map activates)
+		// Tier 3/4 Tone-Map Matcher lazy buffers (1D LUT + 3D Bilateral Grid; 0 VRAM allocated unless active)
 		ComPtr<ID3D12Resource> hudTmHistogram;
 		VkBuffer hudTmHistogramBuf = VK_NULL_HANDLE;
 		ComPtr<ID3D12Resource> hudTmLut;
 		VkBuffer hudTmLutBuf = VK_NULL_HANDLE;
 		bool hudTmResourcesReady = false;
+		ComPtr<ID3D12Resource> hudBgStats;
+		VkBuffer hudBgStatsBuf = VK_NULL_HANDLE;
+		ComPtr<ID3D12Resource> hudBgModel;
+		VkBuffer hudBgModelBuf = VK_NULL_HANDLE;
+		uint32_t hudBgCellsX = 0, hudBgCellsY = 0;
+		uint32_t hudBgFitCountdown = 0;
+		bool hudBgResourcesReady = false;
+		bool hudBgHasModel = false;
+		int32_t activeToneMapMode = 0; // 0=off, 1=1D LUT, 2=3D Bilateral Grid
+
+		// Optional per-stage GPU profiler (4-slot non-blocking ring, 4 timestamps per slot; lazy-allocated only when ON)
+		static constexpr uint32_t kProfRing = 4u;
+		VkQueryPool profPool = VK_NULL_HANDLE;
+		uint32_t profSlot = 0;
+		bool profWritten[kProfRing]{};
+		bool profHasReading = false;
+		float profTotalMs = 0.0f;
+		float profInterpMs = 0.0f;
+		float profHudMs = 0.0f;
 
 		// Adaptive VRAM Guard (DXGI budget via physical device LUID, identical hysteresis to DX12)
 		ComPtr<IDXGIAdapter3> vramAdapter;
@@ -735,6 +765,16 @@ namespace
 			d.hudToneMatchReady = true;
 			Log::Info("Vulkan Tier 3 Hybrid Tone-Map Matcher pipelines ready (6/6 SPIR-V)");
 		}
+
+		if (loadTmPipe("tonemap_bg_clear.spv", d.hudBgPipelines[0]) &&
+			loadTmPipe("tonemap_bg_accum.spv", d.hudBgPipelines[1]) &&
+			loadTmPipe("tonemap_bg_solve.spv", d.hudBgPipelines[2]) &&
+			loadTmPipe("tonemap_bg_apply_rgba8.spv", d.hudBgApplyPipelines[0]) &&
+			loadTmPipe("tonemap_bg_apply_rgb10a2.spv", d.hudBgApplyPipelines[1]))
+		{
+			d.hudBgReady = true;
+			Log::Info("Vulkan Tier 4 3D Bilateral-Grid Tone-Map Matcher pipelines ready (5/5 SPIR-V)");
+		}
 	}
 
 	bool IsVkToneMapSupported(DXGI_FORMAT bbFormat) noexcept
@@ -956,6 +996,20 @@ namespace
 		{
 			d.reason = "device_functions";
 			return false;
+		}
+
+		// Optional timestamp query support for per-stage GPU profiler (never blocks init if unavailable)
+		d.vkCreateQueryPool = reinterpret_cast<PFN_vkCreateQueryPool>(gdpa(d.device, "vkCreateQueryPool"));
+		d.vkDestroyQueryPool = reinterpret_cast<PFN_vkDestroyQueryPool>(gdpa(d.device, "vkDestroyQueryPool"));
+		d.vkCmdResetQueryPool = reinterpret_cast<PFN_vkCmdResetQueryPool>(gdpa(d.device, "vkCmdResetQueryPool"));
+		d.vkCmdWriteTimestamp = reinterpret_cast<PFN_vkCmdWriteTimestamp>(gdpa(d.device, "vkCmdWriteTimestamp"));
+		d.vkGetQueryPoolResults = reinterpret_cast<PFN_vkGetQueryPoolResults>(gdpa(d.device, "vkGetQueryPoolResults"));
+		if (const auto getProps2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+			d.gipa(d.instance, "vkGetPhysicalDeviceProperties2")))
+		{
+			VkPhysicalDeviceProperties2 p2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+			getProps2(d.physical, &p2);
+			d.timestampPeriodNs = p2.properties.limits.timestampPeriod;
 		}
 
 		if (!VulkanPrograms::Installed().Usable())
@@ -1529,11 +1583,126 @@ namespace
 		return true;
 	}
 
+	bool EnsureVkBilateralResources(const Device& d, Feature& f) noexcept
+	{
+		if (f.hudBgResourcesReady)
+			return true;
+		if (!d.hudBgReady || !EnsureVkToneMapResources(d, f) || !d.d3d)
+			return false;
+
+		constexpr uint32_t kCell = 128u, kBins = 8u;
+		const uint32_t cellsX = std::max(1u, (f.width + kCell - 1u) / kCell);
+		const uint32_t cellsY = std::max(1u, (f.height + kCell - 1u) / kCell);
+		const uint32_t totalCells = cellsX * cellsY * kBins;
+		const uint64_t statsBytes = uint64_t(totalCells) * 22ull * 4ull;
+		const uint64_t modelBytes = uint64_t(totalCells) * 12ull * 4ull;
+
+		ID3D12Device* d3d = d.d3d.Get();
+		D3D12_HEAP_PROPERTIES defaultHeap{ D3D12_HEAP_TYPE_DEFAULT };
+		auto makeBuf = [&](uint64_t bytes, ComPtr<ID3D12Resource>& res, VkBuffer& vkBuf) -> bool {
+			D3D12_RESOURCE_DESC bd{};
+			bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+			bd.Width = bytes;
+			bd.Height = 1;
+			bd.DepthOrArraySize = 1;
+			bd.MipLevels = 1;
+			bd.SampleDesc.Count = 1;
+			bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+			bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+			if (FAILED(d3d->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &bd,
+				D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&res))))
+				return false;
+			vkBuf = xvk::BufferOf(res.Get());
+			return vkBuf != VK_NULL_HANDLE;
+		};
+
+		if (!makeBuf(statsBytes, f.hudBgStats, f.hudBgStatsBuf) ||
+			!makeBuf(modelBytes, f.hudBgModel, f.hudBgModelBuf))
+			return false;
+
+		f.hudBgCellsX = cellsX;
+		f.hudBgCellsY = cellsY;
+		f.hudBgHasModel = false;
+		f.hudBgFitCountdown = 0;
+		f.hudBgResourcesReady = true;
+		Log::Info("Vulkan: lazy-allocated 3D Bilateral-Grid Tone-Map Matcher ({}x{}x{} grid)", cellsX, cellsY, kBins);
+		return true;
+	}
+
 	void RecordVkToneMapMatch(const Device& d, Feature& f, VkCommandBuffer command, Slot& slot,
 		VkImageView rawHudlessView, VkImageView rawBackbufferView) noexcept
 	{
 		if (!EnsureVkToneMapResources(d, f) || !rawHudlessView || !rawBackbufferView || !slot.matchedHudlessView)
 			return;
+
+		const int32_t tmPref = std::clamp(Plugin::options.toneMapMatchMode.load(std::memory_order_relaxed), 0, 2);
+		const bool want3D = tmPref == 2;
+		if (want3D && EnsureVkBilateralResources(d, f))
+		{
+			struct VkBilateralPushConstants {
+				uint32_t width, height;
+				uint32_t cellsX, cellsY;
+				uint32_t cell, bins;
+				float lambda;
+				uint32_t totalStatsUints;
+			};
+			constexpr uint32_t kCell = 128u, kBins = 8u, kStride = 4u, kFitInterval = 4u;
+			const uint32_t totalCells = f.hudBgCellsX * f.hudBgCellsY * kBins;
+			const uint32_t totalStatsUints = totalCells * 22u;
+			const VkBilateralPushConstants pc{ f.width, f.height, f.hudBgCellsX, f.hudBgCellsY, kCell, kBins, 1e-3f, totalStatsUints };
+			const int fmtIdx = (f.format == DXGI_FORMAT_R10G10B10A2_UNORM) ? 1 : 0;
+
+			VkDescriptorImageInfo img0{ d.sampler, rawHudlessView, GameLayout };
+			VkDescriptorImageInfo img1{ d.sampler, rawBackbufferView, GameLayout };
+			VkDescriptorImageInfo img2{ VK_NULL_HANDLE, slot.matchedHudlessView, VK_IMAGE_LAYOUT_GENERAL };
+			VkDescriptorBufferInfo buf3{ f.hudBgStatsBuf, 0, VK_WHOLE_SIZE };
+			VkDescriptorBufferInfo buf4{ f.hudBgModelBuf, 0, VK_WHOLE_SIZE };
+			VkWriteDescriptorSet writes[5]{};
+			writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &img0 };
+			writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &img1 };
+			writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &img2 };
+			writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &buf3 };
+			writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &buf4 };
+
+			d.vkCmdPushDescriptorSetKHR(command, VK_PIPELINE_BIND_POINT_COMPUTE, d.hudTmPipelineLayout, 0, 5, writes);
+			d.vkCmdPushConstants(command, d.hudTmPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+
+			const bool runFit = !f.hudBgHasModel || (f.hudBgFitCountdown == 0u);
+			if (runFit)
+			{
+				d.vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, d.hudBgPipelines[0]);
+				d.vkCmdDispatch(command, (totalStatsUints + 63u) / 64u, 1u, 1u);
+				StageBarrier(d, command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+
+				d.vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, d.hudBgPipelines[1]);
+				const uint32_t sampleW = (f.width + kStride - 1u) / kStride;
+				const uint32_t sampleH = (f.height + kStride - 1u) / kStride;
+				d.vkCmdDispatch(command, (sampleW + 7u) / 8u, (sampleH + 7u) / 8u, 1u);
+				StageBarrier(d, command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+				d.vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, d.hudBgPipelines[2]);
+				d.vkCmdDispatch(command, (totalCells + 63u) / 64u, 1u, 1u);
+				StageBarrier(d, command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+				f.hudBgHasModel = true;
+				f.hudBgFitCountdown = kFitInterval - 1u;
+			}
+			else
+			{
+				--f.hudBgFitCountdown;
+			}
+
+			d.vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, d.hudBgApplyPipelines[fmtIdx]);
+			d.vkCmdDispatch(command, (f.width + 7u) / 8u, (f.height + 7u) / 8u, 1u);
+			StageBarrier(d, command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+			f.activeToneMapMode = 2;
+			return;
+		}
+		f.activeToneMapMode = 1;
 
 		struct VkToneMatchPushConstants {
 			uint32_t width, height;
@@ -1645,8 +1814,60 @@ namespace
 			return false;
 		}
 
+		const bool profWanted = Plugin::options.gpuProfiler.load(std::memory_order_relaxed) &&
+			d.vkCreateQueryPool && d.vkCmdResetQueryPool && d.vkCmdWriteTimestamp && d.vkGetQueryPoolResults &&
+			d.timestampPeriodNs > 0.0f;
+		bool profActive = false;
+		uint32_t profBase = 0;
+		if (profWanted)
+		{
+			if (!f.profPool)
+			{
+				VkQueryPoolCreateInfo qci{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+				qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+				qci.queryCount = Feature::kProfRing * 4u;
+				(void)d.vkCreateQueryPool(d.device, &qci, nullptr, &f.profPool);
+			}
+			if (f.profPool)
+			{
+				const uint32_t readSlot = f.profSlot % Feature::kProfRing;
+				if (f.profWritten[readSlot])
+				{
+					uint64_t ts[4]{};
+					if (d.vkGetQueryPoolResults(d.device, f.profPool, readSlot * 4u, 4u, sizeof(ts), ts, sizeof(uint64_t),
+						VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[3] >= ts[0])
+					{
+						const float scaleMs = d.timestampPeriodNs * 1e-6f;
+						const float tot = static_cast<float>(ts[3] - ts[0]) * scaleMs;
+						const float interp = (ts[2] >= ts[1]) ? static_cast<float>(ts[2] - ts[1]) * scaleMs : 0.0f;
+						const float hud = (ts[3] >= ts[2]) ? static_cast<float>(ts[3] - ts[2]) * scaleMs : 0.0f;
+						if (!f.profHasReading)
+						{
+							f.profTotalMs = tot;
+							f.profInterpMs = interp;
+							f.profHudMs = hud;
+							f.profHasReading = true;
+						}
+						else
+						{
+							f.profTotalMs = f.profTotalMs * 0.85f + tot * 0.15f;
+							f.profInterpMs = f.profInterpMs * 0.85f + interp * 0.15f;
+							f.profHudMs = f.profHudMs * 0.85f + hud * 0.15f;
+						}
+					}
+				}
+				profBase = readSlot * 4u;
+				d.vkCmdResetQueryPool(command, f.profPool, profBase, 4u);
+				d.vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, f.profPool, profBase + 0u);
+				d.vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, f.profPool, profBase + 1u);
+				profActive = true;
+			}
+		}
+
 		const xefgd_result_t result = CallXeFG("Execute", [&] { return XeFG::Execute(f.context, f.list.Get(), f.exec); });
 		f.list->Close();
+		if (profActive)
+			d.vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, f.profPool, profBase + 2u);
 		StageBarrier(d, command,
 			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
 			VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -1753,6 +1974,46 @@ namespace
 			}
 		}
 
+		if (profActive)
+		{
+			d.vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, f.profPool, profBase + 3u);
+			f.profWritten[f.profSlot % Feature::kProfRing] = true;
+			++f.profSlot;
+		}
+
+		// Debug split-screen comparison on Vulkan (0% overhead when OFF): left = real backbuffer, right = generated/HUD output.
+		if (Plugin::options.hudSplitCompare.load(std::memory_order_relaxed) && f.width > 1u && f.height > 0u)
+		{
+			const Slot& curSlot = f.slots[f.activeBatchSlot];
+			const VkImage bbImg = curSlot.backbuffer ? xvk::ImageOf(curSlot.backbuffer.Get()) : VK_NULL_HANDLE;
+			if (bbImg)
+			{
+				const float pos = std::clamp(Plugin::options.hudSplitPos.load(std::memory_order_relaxed), 0.05f, 0.95f);
+				const uint32_t splitX = std::clamp(static_cast<uint32_t>(pos * static_cast<float>(f.width)), 1u, f.width - 1u);
+				StageBarrier(d, command,
+					VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+					VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+					VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+				VkImageCopy region{};
+				region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+				region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+				region.extent = { splitX, f.height, 1 };
+				for (uint32_t k = 0; k < range.count; ++k)
+				{
+					const uint32_t outIdx = range.first + k;
+					if (outIdx >= f.outputs.size() || !f.outputs[outIdx])
+						continue;
+					const VkImage outImg = xvk::ImageOf(f.outputs[outIdx].Get());
+					if (outImg)
+						d.vkCmdCopyImage(command, bbImg, VK_IMAGE_LAYOUT_GENERAL, outImg, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+				}
+				StageBarrier(d, command,
+					VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+					VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+					VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+			}
+		}
+
 		f.generatedThrough = range.through;
 		return true;
 	}
@@ -1770,7 +2031,7 @@ namespace
 		const NgxResource* rawGameHudless = ImageParameter(parameters, "DLSSG.HUDLess");
 		const NgxResource* rawGameUi = ImageParameter(parameters, "DLSSG.UI");
 		const auto vkHudMode = static_cast<HudTier::Mode>(
-			std::clamp(Plugin::options.hudTierMode.load(std::memory_order_relaxed), 0, 3));
+			std::clamp(Plugin::options.hudTierMode.load(std::memory_order_relaxed), 0, 4));
 		if (Plugin::options.hudlessUi)
 		{
 			in.hudless = rawGameHudless;
@@ -2438,10 +2699,13 @@ namespace
 				didExecute = f.batchReady;
 				f.batches++;
 
+				const bool profOn = Plugin::options.gpuProfiler.load(std::memory_order_relaxed) && f.profHasReading;
+				const int32_t tmActive = (f.hudDecision.runToneMapMatch && f.hudTmResourcesReady) ? f.activeToneMapMode : 0;
 				Plugin::Report({ f.width, f.height, effectiveCount, f.hudDecision.activeTier != HudTier::ActiveTier::Interpolated,
 					static_cast<int32_t>(f.hudDecision.activeTier), NetworkOf(f.model),
 					f.context == nullptr, f.format == DXGI_FORMAT_R16G16B16A16_FLOAT,
-					count, vramClamped, f.vramUsageMiB, f.vramBudgetMiB });
+					count, vramClamped, f.vramUsageMiB, f.vramBudgetMiB,
+					tmActive, profOn, f.profTotalMs, f.profInterpMs, f.profHudMs });
 
 				if (!f.batchReady)
 				{
@@ -2584,6 +2848,12 @@ namespace
 			// multiplier toggles on Vulkan.
 			if (gDevice.d3d)
 				xvk::WaitRecordedIdle(gDevice.d3d.Get(), 150'000'000ull);
+
+			if (f->profPool && gDevice.device && gDevice.vkDestroyQueryPool)
+			{
+				gDevice.vkDestroyQueryPool(gDevice.device, f->profPool, nullptr);
+				f->profPool = VK_NULL_HANDLE;
+			}
 
 			if (f->context)
 				CallXeFG("Destroy", [&] { return XeFG::Destroy(f->context); });

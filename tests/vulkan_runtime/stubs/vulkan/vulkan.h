@@ -477,6 +477,7 @@ typedef struct VkPhysicalDeviceFeatures2
 typedef struct VkPhysicalDeviceLimits
 {
 	uint32_t maxImageDimension1D; // the rest of the real structure is not used
+	float timestampPeriod;
 } VkPhysicalDeviceLimits;
 
 typedef struct VkPhysicalDeviceSparseProperties
@@ -981,6 +982,28 @@ typedef void(VKAPI_PTR* PFN_vkCmdCopyBuffer)(VkCommandBuffer commandBuffer, VkBu
 	VkBuffer dstBuffer, uint32_t regionCount, const VkBufferCopy* pRegions);
 typedef void(VKAPI_PTR* PFN_vkCmdFillBuffer)(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
 	VkDeviceSize dstOffset, VkDeviceSize size, uint32_t data);
+typedef struct VkQueryPool_T* VkQueryPool;
+typedef uint32_t VkQueryType;
+typedef uint32_t VkQueryResultFlags;
+typedef uint32_t VkQueryPoolCreateFlags;
+constexpr VkQueryType VK_QUERY_TYPE_TIMESTAMP = 2;
+constexpr VkQueryResultFlags VK_QUERY_RESULT_64_BIT = 0x00000001;
+constexpr VkStructureType VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO = static_cast<VkStructureType>(11);
+constexpr VkPipelineStageFlagBits VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT = static_cast<VkPipelineStageFlagBits>(0x00002000);
+typedef struct VkQueryPoolCreateInfo {
+    VkStructureType sType;
+    const void* pNext;
+    VkQueryPoolCreateFlags flags;
+    VkQueryType queryType;
+    uint32_t queryCount;
+    uint32_t pipelineStatistics;
+} VkQueryPoolCreateInfo;
+typedef VkResult(VKAPI_PTR* PFN_vkCreateQueryPool)(VkDevice, const VkQueryPoolCreateInfo*, const VkAllocationCallbacks*, VkQueryPool*);
+typedef void(VKAPI_PTR* PFN_vkDestroyQueryPool)(VkDevice, VkQueryPool, const VkAllocationCallbacks*);
+typedef void(VKAPI_PTR* PFN_vkCmdResetQueryPool)(VkCommandBuffer, VkQueryPool, uint32_t, uint32_t);
+typedef void(VKAPI_PTR* PFN_vkCmdWriteTimestamp)(VkCommandBuffer, VkPipelineStageFlagBits, VkQueryPool, uint32_t);
+typedef VkResult(VKAPI_PTR* PFN_vkGetQueryPoolResults)(VkDevice, VkQueryPool, uint32_t, uint32_t, size_t, void*, VkDeviceSize, VkQueryResultFlags);
+
 typedef void(VKAPI_PTR* PFN_vkCmdCopyImage)(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout,
 	VkImage dstImage, VkImageLayout dstImageLayout, uint32_t regionCount, const VkImageCopy* pRegions);
 typedef void(VKAPI_PTR* PFN_vkCmdPipelineBarrier)(VkCommandBuffer commandBuffer, VkPipelineStageFlags srcStageMask,

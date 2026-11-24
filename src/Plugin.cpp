@@ -110,6 +110,21 @@ namespace
 		api->ItemTooltip(text);
 	}
 
+	struct ScopedDisable
+	{
+		bool active = false;
+		explicit ScopedDisable(bool disabled) noexcept : active(disabled && OPTI_API_HAS(api, Disabled))
+		{
+			if (active)
+				api->Disabled(true);
+		}
+		~ScopedDisable() noexcept
+		{
+			if (active)
+				api->Disabled(false);
+		}
+	};
+
 	bool initialVkWmmaBridge = true;
 	bool initialVkWmmaCaptured = false;
 
@@ -124,11 +139,14 @@ namespace
 
 	NoticeKind lastNoticeKind = NoticeKind::None;
 	std::string lastNoticeFeature;
+	bool unsavedSettings = false;
 
 	void NotifySettingChanged(NoticeKind kind, const char* featureName)
 	{
 		lastNoticeKind = kind;
 		lastNoticeFeature = featureName ? featureName : "";
+		if (kind == NoticeKind::LiveSaved || kind == NoticeKind::RestartGame)
+			unsavedSettings = true;
 	}
 
 	const char* NetworkName(Plugin::Network network)
@@ -177,7 +195,8 @@ namespace
 		}
 		else if (active && current.failed)
 		{
-			Red("XeFG couldn't start");
+			Red("XeFG couldn't start (duplicating real frames)");
+			api->Text("No interpolation active; FPS overlay counts duplicated real frames. Check log for details");
 			logTooltip();
 		}
 		else if (active)
@@ -207,7 +226,17 @@ namespace
 			const char* hudLabel = current.hudTier > 0
 				? HudTier::ActiveTierShortName(static_cast<HudTier::ActiveTier>(current.hudTier))
 				: (current.hudless ? "HUD T1: Native" : "UI interpolated");
-			api->Text(std::format("{}x{} \xC2\xB7 {}", current.width, current.height, hudLabel).c_str());
+			auto hudLine = std::format("{}x{} \xC2\xB7 {}", current.width, current.height, hudLabel);
+			if (current.toneMapActiveMode == 1)
+				hudLine += " \xC2\xB7 Tone-Map: 1D LUT";
+			else if (current.toneMapActiveMode == 2)
+				hudLine += " \xC2\xB7 Tone-Map: 3D Bilateral";
+			api->Text(hudLine.c_str());
+			if (current.profilerActive)
+			{
+				api->Text(std::format("GPU: {:.2f} ms total (Interp {:.2f} ms \xC2\xB7 HUD {:.2f} ms)",
+					current.totalGpuMs, current.interpGpuMs, current.hudGpuMs).c_str());
+			}
 		}
 		else
 		{
@@ -433,15 +462,19 @@ namespace
 
 		bool hooksOn = host.enabled;
 
-		if (api->Checkbox("Vulkan hooks", &hooksOn))
+		const bool vkHooksDisabled = Plugin::activeApi.load(std::memory_order_acquire) == Plugin::ActiveApi::D3D12;
 		{
-			VulkanRuntime::SetHooksEnabled(hooksOn);
-			api->SetBool(self, "VulkanHooks", hooksOn);
+			ScopedDisable dis(vkHooksDisabled);
+			if (api->Checkbox("Vulkan hooks", &hooksOn))
+			{
+				VulkanRuntime::SetHooksEnabled(hooksOn);
+				api->SetBool(self, "VulkanHooks", hooksOn);
+				NotifySettingChanged(NoticeKind::RestartGame, "Vulkan hooks");
+			}
 		}
-
-		api->ItemTooltip("Off: the game's Vulkan device is left alone and Vulkan games get no frame generation. Hooks that\n"
-						 "aren't installed yet come with the next start of the game. XEFG_VULKAN_HOOKS=0 in the environment\n"
-						 "does the same. Saved as VulkanHooks in OptiScaler.ini.");
+		HelpMarker("Enables or disables Vulkan frame generation hooks (Vulkan games only).\n"
+				   "Off: leaves the game's Vulkan device untouched (no Vulkan FG).\n"
+				   "Requires clicking 'Save Settings' and restarting the game when changing.");
 	}
 
 	// A build without the Vulkan headers has no runtime of its own: Vulkan games run through MFG-Unlocker's XeMFG provider
@@ -542,6 +575,10 @@ namespace
 	{
 		api->Section("Settings");
 
+		const auto curApi = Plugin::activeApi.load(std::memory_order_acquire);
+		const bool isD3D12 = (curApi == Plugin::ActiveApi::D3D12);
+		const bool isVulkan = (curApi == Plugin::ActiveApi::Vulkan);
+
 		// Immediate per-click notifications (OptiScaler-style):
 		// - Live settings: confirm immediate change & remind to click 'Save Settings' for next launch
 		// - Game-restart settings: remind to click 'Save Settings' and restart the game (both ON and OFF)
@@ -565,7 +602,12 @@ namespace
 		}
 
 		if (showRestartGameNotice)
-			Yellow("D3D12->Vulkan WMMA bridge: click 'Save Settings' and restart the game to apply.");
+		{
+			const std::string& restartLabel = (lastNoticeKind == NoticeKind::RestartGame && !lastNoticeFeature.empty())
+				? lastNoticeFeature
+				: std::string("Hardware WMMA acceleration (D3D12)");
+			Yellow(std::format("{}: click 'Save Settings' and restart the game to apply.", restartLabel).c_str());
+		}
 		if (pcRestartNeeded)
 			Yellow("AMD RDNA 4 Flip Meter: updated — restart your PC (Windows) to activate.");
 
@@ -612,10 +654,10 @@ namespace
 				   "Turn OFF only if FPS feels stuck or the HUD looks glitched.");
 
 		static const char* const HudTierNames[] = {
-			"Auto (3-Tier)", "Tier 1 (Native HUDless)", "Tier 2 (HUD-Diff Composite)", "Tier 3 (Hybrid: Tone-Match + Static)"
+			"Auto (3-Tier)", "Tier 1 (Native HUDless)", "Tier 2 (HUD-Diff Composite)", "Tier 3 (Hybrid: Tone-Match + Static)", "Off (Pure XeFG / Max FPS)"
 		};
-		int32_t hudTierMode = std::clamp(Plugin::options.hudTierMode.load(), 0, 3);
-		if (api->Combo("HUD protection tier", &hudTierMode, HudTierNames, 4, nullptr))
+		int32_t hudTierMode = std::clamp(Plugin::options.hudTierMode.load(), 0, 4);
+		if (api->Combo("HUD protection tier", &hudTierMode, HudTierNames, 5, nullptr))
 		{
 			Plugin::options.hudTierMode = hudTierMode;
 			api->SetInt(self, "HudTierMode", hudTierMode);
@@ -627,7 +669,9 @@ namespace
 				   "- Tier 1: Uses only the game's built-in HUD data.\n"
 				   "- Tier 2: Separates HUD manually (helps if Tier 1 flickers).\n"
 				   "- Tier 3 (Hybrid): Combines Tone-Map Matching (fixes HDR/dynamic UI)\n"
-				   "  with Static Mask (protects fixed crosshairs & text) on DX12 & Vulkan.");
+				   "  with Static Mask (protects fixed crosshairs & text) on DX12 & Vulkan.\n"
+				   "- Off (Pure XeFG / Max FPS): Disables all extra HUD compute passes\n"
+				   "  for maximum DX12/Vulkan FPS and lowest frametime overhead.");
 
 		bool hudDebug = Plugin::options.hudDebugMagenta;
 		if (api->Checkbox("HUD mask debug (magenta)", &hudDebug))
@@ -662,22 +706,28 @@ namespace
 
 		bool autoVrr = Plugin::options.autoVrrPacing;
 
-		if (api->Checkbox("Auto VRR pacing (Hz - 3)", &autoVrr))
 		{
-			Plugin::options.autoVrrPacing = autoVrr;
-			api->SetBool(self, "AutoVrrPacing", autoVrr);
-			NotifySettingChanged(NoticeKind::LiveSaved, "Auto VRR pacing");
+			ScopedDisable dis(isD3D12);
+			if (api->Checkbox("Auto VRR pacing (Hz - 3)", &autoVrr))
+			{
+				Plugin::options.autoVrrPacing = autoVrr;
+				api->SetBool(self, "AutoVrrPacing", autoVrr);
+				NotifySettingChanged(NoticeKind::LiveSaved, "Auto VRR pacing");
+			}
 		}
 		HelpMarker("Keeps Vulkan frame pacing just under your monitor refresh rate (Hz - 3)\n"
 				   "so FreeSync / G-Sync stays smooth without V-Sync input lag.");
 
 		bool vkWmmaBridge = Plugin::options.d3d12VulkanWmmaBridge;
 
-		if (api->Checkbox("D3D12->Vulkan WMMA bridge (experimental)", &vkWmmaBridge))
 		{
-			Plugin::options.d3d12VulkanWmmaBridge = vkWmmaBridge;
-			api->SetBool(self, "D3D12VulkanWmmaBridge", vkWmmaBridge);
-			NotifySettingChanged(NoticeKind::RestartGame, "D3D12->Vulkan WMMA bridge");
+			ScopedDisable dis(isVulkan);
+			if (api->Checkbox("Hardware WMMA acceleration (D3D12)", &vkWmmaBridge))
+			{
+				Plugin::options.d3d12VulkanWmmaBridge = vkWmmaBridge;
+				api->SetBool(self, "D3D12VulkanWmmaBridge", vkWmmaBridge);
+				NotifySettingChanged(NoticeKind::RestartGame, "Hardware WMMA acceleration (D3D12)");
+			}
 		}
 		HelpMarker("Lets DirectX 12 games use faster hardware AI acceleration (WMMA) on AMD cards.\n"
 				   "Keep ON for best speed; turn OFF if a specific game freezes or crashes.\n"
@@ -696,8 +746,8 @@ namespace
 			api->SetBool(self, "UiTransitionCooldown", uiCooldown);
 			NotifySettingChanged(NoticeKind::LiveSaved, "UI transition guard");
 		}
-		HelpMarker("Briefly pauses extra frames for a split second when opening or closing\n"
-				   "in-game menus so the screen does not flash or glitch.");
+		HelpMarker("Opt-in (OFF by default for max smoothness): briefly pauses extra frames\n"
+				   "when opening or closing in-game menus if the screen flashes or glitches.");
 
 		bool ghostBuster = Plugin::options.ghostBuster;
 
@@ -707,19 +757,34 @@ namespace
 			api->SetBool(self, "GhostBuster", ghostBuster);
 			NotifySettingChanged(NoticeKind::LiveSaved, "GhostBuster anti-ghosting");
 		}
-		HelpMarker("Reduces ghostly trails behind moving objects when you turn the camera\n"
-				   "very quickly or zoom in with a weapon scope.");
+		HelpMarker("Opt-in (OFF by default for max smoothness): resets history on rapid\n"
+				   "camera snaps (>45 deg) or scope zoom to cut ghosting (skips 1 FG beat).");
 
 		bool spinSleep = Plugin::options.pacingSpinlockSleep;
 
-		if (api->Checkbox("Pacing spinlock sleep (lower CPU)", &spinSleep))
 		{
-			Plugin::options.pacingSpinlockSleep = spinSleep;
-			api->SetBool(self, "PacingSpinlockSleep", spinSleep);
-			NotifySettingChanged(NoticeKind::LiveSaved, "Pacing spinlock sleep");
+			ScopedDisable dis(isD3D12);
+			if (api->Checkbox("Pacing spinlock sleep (lower CPU)", &spinSleep))
+			{
+				Plugin::options.pacingSpinlockSleep = spinSleep;
+				api->SetBool(self, "PacingSpinlockSleep", spinSleep);
+				NotifySettingChanged(NoticeKind::LiveSaved, "Pacing spinlock sleep");
+			}
 		}
 		HelpMarker("Lets your processor rest briefly between frames on Vulkan games to reduce\n"
 				   "CPU usage and heat. Turn OFF if frame timing feels less steady.");
+
+		static const char* const ToneMapNames[] = { "Auto (1D -> 3D Bilateral)", "1D LUT (Fastest)", "3D Bilateral Grid (Local)" };
+		int32_t tmMode = std::clamp(Plugin::options.toneMapMatchMode.load(), 0, 2);
+		if (api->Combo("Tone-Map Matcher", &tmMode, ToneMapNames, 3, nullptr))
+		{
+			Plugin::options.toneMapMatchMode = tmMode;
+			api->SetInt(self, "ToneMapMatchMode", tmMode);
+			NotifySettingChanged(NoticeKind::LiveSaved, "Tone-Map Matcher");
+		}
+		HelpMarker("Matches HUD-less colors to HDR/ReShade/RenoDX backbuffers when Tier 4 activates.\n"
+				   "Auto starts with the fast 1D LUT and promotes asynchronously to 3D Bilateral Grid\n"
+				   "(amortized every 4 frames) if spatial vignette/local exposure mismatch persists.");
 
 		bool debugLines = Plugin::options.debugLines;
 
@@ -730,6 +795,61 @@ namespace
 		}
 		HelpMarker("Test mode: draws Intel's built-in indicator lines on generated frames\n"
 				   "so you can visually confirm frame generation is running.");
+
+		bool loggingOn = Plugin::options.logging;
+		if (api->Checkbox("Enable logging", &loggingOn))
+		{
+			Plugin::options.logging = loggingOn;
+			Log::SetEnabled(loggingOn);
+			api->SetBool(self, "Logging", loggingOn);
+			NotifySettingChanged(NoticeKind::LiveSaved, "Enable logging");
+		}
+		HelpMarker("Writes startup diagnostics, HUD tier switches, and crash/TDR records to\n"
+				   "dlssg_to_xefg_intel_is_better.log. Turn OFF for zero disk I/O.");
+
+		bool forceDred = Plugin::options.forceDred;
+		{
+			ScopedDisable dis(isVulkan);
+			if (api->Checkbox("Force DRED crash diagnostics (DX12)", &forceDred))
+			{
+				Plugin::options.forceDred = forceDred;
+				api->SetBool(self, "ForceDRED", forceDred);
+				NotifySettingChanged(NoticeKind::RestartGame, "Force DRED crash diagnostics");
+			}
+		}
+		HelpMarker("DirectX 12 only (opt-in; 0% overhead when OFF): enables D3D12 DRED\n"
+				   "AutoBreadcrumbs + GPU Page Fault tracking so TDR crashes log the exact\n"
+				   "unfinished command list and faulting resource. Adds slight GPU overhead\n"
+				   "while ON; click 'Save Settings' and restart the game to apply.");
+
+		bool gpuProf = Plugin::options.gpuProfiler;
+		if (api->Checkbox("Per-stage GPU profiler", &gpuProf))
+		{
+			Plugin::options.gpuProfiler = gpuProf;
+			NotifySettingChanged(NoticeKind::LiveTemp, "Per-stage GPU profiler");
+		}
+		HelpMarker("Measures real GPU time per stage (Total / Interp / HUD) in Status above.\n"
+				   "Zero overhead when OFF (allocates no query heap or readback buffer).");
+
+		bool splitCmp = Plugin::options.hudSplitCompare;
+		if (api->Checkbox("Split-screen compare", &splitCmp))
+		{
+			Plugin::options.hudSplitCompare = splitCmp;
+			NotifySettingChanged(NoticeKind::LiveTemp, "Split-screen compare");
+		}
+		HelpMarker("Debug split view: left = original real frame, right = generated/HUD-protected output.\n"
+				   "Zero overhead when OFF.");
+		if (splitCmp)
+		{
+			float splitPos = Plugin::options.hudSplitPos.load();
+			if (api->SliderFloat("Split position", &splitPos, 0.05f, 0.95f, "%.2f"))
+			{
+				Plugin::options.hudSplitPos = splitPos;
+				NotifySettingChanged(NoticeKind::LiveTemp, "Split position");
+			}
+			HelpMarker("Moves the vertical split divider between the original frame (left)\n"
+					   "and the generated/HUD-protected output (right). Applies immediately.");
+		}
 
 		// AMD RDNA 4+ Flip Meter (6x) multi-GPU registry section (shown only when an AMD RDNA 4+ GPU is detected)
 		{
@@ -766,16 +886,19 @@ namespace
 
 				if (!snap.allConfigured)
 				{
-					if (api->Button("Apply 6x FlipMeter (Admin)"))
 					{
-						if (AmdFlipMeterReg::LaunchElevatedApply(snap, false))
+						ScopedDisable dis(isVulkan);
+						if (api->Button("Apply 6x FlipMeter (Admin)"))
 						{
-							Sleep(250);
-							RefreshAmdFlipMeterState(false);
-							std::scoped_lock lock(amdFlipMeterMutex);
-							amdFlipMeterState.appliedThisSession = true;
-							amdFlipMeterState.rebootRecommended = true;
-							NotifySettingChanged(NoticeKind::RestartPc, "AMD RDNA 4 Flip Meter");
+							if (AmdFlipMeterReg::LaunchElevatedApply(snap, false))
+							{
+								Sleep(250);
+								RefreshAmdFlipMeterState(false);
+								std::scoped_lock lock(amdFlipMeterMutex);
+								amdFlipMeterState.appliedThisSession = true;
+								amdFlipMeterState.rebootRecommended = true;
+								NotifySettingChanged(NoticeKind::RestartPc, "AMD RDNA 4 Flip Meter");
+							}
 						}
 					}
 					HelpMarker("Unlocks smoother 3x-6x frame pacing in the AMD driver for your RX 9000 card.\n"
@@ -784,15 +907,18 @@ namespace
 				}
 				else
 				{
-					if (api->Button("Revert to 2x default (Admin)"))
 					{
-						if (AmdFlipMeterReg::LaunchElevatedApply(snap, true))
+						ScopedDisable dis(isVulkan);
+						if (api->Button("Revert to 2x default (Admin)"))
 						{
-							Sleep(250);
-							RefreshAmdFlipMeterState(false);
-							std::scoped_lock lock(amdFlipMeterMutex);
-							amdFlipMeterState.rebootRecommended = true;
-							NotifySettingChanged(NoticeKind::RestartPc, "AMD RDNA 4 Flip Meter");
+							if (AmdFlipMeterReg::LaunchElevatedApply(snap, true))
+							{
+								Sleep(250);
+								RefreshAmdFlipMeterState(false);
+								std::scoped_lock lock(amdFlipMeterMutex);
+								amdFlipMeterState.rebootRecommended = true;
+								NotifySettingChanged(NoticeKind::RestartPc, "AMD RDNA 4 Flip Meter");
+							}
 						}
 					}
 					HelpMarker("Restores the AMD driver's original 2x frame pacing limit on your RX 9000 card.\n"
@@ -831,11 +957,14 @@ namespace
 
 		static const char* const UiAlphaNames[] = { "Auto", "Straight", "Premultiplied" };
 		int32_t uiAlpha = std::clamp(Plugin::options.uiAlphaMode.load(), 0, 2);
-		if (api->Combo("UI alpha mode", &uiAlpha, UiAlphaNames, 3, nullptr))
 		{
-			Plugin::options.uiAlphaMode = uiAlpha;
-			api->SetInt(self, "UiAlphaMode", uiAlpha);
-			NotifySettingChanged(NoticeKind::LiveSaved, "UI alpha mode");
+			ScopedDisable dis(isD3D12);
+			if (api->Combo("UI alpha mode", &uiAlpha, UiAlphaNames, 3, nullptr))
+			{
+				Plugin::options.uiAlphaMode = uiAlpha;
+				api->SetInt(self, "UiAlphaMode", uiAlpha);
+				NotifySettingChanged(NoticeKind::LiveSaved, "UI alpha mode");
+			}
 		}
 		HelpMarker("Fixes dark borders or glowing halos around HUD icons in HDR Vulkan games.\n"
 				   "Leave on 'Auto' unless HUD edges look dark or washed out.");
@@ -849,6 +978,63 @@ namespace
 		}
 		HelpMarker("Fixes rare games where frame generation stutters or turns itself off\n"
 				   "every frame because the game keeps sending false reset signals.");
+
+		api->Spacing();
+		api->Separator();
+		if (api->Button("Save Settings"))
+		{
+			if (api->SaveSettings(self))
+			{
+				unsavedSettings = false;
+				lastNoticeKind = NoticeKind::None;
+			}
+		}
+		api->SameLine();
+		if (api->Button("Reset Defaults"))
+		{
+			static const char* const kAllKeys[] = {
+				"NetworkPath", "HudlessUi", "CameraCutDetection", "VramGuard", "AutoVrrPacing",
+				"D3D12VulkanWmmaBridge", "UiTransitionCooldown", "GhostBuster", "PacingSpinlockSleep",
+				"DepthInvertedOverride", "JitteredMvOverride", "UiAlphaMode", "HudTierMode",
+				"ToneMapMatchMode", "IgnoreGameReset", "Logging", "ForceDRED"
+			};
+			for (const char* key : kAllKeys)
+				api->ResetValue(self, key);
+
+			Plugin::options.path = Plugin::Path::XmxNative;
+			Plugin::options.hudlessUi = true;
+			Plugin::ApplyBrokenHudlessQuirkOnce();
+			Plugin::options.cameraCutDetection = true;
+			Plugin::options.vramGuard = true;
+			Plugin::options.autoVrrPacing = false;
+			Plugin::options.d3d12VulkanWmmaBridge = true;
+			Plugin::options.uiTransitionCooldown = false;
+			Plugin::options.ghostBuster = false;
+			Plugin::options.pacingSpinlockSleep = false;
+			Plugin::options.depthInvertedOverride = 0;
+			Plugin::options.jitteredMvOverride = 0;
+			Plugin::options.uiAlphaMode = 0;
+			Plugin::options.hudTierMode = 0;
+			Plugin::options.toneMapMatchMode = 0;
+			Plugin::options.ignoreGameReset = false;
+			Plugin::options.logging = true;
+			Plugin::options.forceDred = false;
+			Log::SetEnabled(true);
+			Plugin::options.hudDebugMagenta = false;
+			Plugin::options.hudSplitCompare = false;
+			Plugin::options.hudSplitPos = 0.5f;
+			Plugin::options.gpuProfiler = false;
+			Plugin::options.debugLines = false;
+			api->SaveSettings(self);
+			unsavedSettings = false;
+			lastNoticeKind = NoticeKind::None;
+		}
+		HelpMarker("Resets all XeMFG XMX plugin keys in OptiScaler.ini to defaults without touching other tabs.");
+		if (unsavedSettings)
+		{
+			api->SameLine();
+			Yellow("(Unsaved)");
+		}
 	}
 
 	void DrawTab(void*)
@@ -1148,8 +1334,23 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* optiAp
 	Plugin::options.depthInvertedOverride = std::clamp(api->GetInt(self, "DepthInvertedOverride", 0), 0, 2);
 	Plugin::options.jitteredMvOverride = std::clamp(api->GetInt(self, "JitteredMvOverride", 0), 0, 2);
 	Plugin::options.uiAlphaMode = std::clamp(api->GetInt(self, "UiAlphaMode", 0), 0, 2);
-	Plugin::options.hudTierMode = std::clamp(api->GetInt(self, "HudTierMode", 0), 0, 3);
+	Plugin::options.hudTierMode = std::clamp(api->GetInt(self, "HudTierMode", 0), 0, 4);
+	Plugin::options.toneMapMatchMode = std::clamp(api->GetInt(self, "ToneMapMatchMode", 0), 0, 2);
 	Plugin::options.ignoreGameReset = api->GetBool(self, "IgnoreGameReset", Plugin::options.ignoreGameReset);
+	Plugin::options.logging = api->GetBool(self, "Logging", Plugin::options.logging);
+	Log::SetEnabled(Plugin::options.logging);
+	Plugin::options.forceDred = api->GetBool(self, "ForceDRED", Plugin::options.forceDred);
+	{
+		wchar_t envBuf[16]{};
+		const DWORD envLen = GetEnvironmentVariableW(L"XEFG_FORCE_DRED", envBuf, static_cast<DWORD>(std::size(envBuf)));
+		if (envLen > 0 && envLen < std::size(envBuf) &&
+			(_wcsicmp(envBuf, L"1") == 0 || _wcsicmp(envBuf, L"true") == 0 || _wcsicmp(envBuf, L"on") == 0 || _wcsicmp(envBuf, L"yes") == 0))
+		{
+			Plugin::options.forceDred = true;
+		}
+	}
+	if (Plugin::options.forceDred)
+		Log::EnableDred();
 	RefreshAmdFlipMeterState(true);
 
 	// Off in OptiScaler.ini, the Vulkan hooks aren't installed. Said before they are, and a copy started by

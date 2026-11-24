@@ -1,3 +1,4 @@
+#include "Plugin.h"
 // The nvngx_dlssg exports for Vulkan, the same 12 mfgunlocker_xemfg.dll has. XeFG has no Vulkan API, so none of this
 // drives XeFG itself: the calls go to the XeMFG provider (see VulkanProvider.h), which runs XeFG on the game's VkDevice
 // with the Vulkan models. The provider is the runtime built into this dll (VulkanRuntime.h, models read from
@@ -134,6 +135,8 @@ namespace
 		*handle = new VulkanFeatureHandle{ { NGX_HANDLE_VULKAN | (nextId++ & ~NGX_HANDLE_VULKAN) }, impl };
 		VulkanProvider::liveFeatures++;
 
+		Plugin::activeApi.store(Plugin::ActiveApi::Vulkan, std::memory_order_release);
+		Log::WarnForeignFgMods(true, VulkanProvider::Query().module != "built into this dll");
 		Log::Info("Vulkan: feature created");
 
 		return NGX_SUCCESS;

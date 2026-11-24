@@ -55,6 +55,25 @@ namespace DeferredDestroy
 	}
 } // namespace DeferredDestroy
 
+inline bool SameFile(const wchar_t* left, const wchar_t* right) noexcept
+{
+	if (!left || !right || !*left || !*right)
+		return false;
+	const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+	HANDLE a = CreateFileW(left, FILE_READ_ATTRIBUTES, share, nullptr, OPEN_EXISTING, 0, nullptr);
+	HANDLE b = CreateFileW(right, FILE_READ_ATTRIBUTES, share, nullptr, OPEN_EXISTING, 0, nullptr);
+	BY_HANDLE_FILE_INFORMATION x{}, y{};
+	const bool same = a != INVALID_HANDLE_VALUE && b != INVALID_HANDLE_VALUE &&
+		GetFileInformationByHandle(a, &x) && GetFileInformationByHandle(b, &y) &&
+		x.dwVolumeSerialNumber == y.dwVolumeSerialNumber &&
+		x.nFileIndexHigh == y.nFileIndexHigh && x.nFileIndexLow == y.nFileIndexLow;
+	if (a != INVALID_HANDLE_VALUE)
+		CloseHandle(a);
+	if (b != INVALID_HANDLE_VALUE)
+		CloseHandle(b);
+	return same;
+}
+
 inline std::filesystem::path ModulePath(HMODULE module)
 {
 	wchar_t path[MAX_PATH]{};

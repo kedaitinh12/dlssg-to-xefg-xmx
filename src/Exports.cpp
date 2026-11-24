@@ -93,6 +93,9 @@ NGX_EXPORT NGXResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList* cm
 	if (Init(device.Get()) != NGX_SUCCESS)
 		return NGX_FAIL_FEATURE_NOT_SUPPORTED;
 
+	Plugin::activeApi.store(Plugin::ActiveApi::D3D12, std::memory_order_release);
+	Log::WarnForeignFgMods(false, false);
+
 	static std::atomic_uint32_t nextId = 1;
 
 	// The XeFG context is created on the first evaluation, once the resources are known. The Vulkan bit stays clear,

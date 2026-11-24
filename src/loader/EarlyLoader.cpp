@@ -2,6 +2,8 @@
 #include "../optiscaler_plugin.h"
 
 #include <Windows.h>
+#include <d3d12.h>
+#include <wrl/client.h>
 
 #include <filesystem>
 #include <format>
@@ -10,6 +12,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace
 {
@@ -24,25 +27,58 @@ namespace
 		return path;
 	}
 
+	std::mutex gLogMutex;
+	std::vector<std::string> gBufferedLines;
+	std::filesystem::path gUnifiedLogPath;
+	bool gUnifiedLogFlushed = false;
+
 	void WriteLog(std::string_view level, std::string_view message)
 	{
-		static std::mutex mutex;
-		static std::ofstream file(LoaderModulePath().replace_extension(L".log"), std::ios::trunc);
-
 		SYSTEMTIME now{};
 		GetLocalTime(&now);
-		const auto line = std::format("[{:02}:{:02}:{:02}.{:03}] [{}] {}\n",
+		const auto line = std::format("[{:02}:{:02}:{:02}.{:03}] [{}] [EarlyLoader] {}\n",
 			now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, level, message);
 
-		std::scoped_lock lock(mutex);
+		std::scoped_lock lock(gLogMutex);
 		if (IsDebuggerPresent())
 			OutputDebugStringA(line.c_str());
 
+		if (gUnifiedLogFlushed && !gUnifiedLogPath.empty())
+		{
+			std::ofstream file(gUnifiedLogPath, std::ios::app);
+			if (file)
+			{
+				file.write(line.data(), static_cast<std::streamsize>(line.size()));
+				file.flush();
+			}
+		}
+		else
+		{
+			gBufferedLines.push_back(line);
+		}
+	}
+
+	// Flushes buffered EarlyLoader messages into the single unified log file next to the main DLL
+	// (never creating a separate .log beside the .asi). Closes immediately so the DLL can append cleanly.
+	void FlushLogNextToDll(const std::filesystem::path& dllPath)
+	{
+		if (dllPath.empty())
+			return;
+		std::scoped_lock lock(gLogMutex);
+		if (gUnifiedLogFlushed)
+			return;
+		gUnifiedLogPath = dllPath;
+		gUnifiedLogPath.replace_extension(L".log");
+		std::ofstream file(gUnifiedLogPath, std::ios::trunc);
 		if (file)
 		{
-			file.write(line.data(), static_cast<std::streamsize>(line.size()));
+			for (const auto& line : gBufferedLines)
+				file.write(line.data(), static_cast<std::streamsize>(line.size()));
 			file.flush();
+			SetEnvironmentVariableW(L"XEFG_EARLY_LOG_INITIALIZED", L"1");
 		}
+		gBufferedLines.clear();
+		gUnifiedLogFlushed = true;
 	}
 
 	bool EnvironmentOff(const wchar_t* name)
@@ -58,6 +94,51 @@ namespace
 			_wcsicmp(value, L"no") == 0;
 	}
 
+	bool EnvironmentOn(const wchar_t* name)
+	{
+		wchar_t value[32]{};
+		const DWORD length = GetEnvironmentVariableW(name, value, static_cast<DWORD>(std::size(value)));
+		if (length == 0 || length >= std::size(value))
+			return false;
+
+		return _wcsicmp(value, L"1") == 0 ||
+			_wcsicmp(value, L"true") == 0 ||
+			_wcsicmp(value, L"on") == 0 ||
+			_wcsicmp(value, L"yes") == 0;
+	}
+
+	void EnableDredEarly()
+	{
+		HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
+		if (!d3d12)
+			d3d12 = LoadLibraryW(L"d3d12.dll");
+		if (!d3d12)
+			return;
+
+		using GetDebugIfaceFn = HRESULT(WINAPI*)(REFIID, void**);
+		auto getDebugIface = reinterpret_cast<GetDebugIfaceFn>(GetProcAddress(d3d12, "D3D12GetDebugInterface"));
+		if (!getDebugIface)
+			return;
+
+		Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedDataSettings1> dred1;
+		if (SUCCEEDED(getDebugIface(IID_PPV_ARGS(&dred1))) && dred1)
+		{
+			dred1->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+			dred1->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+			dred1->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+			WriteLog("info", "ForceDRED enabled early before D3D12CreateDevice (AutoBreadcrumbs + PageFault + Context)");
+			return;
+		}
+
+		Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred0;
+		if (SUCCEEDED(getDebugIface(IID_PPV_ARGS(&dred0))) && dred0)
+		{
+			dred0->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+			dred0->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+			WriteLog("info", "ForceDRED enabled early before D3D12CreateDevice (AutoBreadcrumbs + PageFault)");
+		}
+	}
+
 	std::once_flag gBootstrapOnce;
 
 	void BootstrapImpl()
@@ -65,23 +146,28 @@ namespace
 		const auto self = LoaderModulePath();
 		WriteLog("info", std::format("EarlyLoader starting from {}", self.string()));
 
-		if (EnvironmentOff(L"XEFG_VULKAN_HOOKS"))
-		{
-			WriteLog("info", "XEFG_VULKAN_HOOKS is disabled; skipping early Vulkan bootstrap");
-			return;
-		}
-
 		const auto optiRoot = self.parent_path().parent_path();
 		const auto iniPath = optiRoot / L"OptiScaler.ini";
 		const auto ini = EarlyLoader::ParseOptiScalerIni(iniPath);
+		const auto selected = EarlyLoader::SelectMainDll(optiRoot, ini);
+
+		if ((ini.hasForceDred && ini.forceDred) || EnvironmentOn(L"XEFG_FORCE_DRED"))
+			EnableDredEarly();
+
+		if (EnvironmentOff(L"XEFG_VULKAN_HOOKS"))
+		{
+			WriteLog("info", "XEFG_VULKAN_HOOKS is disabled; skipping early Vulkan bootstrap");
+			FlushLogNextToDll(selected.path);
+			return;
+		}
 
 		if (ini.found && ini.hasVulkanHooks && !ini.vulkanHooks)
 		{
 			WriteLog("info", "VulkanHooks=false in OptiScaler.ini; skipping early Vulkan bootstrap");
+			FlushLogNextToDll(selected.path);
 			return;
 		}
 
-		const auto selected = EarlyLoader::SelectMainDll(optiRoot, ini);
 		if (selected.path.empty())
 		{
 			WriteLog("warn", std::format("No XeFG main DLL found under {}\\custom\\*\\dlssg", optiRoot.string()));
@@ -103,6 +189,7 @@ namespace
 		{
 			WriteLog("error", std::format("LoadLibraryW failed for {} (error {})",
 				selected.path.string(), GetLastError()));
+			FlushLogNextToDll(selected.path);
 			return;
 		}
 
@@ -111,6 +198,7 @@ namespace
 				GetProcAddress(module, EarlyLoader::kBootstrapExportName)))
 		{
 			WriteLog("info", std::format("Handing off early Vulkan bootstrap to {}", selected.path.string()));
+			FlushLogNextToDll(selected.path);
 			bootstrap("EarlyLoader.asi");
 			return;
 		}
@@ -121,12 +209,14 @@ namespace
 		{
 			WriteLog("warn", std::format("{} has no {}; falling back to legacy InitializeASI",
 				selected.path.string(), EarlyLoader::kBootstrapExportName));
+			FlushLogNextToDll(selected.path);
 			legacy();
 			return;
 		}
 
 		WriteLog("error", std::format("{} exports neither {} nor {}",
 			selected.path.string(), EarlyLoader::kBootstrapExportName, EarlyLoader::kLegacyAsiExportName));
+		FlushLogNextToDll(selected.path);
 	}
 
 	void BootstrapOnce()
