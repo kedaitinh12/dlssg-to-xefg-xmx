@@ -38,10 +38,15 @@ namespace HangWatchdog
 			std::thread worker;
 		};
 
+		// Intentionally immortal (like VulkanHost::State):
+		// - When the host calls HangWatchdog::Shutdown() (e.g. NVSDK_NGX_D3D12_Shutdown), Shutdown() stops and joins
+		//   the worker cleanly before DLL unload.
+		// - When the host skips Shutdown() during fast process exit (e.g. OptiScaler's exit path), avoiding a static
+		//   destructor on std::thread prevents both std::terminate() and any loader-lock join() deadlock in DllMain.
 		inline State& S() noexcept
 		{
-			static State s;
-			return s;
+			static State* s = new State;
+			return *s;
 		}
 
 		inline uint64_t NowMs() noexcept
