@@ -1,3 +1,4 @@
+#include "Plugin.h"
 // The nvngx_dlssg exports for DX12. XeFG has no Vulkan API, the Vulkan exports are in ExportsVulkan.cpp and hand
 // the calls to MFG-Unlocker's provider
 #include "FrameGenerator.h"

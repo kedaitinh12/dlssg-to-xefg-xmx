@@ -229,7 +229,9 @@ void Log::WarnForeignFgMods(bool isVulkan, bool usingExternalVulkanProvider) noe
 			return;
 
 		modules.resize(std::min<size_t>(modules.size(), needed / sizeof(HMODULE)));
-		const HMODULE self = SelfModule();
+		HMODULE self = nullptr;
+		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			reinterpret_cast<LPCWSTR>(&Log::WarnForeignFgMods), &self);
 
 		auto toLower = [](std::wstring s) {
 			for (wchar_t& c : s)
@@ -246,6 +248,8 @@ void Log::WarnForeignFgMods(bool isVulkan, bool usingExternalVulkanProvider) noe
 			if (p.empty())
 				continue;
 
+			const auto filename = p.filename().u8string();
+			const std::string displayName(filename.begin(), filename.end());
 			const std::wstring name = toLower(p.filename().wstring());
 			const char* kind = nullptr;
 
@@ -270,14 +274,14 @@ void Log::WarnForeignFgMods(bool isVulkan, bool usingExternalVulkanProvider) noe
 				(GetModuleHandleW(L"amdxc64.dll") != nullptr || GetModuleHandleW(L"amdvlk64.dll") != nullptr))
 			{
 				Warn("overlay_warning: {} detected on AMD GPU — RTSS overlay hooks can cause XeFG crashes in some titles (e.g. Crimson Desert); disable RTSS overlay for this game if unstable",
-					ToUtf8(p.filename().wstring()));
+					displayName);
 				continue;
 			}
 
 			if (kind)
 			{
 				Warn("foreign_fg_mod detected: {} ({}) — running two frame generation mods together can cause hook conflicts or prevent frame generation",
-					ToUtf8(p.filename().wstring()), kind);
+					displayName, kind);
 			}
 		}
 	}

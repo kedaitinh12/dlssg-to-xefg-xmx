@@ -117,7 +117,7 @@ class ShaderPort
 			{
 				std::scoped_lock lock(self->reportedMutex);
 				if (self->missed.size() < 64 && self->missed.insert(key).second)
-					mfg_port::Event("shader_miss", ""key":"" + key + """);
+					mfg_port::Event("shader_miss", "\"key\":\"" + key + "\"");
 			}
 			self->decode(store, keyObject, output);
 			return;

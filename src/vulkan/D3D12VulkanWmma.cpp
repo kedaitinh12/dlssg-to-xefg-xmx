@@ -718,7 +718,7 @@ bool IsDirectGameOutputEligibleLocked(Bridge& b, ID3D12Resource* gameOut, D3D12_
 		desc.SampleDesc.Count == 1 &&
 		(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0 &&
 		(desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0 &&
-		ToVkFormat(desc.Format) != VK_FORMAT_UNDEFINED;
+		DxgiToVkFormat(desc.Format) != VK_FORMAT_UNDEFINED;
 
 	if (shapeOk)
 	{
