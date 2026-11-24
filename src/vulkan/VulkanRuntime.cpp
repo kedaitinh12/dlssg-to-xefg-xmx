@@ -310,6 +310,8 @@ namespace
 		float prevCameraFov = 0.0f;
 		bool hasPrevCamera = false;
 		bool hasPrevFov = false;
+		uint32_t syntheticResetQuietFrames = 0;
+		XeFgEnabler::CameraMotionScale cameraMotionScale;
 		bool hasPrevUiState = false;
 		bool prevUiState = false;
 		uint32_t uiTransitionCooldown = 0;
@@ -1056,8 +1058,24 @@ namespace
 		// installed even when the menu selects the DP4a model, so switching the path needs no new process
 		d.portInstalled = MfgKernels::Install(XeFG::Module());
 
+		if (d.vendor != 0)
+			Plugin::gpuVendorId.store(d.vendor, std::memory_order_relaxed);
+
 		InstallTensorRoute(d, record);
 		InstallCoopMatrixRoute(d, record);
+
+		{
+			const auto curPath = Plugin::options.path.load(std::memory_order_relaxed);
+			const auto resolved = Plugin::ResolveEffectivePath(
+				curPath, d.vendor, false, d.tensorInstalled, d.coopInstalled, d.portInstalled);
+			if (resolved != curPath)
+			{
+				Plugin::RecordPathFallback(curPath, resolved);
+				Plugin::options.path.store(resolved, std::memory_order_relaxed);
+				Log::Warn("Vulkan: model '{}' is not supported on GPU vendor {:#06x}; automatically switched to '{}'",
+					Plugin::PathName(curPath), d.vendor, Plugin::PathName(resolved));
+			}
+		}
 
 		if (!CreatePipelines(d))
 		{
@@ -1120,11 +1138,21 @@ namespace
 
 	// The model this evaluation runs: the ported one unless the menu picks DP4a or the port isn't there. Intel GPUs never
 	// get here, so XeFG's own XMX network (17) isn't an option
+	Plugin::Path EffectiveVulkanPath(const Device& d)
+	{
+		return Plugin::ResolveEffectivePath(
+			Plugin::options.path.load(std::memory_order_relaxed),
+			d.vendor,
+			d.vendor == 0x8086u && d.coopInstalled,
+			d.tensorInstalled,
+			d.coopInstalled,
+			d.portInstalled);
+	}
+
 	int32_t WantedModel(const Device& d)
 	{
-		const bool dp4a = Plugin::options.path.load() == Plugin::Path::Fallback;
-
-		return d.portInstalled && !dp4a ? MfgKernels::MfgModel : MfgKernels::Dp4aModel;
+		const auto eff = EffectiveVulkanPath(d);
+		return (d.portInstalled && eff != Plugin::Path::Fallback) ? MfgKernels::MfgModel : MfgKernels::Dp4aModel;
 	}
 
 	// The tensor-core route replaces layers while the ported model runs on the CUDA path (VulkanPolicy::UseTensorCores).
@@ -1134,7 +1162,7 @@ namespace
 
 	void ApplyTensorGate(const Device& d, int32_t model)
 	{
-		const auto path = Plugin::options.path.load();
+		const auto path = EffectiveVulkanPath(d);
 		const bool portModel = model == MfgKernels::MfgModel;
 		const bool on = d.tensorInstalled && VulkanPolicy::UseTensorCores(portModel,
 			path == Plugin::Path::Cuda, path == Plugin::Path::XmxNative);
@@ -2249,7 +2277,14 @@ namespace
 		f.prevSubrects = curSubrects;
 		f.hasPrevSubrects = true;
 
-		// Camera Cut & Teleport Detector + GhostBuster anti-ghosting (internal safety resets still apply when ignoreGameReset is on)
+		// Camera Cut & Teleport Detector + GhostBuster anti-ghosting (internal safety resets still apply when
+		// ignoreGameReset is on; adaptive camera-step scale prevents meter-threshold false positives in UE cm-scale games)
+		constexpr uint32_t kSyntheticResetQuietFrames = 4u;
+		if (reset)
+			f.syntheticResetQuietFrames = kSyntheticResetQuietFrames;
+		else if (f.syntheticResetQuietFrames > 0u)
+			--f.syntheticResetQuietFrames;
+
 		const bool camCutOn = Plugin::options.cameraCutDetection.load(std::memory_order_relaxed);
 		const bool ghostBusterOn = Plugin::options.ghostBuster.load(std::memory_order_relaxed);
 		if (camCutOn || ghostBusterOn)
@@ -2284,20 +2319,30 @@ namespace
 					   std::sqrt(fwdLenSq * prevLenSq))
 					: 1.0f;
 
-				constexpr float kCutThresholdSq = 4.5f * 4.5f;
-				if (camCutOn && !reset && (distSq > kCutThresholdSq || (!ghostBusterOn && fwdDot < -0.5f)))
+				const float cutThresholdSq = f.cameraMotionScale.CutThresholdSq();
+				const float hardTeleportSq = f.cameraMotionScale.HardTeleportThresholdSq();
+				const bool quietActive = f.syntheticResetQuietFrames > 0u;
+				if (camCutOn && !reset && (distSq > hardTeleportSq || (!quietActive && (distSq > cutThresholdSq || (!ghostBusterOn && fwdDot < -0.5f)))))
+				{
 					reset = true;
+					f.syntheticResetQuietFrames = kSyntheticResetQuietFrames;
+				}
 			}
 
-			if (ghostBusterOn && !reset)
+			if (ghostBusterOn && !reset && f.syntheticResetQuietFrames == 0u)
 			{
 				const bool camMvIncluded = parameters.GetOr<uint32_t>("DLSSG.CameraMotionIncluded", 1) != 0;
 				if (XeFgEnabler::ShouldGhostBusterReset(true, hasCamera, f.hasPrevCamera, fwdDot,
-					curFov, f.prevCameraFov, f.hasPrevFov, camMvIncluded, distSq))
+					curFov, f.prevCameraFov, f.hasPrevFov, camMvIncluded, distSq,
+					f.cameraMotionScale.GhostBusterMoveThresholdSq()))
 				{
 					reset = true;
+					f.syntheticResetQuietFrames = kSyntheticResetQuietFrames;
 				}
 			}
+
+			if (!reset && hasCamera && f.hasPrevCamera)
+				f.cameraMotionScale.Observe(std::sqrt(distSq));
 
 			if (hasCamera)
 			{

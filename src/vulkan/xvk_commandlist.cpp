@@ -42,7 +42,6 @@ void CommandList::Fail(const char* what)
 HRESULT CommandList::Begin(CommandAllocator* allocator)
 {
     if (!allocator) return E_INVALIDARG;
-    auto recLock = device_->LockRecording();
     if (device_->recorded()) {
         // vkprov.1: straight into the open recording (begun and ended by its owner, never here).
         buffer_ = device_->RecordingBuffer();
@@ -102,8 +101,6 @@ void STDMETHODCALLTYPE CommandList::ClearState(ID3D12PipelineState* pso)
     pso_ = nullptr;
     rootSignature_ = nullptr;
     boundPipeline_ = VK_NULL_HANDLE;
-    boundLayout_ = VK_NULL_HANDLE;
-    boundDescriptorSet_ = VK_NULL_HANDLE;
     tables_.fill(nullptr);
     constantMasks_.fill(0);
     constantsDirty_ = 0xFFFFu;
@@ -154,12 +151,10 @@ void STDMETHODCALLTYPE CommandList::Dispatch(UINT x, UINT y, UINT z)
     if (!recording_ || failed_) return;
     if (!pso_) { Fail("Dispatch without a pipeline state"); return; }
     if (device_->tensor().TryLaunch(*device_, buffer_, pso_->tensorLayer(), tables_[0], tables_[1], constants_[2].data(), constantMasks_[2], x, y, z))
-    { boundPipeline_ = VK_NULL_HANDLE; boundLayout_ = VK_NULL_HANDLE; boundDescriptorSet_ = VK_NULL_HANDLE; return; }
+    { boundPipeline_ = VK_NULL_HANDLE; return; }
     if (device_->coopmat().TryLaunch(*device_, buffer_, pso_->tensorLayer(), *pso_, tables_, constants_, constantMasks_, x, y, z))
     {
         boundPipeline_ = VK_NULL_HANDLE;
-        boundLayout_ = VK_NULL_HANDLE;
-        boundDescriptorSet_ = VK_NULL_HANDLE;
         for (const auto& range : pso_->ranges())
             if (const auto* table = tables_[range.parameter]; table && table[range.offset].kind == DescriptorKind::UavBuffer && table[range.offset].resource)
                 table[range.offset].resource->NoteWrite();
@@ -172,16 +167,57 @@ void STDMETHODCALLTYPE CommandList::Dispatch(UINT x, UINT y, UINT z)
         constantsDirty_ = 0xFFFFu;
     }
     const auto& ranges = pso_->ranges();
-    if (!ranges.empty() || !pso_->staticSamplers().empty()) {
-        const char* failReason = nullptr;
-        VkDescriptorSet ds = device_->AcquireDescriptorSet(*pso_, tables_, &failReason);
-        if (!ds) { Fail(failReason ? failReason : "descriptor set acquisition failed"); return; }
-        if (boundDescriptorSet_ != ds || boundLayout_ != pso_->layout()) {
-            vk.vkCmdBindDescriptorSets(buffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pso_->layout(), 0, 1, &ds, 0, nullptr);
-            boundDescriptorSet_ = ds;
-            boundLayout_ = pso_->layout();
+    // Avoid zero-initializing 6 KB of stack memory on every Dispatch; only indices [0..count) are written and passed.
+    std::array<VkWriteDescriptorSet, 64> writes;
+    std::array<VkDescriptorImageInfo, 64> images;
+    std::array<VkDescriptorBufferInfo, 64> buffers;
+    if (ranges.size() > writes.size()) { Fail("too many bindings"); return; }
+    for (size_t i = 0; i < ranges.size(); ++i) {
+        const BoundRange& r = ranges[i];
+        const Descriptor* table = tables_[r.parameter];
+        if (!table) { Fail("descriptor table not set before Dispatch"); return; }
+        const Descriptor& d = table[r.offset];
+        VkWriteDescriptorSet& w = writes[i];
+        w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, r.binding, 0, 1, r.type};
+        switch (r.type) {
+        case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+            if (d.kind != DescriptorKind::SrvImage) { Fail("binding expects a texture SRV"); return; }
+            images[i] = d.image;
+            w.pImageInfo = &images[i];
+            break;
+        case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+            if (d.kind != DescriptorKind::UavImage) { Fail("binding expects a texture UAV"); return; }
+            images[i] = d.image;
+            w.pImageInfo = &images[i];
+            break;
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+            if (d.kind != DescriptorKind::SrvBuffer && d.kind != DescriptorKind::UavBuffer) { Fail("binding expects a buffer view"); return; }
+            buffers[i] = d.buffer;
+            w.pBufferInfo = &buffers[i];
+            break;
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+            if (d.kind != DescriptorKind::Cbv) { Fail("binding expects a CBV"); return; }
+            buffers[i] = d.buffer;
+            w.pBufferInfo = &buffers[i];
+            break;
+        case VK_DESCRIPTOR_TYPE_SAMPLER:
+            if (d.kind != DescriptorKind::Sampler) { Fail("binding expects a sampler"); return; }
+            images[i] = d.image;
+            w.pImageInfo = &images[i];
+            break;
+        default: Fail("descriptor type"); return;
         }
     }
+    size_t count = ranges.size();
+    const auto& samplers = pso_->staticSamplers();
+    if (count + samplers.size() > writes.size()) { Fail("too many bindings"); return; }
+    for (size_t s = 0; s < samplers.size(); ++s, ++count) {
+        images[count] = {samplers[s], VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+        writes[count] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, pso_->staticBindings()[s], 0, 1, VK_DESCRIPTOR_TYPE_SAMPLER,
+                         &images[count]};
+    }
+    if (count)
+        vk.vkCmdPushDescriptorSetKHR(buffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pso_->layout(), 0, uint32_t(count), writes.data());
     if (pso_->pushConstantBytes()) {
         const uint16_t paramBit = uint16_t(1u << pso_->constantsParameter());
         if (constantsDirty_ & paramBit) {
@@ -299,7 +335,6 @@ void STDMETHODCALLTYPE CommandList::ResourceBarrier(UINT count, const D3D12_RESO
 void STDMETHODCALLTYPE CommandList::CopyBufferRegion(ID3D12Resource* dst, UINT64 dstOffset, ID3D12Resource* src, UINT64 srcOffset, UINT64 bytes)
 {
     if (!recording_ || failed_) return;
-    auto recLock = device_->LockRecording();
     auto* d = Own<Resource>(dst);
     auto* s = Own<Resource>(src);
     if (!d->IsBuffer() || !s->IsBuffer()) { Fail("CopyBufferRegion on a texture"); return; }
@@ -311,7 +346,6 @@ void STDMETHODCALLTYPE CommandList::CopyBufferRegion(ID3D12Resource* dst, UINT64
 void STDMETHODCALLTYPE CommandList::CopyResource(ID3D12Resource* dst, ID3D12Resource* src)
 {
     if (!recording_ || failed_) return;
-    auto recLock = device_->LockRecording();
     auto* d = Own<Resource>(dst);
     auto* s = Own<Resource>(src);
     const auto& vk = device_->vk();
@@ -343,7 +377,6 @@ void STDMETHODCALLTYPE CommandList::CopyTextureRegion(const D3D12_TEXTURE_COPY_L
     const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* box)
 {
     if (!recording_ || failed_) return;
-    auto recLock = device_->LockRecording();
     if (!dst || !src) { Fail("CopyTextureRegion arguments"); return; }
     auto* d = Own<Resource>(dst->pResource);
     auto* s = Own<Resource>(src->pResource);
@@ -402,7 +435,6 @@ void STDMETHODCALLTYPE CommandList::CopyTextureRegion(const D3D12_TEXTURE_COPY_L
 
 void CommandList::ClearUav(Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE cpu, const VkClearColorValue& value, uint32_t fillValue)
 {
-    auto recLock = device_->LockRecording();
     const Descriptor& d = *At(cpu);
     const auto& vk = device_->vk();
     if (d.kind == DescriptorKind::UavBuffer) {
@@ -440,7 +472,6 @@ void STDMETHODCALLTYPE CommandList::ClearUnorderedAccessViewFloat(D3D12_GPU_DESC
 void STDMETHODCALLTYPE CommandList::EndQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index)
 {
     if (!recording_ || failed_) return;
-    auto recLock = device_->LockRecording();
     if (type != D3D12_QUERY_TYPE_TIMESTAMP) { Unimplemented("EndQuery(non-timestamp)"); return; }
     const VkQueryPool pool = Own<QueryHeap>(heap)->pool();
     device_->vk().vkCmdResetQueryPool(buffer_, pool, index, 1);
@@ -451,7 +482,6 @@ void STDMETHODCALLTYPE CommandList::ResolveQueryData(ID3D12QueryHeap* heap, D3D1
     UINT64 offset)
 {
     if (!recording_ || failed_) return;
-    auto recLock = device_->LockRecording();
     if (type != D3D12_QUERY_TYPE_TIMESTAMP) { Unimplemented("ResolveQueryData(non-timestamp)"); return; }
     device_->vk().vkCmdCopyQueryPoolResults(buffer_, Own<QueryHeap>(heap)->pool(), start, count, Own<Resource>(dst)->buffer(), offset, 8,
                                             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);

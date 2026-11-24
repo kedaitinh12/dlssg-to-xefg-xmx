@@ -176,6 +176,28 @@ uint RequantFlow(int a, int ib, int neg, int lim, uint posMul, uint s1, uint s2,
 }
 #endif
 
+// L2-cache-friendly 2D workgroup swizzle (vertical bands of 8 tiles = 128 px wide).
+// Exact bijection over [0..numWg.x-1] x [0..numWg.y-1]; out-of-bounds groups remain untouched.
+uint2 SwizzleWorkGroup2D(uint2 wg, uint2 numWg)
+{
+    if (wg.x >= numWg.x || wg.y >= numWg.y || numWg.x == 0u || numWg.y == 0u)
+        return wg;
+    const uint linearIndex     = wg.y * numWg.x + wg.x;
+    const uint bandW      = 8u;
+    const uint fullBandsX = numWg.x & ~(bandW - 1u);
+    const uint fullArea   = fullBandsX * numWg.y;
+    if (linearIndex < fullArea)
+    {
+        const uint bandArea = bandW * numWg.y;
+        const uint band     = linearIndex / bandArea;
+        const uint rem      = linearIndex - band * bandArea;
+        return uint2(band * bandW + (rem & (bandW - 1u)), rem >> 3u);
+    }
+    const uint remW = numWg.x - fullBandsX;
+    const uint tail = linearIndex - fullArea;
+    return uint2(fullBandsX + (tail % remW), tail / remW);
+}
+
 [WaveSize(32)]
 [numthreads(128, 1, 1)]
 void main(uint3 groupID : SV_GroupID, uint tid : SV_GroupIndex)
@@ -193,8 +215,10 @@ void main(uint3 groupID : SV_GroupID, uint tid : SV_GroupIndex)
 
 #if LAYER_FAMILY != 2
     // ---- Family 0 (PoolConv) & Family 1 (UpSkip Decoder) ----
-    const int X0         = int(groupID.x) * ((LAYER_POOL != 0) ? 8 : 16);
-    const int Y0         = int(groupID.y) * LAYER_TILE_H;
+    const uint tileW     = (LAYER_POOL != 0) ? 8u : 16u;
+    const uint2 swWg     = SwizzleWorkGroup2D(groupID.xy, uint2((outW + tileW - 1u) / tileW, (outH + uint(LAYER_TILE_H) - 1u) / uint(LAYER_TILE_H)));
+    const int X0         = int(swWg.x * tileW);
+    const int Y0         = int(swWg.y) * LAYER_TILE_H;
     const int limitW     = int(outW);
     const int limitH     = int(outH);
     const int lo         = (LAYER_FAMILY == 1 || LAYER_RELU != 0) ? 0 : -128;
@@ -434,11 +458,12 @@ void main(uint3 groupID : SV_GroupID, uint tid : SV_GroupIndex)
     const uint sh1    = shifts & 31u;
     const uint sh2    = (shifts >> 8u) & 31u;
     const int  lim    = 1 << LAYER_ACC_BITS;
-    const int  X0     = int(groupID.x) * 16;
-    const int  Y0     = int(groupID.y) * LAYER_TILE_H;
-    const int  n0     = int(groupID.z) * LAYER_NT;
     const int  limitW = min(int(outW), Wout);
     const int  limitH = min(int(outH), Hout);
+    const uint2 swWg  = SwizzleWorkGroup2D(groupID.xy, uint2((uint(max(limitW, 0)) + 15u) / 16u, (uint(max(limitH, 0)) + uint(LAYER_TILE_H) - 1u) / uint(LAYER_TILE_H)));
+    const int  X0     = int(swWg.x) * 16;
+    const int  Y0     = int(swWg.y) * LAYER_TILE_H;
+    const int  n0     = int(groupID.z) * LAYER_NT;
 
     // Each thread accumulates 16 output channels: halfCh == 0 covers tiles nt = 0,1; halfCh == 1 covers tiles nt = 2,3
     int acc[ROWS][16];

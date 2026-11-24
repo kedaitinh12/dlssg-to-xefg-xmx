@@ -32,6 +32,7 @@ constexpr size_t kMaxDxbcBytes = 4 * 1024 * 1024;
 std::mutex gMutex;
 std::atomic<LogFunction> gLog{};
 std::atomic<State> gState{State::NotAttempted};
+std::atomic<bool> gSharedTileReady{false};
 std::atomic<Arch> gArch{Arch::Unknown};
 std::atomic<bool> gActive{false};
 uint32_t gVendorId{};
@@ -1235,16 +1236,19 @@ bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem
             return false;
         }
 
-        if (probe.vendorId != 0x1002)
+        // Query Shader Model 6.6 + WaveOps support so XMX Port can also use the 3x3 shared-tile cs_6_6 DP4a shaders
+        // on non-RDNA3/4 GPUs (e.g. AMD RX 5000/6000, NVIDIA GTX/RTX, Intel) when SM 6.6 + WaveOps are supported.
+        bool supportsSm66Wave = false;
         {
-            MarkUnavailable("not_amd",
-                "\"vendor_hex\":\"" + adapter_identity::Hex16(probe.vendorId) +
-                "\",\"device_hex\":\"" + adapter_identity::Hex16(probe.deviceId) +
-                "\",\"gpu\":\"" + gGpuName +
-                "\",\"source\":\"" + probe.source +
-                "\",\"dxgi_spoofed\":" + (probe.dxgiSpoofed ? "true" : "false"));
-            reason = gReason;
-            return false;
+            D3D12_FEATURE_DATA_SHADER_MODEL sm{ D3D_SHADER_MODEL_6_6 };
+            D3D12_FEATURE_DATA_D3D12_OPTIONS1 opts1{};
+            if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))) &&
+                sm.HighestShaderModel >= D3D_SHADER_MODEL_6_6 &&
+                SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &opts1, sizeof(opts1))) &&
+                opts1.WaveOps && opts1.WaveLaneCountMin <= 32u && opts1.WaveLaneCountMax >= 32u)
+            {
+                supportsSm66Wave = true;
+            }
         }
 
         // Query D3D12_FEATURE_D3D12_OPTIONS9 (27) for WaveMMA support before architecture gating so diagnostics include it.
@@ -1260,15 +1264,31 @@ bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem
         if (SUCCEEDED(device->CheckFeatureSupport(static_cast<D3D12_FEATURE>(27), &options9, sizeof(options9))))
             gWaveMmaTier = options9.WaveMMATier;
 
-        const Arch arch = DetectAmdArch(probe.vendorId, probe.deviceId, probe.description);
-        if (arch == Arch::Unknown)
+        const Arch arch = (probe.vendorId == 0x1002)
+            ? DetectAmdArch(probe.vendorId, probe.deviceId, probe.description)
+            : Arch::Unknown;
+        const bool isWmmaGpu = (probe.vendorId == 0x1002 && arch != Arch::Unknown);
+
+        if (!isWmmaGpu && !supportsSm66Wave)
         {
-            MarkUnavailable("architecture_unsupported",
-                "\"vendor_hex\":\"0x1002\",\"device_hex\":\"" + adapter_identity::Hex16(probe.deviceId) +
-                "\",\"gpu\":\"" + gGpuName +
-                "\",\"wave_mma_tier\":" + std::to_string(gWaveMmaTier) +
-                ",\"source\":\"" + probe.source +
-                "\",\"umd\":\"" + umdAscii + "\"");
+            if (probe.vendorId != 0x1002)
+            {
+                MarkUnavailable("not_amd",
+                    "\"vendor_hex\":\"" + adapter_identity::Hex16(probe.vendorId) +
+                    "\",\"device_hex\":\"" + adapter_identity::Hex16(probe.deviceId) +
+                    "\",\"gpu\":\"" + gGpuName +
+                    "\",\"source\":\"" + probe.source +
+                    "\",\"dxgi_spoofed\":" + (probe.dxgiSpoofed ? "true" : "false"));
+            }
+            else
+            {
+                MarkUnavailable("architecture_unsupported",
+                    "\"vendor_hex\":\"0x1002\",\"device_hex\":\"" + adapter_identity::Hex16(probe.deviceId) +
+                    "\",\"gpu\":\"" + gGpuName +
+                    "\",\"wave_mma_tier\":" + std::to_string(gWaveMmaTier) +
+                    ",\"source\":\"" + probe.source +
+                    "\",\"umd\":\"" + umdAscii + "\"");
+            }
             reason = gReason;
             return false;
         }
@@ -1299,6 +1319,13 @@ bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem
             ",\"expected\":" + std::to_string(expectedLayers) +
             ",\"missing\":" + std::to_string(expectedLayers - gOverrideLayers));
 
+        if (!isWmmaGpu && gOverrideLayers == 0)
+        {
+            MarkUnavailable(probe.vendorId != 0x1002 ? "not_amd" : "architecture_unsupported");
+            reason = gReason;
+            return false;
+        }
+
         gDeviceIdentity = identity.Detach();
         gDevice = device;
         gDevice->AddRef();
@@ -1309,6 +1336,16 @@ bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem
             MarkUnavailable(patchFailure,
                 "\"device_hex\":\"" + adapter_identity::Hex16(gDeviceId) +
                 "\",\"gpu\":\"" + gGpuName + "\"");
+            reason = gReason;
+            return false;
+        }
+
+        gSharedTileReady.store(gOverrideLayers > 0, std::memory_order_release);
+        if (!isWmmaGpu)
+        {
+            // Keep WMMA menu option disabled on non-RDNA3/4 GPUs while enabling cs_6_6 3x3 shared-tile overrides for XMX Port.
+            MarkUnavailable(probe.vendorId != 0x1002 ? "not_amd" : "architecture_unsupported",
+                "\"shared_tile_3x3\":true,\"overrides\":" + std::to_string(gOverrideLayers));
             reason = gReason;
             return false;
         }
@@ -1352,21 +1389,28 @@ void Disable(const char* reason) noexcept
 
 void SetEnabled(bool enabled) noexcept
 {
-    if (gState.load(std::memory_order_acquire) == State::Active && gActive.load(std::memory_order_relaxed) == enabled)
+    const bool ready = gState.load(std::memory_order_acquire) == State::Active || gSharedTileReady.load(std::memory_order_acquire);
+    if (ready && gActive.load(std::memory_order_relaxed) == enabled)
         return;
     std::lock_guard lock(gMutex);
-    if (gState.load(std::memory_order_acquire) == State::Active)
+    if (gState.load(std::memory_order_acquire) == State::Active || gSharedTileReady.load(std::memory_order_acquire))
         gActive.store(enabled, std::memory_order_release);
 }
 
 bool Enabled() noexcept
 {
-    return gState.load(std::memory_order_acquire) == State::Active && gActive.load(std::memory_order_acquire);
+    const bool ready = gState.load(std::memory_order_acquire) == State::Active || gSharedTileReady.load(std::memory_order_acquire);
+    return ready && gActive.load(std::memory_order_acquire);
 }
 
 bool Supported() noexcept
 {
     return gState.load(std::memory_order_acquire) == State::Active;
+}
+
+bool SharedTileSupported() noexcept
+{
+    return gState.load(std::memory_order_acquire) == State::Active || gSharedTileReady.load(std::memory_order_acquire);
 }
 
 bool IsRdna4() noexcept
@@ -1376,7 +1420,7 @@ bool IsRdna4() noexcept
 
 void Adopt(ID3D12GraphicsCommandList* list) noexcept
 {
-    if (!list || gState.load(std::memory_order_acquire) != State::Active)
+    if (!list || (gState.load(std::memory_order_acquire) != State::Active && !gSharedTileReady.load(std::memory_order_acquire)))
         return;
 
     void** fastTable = *reinterpret_cast<void***>(list);

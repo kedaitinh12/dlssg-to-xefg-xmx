@@ -245,7 +245,15 @@ void main() {
 
 #elif TM_PASS == 4
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+shared float sApplyLut[768];
 void main() {
+    uint totalLut = min(3u * bins, 768u);
+    for (uint li = gl_LocalInvocationIndex; li < totalLut; li += 64u) {
+        sApplyLut[li] = lut[li];
+    }
+    memoryBarrierShared();
+    barrier();
+
     uvec2 id = gl_GlobalInvocationID.xy;
     if (id.x >= width || id.y >= height) return;
     vec3 h = texelFetch(hudlessTex, ivec2(id), 0).rgb;
@@ -256,7 +264,8 @@ void main() {
         f = clamp(f, 0.0, float(bins - 1u));
         uint i = min(uint(f), bins - 2u);
         float t = clamp(f - float(i), 0.0, 1.0);
-        o[c] = mix(lut[c * bins + i], lut[c * bins + i + 1u], t);
+        uint lutIdx = c * bins + i;
+        o[c] = mix(sApplyLut[lutIdx], sApplyLut[lutIdx + 1u], t);
     }
     imageStore(outColor, ivec2(id), vec4(o, 1.0));
 }
@@ -384,7 +393,33 @@ void main() {
 
 #elif TM_PASS == 8
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+// 4 spatial corners x 8 luma bins x 3 vec4 rows = 96 vec4 (1.5 KB LDS):
+// All 64 threads in every 8x8 workgroup share identical (x0,y0,x1,y1) for cell=128,
+// cutting global SSBO reads by 16x with bit-exact output.
+shared vec4 sCellModels[96];
 void main() {
+    float grpGx = (float(gl_WorkGroupID.x * 8u) + 0.5) / float(cell) - 0.5;
+    float grpGy = (float(gl_WorkGroupID.y * 8u) + 0.5) / float(cell) - 0.5;
+    int gx0 = clamp(int(floor(grpGx)), 0, int(cellsX) - 1);
+    int gy0 = clamp(int(floor(grpGy)), 0, int(cellsY) - 1);
+    int gx1 = min(gx0 + 1, int(cellsX) - 1);
+    int gy1 = min(gy0 + 1, int(cellsY) - 1);
+
+    uint cachedBins = min(bins, 8u);
+    uint totalVecs = 4u * cachedBins * 3u;
+    for (uint v = gl_LocalInvocationIndex; v < totalVecs; v += 64u) {
+        uint row = v % 3u;
+        uint cb = v / 3u;
+        uint cz = cb % cachedBins;
+        uint sc = cb / cachedBins;
+        uint cx = uint(((sc & 1u) != 0u) ? gx1 : gx0);
+        uint cy = uint(((sc & 2u) != 0u) ? gy1 : gy0);
+        uint mBase = ((cy * cellsX + cx) * bins + cz) * 12u + row * 4u;
+        sCellModels[v] = vec4(lut[mBase + 0u], lut[mBase + 1u], lut[mBase + 2u], lut[mBase + 3u]);
+    }
+    memoryBarrierShared();
+    barrier();
+
     uvec2 id = gl_GlobalInvocationID.xy;
     if (id.x >= width || id.y >= height) return;
 
@@ -394,12 +429,8 @@ void main() {
     float gy = (float(id.y) + 0.5) / float(cell) - 0.5;
     float gz = clamp(luma709(h), 0.0, 1.0) * float(bins - 1u);
 
-    int x0 = clamp(int(floor(gx)), 0, int(cellsX) - 1);
-    int y0 = clamp(int(floor(gy)), 0, int(cellsY) - 1);
-    int x1 = min(x0 + 1, int(cellsX) - 1);
-    int y1 = min(y0 + 1, int(cellsY) - 1);
-    uint z0 = min(uint(floor(gz)), bins - 1u);
-    uint z1 = min(z0 + 1u, bins - 1u);
+    uint z0 = min(uint(floor(gz)), cachedBins - 1u);
+    uint z1 = min(z0 + 1u, cachedBins - 1u);
 
     float fx = clamp(gx - floor(gx), 0.0, 1.0);
     float fy = clamp(gy - floor(gy), 0.0, 1.0);
@@ -414,13 +445,12 @@ void main() {
         bool by = (corner & 2u) != 0u;
         bool bz = (corner & 4u) != 0u;
         float w = (bx ? fx : (1.0 - fx)) * (by ? fy : (1.0 - fy)) * (bz ? fz : (1.0 - fz));
-        uint cx = uint(bx ? x1 : x0);
-        uint cy = uint(by ? y1 : y0);
+        uint sc = corner & 3u;
         uint cz = bz ? z1 : z0;
-        uint mBase = ((cy * cellsX + cx) * bins + cz) * 12u;
-        m0 += w * vec4(lut[mBase + 0u], lut[mBase + 1u], lut[mBase + 2u], lut[mBase + 3u]);
-        m1 += w * vec4(lut[mBase + 4u], lut[mBase + 5u], lut[mBase + 6u], lut[mBase + 7u]);
-        m2 += w * vec4(lut[mBase + 8u], lut[mBase + 9u], lut[mBase + 10u], lut[mBase + 11u]);
+        uint baseV = (sc * cachedBins + cz) * 3u;
+        m0 += w * sCellModels[baseV + 0u];
+        m1 += w * sCellModels[baseV + 1u];
+        m2 += w * sCellModels[baseV + 2u];
     }
 
     vec3 o = vec3(

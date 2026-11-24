@@ -87,6 +87,8 @@ private:
 		bool hasPrevFov = false;
 		// Cooldown window (kQuiet) preventing back-to-back synthetic CameraCut/GhostBuster resets on flashes/shake
 		uint32_t syntheticResetQuietFrames = 0;
+		// Adaptive camera displacement scale (prevents meter-threshold false positives in UE cm-scale games)
+		XeFgEnabler::CameraMotionScale cameraMotionScale;
 
 		// UI / HUD-less transition cooldown (DLSS Enabler XeFG: skip 10 real frames on state toggle)
 		uint32_t uiTransitionCooldown = 0;

@@ -214,14 +214,38 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
             reason = "no_s8_matrix_shape";
             return false;
         }
-        subgroupSize_ = wantedSubgroup;
-        requireSubgroupSize_ = supportsWantedSubgroup;
-
         device_ = desc.device;
         options_ = options;
         tileM_ = m;
         tileN_ = n;
         tileK_ = k;
+        subgroupSize_ = wantedSubgroup;
+        requireSubgroupSize_ = supportsWantedSubgroup;
+
+        gpuArch_ = GpuArch::Generic;
+        if (devProps.properties.vendorID == 0x1002u && tileM_ == 16u && tileN_ == 16u && tileK_ == 16u && subgroupSize_ == 32u)
+        {
+            const uint32_t devId = devProps.properties.deviceID;
+            const std::string_view devName(devProps.properties.deviceName);
+            const bool isRdna4 = (devId >= 0x7550u && devId <= 0x75FFu) ||
+                                 devName.find("gfx12") != std::string_view::npos ||
+                                 devName.find("9070") != std::string_view::npos ||
+                                 devName.find("9060") != std::string_view::npos ||
+                                 devName.find("R9700") != std::string_view::npos;
+            const bool isRdna3 = !isRdna4 && (
+                                 (devId >= 0x7440u && devId <= 0x74FFu) ||
+                                 devName.find("gfx11") != std::string_view::npos ||
+                                 devName.find("7900") != std::string_view::npos ||
+                                 devName.find("7800") != std::string_view::npos ||
+                                 devName.find("7700") != std::string_view::npos ||
+                                 devName.find("7600") != std::string_view::npos ||
+                                 devName.find("8060") != std::string_view::npos ||
+                                 devName.find("8050") != std::string_view::npos);
+            if (isRdna4)
+                gpuArch_ = GpuArch::Rdna4;
+            else if (isRdna3)
+                gpuArch_ = GpuArch::Rdna3;
+        }
 
 #define LOAD_FN(member, name) member = reinterpret_cast<PFN_##name>(gdpa(device_, #name))
         LOAD_FN(createShaderModule_, vkCreateShaderModule);
@@ -232,14 +256,14 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
         LOAD_FN(destroyPipelineCache_, vkDestroyPipelineCache);
         LOAD_FN(getPipelineCacheData_, vkGetPipelineCacheData);
         LOAD_FN(bindPipeline_, vkCmdBindPipeline);
-        LOAD_FN(bindDescriptorSets_, vkCmdBindDescriptorSets);
+        LOAD_FN(pushDescriptorSet_, vkCmdPushDescriptorSetKHR);
         LOAD_FN(pushConstants_, vkCmdPushConstants);
         LOAD_FN(dispatch_, vkCmdDispatch);
         LOAD_FN(barrier_, vkCmdPipelineBarrier2);
 #undef LOAD_FN
 
         if (!createShaderModule_ || !destroyShaderModule_ || !createComputePipelines_ || !destroyPipeline_ ||
-            !bindPipeline_ || !bindDescriptorSets_ || !pushConstants_ || !dispatch_ || !barrier_)
+            !bindPipeline_ || !pushDescriptorSet_ || !pushConstants_ || !dispatch_ || !barrier_)
         {
             reason = "device_functions";
             return false;
@@ -304,7 +328,7 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
                 std::error_code ec;
                 std::filesystem::create_directories(cacheDir, ec);
                 char fname[96]{};
-                std::snprintf(fname, sizeof(fname), "vk_coopmat_cache_%04x_%04x_%ux%ux%u%s.bin",
+                std::snprintf(fname, sizeof(fname), "vk_coopmat_cache_v2_%04x_%04x_%ux%ux%u%s.bin",
                     devProps.properties.vendorID, devProps.properties.deviceID, tileM_, tileN_, tileK_,
                     useRadvReg ? "_radvreg" : "");
                 cachePath_ = cacheDir / fname;
@@ -327,9 +351,13 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
         installedLayers_ = loadedCount;
         active_.store(true, std::memory_order_release);
         xefg_cuda::ReportCoopMatrix(xefg_cuda::State::Active, tileM_, tileN_, tileK_, installedLayers_, "");
+        const char* archTag = (gpuArch_ == GpuArch::Rdna4) ? "rdna4_gfx12"
+                            : (gpuArch_ == GpuArch::Rdna3) ? "rdna3_gfx11"
+                                                           : "generic";
         xefg_cuda::Report("coopmat_route_vk",
             "\"state\":\"active\",\"vendor\":" + std::to_string(devProps.properties.vendorID) +
-            ",\"tile\":\"" + std::to_string(tileM_) + "x" + std::to_string(tileN_) + "x" + std::to_string(tileK_) +
+            ",\"arch\":\"" + std::string(archTag) +
+            "\",\"tile\":\"" + std::to_string(tileM_) + "x" + std::to_string(tileN_) + "x" + std::to_string(tileK_) +
             "\",\"subgroup\":" + std::to_string(subgroupSize_) +
             ",\"modules\":" + std::to_string(installedLayers_) +
             ",\"full_barriers\":" + (options_.fullBarriers ? "true" : "false"));
@@ -342,6 +370,29 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
         reason = "exception";
         return false;
     }
+}
+
+uint32_t CoopMatrixRoute::SelectWorkgroupSize(size_t layerIdx) const noexcept
+{
+    if (layerIdx >= std::size(xefg_cuda::kLayers) || subgroupSize_ != 32u)
+        return 128u;
+    const auto& layer = xefg_cuda::kLayers[layerIdx];
+    if (layer.family == xefg_cuda::Family::Flow || layer.tileH < 16u)
+        return 128u;
+
+    if (gpuArch_ == GpuArch::Rdna3)
+    {
+        // RDNA 3 (gfx11): wider WMMA fragments double accumulator VGPR pressure on 16-row tiles.
+        // 8 Wave32s (256 threads) halve per-wave accumulators (4->2 rows) to raise SIMD32 occupancy.
+        return 256u;
+    }
+    if (gpuArch_ == GpuArch::Rdna4)
+    {
+        // RDNA 4 (gfx12): Dynamic VGPRs handle 4-row tiles at 128 threads; use 256 threads on multi-slice
+        // PoolConv 16-row layers (L_dcd8becf, L_06e97933) to maximize winWords/wsmWords sharing across warps.
+        return (layer.family == xefg_cuda::Family::Pool && (layerIdx == 2u || layerIdx == 7u)) ? 256u : 128u;
+    }
+    return 128u;
 }
 
 bool CoopMatrixRoute::EnsureLayerPipeline(Device& device, uint8_t layerIdx, PipelineState& basePso) noexcept
@@ -376,16 +427,18 @@ bool CoopMatrixRoute::EnsureLayerPipeline(Device& device, uint8_t layerIdx, Pipe
         return false;
     }
 
-    // Specialization constants 0..3 pass hardware cooperative-matrix tile (M, N, K) and subgroup size to the SPIR-V module.
-    const uint32_t specData[4] = {tileM_, tileN_, tileK_, subgroupSize_};
-    const VkSpecializationMapEntry specEntries[4] = {
+    // Specialization constants 0..4 pass cooperative-matrix tile (M, N, K), subgroup size, and arch-tuned workgroup size.
+    const uint32_t localSizeX = SelectWorkgroupSize(idx);
+    const uint32_t specData[5] = {tileM_, tileN_, tileK_, subgroupSize_, localSizeX};
+    const VkSpecializationMapEntry specEntries[5] = {
         {0, 0 * sizeof(uint32_t), sizeof(uint32_t)},
         {1, 1 * sizeof(uint32_t), sizeof(uint32_t)},
         {2, 2 * sizeof(uint32_t), sizeof(uint32_t)},
         {3, 3 * sizeof(uint32_t), sizeof(uint32_t)},
+        {4, 4 * sizeof(uint32_t), sizeof(uint32_t)},
     };
     VkSpecializationInfo specInfo{};
-    specInfo.mapEntryCount = 4;
+    specInfo.mapEntryCount = 5;
     specInfo.pMapEntries = specEntries;
     specInfo.dataSize = sizeof(specData);
     specInfo.pData = specData;
@@ -506,13 +559,66 @@ bool CoopMatrixRoute::TryLaunch(Device& device, VkCommandBuffer buffer, uint8_t 
         if (!EnsureLayerPipeline(device, id, basePso))
             return fallback("no_coopmat_module");
 
-        VkDescriptorSet ds = VK_NULL_HANDLE;
-        if (!basePso.ranges().empty() || !basePso.staticSamplers().empty())
+        const auto& ranges = basePso.ranges();
+        // Avoid zero-initializing 6 KB of stack memory on every WMMA Dispatch; only [0..count) are written and passed.
+        std::array<VkWriteDescriptorSet, 64> writes;
+        std::array<VkDescriptorImageInfo, 64> images;
+        std::array<VkDescriptorBufferInfo, 64> buffers;
+        if (ranges.size() > writes.size())
+            return fallback("bindings_overflow");
+
+        for (size_t i = 0; i < ranges.size(); ++i)
         {
-            const char* failReason = nullptr;
-            ds = device.AcquireDescriptorSet(basePso, tables, &failReason);
-            if (!ds)
-                return fallback(failReason ? failReason : "descriptor_set");
+            const BoundRange& r = ranges[i];
+            const Descriptor* table = tables[r.parameter];
+            if (!table)
+                return fallback("bindings_incomplete");
+
+            const Descriptor& d = table[r.offset];
+            VkWriteDescriptorSet& w = writes[i];
+            w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, r.binding, 0, 1, r.type};
+            switch (r.type)
+            {
+            case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+                if (d.kind != DescriptorKind::SrvImage) return fallback("view_type");
+                images[i] = d.image;
+                w.pImageInfo = &images[i];
+                break;
+            case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+                if (d.kind != DescriptorKind::UavImage) return fallback("view_type");
+                images[i] = d.image;
+                w.pImageInfo = &images[i];
+                break;
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+                if (d.kind != DescriptorKind::SrvBuffer && d.kind != DescriptorKind::UavBuffer) return fallback("view_type");
+                buffers[i] = d.buffer;
+                w.pBufferInfo = &buffers[i];
+                break;
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+                if (d.kind != DescriptorKind::Cbv) return fallback("view_type");
+                buffers[i] = d.buffer;
+                w.pBufferInfo = &buffers[i];
+                break;
+            case VK_DESCRIPTOR_TYPE_SAMPLER:
+                if (d.kind != DescriptorKind::Sampler) return fallback("view_type");
+                images[i] = d.image;
+                w.pImageInfo = &images[i];
+                break;
+            default:
+                return fallback("view_type");
+            }
+        }
+
+        size_t count = ranges.size();
+        const auto& samplers = basePso.staticSamplers();
+        if (count + samplers.size() > writes.size())
+            return fallback("bindings_overflow");
+
+        for (size_t s = 0; s < samplers.size(); ++s, ++count)
+        {
+            images[count] = {samplers[s], VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+            writes[count] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE,
+                             basePso.staticBindings()[s], 0, 1, VK_DESCRIPTOR_TYPE_SAMPLER, &images[count]};
         }
 
         if (!seen_[id - 1].exchange(true))
@@ -522,8 +628,8 @@ bool CoopMatrixRoute::TryLaunch(Device& device, VkCommandBuffer buffer, uint8_t 
         }
 
         bindPipeline_(buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines_[id - 1]);
-        if (ds)
-            bindDescriptorSets_(buffer, VK_PIPELINE_BIND_POINT_COMPUTE, basePso.layout(), 0, 1, &ds, 0, nullptr);
+        if (count)
+            pushDescriptorSet_(buffer, VK_PIPELINE_BIND_POINT_COMPUTE, basePso.layout(), 0, uint32_t(count), writes.data());
 
         if (basePso.pushConstantBytes() && basePso.constantsParameter() >= 0)
         {

@@ -20,6 +20,17 @@ namespace Plugin
 	// The path's name in the menu and in the log
 	const char* PathName(Path path);
 
+	// Preferred network path fallback order per GPU vendor:
+	//   AMD (0x1002):    WMMA -> XMX Port -> Fallback (DP4a)
+	//   NVIDIA (0x10DE): CUDA -> XMX Port -> Fallback (DP4a)
+	//   Intel (0x8086):  XMX (native) -> XMX Port -> Fallback (DP4a)
+	//   Unknown vendor:  XMX (native) -> XMX Port -> Fallback (DP4a)
+	Path PreferredPathForGpu(uint32_t vendorId, bool xmxReady, bool cudaReady, bool wmmaReady, bool portReady) noexcept;
+
+	// Safely resolves a requested path for the active GPU; if XMX (native) is requested on a GPU that cannot run it
+	// (e.g. AMD/NVIDIA default or stale INI), falls back through that vendor's own priority chain.
+	Path ResolveEffectivePath(Path requested, uint32_t vendorId, bool xmxReady, bool cudaReady, bool wmmaReady, bool portReady) noexcept;
+
 	struct Options
 	{
 		// XeFG's own XMX network on Intel GPUs with XMX, the ported model on DXIL, CUDA tensor cores, or WMMA INT8,
@@ -106,6 +117,24 @@ namespace Plugin
 	};
 
 	inline std::atomic<WmmaSupport> wmmaSupport = WmmaSupport::Unknown;
+	inline std::atomic<uint32_t> gpuVendorId{ 0 };
+	inline std::atomic<int32_t> fallbackFromPath{ -1 };
+	inline std::atomic<int32_t> fallbackToPath{ -1 };
+
+	inline void RecordPathFallback(Path requested, Path resolved) noexcept
+	{
+		if (requested != resolved)
+		{
+			fallbackFromPath.store(static_cast<int32_t>(requested), std::memory_order_relaxed);
+			fallbackToPath.store(static_cast<int32_t>(resolved), std::memory_order_relaxed);
+		}
+	}
+
+	inline void ClearPathFallback() noexcept
+	{
+		fallbackFromPath.store(-1, std::memory_order_relaxed);
+		fallbackToPath.store(-1, std::memory_order_relaxed);
+	}
 
 	// Which network is running
 	enum class Network : int32_t

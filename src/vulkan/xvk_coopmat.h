@@ -57,6 +57,8 @@ public:
     uint32_t installedLayers() const noexcept { return installedLayers_; }
 
 private:
+    enum class GpuArch : uint8_t { Generic, Rdna3, Rdna4 };
+    uint32_t SelectWorkgroupSize(size_t layerIdx) const noexcept;
     bool EnsureLayerPipeline(Device& device, uint8_t layerIdx, PipelineState& basePso) noexcept;
 
     VkDevice device_ = VK_NULL_HANDLE;
@@ -71,7 +73,7 @@ private:
     std::filesystem::path cachePath_;
     std::atomic<bool> cacheDirty_{false};
     PFN_vkCmdBindPipeline bindPipeline_{};
-    PFN_vkCmdBindDescriptorSets bindDescriptorSets_{};
+    PFN_vkCmdPushDescriptorSetKHR pushDescriptorSet_{};
     PFN_vkCmdPushConstants pushConstants_{};
     PFN_vkCmdDispatch dispatch_{};
     PFN_vkCmdPipelineBarrier2 barrier_{};
@@ -80,6 +82,7 @@ private:
     uint32_t tileM_{}, tileN_{}, tileK_{};
     uint32_t subgroupSize_{};
     bool requireSubgroupSize_{};
+    GpuArch gpuArch_{GpuArch::Generic};
     uint32_t installedLayers_{};
     std::array<std::vector<uint32_t>, 17> spirvModules_{};
     std::array<VkPipeline, 17> pipelines_{};
