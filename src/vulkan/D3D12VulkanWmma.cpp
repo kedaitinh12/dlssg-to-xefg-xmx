@@ -240,9 +240,23 @@ struct Bridge
 
 	uint64_t contextEpoch = 1;
 
+	struct RetiredImport
+	{
+		uint64_t retireFence = 0;
+		SharedImport imp;
+	};
+	struct RetiredContext
+	{
+		uint64_t retireFence = 0;
+		xefgd_handle_t handle = nullptr;
+	};
+
 	// Cached D3D12 -> Vulkan shared imports keyed by ID3D12Resource*
 	std::unordered_map<ID3D12Resource*, SharedImport> imports;
 	std::unordered_map<ID3D12Resource*, bool> directOutEligible;
+	// Deferred retirement queues for contexts/imports whose 500ms drain timed out (never destroy while GPU may still read them)
+	std::vector<RetiredImport> retiredImports;
+	std::vector<RetiredContext> retiredContexts;
 	std::atomic<size_t> importCount{ 0 };
 	std::atomic<uint64_t> directZeroCopyOuts{ 0 };
 
@@ -260,6 +274,8 @@ struct Bridge
 	// Telemetry
 	std::atomic<uint64_t> batches{ 0 };
 	std::atomic<uint64_t> fallbacks{ 0 };
+	std::atomic<uint64_t> totalCpuWaitUs{ 0 };
+	std::atomic<uint64_t> cpuWaitSamples{ 0 };
 };
 
 constexpr uint32_t kMaxRecoveryAttempts = 3u;
@@ -488,6 +504,54 @@ void DestroyImport(Bridge& b, SharedImport& imp) noexcept
 	{
 		b.vkFreeMemory(b.device, imp.vkMemory, nullptr);
 		imp.vkMemory = VK_NULL_HANDLE;
+	}
+}
+
+bool FenceValueCompletedLocked(uint64_t value) noexcept
+{
+	if (value == 0 || !gBridge.device || !gBridge.sharedSemaphore || !gBridge.vkWaitSemaphores)
+		return true;
+	VkSemaphoreWaitInfo waitInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+	waitInfo.semaphoreCount = 1;
+	waitInfo.pSemaphores = &gBridge.sharedSemaphore;
+	waitInfo.pValues = &value;
+	return gBridge.vkWaitSemaphores(gBridge.device, &waitInfo, 0ull) == VK_SUCCESS;
+}
+
+void ReapRetiredLocked(bool forceAll = false) noexcept
+{
+	if (!gBridge.retiredImports.empty())
+	{
+		auto it = gBridge.retiredImports.begin();
+		while (it != gBridge.retiredImports.end())
+		{
+			if (forceAll || FenceValueCompletedLocked(it->retireFence))
+			{
+				DestroyImport(gBridge, it->imp);
+				it = gBridge.retiredImports.erase(it);
+			}
+			else
+			{
+				++it;
+			}
+		}
+	}
+	if (!gBridge.retiredContexts.empty())
+	{
+		auto it = gBridge.retiredContexts.begin();
+		while (it != gBridge.retiredContexts.end())
+		{
+			if (forceAll || FenceValueCompletedLocked(it->retireFence))
+			{
+				if (it->handle)
+					XeFG::Destroy(it->handle);
+				it = gBridge.retiredContexts.erase(it);
+			}
+			else
+			{
+				++it;
+			}
+		}
 	}
 }
 
@@ -1642,6 +1706,7 @@ bool EnsureContext(const ContextSettings& settings) noexcept
 		for (uint32_t i = 0; i < kRingSize; ++i)
 			gBridge.vkSlotDoneFence[i] = 0;
 
+		ReapRetiredLocked();
 		oldCtx = gBridge.xefgContext;
 		gBridge.xefgContext = nullptr;
 		initCmd = gBridge.cmdBufs[0];
@@ -1806,8 +1871,17 @@ void ResetContext() noexcept
 	gBridge.contextFailCount = 0;
 	if (gBridge.xefgContext)
 	{
-		DrainVulkanQueueLocked(500'000'000ull);
-		XeFG::Destroy(gBridge.xefgContext);
+		if (DrainVulkanQueueLocked(500'000'000ull))
+		{
+			XeFG::Destroy(gBridge.xefgContext);
+			ReapRetiredLocked();
+		}
+		else
+		{
+			const uint64_t fence = gBridge.lastSubmittedVkFence.load(std::memory_order_acquire);
+			gBridge.retiredContexts.push_back({ fence, gBridge.xefgContext });
+			Log::Warn("D3D12->Vulkan WMMA bridge: ResetContext drain timed out; deferring XeFG context destroy until fence {} completes", fence);
+		}
 		gBridge.xefgContext = nullptr;
 		++gBridge.contextEpoch;
 		gBridge.directOutEligible.clear();
@@ -1932,7 +2006,12 @@ bool ScheduleBatch(
 		paceWait.semaphoreCount = 1;
 		paceWait.pSemaphores = &gBridge.sharedSemaphore;
 		paceWait.pValues = &prevVkFence;
+		const auto waitStart = std::chrono::steady_clock::now();
 		(void)gBridge.vkWaitSemaphores(gBridge.device, &paceWait, 50'000'000ull);
+		const auto waitUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now() - waitStart).count());
+		gBridge.totalCpuWaitUs.fetch_add(waitUs, std::memory_order_relaxed);
+		gBridge.cpuWaitSamples.fetch_add(1u, std::memory_order_relaxed);
 	}
 
 	PendingBatch batch{};
@@ -2030,8 +2109,17 @@ void ForgetResource(ID3D12Resource* resource) noexcept
 	gBridge.directOutEligible.erase(resource);
 	if (it != gBridge.imports.end())
 	{
-		DrainVulkanQueueLocked(500'000'000ull);
-		DestroyImport(gBridge, it->second);
+		if (DrainVulkanQueueLocked(500'000'000ull))
+		{
+			DestroyImport(gBridge, it->second);
+			ReapRetiredLocked();
+		}
+		else
+		{
+			const uint64_t fence = gBridge.lastSubmittedVkFence.load(std::memory_order_acquire);
+			gBridge.retiredImports.push_back({ fence, std::move(it->second) });
+			Log::Warn("D3D12->Vulkan WMMA bridge: ForgetResource drain timed out; deferring Vulkan import destroy until fence {} completes", fence);
+		}
 		gBridge.imports.erase(it);
 		gBridge.importCount.store(gBridge.imports.size(), std::memory_order_release);
 	}
@@ -2048,6 +2136,8 @@ Status Snapshot() noexcept
 	s.coopLayers = gBridge.coopLayers;
 	s.batches = gBridge.batches.load(std::memory_order_relaxed);
 	s.fallbacks = gBridge.fallbacks.load(std::memory_order_relaxed);
+	const uint64_t waitSamples = gBridge.cpuWaitSamples.load(std::memory_order_relaxed);
+	s.avgCpuWaitMs = waitSamples ? (static_cast<float>(gBridge.totalCpuWaitUs.load(std::memory_order_relaxed)) / (1000.0f * static_cast<float>(waitSamples))) : 0.0f;
 	{
 		std::lock_guard lock(gBridge.reasonMutex);
 		s.reason = gBridge.reason;

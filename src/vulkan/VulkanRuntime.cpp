@@ -2231,10 +2231,10 @@ namespace
 		f.prevSubrects = curSubrects;
 		f.hasPrevSubrects = true;
 
-		// Camera Cut & Teleport Detector + GhostBuster anti-ghosting (respects ignoreGameReset)
+		// Camera Cut & Teleport Detector + GhostBuster anti-ghosting (internal safety resets still apply when ignoreGameReset is on)
 		const bool camCutOn = Plugin::options.cameraCutDetection.load(std::memory_order_relaxed);
 		const bool ghostBusterOn = Plugin::options.ghostBuster.load(std::memory_order_relaxed);
-		if (!ignoreGameReset && (camCutOn || ghostBusterOn))
+		if (camCutOn || ghostBusterOn)
 		{
 			auto finiteOr = [](float v, float fallback) noexcept { return std::isfinite(v) ? v : fallback; };
 			const float px = finiteOr(parameters.GetOr<float>("DLSSG.CameraPosX", 0.0f), 0.0f);
@@ -2647,7 +2647,8 @@ namespace
 			// DLSSG.EnableInterp 0 or DLSSG.OutputDisableInterpolation 1 pauses generation for this frame
 			// (menu, cutscene, loading screen): copy the real frame cleanly without invoking XeFG (dlssg-0.4.2 M1).
 			const bool disableInterp = parameters->GetOr<uint32_t>("DLSSG.OutputDisableInterpolation", 0) != 0;
-			const bool resetRequested = parameters->GetOr<uint32_t>("DLSSG.Reset", 0) != 0;
+			const bool ignoreGameResetEval = Plugin::options.ignoreGameReset.load(std::memory_order_relaxed);
+			const bool resetRequested = !ignoreGameResetEval && (parameters->GetOr<uint32_t>("DLSSG.Reset", 0) != 0);
 			const bool interpolate = parameters->GetOr<uint32_t>("DLSSG.EnableInterp", 1) != 0 && !disableInterp;
 			bool didExecute = false;
 
