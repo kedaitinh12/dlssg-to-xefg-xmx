@@ -313,8 +313,11 @@ struct Bridge
 	std::vector<PendingBatch> pending;
 
 	// Bounded auto-recovery after transient VK_ERROR_DEVICE_LOST / GPU stall while D3D12 stays healthy
+	// Requires both cooldown and 8 consecutive clean fallback frames (f5low-fg docs/ROBUSTNESS.md)
+	static constexpr uint32_t kMinCleanFallbackFrames = 8u;
 	std::atomic<bool> recoveryNeeded{ false };
 	std::atomic<bool> recoveryInFlight{ false };
+	std::atomic<uint32_t> cleanFallbackFrames{ 0 };
 	uint32_t recoveryAttempts = 0;
 	std::chrono::steady_clock::time_point lastFaultAt{};
 
@@ -686,6 +689,7 @@ void MarkBridgeFaultLocked(const char* stage, int vkResult) noexcept
 {
 	gBridge.active.store(false, std::memory_order_release);
 	gBridge.contextReady.store(false, std::memory_order_release);
+	gBridge.cleanFallbackFrames.store(0u, std::memory_order_release);
 	gBridge.lastFaultAt = std::chrono::steady_clock::now();
 
 	const bool d3dAlive = gBridge.d3dDevice && gBridge.d3dDevice->GetDeviceRemovedReason() == S_OK;
@@ -2495,6 +2499,22 @@ void ResetContext() noexcept
 	}
 }
 
+bool NeedsRecovery() noexcept
+{
+	return gBridge.recoveryNeeded.load(std::memory_order_acquire);
+}
+
+void RecordCleanFallbackFrame() noexcept
+{
+	if (gBridge.recoveryNeeded.load(std::memory_order_acquire))
+		gBridge.cleanFallbackFrames.fetch_add(1u, std::memory_order_acq_rel);
+}
+
+void ResetCleanFallbackFrames() noexcept
+{
+	gBridge.cleanFallbackFrames.store(0u, std::memory_order_release);
+}
+
 bool TryRecoverAsync(const ContextSettings& settings) noexcept
 {
 	if (!gBridge.recoveryNeeded.load(std::memory_order_acquire) ||
@@ -2510,7 +2530,8 @@ bool TryRecoverAsync(const ContextSettings& settings) noexcept
 			gBridge.active.load(std::memory_order_acquire) ||
 			gBridge.recoveryAttempts >= kMaxRecoveryAttempts)
 			return false;
-		if ((std::chrono::steady_clock::now() - gBridge.lastFaultAt) < kRecoveryCooldown)
+		if (gBridge.cleanFallbackFrames.load(std::memory_order_acquire) < Bridge::kMinCleanFallbackFrames ||
+			(std::chrono::steady_clock::now() - gBridge.lastFaultAt) < kRecoveryCooldown)
 			return false;
 		if (!gBridge.d3dDevice || gBridge.d3dDevice->GetDeviceRemovedReason() != S_OK)
 		{

@@ -144,10 +144,13 @@ private:
 	ActiveExecRoute currentExecRoute = ActiveExecRoute::None;
 	const char* currentExecRouteReason = "";
 
-	// Adaptive VRAM Guard: cached IDXGIAdapter3 + hysteresis state (zero per-frame factory overhead)
+	// Adaptive VRAM Guard: cached IDXGIAdapter3 + step-down hysteresis state (zero per-frame factory overhead)
 	ComPtr<IDXGIAdapter3> vramAdapter;
 	bool vramAdapterChecked = false;
 	bool vramGuardActive = false;
+	uint32_t vramGuardStepDown = 0; // 0 = full multiplier, 1 = -1 generated frame, 2+ = clamp to 2x
+	std::chrono::steady_clock::time_point vramReleaseSince{};
+	bool vramReleasePending = false;
 	uint32_t vramPollCounter = 0;
 
 	// 3-Tier Adaptive HUD Protection (persists across XeFG context recreations when tier changes)

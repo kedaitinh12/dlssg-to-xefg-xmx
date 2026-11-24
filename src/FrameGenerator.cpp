@@ -1,4 +1,5 @@
 #include "FrameGenerator.h"
+#include "HangWatchdog.h"
 #include "Log.h"
 #include "MfgKernels.h"
 #include "MfgPort/Cuda/cuda_route.h"
@@ -1114,9 +1115,11 @@ bool FrameGenerator::PollVramGuard() noexcept
 {
 	if (!Plugin::options.vramGuard.load(std::memory_order_relaxed))
 	{
-		if (vramGuardActive)
+		if (vramGuardActive || vramGuardStepDown > 0u)
 		{
 			vramGuardActive = false;
+			vramGuardStepDown = 0u;
+			vramReleasePending = false;
 			Log::Info("Adaptive VRAM guard disabled by user, restoring full MFG multiplier");
 		}
 		return false;
@@ -1149,26 +1152,56 @@ bool FrameGenerator::PollVramGuard() noexcept
 	vramUsageMiB = static_cast<uint32_t>(memInfo.CurrentUsage / (1024ull * 1024ull));
 	vramBudgetMiB = static_cast<uint32_t>(memInfo.Budget / (1024ull * 1024ull));
 
-	constexpr uint64_t kSafetyMarginBytes = 200ull * 1024ull * 1024ull; // 200 MiB safety margin
-	constexpr uint64_t kReleaseMarginBytes = 400ull * 1024ull * 1024ull; // 400 MiB hysteresis to avoid oscillation
+	constexpr uint64_t kCriticalMarginBytes = 100ull * 1024ull * 1024ull; // 100 MiB critical -> clamp straight to 2x
+	constexpr uint64_t kSafetyMarginBytes = 200ull * 1024ull * 1024ull;   // 200 MiB safety -> step down gradually
+	constexpr uint64_t kReleaseMarginBytes = 400ull * 1024ull * 1024ull;  // 400 MiB hysteresis + 3s dwell before stepping up
+	constexpr auto kReleaseDwell = std::chrono::seconds(3);
 
-	if (!vramGuardActive)
+	const bool critical = memInfo.Budget > kCriticalMarginBytes && memInfo.CurrentUsage + kCriticalMarginBytes >= memInfo.Budget;
+	const bool tight = memInfo.Budget > kSafetyMarginBytes && memInfo.CurrentUsage + kSafetyMarginBytes >= memInfo.Budget;
+	const bool comfortable = memInfo.Budget > kReleaseMarginBytes && memInfo.CurrentUsage + kReleaseMarginBytes < memInfo.Budget;
+
+	if (critical || tight)
 	{
-		if (memInfo.Budget > kSafetyMarginBytes && memInfo.CurrentUsage + kSafetyMarginBytes >= memInfo.Budget)
+		vramReleasePending = false;
+		const uint32_t nextStep = critical ? 4u : std::min(vramGuardStepDown + 1u, 4u);
+		if (!vramGuardActive || nextStep != vramGuardStepDown)
 		{
 			vramGuardActive = true;
-			Log::Warn("Adaptive VRAM guard engaged ({} MiB / {} MiB budget): clamping MFG temporarily to 2x to prevent swap stutter",
-				memInfo.CurrentUsage / (1024ull * 1024ull), memInfo.Budget / (1024ull * 1024ull));
+			vramGuardStepDown = nextStep;
+			Log::Warn("Adaptive VRAM guard engaged ({} MiB / {} MiB budget): stepping down MFG by {} to prevent swap stutter",
+				memInfo.CurrentUsage / (1024ull * 1024ull), memInfo.Budget / (1024ull * 1024ull), vramGuardStepDown);
+		}
+	}
+	else if (vramGuardActive && comfortable)
+	{
+		const auto now = std::chrono::steady_clock::now();
+		if (!vramReleasePending)
+		{
+			vramReleasePending = true;
+			vramReleaseSince = now;
+		}
+		else if ((now - vramReleaseSince) >= kReleaseDwell)
+		{
+			vramReleasePending = false;
+			if (vramGuardStepDown > 1u)
+			{
+				--vramGuardStepDown;
+				Log::Info("Adaptive VRAM guard easing ({} MiB / {} MiB budget): step-down now {}",
+					memInfo.CurrentUsage / (1024ull * 1024ull), memInfo.Budget / (1024ull * 1024ull), vramGuardStepDown);
+			}
+			else
+			{
+				vramGuardActive = false;
+				vramGuardStepDown = 0u;
+				Log::Info("Adaptive VRAM guard released ({} MiB / {} MiB budget): restoring full MFG multiplier",
+					memInfo.CurrentUsage / (1024ull * 1024ull), memInfo.Budget / (1024ull * 1024ull));
+			}
 		}
 	}
 	else
 	{
-		if (memInfo.Budget > kReleaseMarginBytes && memInfo.CurrentUsage + kReleaseMarginBytes < memInfo.Budget)
-		{
-			vramGuardActive = false;
-			Log::Info("Adaptive VRAM guard released ({} MiB / {} MiB budget): restoring full MFG multiplier",
-				memInfo.CurrentUsage / (1024ull * 1024ull), memInfo.Budget / (1024ull * 1024ull));
-		}
+		vramReleasePending = false;
 	}
 
 	return vramGuardActive;
@@ -1713,7 +1746,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 
 	// Force history reset + 10-frame UI transition cooldown only when the game's raw HUD-less presence toggles
 	// (not when HudTierPolicy internally switches between Tier 1 Native and Tier 3 Static Mask).
-	const bool curRawHudless = (params.GetOr<ID3D12Resource*>("DLSSG.HUDLess", nullptr) != nullptr);
+	const bool curRawHudless = (rawHudless != nullptr);
 	if (captured && context->hasPrevRawHudless && curRawHudless != context->prevRawHudless)
 	{
 		if (!ignoreGameReset)
@@ -2151,14 +2184,21 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 	bool vramGuarded = vramGuardActive;
 	if (frameIndex == 1)
 	{
+		HangWatchdog::Beat("DX12::CaptureRealFrame", true);
 		vramGuarded = PollVramGuard();
 		CaptureRealFrame(cmdList, params);
+	}
+	else
+	{
+		HangWatchdog::Beat("DX12::Interpolate");
 	}
 	if (profileThisFrame)
 		gpuProfiler.Mark(cmdList, 1);
 
-	const bool vramClamped = vramGuarded && requestedCount > 1u;
-	const uint32_t effectiveCount = vramClamped ? 1u : requestedCount;
+	const bool vramClamped = vramGuarded && vramGuardStepDown > 0u && requestedCount > 1u;
+	const uint32_t effectiveCount = vramClamped
+		? (requestedCount > vramGuardStepDown ? (requestedCount - vramGuardStepDown) : 1u)
+		: requestedCount;
 
 	if (frameIndex == 1)
 	{
@@ -2181,10 +2221,18 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 	// skip the bridge's 50ms CPU paceWait there so FlipMeter's _averageFrameQpc pacing stays undistorted.
 	const bool callerRecording = params.GetOr<uint32_t>("DLSSG.IsRecording", 0u) != 0u;
 
-	// When VRAM guard clamps 3x-6x down to 2x, skip extra generated frames gracefully by showing the real frame
+	// When VRAM guard steps down 3x-6x, skip extra generated frames gracefully by showing the real frame
 	const auto result = (frameIndex <= effectiveCount)
 		? Interpolate(cmdList, output, targetDesc, frameIndex, effectiveCount, interpolationTime, callerRecording)
 		: InterpolateResult::Skipped;
+	if (frameIndex == 1 && currentExecRoute == ActiveExecRoute::D3D12WmmaFallback && D3D12VulkanWmma::NeedsRecovery())
+	{
+		if (result == InterpolateResult::Interpolated)
+			D3D12VulkanWmma::RecordCleanFallbackFrame();
+		else if (result == InterpolateResult::Failed)
+			D3D12VulkanWmma::ResetCleanFallbackFrames();
+	}
+	HangWatchdog::EndFrame();
 
 	if (profileThisFrame)
 	{

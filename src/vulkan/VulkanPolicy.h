@@ -866,6 +866,16 @@ namespace VulkanPolicy
 				return 0;
 			}
 
+			// Stale-present cancellation (NSS-OFG): if the batch has already exceeded a full real-frame interval,
+			// drain remaining generated presents immediately so stale waits never add input latency.
+			if (batchStartNs != 0 && emaBatchNs != 0 && nowNs > batchStartNs + emaBatchNs)
+			{
+				skipBatch = true;
+				++presentsInBatch;
+				lastPresentNs = nowNs;
+				return 0;
+			}
+
 			const uint32_t slotIndex = presentsInBatch++;
 			if (slotIndex == 0)
 				batchPresentOriginNs = nowNs;

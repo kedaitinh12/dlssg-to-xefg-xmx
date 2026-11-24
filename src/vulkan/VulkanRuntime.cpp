@@ -317,6 +317,8 @@ namespace
 		uint32_t uiTransitionCooldown = 0;
 		std::array<uint32_t, 12> prevSubrects{};
 		bool hasPrevSubrects = false;
+		std::chrono::steady_clock::time_point lastRealFrameTime{};
+		bool hasLastRealFrameTime = false;
 		bool hudlessMismatchLogged = false;
 		uint32_t consecutiveFailures = 0;
 		uint32_t stallCooldownBatches = 0;
@@ -2078,6 +2080,20 @@ namespace
 		in.motion = ImageParameter(parameters, "DLSSG.MVecs");
 
 		const NgxResource* rawGameHudless = ImageParameter(parameters, "DLSSG.HUDLess");
+		if (!rawGameHudless && in.backbuffer &&
+			in.backbuffer->format != VK_FORMAT_R16G16B16A16_SFLOAT &&
+			in.backbuffer->format != VK_FORMAT_A2B10G10R10_UNORM_PACK32 &&
+			in.backbuffer->format != VK_FORMAT_A2R10G10B10_UNORM_PACK32)
+		{
+			if (const NgxResource* optiHudless = ImageParameter(parameters, "Opti.Hudless");
+				optiHudless && optiHudless->image && optiHudless->image != in.backbuffer->image)
+			{
+				rawGameHudless = optiHudless;
+				static bool loggedVkOptiHudless = false;
+				if (!std::exchange(loggedVkOptiHudless, true))
+					Log::Info("Vulkan UnityUpscalerBridge: using Opti.Hudless as HUD-less source (SDR)");
+			}
+		}
 		const NgxResource* rawGameUi = ImageParameter(parameters, "DLSSG.UI");
 		const auto vkHudMode = static_cast<HudTier::Mode>(
 			std::clamp(Plugin::options.hudTierMode.load(std::memory_order_relaxed), 0, 4));
@@ -2086,6 +2102,7 @@ namespace
 			in.hudless = rawGameHudless;
 			in.ui = rawGameUi;
 		}
+
 
 		if (!in.backbuffer || !in.depth || !in.motion)
 		{
@@ -2258,6 +2275,16 @@ namespace
 
 		const bool ignoreGameReset = Plugin::options.ignoreGameReset.load(std::memory_order_relaxed);
 		bool reset = !ignoreGameReset && (parameters.GetOr<uint32_t>("DLSSG.Reset", 0) != 0);
+
+		// Long-pause / Alt+Tab / window-minimize history reset (>500 ms between real frames), matching DX12.
+		const auto nowReal = std::chrono::steady_clock::now();
+		if (f.hasLastRealFrameTime &&
+			std::chrono::duration_cast<std::chrono::milliseconds>(nowReal - f.lastRealFrameTime).count() > 500)
+		{
+			reset = true;
+		}
+		f.lastRealFrameTime = nowReal;
+		f.hasLastRealFrameTime = true;
 
 		// DRS / Subrect Change Detector (dlssg-0.4.2 M3): force history reset if any active subrect changes
 		// between consecutive batches even when the game omits DLSSG.Reset.

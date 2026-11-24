@@ -17,6 +17,9 @@ namespace D3D12VulkanWmma
 	void WarmupContextAsync(const ContextSettings&) noexcept {}
 	void ResetContext() noexcept {}
 	bool TryRecoverAsync(const ContextSettings&) noexcept { return false; }
+	bool NeedsRecovery() noexcept { return false; }
+	void RecordCleanFallbackFrame() noexcept {}
+	void ResetCleanFallbackFrames() noexcept {}
 
 	bool ScheduleBatch(ID3D12GraphicsCommandList*, const ContextSettings&, const FrameInputs&, const FrameInputs&,
 		ID3D12Resource* const*, const xefgd_2d_t*, uint32_t, ID3D12Resource*, D3D12_RESOURCE_STATES, bool) noexcept

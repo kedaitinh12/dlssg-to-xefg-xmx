@@ -23,6 +23,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <type_traits>
 #include <unordered_set>
@@ -44,6 +45,7 @@ namespace
 	struct State
 	{
 		// The maps and the strings, held briefly and never while calling out
+		std::shared_mutex instanceLifecycleMutex;
 		std::mutex mutex;
 		std::vector<std::pair<VkInstance, uint32_t>> instances; // live instances in creation order (newest checked first)
 		std::unordered_set<VkInstance> ignoredInstances; // skipped translation-layer / internal WMMA bridge instances
@@ -920,7 +922,12 @@ namespace
 		}
 
 		ReentryGuard guard(inDestroyInstance);
-		InstanceDestroyed(instance);
+		// Erase instance and wait for any in-flight vkEnumeratePhysicalDevices probes to finish
+		// before calling vkDestroyInstance so probes can never use a destroyed VkInstance.
+		{
+			std::unique_lock lifecycleLock(S().instanceLifecycleMutex);
+			InstanceDestroyed(instance);
+		}
 		if (next)
 			next(instance, allocator);
 	}
@@ -1003,6 +1010,56 @@ namespace
 		return nullptr;
 	}
 
+	bool ProbeInstanceHasPhysical(PFN_vkGetInstanceProcAddr gipaFn, VkInstance inst, VkPhysicalDevice target) noexcept
+	{
+		if (!gipaFn || !inst || !target)
+			return false;
+#ifdef _MSC_VER
+		__try
+		{
+#endif
+			auto enumerate = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
+				gipaFn(inst, "vkEnumeratePhysicalDevices"));
+			uint32_t count = 0;
+			if (!enumerate || enumerate(inst, &count, nullptr) != VK_SUCCESS || !count || count > 64)
+				return false;
+			VkPhysicalDevice list[64]{};
+			if (enumerate(inst, &count, list) != VK_SUCCESS)
+				return false;
+			const uint32_t n = count < 64u ? count : 64u;
+			for (uint32_t i = 0; i < n; ++i)
+				if (list[i] == target)
+					return true;
+			return false;
+#ifdef _MSC_VER
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return false;
+		}
+#endif
+	}
+
+	bool IsIgnoredPhysicalDevice(State& s, VkPhysicalDevice physical) noexcept
+	{
+		if (!physical || !s.loaderGipa)
+			return false;
+		std::shared_lock lifecycleLock(s.instanceLifecycleMutex);
+		std::vector<VkInstance> ignored;
+		{
+			std::lock_guard lock(s.mutex);
+			if (s.ignoredInstances.empty())
+				return false;
+			ignored.assign(s.ignoredInstances.begin(), s.ignoredInstances.end());
+		}
+		for (VkInstance inst : ignored)
+		{
+			if (ProbeInstanceHasPhysical(s.loaderGipa, inst, physical))
+				return true;
+		}
+		return false;
+	}
+
 	// What XeFG's programs need from a device, and the game's device edited to have it. Null (the game's request goes
 	// through as it is) when the device can't have it
 	std::unique_ptr<DeviceEdit> PrepareDevice(VkPhysicalDevice physical, const VkDeviceCreateInfo* info) noexcept
@@ -1017,51 +1074,24 @@ namespace
 			auto edit = std::make_unique<DeviceEdit>();
 
 			// The instance that enumerated this physical device and the API version it was created with
-			std::vector<std::pair<VkInstance, uint32_t>> known;
-			{
-				std::lock_guard lock(s.mutex);
-				known.assign(s.instances.begin(), s.instances.end());
-			}
-
 			uint32_t instanceVersion = 0;
-
-			auto probeInstance = [](PFN_vkGetInstanceProcAddr gipaFn, VkInstance inst, VkPhysicalDevice target) noexcept -> bool
 			{
-#ifdef _MSC_VER
-				__try
+				std::shared_lock lifecycleLock(s.instanceLifecycleMutex);
+				std::vector<std::pair<VkInstance, uint32_t>> known;
 				{
-#endif
-					auto enumerate = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
-						gipaFn(inst, "vkEnumeratePhysicalDevices"));
-					uint32_t count = 0;
-					if (!enumerate || enumerate(inst, &count, nullptr) != VK_SUCCESS || !count || count > 64)
-						return false;
-					VkPhysicalDevice list[64]{};
-					if (enumerate(inst, &count, list) != VK_SUCCESS)
-						return false;
-					const uint32_t n = count < 64u ? count : 64u;
-					for (uint32_t i = 0; i < n; ++i)
-						if (list[i] == target)
-							return true;
-					return false;
-#ifdef _MSC_VER
+					std::lock_guard lock(s.mutex);
+					known.assign(s.instances.begin(), s.instances.end());
 				}
-				__except (EXCEPTION_EXECUTE_HANDLER)
+
+				// Check newest live instances first so a stale probe instance can never shadow the active game instance
+				for (auto it = known.rbegin(); it != known.rend(); ++it)
 				{
-					return false;
+					if (!ProbeInstanceHasPhysical(s.loaderGipa, it->first, physical))
+						continue;
+					edit->record.instance = it->first;
+					instanceVersion = it->second;
+					break;
 				}
-#endif
-			};
-
-			// Check newest live instances first so a stale probe instance can never shadow the active game instance
-			for (auto it = known.rbegin(); it != known.rend(); ++it)
-			{
-				if (!probeInstance(s.loaderGipa, it->first, physical))
-					continue;
-
-				edit->record.instance = it->first;
-				instanceVersion = it->second;
-				break;
 			}
 
 			if (!edit->record.instance)
@@ -1241,13 +1271,23 @@ namespace
 			const void* chain = edit->chain.Head();
 
 			if (auto* f2 = FindStruct<VkPhysicalDeviceFeatures2>(chain, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2))
+			{
 				edit->Raise(f2->features.shaderStorageImageExtendedFormats);
+				if (supported.features.shaderStorageImageReadWithoutFormat)
+					edit->Raise(f2->features.shaderStorageImageReadWithoutFormat);
+				if (supported.features.shaderStorageImageWriteWithoutFormat)
+					edit->Raise(f2->features.shaderStorageImageWriteWithoutFormat);
+			}
 			else
 			{
 				if (info->pEnabledFeatures)
 					edit->features10 = *info->pEnabledFeatures;
 
 				edit->features10.shaderStorageImageExtendedFormats = VK_TRUE;
+				if (supported.features.shaderStorageImageReadWithoutFormat)
+					edit->features10.shaderStorageImageReadWithoutFormat = VK_TRUE;
+				if (supported.features.shaderStorageImageWriteWithoutFormat)
+					edit->features10.shaderStorageImageWriteWithoutFormat = VK_TRUE;
 				edit->info.pEnabledFeatures = &edit->features10;
 			}
 
@@ -1378,7 +1418,7 @@ namespace
 				Log::Info("Vulkan hooks: bypassing internal D3D12->Vulkan WMMA bridge instance/device");
 			return next(physical, info, allocator, device);
 		}
-		if (IsTranslationLayerCaller(caller))
+		if (IsTranslationLayerCaller(caller) || IsIgnoredPhysicalDevice(s, physical))
 		{
 			if (!s.translationSkipLogged.exchange(true, std::memory_order_relaxed))
 				Log::Info("Vulkan hooks: skipping DXVK/VKD3D translation-layer instance/device (leaving D3D-on-Vulkan untouched)");
@@ -1499,7 +1539,11 @@ namespace
 
 		const uint32_t targetBuffers = GetSwapchainBufferTarget();
 		const bool devicePrepared = S().prepared.load(std::memory_order_relaxed) > 0;
-		if (info && info->surface && devicePrepared)
+		// Never raise minImageCount downstream of Streamline (sl.dlss_g.dll): Streamline already chose its own
+		// swapchain image count (e.g. 6) and sized its internal dlfgSwapchain arrays accordingly. Creating 8 images
+		// behind Streamline's back causes an out-of-bounds crash on vkAcquireNextImageKHR.
+		const bool streamlineLoaded = (GetModuleHandleW(L"sl.dlss_g.dll") != nullptr);
+		if (info && info->surface && devicePrepared && !streamlineLoaded)
 		{
 			if (isNativeIcd)
 			{
@@ -1582,9 +1626,18 @@ namespace
 		}
 		else if (result == VK_SUCCESS && info && devicePrepared)
 		{
-			Log::Info("Vulkan swapchain: created {}x{} minImageCount={} (target {}, surface caps {}..{}, presentMode {}, caller {})",
-				info->imageExtent.width, info->imageExtent.height, info->minImageCount, targetBuffers,
-				capMin, capMax, static_cast<int>(info->presentMode), DescribeModuleOfAddress(caller));
+			if (streamlineLoaded && targetBuffers > info->minImageCount)
+			{
+				Log::Info("Vulkan swapchain: created {}x{} preserving Streamline minImageCount={} (skipped downstream boost to {} to prevent sl.dlss_g mismatch crash, presentMode {}, caller {})",
+					info->imageExtent.width, info->imageExtent.height, info->minImageCount, targetBuffers,
+					static_cast<int>(info->presentMode), DescribeModuleOfAddress(caller));
+			}
+			else
+			{
+				Log::Info("Vulkan swapchain: created {}x{} minImageCount={} (target {}, surface caps {}..{}, presentMode {}, caller {})",
+					info->imageExtent.width, info->imageExtent.height, info->minImageCount, targetBuffers,
+					capMin, capMax, static_cast<int>(info->presentMode), DescribeModuleOfAddress(caller));
+			}
 		}
 
 		if (result == VK_SUCCESS && info && swapchain && *swapchain && devicePrepared)

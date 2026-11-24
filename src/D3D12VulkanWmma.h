@@ -92,6 +92,11 @@ namespace D3D12VulkanWmma
 	// the game's D3D12 device is still healthy, asynchronously tears down and recreates the bridge
 	// after a short cooldown (bounded retries) so WMMA acceleration resumes without restarting.
 	bool TryRecoverAsync(const ContextSettings& settings) noexcept;
+	// True while the bridge is awaiting bounded recovery after a transient fault.
+	bool NeedsRecovery() noexcept;
+	// Record or reset consecutive successful D3D12 fallback frames while recovery is pending.
+	void RecordCleanFallbackFrame() noexcept;
+	void ResetCleanFallbackFrames() noexcept;
 
 	// Schedules a full XeFG batch (all `frameCount` generated frames) on the Vulkan VK_KHR_cooperative_matrix
 	// queue to run immediately when `cmdList` is submitted to ID3D12CommandQueue::ExecuteCommandLists.

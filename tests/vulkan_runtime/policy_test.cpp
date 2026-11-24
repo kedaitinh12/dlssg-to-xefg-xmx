@@ -649,6 +649,26 @@ int main()
 		CHECK(cutCm >= 143.9f && cutCm <= 144.1f);
 	}
 
+	// Stale-present cancellation (NSS-OFG): start with an actively paced batch (skipBatch == false, wait > 0),
+	// then exceed emaBatchNs and prove skipBatch flips false -> true and drains immediately with 0 wait
+	{
+		VulkanPolicy::PresentPacer p;
+		const uint64_t step = 16'000'000ull; // 16 ms base (~62.5 FPS)
+		p.OnBatchStart(step * 1, 3);
+		p.OnBatchStart(step * 2, 3);
+		p.OnBatchStart(step * 3, 3);
+		CHECK(!p.skipBatch);
+		(void)p.ComputePresentWaitNs(step * 3 + 500'000ull, false);
+		const uint64_t normalWait = p.ComputePresentWaitNs(step * 3 + 1'000'000ull, false);
+		CHECK(normalWait > 0);
+		CHECK(!p.skipBatch);
+		const uint64_t staleWait = p.ComputePresentWaitNs(step * 3 + 20'000'000ull, false);
+		CHECK(staleWait == 0);
+		CHECK(p.skipBatch);
+		const uint64_t followWait = p.ComputePresentWaitNs(step * 3 + 20'500'000ull, false);
+		CHECK(followWait == 0);
+	}
+
 	std::printf("%d checks, %d failed\n", checks, failures);
 	return failures ? 1 : 0;
 }

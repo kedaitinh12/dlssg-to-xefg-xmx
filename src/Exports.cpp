@@ -2,6 +2,7 @@
 // The nvngx_dlssg exports for DX12. XeFG has no Vulkan API, the Vulkan exports are in ExportsVulkan.cpp and hand
 // the calls to MFG-Unlocker's provider
 #include "FrameGenerator.h"
+#include "HangWatchdog.h"
 #include "Log.h"
 #include "Util.h"
 
@@ -50,6 +51,7 @@ NGX_EXPORT NGXResult NVSDK_NGX_D3D12_Init_Ext(unsigned long long, const wchar_t*
 
 NGX_EXPORT NGXResult NVSDK_NGX_D3D12_Shutdown()
 {
+	HangWatchdog::Shutdown();
 	DeferredDestroy::Collect(true);
 	return NGX_SUCCESS;
 }

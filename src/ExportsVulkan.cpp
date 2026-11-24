@@ -14,6 +14,7 @@
 #include "VulkanRuntime.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 
@@ -120,11 +121,34 @@ namespace
 		void* impl = nullptr;
 		const NGXResult result = api->create(device, cmdBuf, params, &impl);
 
+		static std::atomic<uint64_t> sCreateFailCount{ 0 };
+		static std::atomic<uint64_t> sCreateFailSuppressed{ 0 };
+		static std::atomic<uint64_t> sCreateFailLastLogMs{ 0 };
+
 		if (result != NGX_SUCCESS)
 		{
-			Log::Error("Vulkan: the XeMFG provider couldn't create a feature, 0x{:X}", result);
+			const uint64_t totalFails = sCreateFailCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
+			const uint64_t nowMs = static_cast<uint64_t>(
+				std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::steady_clock::now().time_since_epoch()).count());
+			const uint64_t lastMs = sCreateFailLastLogMs.load(std::memory_order_relaxed);
+			if (totalFails == 1u || (nowMs > lastMs && (nowMs - lastMs) >= 5000ull))
+			{
+				sCreateFailLastLogMs.store(nowMs, std::memory_order_relaxed);
+				const uint64_t suppressed = sCreateFailSuppressed.exchange(0u, std::memory_order_relaxed);
+				if (suppressed > 0u)
+					Log::Error("Vulkan: the XeMFG provider couldn't create a feature, 0x{:X} ({} repeated failures suppressed)", result, suppressed);
+				else
+					Log::Error("Vulkan: the XeMFG provider couldn't create a feature, 0x{:X}", result);
+			}
+			else
+			{
+				sCreateFailSuppressed.fetch_add(1u, std::memory_order_relaxed);
+			}
 			return result;
 		}
+		sCreateFailCount.store(0u, std::memory_order_relaxed);
+		sCreateFailSuppressed.store(0u, std::memory_order_relaxed);
 
 		if (!impl)
 			return NGX_FAIL;
