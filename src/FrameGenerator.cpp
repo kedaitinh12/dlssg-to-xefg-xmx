@@ -107,6 +107,11 @@ static const char* HdrDescription(DXGI_FORMAT format)
 	}
 }
 
+static bool IsHdrFormat(DXGI_FORMAT format) noexcept
+{
+	return format == DXGI_FORMAT_R10G10B10A2_UNORM || format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+}
+
 // XeFG only accepts 8-bit UNORM/sRGB and HDR10 R10G10B10A2_UNORM; scRGB FP16 (R16G16B16A16_FLOAT) is rejected by libxess_fg.
 static bool IsSupportedXeFGColorFormat(DXGI_FORMAT format) noexcept
 {
@@ -776,6 +781,8 @@ static int32_t NativeModel(ID3D12Device* device)
 	static const int32_t model = [device]
 		{
 			const auto probe = device ? adapter_identity::Probe(device->GetAdapterLuid()) : adapter_identity::ProbeResult{};
+			if (probe.vendorId != 0)
+				Plugin::gpuVendorId.store(probe.vendorId, std::memory_order_relaxed);
 			const bool isRealIntel = (probe.vendorId == 0x8086);
 			const int32_t picked = XeFG::AutoModel(device);
 			const bool nativeXmxAllowed = isRealIntel && (picked == XeFGXmxModel);
@@ -902,52 +909,87 @@ void FrameGenerator::ProbeSupport(ID3D12Device* device)
 				Log::Info("WMMA route inactive: {} (real GPU: {}, vendor 0x{:04X}, device 0x{:04X}, source: {}, DXGI spoofed: {}, WaveMMA tier: {})",
 					wmmaReason, st.gpuName.empty() ? "unknown" : st.gpuName, st.vendorId, st.deviceId,
 					st.probeSource.empty() ? "none" : st.probeSource, st.dxgiSpoofed ? "true" : "false", st.waveMmaTier);
+				if (xefg_wmma::SharedTileSupported())
+				{
+					Log::Info("XMX Port 3x3 shared-tile DP4a acceleration ready ({}/{} cs_6_6 shader overrides loaded)",
+						st.overrideLayers, st.layers);
+				}
+			}
+
+			// Normalize unsupported default/saved path (e.g. XMX (native) on AMD/NVIDIA) to the GPU's preferred path.
+			const auto curPath = Plugin::options.path.load(std::memory_order_relaxed);
+			const auto resolved = Plugin::ResolveEffectivePath(
+				curPath,
+				Plugin::gpuVendorId.load(std::memory_order_relaxed),
+				Plugin::xmxSupport.load(std::memory_order_relaxed) == Plugin::XmxSupport::Supported,
+				Plugin::cudaSupport.load(std::memory_order_relaxed) == Plugin::CudaSupport::Supported,
+				Plugin::wmmaSupport.load(std::memory_order_relaxed) == Plugin::WmmaSupport::Supported,
+				PortAvailable());
+			if (resolved != curPath)
+			{
+				Plugin::RecordPathFallback(curPath, resolved);
+				Plugin::options.path.store(resolved, std::memory_order_relaxed);
+				Log::Warn("Model '{}' is not supported on GPU vendor 0x{:04X}; automatically switched to '{}'",
+					Plugin::PathName(curPath), Plugin::gpuVendorId.load(std::memory_order_relaxed), Plugin::PathName(resolved));
 			}
 		});
+}
+
+static Plugin::Path EffectiveD3D12Path(bool xmxReady)
+{
+	return Plugin::ResolveEffectivePath(
+		Plugin::options.path.load(std::memory_order_relaxed),
+		Plugin::gpuVendorId.load(std::memory_order_relaxed),
+		xmxReady,
+		Plugin::cudaSupport.load(std::memory_order_relaxed) == Plugin::CudaSupport::Supported,
+		Plugin::wmmaSupport.load(std::memory_order_relaxed) == Plugin::WmmaSupport::Supported && xefg_wmma::Supported(),
+		PortAvailable());
 }
 
 static int32_t PickModel(ID3D12Device* device)
 {
 	const int32_t native = NativeModel(device);
+	const auto eff = EffectiveD3D12Path(native == XeFGXmxModel);
 
-	switch (Plugin::options.path.load())
+	switch (eff)
 	{
 	case Plugin::Path::Fallback:
 		return MfgKernels::Dp4aModel;
 	case Plugin::Path::XmxNative:
-		if (native == XeFGXmxModel)
-			return XeFGXmxModel;
-
-		// Unsupported, the CUDA / WMMA / ported defaults below
-		break;
+		return (native == XeFGXmxModel) ? XeFGXmxModel : (PortAvailable() ? MfgKernels::MfgModel : MfgKernels::Dp4aModel);
 	case Plugin::Path::Cuda:
 	case Plugin::Path::Wmma:
 	case Plugin::Path::XmxPort:
-		break;
+	default:
+		return PortAvailable() ? MfgKernels::MfgModel : MfgKernels::Dp4aModel;
 	}
-
-	return PortAvailable() ? MfgKernels::MfgModel : MfgKernels::Dp4aModel;
 }
 
-// The ported model runs on the CUDA tensor-core route when that's the selected path, otherwise on WMMA or DXIL. XeFG's own
-// XMX network doesn't need the port at all.
+// The ported model runs on the CUDA tensor-core route when NVIDIA resolves to CUDA.
 static bool UseCuda(int32_t model)
 {
 	if (model != MfgKernels::MfgModel)
 		return false;
 
-	const auto path = Plugin::options.path.load();
-	return path == Plugin::Path::Cuda || (path == Plugin::Path::XmxNative && Plugin::cudaSupport.load() == Plugin::CudaSupport::Supported);
+	return EffectiveD3D12Path(Plugin::xmxSupport.load(std::memory_order_relaxed) == Plugin::XmxSupport::Supported) == Plugin::Path::Cuda;
 }
 
-// The ported model runs on the AMD WMMA INT8 route only when WMMA is explicitly selected.
-// XMX (native) is strictly reserved for Intel GPUs with XMX support and falls back to XMX Port (or CUDA) elsewhere.
+// The ported model runs on the AMD WMMA INT8 route when AMD resolves to WMMA (including safety fallback from XMX (native)).
 static bool UseWmma(int32_t model)
 {
 	if (model != MfgKernels::MfgModel || !xefg_wmma::Supported())
 		return false;
 
-	return Plugin::options.path.load() == Plugin::Path::Wmma;
+	return EffectiveD3D12Path(Plugin::xmxSupport.load(std::memory_order_relaxed) == Plugin::XmxSupport::Supported) == Plugin::Path::Wmma;
+}
+
+// Any SM 6.6 + Wave32-capable GPU running XMX Port uses the 17 cs_6_6 shared-tile 3x3 DP4a overrides when available.
+static bool UseSharedTileXmxPort(int32_t model)
+{
+	if (model != MfgKernels::MfgModel || !xefg_wmma::SharedTileSupported())
+		return false;
+
+	return EffectiveD3D12Path(Plugin::xmxSupport.load(std::memory_order_relaxed) == Plugin::XmxSupport::Supported) == Plugin::Path::XmxPort;
 }
 
 static Plugin::Network CurrentNetwork(int32_t model)
@@ -985,7 +1027,7 @@ bool FrameGenerator::CreateContext()
 	}
 
 	xefg_cuda::SetEnabled(UseCuda(settings.model));
-	xefg_wmma::SetEnabled(UseWmma(settings.model));
+	xefg_wmma::SetEnabled(UseWmma(settings.model) || UseSharedTileXmxPort(settings.model));
 
 	// Process wide, they also affect other XeFG contexts. Must happen before the context picks its model
 	XeFG::SetMaxInterpolatedFrames(MaxFrames);
@@ -1138,7 +1180,20 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	Plugin::ApplyBrokenHudlessQuirkOnce();
 
 	auto backbuffer = params.GetOr<ID3D12Resource*>("DLSSG.Backbuffer", nullptr);
+	const auto bbDesc = backbuffer->GetDesc();
+	const auto backbufferFormat = TypedFormat(bbDesc.Format);
 	auto rawHudless = params.GetOr<ID3D12Resource*>("DLSSG.HUDLess", nullptr);
+	if (!rawHudless && !IsHdrFormat(backbufferFormat))
+	{
+		if (auto optiHudless = params.GetOr<ID3D12Resource*>("Opti.Hudless", nullptr);
+			optiHudless && optiHudless != backbuffer)
+		{
+			rawHudless = optiHudless;
+			static bool loggedOptiHudless = false;
+			if (!std::exchange(loggedOptiHudless, true))
+				Log::Info("UnityUpscalerBridge: using Opti.Hudless as HUD-less source (SDR)");
+		}
+	}
 	auto hudless = Plugin::options.hudlessUi ? rawHudless : nullptr;
 	auto depth = params.GetOr<ID3D12Resource*>("DLSSG.Depth", nullptr);
 	auto mvecs = params.GetOr<ID3D12Resource*>("DLSSG.MVecs", nullptr);
@@ -1150,9 +1205,6 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	const bool mvecJittered = XeFgEnabler::ApplyTriStateOverride(
 		Plugin::options.jitteredMvOverride.load(std::memory_order_relaxed),
 		params.GetOr<uint32_t>("DLSSG.MvecJittered", 0) != 0);
-
-	const auto bbDesc = backbuffer->GetDesc();
-	const auto backbufferFormat = TypedFormat(bbDesc.Format);
 	auto hudlessFormat = hudless ? TypedFormat(hudless->GetDesc().Format) : DXGI_FORMAT_UNKNOWN;
 
 	// Guard against aliased or mismatched HUD-less textures (size, format, MSAA, or subrect) which break XeFG UI extraction.
@@ -1292,7 +1344,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 
 	// The menu path can change without a context change: XMX Port, CUDA, and WMMA all run the ported model (16), only the
 	// route that executes its programs differs. Log the switch, and say whether it took effect below
-	const auto path = Plugin::options.path.load();
+	const auto path = EffectiveD3D12Path(Plugin::xmxSupport.load(std::memory_order_relaxed) == Plugin::XmxSupport::Supported);
 	const bool pathChanged = (int32_t)path != loggedPath;
 
 	if (pathChanged)
@@ -1357,7 +1409,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 		return;
 
 	xefg_cuda::SetEnabled(UseCuda(settings.model));
-	xefg_wmma::SetEnabled(UseWmma(settings.model));
+	xefg_wmma::SetEnabled(UseWmma(settings.model) || UseSharedTileXmxPort(settings.model));
 	const bool debugLines = Plugin::options.debugLines.load(std::memory_order_relaxed);
 	static std::atomic<int> sLastDebugLines{ -1 };
 	if (sLastDebugLines.exchange(debugLines ? 1 : 0, std::memory_order_relaxed) != (debugLines ? 1 : 0))
@@ -1570,7 +1622,8 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 		}
 	}
 
-	// Camera Cut & Teleport Detector + GhostBuster anti-ghosting (respects ignoreGameReset + kQuiet anti-double-reset)
+	// Camera Cut & Teleport Detector + GhostBuster anti-ghosting (internal safety resets still apply when
+	// ignoreGameReset is on; adaptive camera-step scale prevents meter-threshold false positives in UE cm-scale games)
 	constexpr uint32_t kSyntheticResetQuietFrames = 4u;
 	if (reset)
 		context->syntheticResetQuietFrames = kSyntheticResetQuietFrames;
@@ -1609,11 +1662,11 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 				    curFwd.z * context->prevCameraFwd[2]) * invCur / std::sqrt(prevLenSq))
 				: 1.0f;
 
-			constexpr float kCutThresholdSq = 4.5f * 4.5f;
-			constexpr float kHardTeleportSq = 100.0f; // 10m+ genuine teleport always bypasses quiet window
+			const float cutThresholdSq = context->cameraMotionScale.CutThresholdSq();
+			const float hardTeleportSq = context->cameraMotionScale.HardTeleportThresholdSq();
 			const bool quietActive = context->syntheticResetQuietFrames > 0u;
 			// GhostBuster already checks sharper rotation snaps (fwdDot < 0.707); only check 120-deg flip when GhostBuster is off.
-			if (camCutOn && !reset && (distSq > kHardTeleportSq || (!quietActive && (distSq > kCutThresholdSq || (!ghostBusterOn && fwdDot < -0.5f)))))
+			if (camCutOn && !reset && (distSq > hardTeleportSq || (!quietActive && (distSq > cutThresholdSq || (!ghostBusterOn && fwdDot < -0.5f)))))
 			{
 				reset = true;
 				context->syntheticResetQuietFrames = kSyntheticResetQuietFrames;
@@ -1624,12 +1677,16 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 		{
 			const bool camMvIncluded = params.GetOr<uint32_t>("DLSSG.CameraMotionIncluded", 1) != 0;
 			if (XeFgEnabler::ShouldGhostBusterReset(true, hasCamera, context->hasPrevCamera, fwdDot,
-				curFov, context->prevCameraFov, context->hasPrevFov, camMvIncluded, distSq))
+				curFov, context->prevCameraFov, context->hasPrevFov, camMvIncluded, distSq,
+				context->cameraMotionScale.GhostBusterMoveThresholdSq()))
 			{
 				reset = true;
 				context->syntheticResetQuietFrames = kSyntheticResetQuietFrames;
 			}
 		}
+
+		if (!reset && hasCamera && context->hasPrevCamera)
+			context->cameraMotionScale.Observe(std::sqrt(distSq));
 
 		if (hasCamera)
 		{
@@ -1859,7 +1916,7 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 	// Execute records the provider's dispatches into the caller's list; make sure that list's table is hooked too
 	if (UseCuda(settings.model))
 		xefg_cuda::Adopt(cmdList);
-	else if (UseWmma(settings.model))
+	else if (UseWmma(settings.model) || UseSharedTileXmxPort(settings.model))
 		xefg_wmma::Adopt(cmdList);
 
 	auto result = XeFG::Execute(context->handle, cmdList, params, interpolationTime);
@@ -2121,7 +2178,7 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 				Log::Warn("CUDA route: no tensor-core kernel launched ({} layer binds, {} layers recognized), the DXIL port is running",
 					route.binds, route.layers);
 		}
-		else if (UseWmma(settings.model))
+		else if (UseWmma(settings.model) || UseSharedTileXmxPort(settings.model))
 		{
 			routeReported = true;
 			const auto vkWmma = D3D12VulkanWmma::Snapshot();

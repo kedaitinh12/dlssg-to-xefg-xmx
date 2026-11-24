@@ -618,23 +618,37 @@ namespace
 
 		int32_t path = (int32_t)Plugin::options.path.load();
 
-		// A saved choice the GPU doesn't support runs something else, show what is actually running
-		if (path == (int32_t)Plugin::Path::XmxNative && xmxDisabled)
-			path = !cudaDisabled ? (int32_t)Plugin::Path::Cuda : (int32_t)Plugin::Path::XmxPort;
-
-		if (path == (int32_t)Plugin::Path::Cuda && cudaDisabled)
-			path = (int32_t)Plugin::Path::XmxPort;
-
-		if (path == (int32_t)Plugin::Path::Wmma && wmmaDisabled)
-			path = (int32_t)Plugin::Path::XmxPort;
+		// A saved choice the GPU doesn't support runs something else; auto-switch to the fallback model and notify.
+		const bool xmxReady = !xmxDisabled;
+		const bool cudaReady = Plugin::cudaSupport.load() == Plugin::CudaSupport::Supported;
+		const bool wmmaReady = Plugin::wmmaSupport.load() == Plugin::WmmaSupport::Supported;
+		const auto resolvedPath = Plugin::ResolveEffectivePath((Plugin::Path)path,
+			Plugin::gpuVendorId.load(std::memory_order_relaxed), xmxReady, cudaReady, wmmaReady, true);
+		if ((int32_t)resolvedPath != path)
+		{
+			Plugin::RecordPathFallback((Plugin::Path)path, resolvedPath);
+			path = (int32_t)resolvedPath;
+			Plugin::options.path = resolvedPath;
+			api->SetInt(self, "NetworkPath", path);
+		}
 
 		const bool disabled[] = { false, cudaDisabled, false, xmxDisabled, wmmaDisabled };
 
 		if (api->Combo("Network path", &path, PathNames, 5, disabled))
 		{
+			Plugin::ClearPathFallback();
 			Plugin::options.path = (Plugin::Path)path;
 			api->SetInt(self, "NetworkPath", path);
 			NotifySettingChanged(NoticeKind::LiveSaved, "Network path");
+		}
+		{
+			const int32_t fbFrom = Plugin::fallbackFromPath.load(std::memory_order_relaxed);
+			const int32_t fbTo = Plugin::fallbackToPath.load(std::memory_order_relaxed);
+			if (fbFrom >= 0 && fbFrom < 5 && fbTo >= 0 && fbTo < 5 && fbFrom != fbTo)
+			{
+				Yellow(std::format("Model '{}' is not supported on this GPU; automatically switched to '{}'.",
+					PathNames[fbFrom], PathNames[fbTo]).c_str());
+			}
 		}
 		HelpMarker("Picks which AI engine on your graphics card creates extra frames.\n"
 				   "- WMMA: Fastest on newer AMD RX 7000 / 9000 cards.\n"
@@ -758,7 +772,11 @@ namespace
 			NotifySettingChanged(NoticeKind::LiveSaved, "GhostBuster anti-ghosting");
 		}
 		HelpMarker("Opt-in (OFF by default for max smoothness): resets history on rapid\n"
-				   "camera snaps (>45 deg) or scope zoom to cut ghosting (skips 1 FG beat).");
+				   "camera snaps (>45 deg/frame, or >30 deg if camera MV is missing) and\n"
+				   "sudden scope/ADS FOV jumps (>14 deg), skipping 1 FG beat each time.\n"
+				   "Avoid in fast-paced shooters/esports or high-speed action games with\n"
+				   "frequent quick-scoping or fast mouse flicks (can cause brief 1-frame\n"
+				   "hitches). Best reserved for single-player games with heavy ghosting.");
 
 		bool spinSleep = Plugin::options.pacingSpinlockSleep;
 
@@ -1001,7 +1019,13 @@ namespace
 			for (const char* key : kAllKeys)
 				api->ResetValue(self, key);
 
-			Plugin::options.path = Plugin::Path::XmxNative;
+			Plugin::ClearPathFallback();
+			Plugin::options.path = Plugin::PreferredPathForGpu(
+				Plugin::gpuVendorId.load(std::memory_order_relaxed),
+				Plugin::xmxSupport.load() == Plugin::XmxSupport::Supported,
+				Plugin::cudaSupport.load() == Plugin::CudaSupport::Supported,
+				Plugin::wmmaSupport.load() == Plugin::WmmaSupport::Supported,
+				true);
 			Plugin::options.hudlessUi = true;
 			Plugin::ApplyBrokenHudlessQuirkOnce();
 			Plugin::options.cameraCutDetection = true;
@@ -1162,6 +1186,52 @@ namespace
 		std::call_once(asiStartOnce, StartFromAsiImpl);
 	}
 } // namespace
+
+Plugin::Path Plugin::PreferredPathForGpu(uint32_t vendorId, bool xmxReady, bool cudaReady, bool wmmaReady, bool portReady) noexcept
+{
+	switch (vendorId)
+	{
+	case 0x1002u: // AMD: WMMA -> XMX Port -> Fallback (DP4a)
+		if (wmmaReady && portReady)
+			return Path::Wmma;
+		return portReady ? Path::XmxPort : Path::Fallback;
+	case 0x10DEu: // NVIDIA: CUDA -> XMX Port -> Fallback (DP4a)
+		if (cudaReady && portReady)
+			return Path::Cuda;
+		return portReady ? Path::XmxPort : Path::Fallback;
+	case 0x8086u: // Intel: XMX (native) -> XMX Port -> Fallback (DP4a)
+	default:      // Unknown GPU: XMX (native) -> XMX Port -> Fallback (DP4a)
+		if (xmxReady)
+			return Path::XmxNative;
+		return portReady ? Path::XmxPort : Path::Fallback;
+	}
+}
+
+Plugin::Path Plugin::ResolveEffectivePath(Path requested, uint32_t vendorId, bool xmxReady, bool cudaReady, bool wmmaReady, bool portReady) noexcept
+{
+	switch (requested)
+	{
+	case Path::Fallback:
+		return Path::Fallback;
+	case Path::XmxPort:
+		return portReady ? Path::XmxPort : Path::Fallback;
+	case Path::Wmma:
+		if (wmmaReady && portReady)
+			return Path::Wmma;
+		return portReady ? Path::XmxPort : Path::Fallback;
+	case Path::Cuda:
+		if (cudaReady && portReady)
+			return Path::Cuda;
+		return portReady ? Path::XmxPort : Path::Fallback;
+	case Path::XmxNative:
+		if (xmxReady && (vendorId == 0x8086u || vendorId == 0u))
+			return Path::XmxNative;
+		// Safety net: any GPU that ends up with XMX (native) without native XMX support falls back via its vendor chain.
+		return PreferredPathForGpu(vendorId, false, cudaReady, wmmaReady, portReady);
+	default:
+		return PreferredPathForGpu(vendorId, xmxReady, cudaReady, wmmaReady, portReady);
+	}
+}
 
 const char* Plugin::PathName(Path path)
 {

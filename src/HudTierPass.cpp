@@ -134,13 +134,21 @@ bool IsHudDiff(int2 p)
 }
 
 // 10x10 shared tile for 8x8 group + 1-pixel halo (200 vs 1152 texture loads per group = 5.76x fewer VRAM reads)
+// plus uniform tile early-exit (~90%+ non-HUD background tiles skip dilation, counter & composite passes completely)
 groupshared uint g_sDiff[100];
 groupshared uint g_diffGroupCount;
+groupshared uint g_tileHasAnyDiff;
 
 [numthreads(8, 8, 1)]
 void HudDiffCompositeCS(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID, uint gidx : SV_GroupIndex)
 {
-    if (gidx == 0u) g_diffGroupCount = 0u;
+    if (gidx == 0u)
+    {
+        g_diffGroupCount = 0u;
+        g_tileHasAnyDiff = 0u;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
     int2 maxCoord = int2(Width - 1u, Height - 1u);
     int2 tileOrigin = int2(gid.xy * 8u) - int2(1, 1);
 
@@ -149,9 +157,14 @@ void HudDiffCompositeCS(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThr
         int tx = int(idx % 10u);
         int ty = int(idx / 10u);
         int2 q = clamp(tileOrigin + int2(tx, ty), int2(0, 0), maxCoord);
-        g_sDiff[idx] = IsHudDiff(q) ? 1u : 0u;
+        uint d = IsHudDiff(q) ? 1u : 0u;
+        g_sDiff[idx] = d;
+        if (d != 0u) g_tileHasAnyDiff = 1u;
     }
     GroupMemoryBarrierWithGroupSync();
+
+    // Uniform across all 64 threads: if no pixel in the 10x10 halo differs, no pixel in the 8x8 tile is HUD.
+    if (g_tileHasAnyDiff == 0u) return;
 
     if (id.x < Width && id.y < Height)
     {
@@ -437,7 +450,7 @@ cbuffer Match : register(b0)
 Texture2D<float4> hudless : register(t0);
 Texture2D<float4> backBuffer : register(t1);
 RWTexture2D<float4> output : register(u0);
-RWStructuredBuffer<uint> histogram : register(u1);
+RWByteAddressBuffer histogram : register(u1);
 RWByteAddressBuffer lut : register(u2);
 
 uint BinOf(float v)
@@ -451,7 +464,7 @@ uint BinOf(float v)
 [numthreads(64, 1, 1)]
 void clear(uint3 id : SV_DispatchThreadID)
 {
-    if (id.x < 3 * bins * codes) histogram[id.x] = 0u;
+    if (id.x < 3 * bins * codes) histogram.Store(id.x * 4u, 0u);
 }
 
 [numthreads(8, 8, 1)]
@@ -465,7 +478,7 @@ void accumulate(uint3 id : SV_DispatchThreadID)
     {
         const uint code = (uint)(saturate(b[c]) * (codes - 1) + 0.5);
         uint previous;
-        InterlockedAdd(histogram[(c * bins + BinOf(h[c])) * codes + code], 1u, previous);
+        histogram.InterlockedAdd(((c * bins + BinOf(h[c])) * codes + code) * 4u, 1u, previous);
     }
 }
 
@@ -477,7 +490,7 @@ void median(uint3 group : SV_GroupID, uint gi : SV_GroupIndex)
     const uint base = (c * bins + bin) * codes + gi * 4;
     uint counts[4];
     uint sum = 0;
-    [unroll] for (uint k = 0; k < 4; ++k) { counts[k] = histogram[base + k]; sum += counts[k]; }
+    [unroll] for (uint k = 0; k < 4; ++k) { counts[k] = histogram.Load((base + k) * 4u); sum += counts[k]; }
     partial[gi] = sum;
     GroupMemoryBarrierWithGroupSync();
     [unroll] for (uint offset = 1; offset < 256; offset <<= 1)
@@ -501,21 +514,25 @@ void median(uint3 group : SV_GroupID, uint gi : SV_GroupIndex)
     }
 }
 
-[numthreads(1, 1, 1)]
-void fill(uint3 group : SV_GroupID)
+groupshared float fillRaw[256];
+groupshared float fillLut[256];
+[numthreads(256, 1, 1)]
+void fill(uint3 group : SV_GroupID, uint gi : SV_GroupIndex)
 {
     const uint c = group.x, base = c * bins;
-    float raw[256], l[256];
-    for (uint r = 0; r < 256; ++r) { raw[r] = asfloat(lut.Load((base + r) * 4)); l[r] = raw[r]; }
-    for (uint k = 0; k < 256; ++k)
+    const float rawVal = asfloat(lut.Load((base + gi) * 4));
+    fillRaw[gi] = rawVal;
+    fillLut[gi] = rawVal;
+    GroupMemoryBarrierWithGroupSync();
+
+    if (rawVal >= 0.0)
     {
-        if (raw[k] < 0.0) continue;
         float w[5];
         uint n = 0;
         for (int d = -2; d <= 2; ++d)
         {
-            const int j = (int)k + d;
-            if (j >= 0 && j < 256 && raw[j] >= 0.0) { w[n] = raw[j]; ++n; }
+            const int j = (int)gi + d;
+            if (j >= 0 && j < 256 && fillRaw[j] >= 0.0) { w[n] = fillRaw[j]; ++n; }
         }
         for (uint a = 1; a < n; ++a)
         {
@@ -524,29 +541,49 @@ void fill(uint3 group : SV_GroupID)
             while (p >= 0 && w[p] > x) { w[p + 1] = w[p]; --p; }
             w[p + 1] = x;
         }
-        if (abs(raw[k] - w[n / 2]) > OUTLIER) l[k] = w[n / 2];
+        if (abs(rawVal - w[n / 2]) > OUTLIER) fillLut[gi] = w[n / 2];
     }
-    int first = -1, last = -1;
-    for (uint i = 0; i < 256; ++i) if (l[i] >= 0.0) { if (first < 0) first = (int)i; last = (int)i; }
-    if (first < 0) { for (uint z = 0; z < 256; ++z) lut.Store((base + z) * 4, asuint(0.0)); return; }
-    int previous = first;
-    for (int b = first + 1; b <= last; ++b)
+    GroupMemoryBarrierWithGroupSync();
+
+    if (gi == 0u)
     {
-        if (l[b] < 0.0) continue;
-        for (int g = previous + 1; g < b; ++g) l[g] = lerp(l[previous], l[b], (float)(g - previous) / (float)(b - previous));
-        previous = b;
+        int first = -1, last = -1;
+        for (uint i = 0; i < 256; ++i) if (fillLut[i] >= 0.0) { if (first < 0) first = (int)i; last = (int)i; }
+        if (first < 0)
+        {
+            for (uint z = 0; z < 256; ++z) fillLut[z] = 0.0;
+        }
+        else
+        {
+            int previous = first;
+            for (int b = first + 1; b <= last; ++b)
+            {
+                if (fillLut[b] < 0.0) continue;
+                for (int g = previous + 1; g < b; ++g) fillLut[g] = lerp(fillLut[previous], fillLut[b], (float)(g - previous) / (float)(b - previous));
+                previous = b;
+            }
+            const int span = min(4, last - first);
+            const float headSlope = span > 0 ? max((fillLut[first + span] - fillLut[first]) / (float)span, 0.0) : 0.0;
+            const float tailSlope = span > 0 ? max((fillLut[last] - fillLut[last - span]) / (float)span, 0.0) : 0.0;
+            for (int h = 0; h < first; ++h) fillLut[h] = saturate(fillLut[first] - headSlope * (float)(first - h));
+            for (int t = last + 1; t < 256; ++t) fillLut[t] = saturate(fillLut[last] + tailSlope * (float)(t - last));
+        }
     }
-    const int span = min(4, last - first);
-    const float headSlope = span > 0 ? max((l[first + span] - l[first]) / (float)span, 0.0) : 0.0;
-    const float tailSlope = span > 0 ? max((l[last] - l[last - span]) / (float)span, 0.0) : 0.0;
-    for (int h = 0; h < first; ++h) l[h] = saturate(l[first] - headSlope * (float)(first - h));
-    for (int t = last + 1; t < 256; ++t) l[t] = saturate(l[last] + tailSlope * (float)(t - last));
-    for (uint o = 0; o < 256; ++o) lut.Store((base + o) * 4, asuint(l[o]));
+    GroupMemoryBarrierWithGroupSync();
+
+    lut.Store((base + gi) * 4, asuint(fillLut[gi]));
 }
 
+groupshared float g_applyLut[768];
+
 [numthreads(8, 8, 1)]
-void apply(uint3 id : SV_DispatchThreadID)
+void apply(uint3 id : SV_DispatchThreadID, uint gidx : SV_GroupIndex)
 {
+    const uint totalLut = min(3u * bins, 768u);
+    for (uint li = gidx; li < totalLut; li += 64u)
+        g_applyLut[li] = asfloat(lut.Load(li * 4u));
+    GroupMemoryBarrierWithGroupSync();
+
     if (id.x >= width || id.y >= height) return;
     const float3 h = hudless.Load(int3(id.xy, 0)).rgb;
     float3 o = 0;
@@ -557,7 +594,8 @@ void apply(uint3 id : SV_DispatchThreadID)
         f = clamp(f, 0.0, (float)(bins - 1));
         const uint i = min((uint)f, bins - 2);
         const float t = saturate(f - (float)i);
-        o[c] = lerp(asfloat(lut.Load((c * bins + i) * 4)), asfloat(lut.Load((c * bins + i + 1) * 4)), t);
+        const uint lutIdx = c * bins + i;
+        o[c] = lerp(g_applyLut[lutIdx], g_applyLut[lutIdx + 1u], t);
     }
     o = float3(
         IsFiniteF(o.r) ? saturate(o.r) : 0.0f,
@@ -640,7 +678,7 @@ cbuffer BilateralParams : register(b0)
 Texture2D<float4> hudless : register(t0);
 Texture2D<float4> backBuffer : register(t1);
 RWTexture2D<float4> output : register(u0);
-RWStructuredBuffer<uint> statsBuf : register(u1);
+RWByteAddressBuffer statsBuf : register(u1);
 RWByteAddressBuffer modelBuf : register(u2);
 
 float3 SafeSaturateRgb(float3 c)
@@ -661,35 +699,35 @@ void AccumBin(uint cellIdx, uint b, float w, float3 x, float3 y)
     if (w <= 1e-4f) return;
     uint base = (cellIdx * bins + b) * 22u;
     uint dummy;
-    InterlockedAdd(statsBuf[base + 0u], (uint)(w * B_SCALE + 0.5f), dummy);
-    InterlockedAdd(statsBuf[base + 1u], (uint)(w * x.r * B_SCALE + 0.5f), dummy);
-    InterlockedAdd(statsBuf[base + 2u], (uint)(w * x.g * B_SCALE + 0.5f), dummy);
-    InterlockedAdd(statsBuf[base + 3u], (uint)(w * x.b * B_SCALE + 0.5f), dummy);
-    InterlockedAdd(statsBuf[base + 4u], (uint)(w * x.r * x.r * B_SCALE + 0.5f), dummy);
-    InterlockedAdd(statsBuf[base + 5u], (uint)(w * x.r * x.g * B_SCALE + 0.5f), dummy);
-    InterlockedAdd(statsBuf[base + 6u], (uint)(w * x.r * x.b * B_SCALE + 0.5f), dummy);
-    InterlockedAdd(statsBuf[base + 7u], (uint)(w * x.g * x.g * B_SCALE + 0.5f), dummy);
-    InterlockedAdd(statsBuf[base + 8u], (uint)(w * x.g * x.b * B_SCALE + 0.5f), dummy);
-    InterlockedAdd(statsBuf[base + 9u], (uint)(w * x.b * x.b * B_SCALE + 0.5f), dummy);
-    InterlockedAdd(statsBuf[base + 10u], (uint)(w * x.r * y.r * B_SCALE + 0.5f), dummy);
-    InterlockedAdd(statsBuf[base + 11u], (uint)(w * x.r * y.g * B_SCALE + 0.5f), dummy);
-    InterlockedAdd(statsBuf[base + 12u], (uint)(w * x.r * y.b * B_SCALE + 0.5f), dummy);
-    InterlockedAdd(statsBuf[base + 13u], (uint)(w * x.g * y.r * B_SCALE + 0.5f), dummy);
-    InterlockedAdd(statsBuf[base + 14u], (uint)(w * x.g * y.g * B_SCALE + 0.5f), dummy);
-    InterlockedAdd(statsBuf[base + 15u], (uint)(w * x.g * y.b * B_SCALE + 0.5f), dummy);
-    InterlockedAdd(statsBuf[base + 16u], (uint)(w * x.b * y.r * B_SCALE + 0.5f), dummy);
-    InterlockedAdd(statsBuf[base + 17u], (uint)(w * x.b * y.g * B_SCALE + 0.5f), dummy);
-    InterlockedAdd(statsBuf[base + 18u], (uint)(w * x.b * y.b * B_SCALE + 0.5f), dummy);
-    InterlockedAdd(statsBuf[base + 19u], (uint)(w * y.r * B_SCALE + 0.5f), dummy);
-    InterlockedAdd(statsBuf[base + 20u], (uint)(w * y.g * B_SCALE + 0.5f), dummy);
-    InterlockedAdd(statsBuf[base + 21u], (uint)(w * y.b * B_SCALE + 0.5f), dummy);
+    statsBuf.InterlockedAdd((base + 0u) * 4u, (uint)(w * B_SCALE + 0.5f), dummy);
+    statsBuf.InterlockedAdd((base + 1u) * 4u, (uint)(w * x.r * B_SCALE + 0.5f), dummy);
+    statsBuf.InterlockedAdd((base + 2u) * 4u, (uint)(w * x.g * B_SCALE + 0.5f), dummy);
+    statsBuf.InterlockedAdd((base + 3u) * 4u, (uint)(w * x.b * B_SCALE + 0.5f), dummy);
+    statsBuf.InterlockedAdd((base + 4u) * 4u, (uint)(w * x.r * x.r * B_SCALE + 0.5f), dummy);
+    statsBuf.InterlockedAdd((base + 5u) * 4u, (uint)(w * x.r * x.g * B_SCALE + 0.5f), dummy);
+    statsBuf.InterlockedAdd((base + 6u) * 4u, (uint)(w * x.r * x.b * B_SCALE + 0.5f), dummy);
+    statsBuf.InterlockedAdd((base + 7u) * 4u, (uint)(w * x.g * x.g * B_SCALE + 0.5f), dummy);
+    statsBuf.InterlockedAdd((base + 8u) * 4u, (uint)(w * x.g * x.b * B_SCALE + 0.5f), dummy);
+    statsBuf.InterlockedAdd((base + 9u) * 4u, (uint)(w * x.b * x.b * B_SCALE + 0.5f), dummy);
+    statsBuf.InterlockedAdd((base + 10u) * 4u, (uint)(w * x.r * y.r * B_SCALE + 0.5f), dummy);
+    statsBuf.InterlockedAdd((base + 11u) * 4u, (uint)(w * x.r * y.g * B_SCALE + 0.5f), dummy);
+    statsBuf.InterlockedAdd((base + 12u) * 4u, (uint)(w * x.r * y.b * B_SCALE + 0.5f), dummy);
+    statsBuf.InterlockedAdd((base + 13u) * 4u, (uint)(w * x.g * y.r * B_SCALE + 0.5f), dummy);
+    statsBuf.InterlockedAdd((base + 14u) * 4u, (uint)(w * x.g * y.g * B_SCALE + 0.5f), dummy);
+    statsBuf.InterlockedAdd((base + 15u) * 4u, (uint)(w * x.g * y.b * B_SCALE + 0.5f), dummy);
+    statsBuf.InterlockedAdd((base + 16u) * 4u, (uint)(w * x.b * y.r * B_SCALE + 0.5f), dummy);
+    statsBuf.InterlockedAdd((base + 17u) * 4u, (uint)(w * x.b * y.g * B_SCALE + 0.5f), dummy);
+    statsBuf.InterlockedAdd((base + 18u) * 4u, (uint)(w * x.b * y.b * B_SCALE + 0.5f), dummy);
+    statsBuf.InterlockedAdd((base + 19u) * 4u, (uint)(w * y.r * B_SCALE + 0.5f), dummy);
+    statsBuf.InterlockedAdd((base + 20u) * 4u, (uint)(w * y.g * B_SCALE + 0.5f), dummy);
+    statsBuf.InterlockedAdd((base + 21u) * 4u, (uint)(w * y.b * B_SCALE + 0.5f), dummy);
 }
 
 [numthreads(64, 1, 1)]
 void BilateralClearCS(uint3 id : SV_DispatchThreadID)
 {
     if (id.x < totalStatsUints)
-        statsBuf[id.x] = 0u;
+        statsBuf.Store(id.x * 4u, 0u);
 }
 
 [numthreads(8, 8, 1)]
@@ -746,7 +784,7 @@ void BilateralSolveCS(uint3 id : SV_DispatchThreadID)
             float w = (float)((2 - abs(dx)) * (2 - abs(dy)));
             uint nBase = (((uint)ny * cellsX + (uint)nx) * bins + b) * 22u;
             for (uint m = 0u; m < 22u; ++m)
-                s[m] += w * ((float)statsBuf[nBase + m] * B_INV_SCALE);
+                s[m] += w * ((float)statsBuf.Load((nBase + m) * 4u) * B_INV_SCALE);
         }
     }
 
@@ -801,7 +839,7 @@ void BilateralSolveCS(uint3 id : SV_DispatchThreadID)
             float4 cand0 = float4(w0, my.x - dot(mx, w0));
             float4 cand1 = float4(w1, my.y - dot(mx, w1));
             float4 cand2 = float4(w2, my.z - dot(mx, w2));
-            if (all(IsFiniteF3(cand0)) && all(IsFiniteF3(cand1)) && all(IsFiniteF3(cand2)))
+            if (all(IsFiniteF3(cand0.xyz)) && IsFiniteF(cand0.w) && all(IsFiniteF3(cand1.xyz)) && IsFiniteF(cand1.w) && all(IsFiniteF3(cand2.xyz)) && IsFiniteF(cand2.w))
             {
                 row0 = cand0;
                 row1 = cand1;
@@ -816,9 +854,36 @@ void BilateralSolveCS(uint3 id : SV_DispatchThreadID)
     modelBuf.Store4((mBase + 8u) * 4u, asuint(row2));
 }
 
+// 4 spatial corners x 8 luma bins x 3 float4 rows = 96 float4 (1.5 KB LDS):
+// Because cell=128 is a multiple of 16, all 64 threads in every 8x8 group share identical (x0,y0,x1,y1),
+// cutting global modelBuf Load4 traffic by 16x (96 loads/group vs 1536 loads/group) with bit-exact output.
+groupshared float4 g_cellModels[96];
+
 [numthreads(8, 8, 1)]
-void BilateralApplyCS(uint3 id : SV_DispatchThreadID)
+void BilateralApplyCS(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gidx : SV_GroupIndex)
 {
+    const float grpGx = ((float)(gid.x * 8u) + 0.5f) / (float)cell - 0.5f;
+    const float grpGy = ((float)(gid.y * 8u) + 0.5f) / (float)cell - 0.5f;
+    const int gx0 = clamp((int)floor(grpGx), 0, (int)cellsX - 1);
+    const int gy0 = clamp((int)floor(grpGy), 0, (int)cellsY - 1);
+    const int gx1 = min(gx0 + 1, (int)cellsX - 1);
+    const int gy1 = min(gy0 + 1, (int)cellsY - 1);
+
+    const uint cachedBins = min(bins, 8u);
+    const uint totalVecs = 4u * cachedBins * 3u;
+    for (uint v = gidx; v < totalVecs; v += 64u)
+    {
+        const uint row = v % 3u;
+        const uint cb = v / 3u;
+        const uint cz = cb % cachedBins;
+        const uint sc = cb / cachedBins;
+        const uint cx = (uint)(((sc & 1u) != 0u) ? gx1 : gx0);
+        const uint cy = (uint)(((sc & 2u) != 0u) ? gy1 : gy0);
+        const uint mBase = ((cy * cellsX + cx) * bins + cz) * 12u;
+        g_cellModels[v] = asfloat(modelBuf.Load4((mBase + row * 4u) * 4u));
+    }
+    GroupMemoryBarrierWithGroupSync();
+
     if (id.x >= width || id.y >= height) return;
 
     float3 h = SafeSaturateRgb(hudless.Load(int3(id.xy, 0)).rgb);
@@ -827,12 +892,8 @@ void BilateralApplyCS(uint3 id : SV_DispatchThreadID)
     float gy = ((float)id.y + 0.5f) / (float)cell - 0.5f;
     float gz = saturate(Luma709(h)) * (float)(bins - 1u);
 
-    int x0 = clamp((int)floor(gx), 0, (int)cellsX - 1);
-    int y0 = clamp((int)floor(gy), 0, (int)cellsY - 1);
-    int x1 = min(x0 + 1, (int)cellsX - 1);
-    int y1 = min(y0 + 1, (int)cellsY - 1);
-    uint z0 = min((uint)floor(gz), bins - 1u);
-    uint z1 = min(z0 + 1u, bins - 1u);
+    uint z0 = min((uint)floor(gz), cachedBins - 1u);
+    uint z1 = min(z0 + 1u, cachedBins - 1u);
 
     float fx = saturate(gx - floor(gx));
     float fy = saturate(gy - floor(gy));
@@ -842,19 +903,18 @@ void BilateralApplyCS(uint3 id : SV_DispatchThreadID)
     float4 m1 = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 m2 = float4(0.0f, 0.0f, 0.0f, 0.0f);
 
-    for (uint corner = 0u; corner < 8u; ++corner)
+    [unroll] for (uint corner = 0u; corner < 8u; ++corner)
     {
         bool bx = (corner & 1u) != 0u;
         bool by = (corner & 2u) != 0u;
         bool bz = (corner & 4u) != 0u;
         float w = (bx ? fx : (1.0f - fx)) * (by ? fy : (1.0f - fy)) * (bz ? fz : (1.0f - fz));
-        uint cx = (uint)(bx ? x1 : x0);
-        uint cy = (uint)(by ? y1 : y0);
+        uint sc = corner & 3u;
         uint cz = bz ? z1 : z0;
-        uint mBase = ((cy * cellsX + cx) * bins + cz) * 12u;
-        m0 += w * asfloat(modelBuf.Load4((mBase + 0u) * 4u));
-        m1 += w * asfloat(modelBuf.Load4((mBase + 4u) * 4u));
-        m2 += w * asfloat(modelBuf.Load4((mBase + 8u) * 4u));
+        uint baseV = (sc * cachedBins + cz) * 3u;
+        m0 += w * g_cellModels[baseV + 0u];
+        m1 += w * g_cellModels[baseV + 1u];
+        m2 += w * g_cellModels[baseV + 2u];
     }
 
     float3 o = float3(
@@ -2006,26 +2066,20 @@ bool HudTierPass::EnsureBilateralMatchReady(ID3D12Device* device, DXGI_FORMAT ba
 						ranges[0].BaseShaderRegister = 0;
 						ranges[0].OffsetInDescriptorsFromTableStart = 0;
 						ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-						ranges[1].NumDescriptors = 1;
+						ranges[1].NumDescriptors = 3; // u0 (outTex), u1 (histogram/stats), u2 (lut/model)
 						ranges[1].BaseShaderRegister = 0;
 						ranges[1].OffsetInDescriptorsFromTableStart = 2;
 
-						D3D12_ROOT_PARAMETER params[4]{};
+						D3D12_ROOT_PARAMETER params[2]{};
 						params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 						params[0].Constants = { 0, 0, 8 };
 						params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 						params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 						params[1].DescriptorTable = { 2, ranges };
 						params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-						params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-						params[2].Descriptor = { 1, 0 };
-						params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-						params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-						params[3].Descriptor = { 2, 0 };
-						params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
 						D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-						rsDesc.NumParameters = 4;
+						rsDesc.NumParameters = 2;
 						rsDesc.pParameters = params;
 
 						Microsoft::WRL::ComPtr<ID3DBlob> sigBlob, errBlob;
@@ -2118,7 +2172,7 @@ bool HudTierPass::EnsureBilateralMatchReady(ID3D12Device* device, DXGI_FORMAT ba
 
 		D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
 		heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-		heapDesc.NumDescriptors = kToneMatchDescSlots * 3u;
+		heapDesc.NumDescriptors = kToneMatchDescSlots * 5u; // 32-slot ring * (t0, t1, u0, u1, u2)
 		heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 		if (FAILED(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&toneMatchHeap_))))
 			return false;
@@ -2172,7 +2226,7 @@ bool HudTierPass::EnsureBilateralMatchReady(ID3D12Device* device, DXGI_FORMAT ba
 		d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 		d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 		return SUCCEEDED(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &d,
-			D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&out)));
+			D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&out)));
 	};
 
 	const uint64_t totalCells = static_cast<uint64_t>(cx) * cy * kBilateralBins;
@@ -2221,26 +2275,20 @@ bool HudTierPass::EnsureToneMapMatchReady(ID3D12Device* device, DXGI_FORMAT back
 						ranges[0].BaseShaderRegister = 0;
 						ranges[0].OffsetInDescriptorsFromTableStart = 0;
 						ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-						ranges[1].NumDescriptors = 1;
+						ranges[1].NumDescriptors = 3; // u0 (outTex), u1 (histogram/stats), u2 (lut/model)
 						ranges[1].BaseShaderRegister = 0;
 						ranges[1].OffsetInDescriptorsFromTableStart = 2;
 
-						D3D12_ROOT_PARAMETER params[4]{};
+						D3D12_ROOT_PARAMETER params[2]{};
 						params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 						params[0].Constants = { 0, 0, 8 };
 						params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 						params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 						params[1].DescriptorTable = { 2, ranges };
 						params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-						params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-						params[2].Descriptor = { 1, 0 };
-						params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-						params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-						params[3].Descriptor = { 2, 0 };
-						params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
 						D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-						rsDesc.NumParameters = 4;
+						rsDesc.NumParameters = 2;
 						rsDesc.pParameters = params;
 
 						Microsoft::WRL::ComPtr<ID3DBlob> sigBlob, errBlob;
@@ -2344,7 +2392,7 @@ bool HudTierPass::EnsureToneMapMatchReady(ID3D12Device* device, DXGI_FORMAT back
 		d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 		d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 		return SUCCEEDED(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &d,
-			D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&out)));
+			D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&out)));
 	};
 
 	if (toneMatchResReady_ && toneMatchFormat_ == outFmt && toneMatchShared_ == wantShared)
@@ -2363,7 +2411,7 @@ bool HudTierPass::EnsureToneMapMatchReady(ID3D12Device* device, DXGI_FORMAT back
 
 	D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
 	heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-	heapDesc.NumDescriptors = kToneMatchDescSlots * 3u; // 32-slot ring * (t0, t1, u0)
+	heapDesc.NumDescriptors = kToneMatchDescSlots * 5u; // 32-slot ring * (t0, t1, u0, u1, u2)
 	heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 	if (FAILED(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&toneMatchHeap_))))
 		return false;
@@ -2425,10 +2473,14 @@ ID3D12Resource* HudTierPass::RecordToneMapMatch(ID3D12GraphicsCommandList* cmdLi
 
 		const uint32_t descSlot = toneMatchDescCursor_;
 		toneMatchDescCursor_ = (toneMatchDescCursor_ + 1u) % kToneMatchDescSlots;
+		const uint32_t totalCells = bilateralCellsX_ * bilateralCellsY_ * kBilateralBins;
+		const uint32_t totalStatsUints = totalCells * 22u;
+		const uint32_t totalModelUints = totalCells * 12u;
+
 		D3D12_CPU_DESCRIPTOR_HANDLE cpu = toneMatchHeap_->GetCPUDescriptorHandleForHeapStart();
-		cpu.ptr += static_cast<SIZE_T>(descSlot) * 3u * descSize_;
+		cpu.ptr += static_cast<SIZE_T>(descSlot) * 5u * descSize_;
 		D3D12_GPU_DESCRIPTOR_HANDLE gpu = toneMatchHeap_->GetGPUDescriptorHandleForHeapStart();
-		gpu.ptr += static_cast<SIZE_T>(descSlot) * 3u * descSize_;
+		gpu.ptr += static_cast<SIZE_T>(descSlot) * 5u * descSize_;
 
 		D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
 		srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -2447,25 +2499,35 @@ ID3D12Resource* HudTierPass::RecordToneMapMatch(ID3D12GraphicsCommandList* cmdLi
 		uavOut.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
 		uavOut.Format = toneMatchFormat_;
 		device_->CreateUnorderedAccessView(outTex, nullptr, &uavOut, cpu);
+		cpu.ptr += descSize_;
+
+		D3D12_UNORDERED_ACCESS_VIEW_DESC uavRaw{};
+		uavRaw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+		uavRaw.Format = DXGI_FORMAT_R32_TYPELESS;
+		uavRaw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+		uavRaw.Buffer.NumElements = totalStatsUints;
+		device_->CreateUnorderedAccessView(bilateralStats_.Get(), nullptr, &uavRaw, cpu);
+		cpu.ptr += descSize_;
+
+		uavRaw.Buffer.NumElements = totalModelUints;
+		device_->CreateUnorderedAccessView(bilateralModel_.Get(), nullptr, &uavRaw, cpu);
 
 		TransitionBarrier(cmdList, realTex, realState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 		TransitionBarrier(cmdList, hudlessTex, hudlessState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 		TransitionBarrier(cmdList, outTex, matchedOutputState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		TransitionBarrier(cmdList, bilateralStats_.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		TransitionBarrier(cmdList, bilateralModel_.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
 		ID3D12DescriptorHeap* heaps[] = { toneMatchHeap_.Get() };
 		cmdList->SetDescriptorHeaps(1, heaps);
 		cmdList->SetComputeRootSignature(bilateralRootSig_.Get());
 
-		const uint32_t totalCells = bilateralCellsX_ * bilateralCellsY_ * kBilateralBins;
-		const uint32_t totalStatsUints = totalCells * 22u;
 		const BilateralConstants bc{
 			width_, height_, bilateralCellsX_, bilateralCellsY_,
 			kBilateralCell, kBilateralBins, kBilateralLambda, totalStatsUints
 		};
 		cmdList->SetComputeRoot32BitConstants(0, 8, &bc, 0);
 		cmdList->SetComputeRootDescriptorTable(1, gpu);
-		cmdList->SetComputeRootUnorderedAccessView(2, bilateralStats_->GetGPUVirtualAddress());
-		cmdList->SetComputeRootUnorderedAccessView(3, bilateralModel_->GetGPUVirtualAddress());
 
 		// Amortized Fit: run Clear+Accum+Solve on first frame, camera cut/reset, or every 4 real frames (~60-75% GPU savings).
 		const bool runFit = !bilateralHasValidModel_ || forceRefit || (bilateralFrameCounter_ % kBilateralFitInterval == 0u);
@@ -2493,6 +2555,8 @@ ID3D12Resource* HudTierPass::RecordToneMapMatch(ID3D12GraphicsCommandList* cmdLi
 		cmdList->Dispatch((width_ + 7u) / 8u, (height_ + 7u) / 8u, 1u);
 		UavBarrier(cmdList, outTex);
 
+		TransitionBarrier(cmdList, bilateralStats_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+		TransitionBarrier(cmdList, bilateralModel_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
 		TransitionBarrier(cmdList, realTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, realState);
 		TransitionBarrier(cmdList, hudlessTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, hudlessState);
 		TransitionBarrier(cmdList, outTex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, matchedOutputState);
@@ -2514,9 +2578,9 @@ ID3D12Resource* HudTierPass::RecordToneMapMatch(ID3D12GraphicsCommandList* cmdLi
 	const uint32_t descSlot = toneMatchDescCursor_;
 	toneMatchDescCursor_ = (toneMatchDescCursor_ + 1u) % kToneMatchDescSlots;
 	D3D12_CPU_DESCRIPTOR_HANDLE cpu = toneMatchHeap_->GetCPUDescriptorHandleForHeapStart();
-	cpu.ptr += static_cast<SIZE_T>(descSlot) * 3u * descSize_;
+	cpu.ptr += static_cast<SIZE_T>(descSlot) * 5u * descSize_;
 	D3D12_GPU_DESCRIPTOR_HANDLE gpu = toneMatchHeap_->GetGPUDescriptorHandleForHeapStart();
-	gpu.ptr += static_cast<SIZE_T>(descSlot) * 3u * descSize_;
+	gpu.ptr += static_cast<SIZE_T>(descSlot) * 5u * descSize_;
 
 	D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
 	srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -2535,10 +2599,24 @@ ID3D12Resource* HudTierPass::RecordToneMapMatch(ID3D12GraphicsCommandList* cmdLi
 	uavOut.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
 	uavOut.Format = toneMatchFormat_;
 	device_->CreateUnorderedAccessView(outTex, nullptr, &uavOut, cpu);
+	cpu.ptr += descSize_;
+
+	D3D12_UNORDERED_ACCESS_VIEW_DESC uavRaw{};
+	uavRaw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+	uavRaw.Format = DXGI_FORMAT_R32_TYPELESS;
+	uavRaw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+	uavRaw.Buffer.NumElements = 3u * kToneMatchBins * kToneMatchCodes;
+	device_->CreateUnorderedAccessView(toneMatchHistogram_.Get(), nullptr, &uavRaw, cpu);
+	cpu.ptr += descSize_;
+
+	uavRaw.Buffer.NumElements = 3u * kToneMatchBins;
+	device_->CreateUnorderedAccessView(toneMatchLut_.Get(), nullptr, &uavRaw, cpu);
 
 	TransitionBarrier(cmdList, realTex, realState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 	TransitionBarrier(cmdList, hudlessTex, hudlessState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 	TransitionBarrier(cmdList, outTex, matchedOutputState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	TransitionBarrier(cmdList, toneMatchHistogram_.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	TransitionBarrier(cmdList, toneMatchLut_.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
 	ID3D12DescriptorHeap* heaps[] = { toneMatchHeap_.Get() };
 	cmdList->SetDescriptorHeaps(1, heaps);
@@ -2550,8 +2628,6 @@ ID3D12Resource* HudTierPass::RecordToneMapMatch(ID3D12GraphicsCommandList* cmdLi
 	};
 	cmdList->SetComputeRoot32BitConstants(0, 8, &rc, 0);
 	cmdList->SetComputeRootDescriptorTable(1, gpu);
-	cmdList->SetComputeRootUnorderedAccessView(2, toneMatchHistogram_->GetGPUVirtualAddress());
-	cmdList->SetComputeRootUnorderedAccessView(3, toneMatchLut_->GetGPUVirtualAddress());
 
 	// 1. clear histogram
 	cmdList->SetPipelineState(toneMatchPso_[0].Get());
@@ -2580,6 +2656,8 @@ ID3D12Resource* HudTierPass::RecordToneMapMatch(ID3D12GraphicsCommandList* cmdLi
 	cmdList->Dispatch((width_ + 7u) / 8u, (height_ + 7u) / 8u, 1u);
 	UavBarrier(cmdList, outTex);
 
+	TransitionBarrier(cmdList, toneMatchHistogram_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+	TransitionBarrier(cmdList, toneMatchLut_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
 	TransitionBarrier(cmdList, realTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, realState);
 	TransitionBarrier(cmdList, hudlessTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, hudlessState);
 	TransitionBarrier(cmdList, outTex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, matchedOutputState);

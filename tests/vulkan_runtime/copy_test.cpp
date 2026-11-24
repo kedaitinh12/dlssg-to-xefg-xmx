@@ -18,6 +18,14 @@ static void VKAPI_CALL Capture(VkCommandBuffer, VkImage source, VkImageLayout, V
 bool Log::IsEnabled() noexcept { return true; }
 void Log::Write(std::string_view, std::string_view) {}
 
+namespace Plugin
+{
+    Path ResolveEffectivePath(Path requested, uint32_t, bool, bool, bool, bool) noexcept
+    {
+        return requested;
+    }
+}
+
 static uint64_t gFakeMissingProgramCount = 0;
 static bool gSimulateMissingProgramOnInit = false;
 static bool gFakeWaitRecordedIdleResult = true;

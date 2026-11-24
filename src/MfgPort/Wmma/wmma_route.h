@@ -41,6 +41,7 @@ void Disable(const char* reason) noexcept;
 void SetEnabled(bool enabled) noexcept;
 bool Enabled() noexcept;
 bool Supported() noexcept;
+bool SharedTileSupported() noexcept;
 bool IsRdna4() noexcept;
 void Adopt(ID3D12GraphicsCommandList* list) noexcept;
 void ForgetLayers() noexcept;

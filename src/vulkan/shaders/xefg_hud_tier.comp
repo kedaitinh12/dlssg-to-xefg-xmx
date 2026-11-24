@@ -5,9 +5,9 @@
 // Compiled by tools/GenerateXeFgCoopMat.py into coopmat/hud/*.spv.
 //
 // Modes (compile-time -DHUD_MODE=...):
-//   0 = Tier 1 Guard (1/16 sampled |Real - Hudless| > Tolerance counter)
-//   1 = Tier 2 Diff Composite (3x3 dilated |Real - Hudless| > Tolerance -> OutColor + optional 1/16 counter)
-//   2 = Tier 3 Static HUD Update (compare CurrReal vs PrevReal -> update r8ui StaticCount + 1/16 counter)
+//   0 = Tier 1 Guard (1/16 sampled |Real - Hudless| > Tolerance counter, groupshared reduction)
+//   1 = Tier 2 Diff Composite (3x3 dilated |Real - Hudless| > Tolerance -> OutColor + uniform tile early-exit)
+//   2 = Tier 3 Static HUD Update (compare CurrReal vs PrevReal -> update r8ui StaticCount + groupshared reduction)
 //   3 = Tier 3 Static HUD Composite (copy CurrReal where StaticCount >= 4 -> OutColor)
 //   4 = Tier 3 Hybrid Fused Composite (3x3 dilated |Real - Hudless| > Tolerance OR StaticCount >= 4 -> OutColor in 1 pass)
 
@@ -51,20 +51,34 @@ layout(set = 0, binding = 4, r8ui) uniform readonly uimage2D StaticCountHybrid;
 #endif
 
 #if HUD_MODE == 0
-void main() {
-    uvec2 id = gl_GlobalInvocationID.xy;
-    if (id.x >= Width || id.y >= Height) return;
-    if ((id.x & 3u) != 0u || (id.y & 3u) != 0u) return;
+shared uint sGuardGroupCount;
 
-    ivec2 p = ivec2(id);
-    vec3 d = abs(imageLoad(TexA, p).rgb - imageLoad(TexB, p).rgb);
-    if (max(d.r, max(d.g, d.b)) > Tolerance) {
-        atomicAdd(Counts[0], 1u);
+void main() {
+    if (gl_LocalInvocationIndex == 0u) sGuardGroupCount = 0u;
+    memoryBarrierShared();
+    barrier();
+
+    uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x < Width && id.y < Height && (id.x & 3u) == 0u && (id.y & 3u) == 0u) {
+        ivec2 p = ivec2(id);
+        vec3 d = abs(imageLoad(TexA, p).rgb - imageLoad(TexB, p).rgb);
+        if (max(d.r, max(d.g, d.b)) > Tolerance) {
+            atomicAdd(sGuardGroupCount, 1u);
+        }
+    }
+
+    memoryBarrierShared();
+    barrier();
+    if (gl_LocalInvocationIndex == 0u && sGuardGroupCount != 0u) {
+        atomicAdd(Counts[0], sGuardGroupCount);
     }
 }
 #elif HUD_MODE == 1
 // 10x10 shared tile for 8x8 workgroup + 1-pixel halo (200 vs 1152 texture loads per workgroup = 5.76x fewer VRAM reads)
+// plus uniform tile early-exit and shared per-group atomic reduction.
 shared uint sDiff[100];
+shared uint sDiffGroupCount;
+shared uint sTileHasAnyDiff;
 
 bool isHudDiff(ivec2 p) {
     vec3 d = abs(imageLoad(TexA, p).rgb - imageLoad(TexB, p).rgb);
@@ -72,6 +86,13 @@ bool isHudDiff(ivec2 p) {
 }
 
 void main() {
+    if (gl_LocalInvocationIndex == 0u) {
+        sDiffGroupCount = 0u;
+        sTileHasAnyDiff = 0u;
+    }
+    memoryBarrierShared();
+    barrier();
+
     ivec2 maxCoord = ivec2(int(Width) - 1, int(Height) - 1);
     ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy * 8u) - ivec2(1, 1);
 
@@ -80,50 +101,75 @@ void main() {
         int tx = int(idx % 10u);
         int ty = int(idx / 10u);
         ivec2 q = clamp(tileOrigin + ivec2(tx, ty), ivec2(0), maxCoord);
-        sDiff[idx] = isHudDiff(q) ? 1u : 0u;
+        uint d = isHudDiff(q) ? 1u : 0u;
+        sDiff[idx] = d;
+        if (d != 0u) sTileHasAnyDiff = 1u;
     }
     memoryBarrierShared();
     barrier();
 
+    // Uniform across all 64 threads: skip non-HUD tiles entirely.
+    if (sTileHasAnyDiff == 0u) return;
+
     uvec2 id = gl_GlobalInvocationID.xy;
-    if (id.x >= Width || id.y >= Height) return;
+    if (id.x < Width && id.y < Height) {
+        uint base = gl_LocalInvocationID.y * 10u + gl_LocalInvocationID.x;
+        uint mask = sDiff[base + 0u]  | sDiff[base + 1u]  | sDiff[base + 2u]
+                  | sDiff[base + 10u] | sDiff[base + 11u] | sDiff[base + 12u]
+                  | sDiff[base + 20u] | sDiff[base + 21u] | sDiff[base + 22u];
+        bool hud = (mask != 0u);
 
-    uint base = gl_LocalInvocationID.y * 10u + gl_LocalInvocationID.x;
-    uint mask = sDiff[base + 0u]  | sDiff[base + 1u]  | sDiff[base + 2u]
-              | sDiff[base + 10u] | sDiff[base + 11u] | sDiff[base + 12u]
-              | sDiff[base + 20u] | sDiff[base + 21u] | sDiff[base + 22u];
-    bool hud = (mask != 0u);
+        if ((Flags & 1u) != 0u && hud && (id.x & 3u) == 0u && (id.y & 3u) == 0u) {
+            atomicAdd(sDiffGroupCount, 1u);
+        }
 
-    if ((Flags & 1u) != 0u && hud && (id.x & 3u) == 0u && (id.y & 3u) == 0u) {
-        atomicAdd(Counts[0], 1u);
+        if (hud) {
+            ivec2 p = ivec2(id);
+            if ((Flags & 2u) != 0u)
+                imageStore(OutColor, p, vec4(1.0, 0.0, 1.0, 1.0));
+            else
+                imageStore(OutColor, p, imageLoad(TexA, p));
+        }
     }
 
-    if (hud) {
-        ivec2 p = ivec2(id);
-        if ((Flags & 2u) != 0u)
-            imageStore(OutColor, p, vec4(1.0, 0.0, 1.0, 1.0));
-        else
-            imageStore(OutColor, p, imageLoad(TexA, p));
+    if ((Flags & 1u) != 0u) {
+        memoryBarrierShared();
+        barrier();
+        if (gl_LocalInvocationIndex == 0u && sDiffGroupCount != 0u) {
+            atomicAdd(Counts[0], sDiffGroupCount);
+        }
     }
 }
 #elif HUD_MODE == 2
-void main() {
-    uvec2 id = gl_GlobalInvocationID.xy;
-    if (id.x >= Width || id.y >= Height) return;
+shared uint sStaticGroupCount;
 
-    ivec2 p = ivec2(id);
-    uint count = 0u;
-    if ((Flags & 1u) == 0u) {
-        vec3 d = abs(imageLoad(TexA, p).rgb - imageLoad(TexB, p).rgb);
-        bool unchanged = max(d.r, max(d.g, d.b)) <= Tolerance;
-        uint prev = imageLoad(StaticCountOut, p).r;
-        count = unchanged ? min(prev + 1u, 8u) : 0u;
+void main() {
+    if (gl_LocalInvocationIndex == 0u) sStaticGroupCount = 0u;
+    memoryBarrierShared();
+    barrier();
+
+    uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x < Width && id.y < Height) {
+        ivec2 p = ivec2(id);
+        uint count = 0u;
+        if ((Flags & 1u) == 0u) {
+            vec3 d = abs(imageLoad(TexA, p).rgb - imageLoad(TexB, p).rgb);
+            bool unchanged = max(d.r, max(d.g, d.b)) <= Tolerance;
+            uint prev = imageLoad(StaticCountOut, p).r;
+            count = unchanged ? min(prev + 1u, 8u) : 0u;
+        }
+
+        imageStore(StaticCountOut, p, uvec4(count, 0u, 0u, 0u));
+
+        if (count >= 4u && (id.x & 3u) == 0u && (id.y & 3u) == 0u) {
+            atomicAdd(sStaticGroupCount, 1u);
+        }
     }
 
-    imageStore(StaticCountOut, p, uvec4(count, 0u, 0u, 0u));
-
-    if (count >= 4u && (id.x & 3u) == 0u && (id.y & 3u) == 0u) {
-        atomicAdd(Counts[1], 1u);
+    memoryBarrierShared();
+    barrier();
+    if (gl_LocalInvocationIndex == 0u && sStaticGroupCount != 0u) {
+        atomicAdd(Counts[1], sStaticGroupCount);
     }
 }
 #elif HUD_MODE == 3
@@ -141,7 +187,10 @@ void main() {
 }
 #elif HUD_MODE == 4
 // 10x10 shared tile for 8x8 workgroup + 1-pixel halo (5.76x fewer TexA/TexB VRAM reads)
+// plus shared per-group atomic reduction and skip of 9-tap dilation when tile has no diff.
 shared uint sDiffHybrid[100];
+shared uint sHybridGroupCount;
+shared uint sHybridHasAnyDiff;
 
 bool isHudDiffHybrid(ivec2 p) {
     vec3 d = abs(imageLoad(TexA, p).rgb - imageLoad(TexB, p).rgb);
@@ -149,6 +198,13 @@ bool isHudDiffHybrid(ivec2 p) {
 }
 
 void main() {
+    if (gl_LocalInvocationIndex == 0u) {
+        sHybridGroupCount = 0u;
+        sHybridHasAnyDiff = 0u;
+    }
+    memoryBarrierShared();
+    barrier();
+
     ivec2 maxCoord = ivec2(int(Width) - 1, int(Height) - 1);
     ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy * 8u) - ivec2(1, 1);
 
@@ -156,31 +212,44 @@ void main() {
         int tx = int(idx % 10u);
         int ty = int(idx / 10u);
         ivec2 q = clamp(tileOrigin + ivec2(tx, ty), ivec2(0), maxCoord);
-        sDiffHybrid[idx] = isHudDiffHybrid(q) ? 1u : 0u;
+        uint d = isHudDiffHybrid(q) ? 1u : 0u;
+        sDiffHybrid[idx] = d;
+        if (d != 0u) sHybridHasAnyDiff = 1u;
     }
     memoryBarrierShared();
     barrier();
 
     uvec2 id = gl_GlobalInvocationID.xy;
-    if (id.x >= Width || id.y >= Height) return;
+    if (id.x < Width && id.y < Height) {
+        bool hudDiff = false;
+        if (sHybridHasAnyDiff != 0u) {
+            uint base = gl_LocalInvocationID.y * 10u + gl_LocalInvocationID.x;
+            uint mask = sDiffHybrid[base + 0u]  | sDiffHybrid[base + 1u]  | sDiffHybrid[base + 2u]
+                      | sDiffHybrid[base + 10u] | sDiffHybrid[base + 11u] | sDiffHybrid[base + 12u]
+                      | sDiffHybrid[base + 20u] | sDiffHybrid[base + 21u] | sDiffHybrid[base + 22u];
+            hudDiff = (mask != 0u);
+        }
 
-    uint base = gl_LocalInvocationID.y * 10u + gl_LocalInvocationID.x;
-    uint mask = sDiffHybrid[base + 0u]  | sDiffHybrid[base + 1u]  | sDiffHybrid[base + 2u]
-              | sDiffHybrid[base + 10u] | sDiffHybrid[base + 11u] | sDiffHybrid[base + 12u]
-              | sDiffHybrid[base + 20u] | sDiffHybrid[base + 21u] | sDiffHybrid[base + 22u];
-    bool hudDiff = (mask != 0u);
+        if ((Flags & 1u) != 0u && hudDiff && (id.x & 3u) == 0u && (id.y & 3u) == 0u) {
+            atomicAdd(sHybridGroupCount, 1u);
+        }
 
-    if ((Flags & 1u) != 0u && hudDiff && (id.x & 3u) == 0u && (id.y & 3u) == 0u) {
-        atomicAdd(Counts[0], 1u);
+        ivec2 p = ivec2(id);
+        bool isStatic = imageLoad(StaticCountHybrid, p).r >= 4u;
+        if (hudDiff || isStatic) {
+            if ((Flags & 2u) != 0u)
+                imageStore(OutColor, p, vec4(1.0, 0.0, 1.0, 1.0));
+            else
+                imageStore(OutColor, p, imageLoad(TexA, p));
+        }
     }
 
-    ivec2 p = ivec2(id);
-    bool isStatic = imageLoad(StaticCountHybrid, p).r >= 4u;
-    if (hudDiff || isStatic) {
-        if ((Flags & 2u) != 0u)
-            imageStore(OutColor, p, vec4(1.0, 0.0, 1.0, 1.0));
-        else
-            imageStore(OutColor, p, imageLoad(TexA, p));
+    if ((Flags & 1u) != 0u) {
+        memoryBarrierShared();
+        barrier();
+        if (gl_LocalInvocationIndex == 0u && sHybridGroupCount != 0u) {
+            atomicAdd(Counts[0], sHybridGroupCount);
+        }
     }
 }
 #endif

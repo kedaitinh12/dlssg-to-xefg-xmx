@@ -20,6 +20,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -116,6 +117,7 @@ struct SharedImport
 	uint32_t height = 0;
 	bool isOutput = false;
 	bool zeroCopy = false;
+	bool evicted = false;
 };
 
 struct OutputCopy
@@ -141,6 +143,9 @@ struct PendingBatch
 	D3D12_RESOURCE_STATES directFirstOutputState = D3D12_RESOURCE_STATE_COMMON;
 	ComPtr<ID3D12Resource> fallbackRealFrame;
 	D3D12_RESOURCE_STATES fallbackRealFrameState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+	// Holds shared ownership of every Vulkan SharedImport referenced by the pre-recorded command buffer
+	// across both out-of-pending race windows (post-record/pre-push and post-pop/pre-submit).
+	std::vector<std::shared_ptr<SharedImport>> keptImports;
 	bool preRecorded = false;
 	bool anyOutputCopy = false;
 	uint32_t vkSlot = 0;
@@ -220,6 +225,8 @@ struct Bridge
 	uint64_t vkSlotOwner[kRingSize]{};
 	uint64_t nextSlotToken = 1;
 	std::atomic<uint64_t> lastSubmittedVkFence{ 0 };
+	std::atomic<uint64_t> prevSubmittedVkFence{ 0 };
+	std::atomic<uint64_t> lastSignaledBridgeFence{ 0 };
 	uint32_t vkCursor = 0;
 	VkSemaphore sharedSemaphore = VK_NULL_HANDLE;
 
@@ -250,7 +257,8 @@ struct Bridge
 	struct RetiredImport
 	{
 		uint64_t retireFence = 0;
-		SharedImport imp;
+		std::chrono::steady_clock::time_point retireAfter{};
+		std::shared_ptr<SharedImport> imp;
 	};
 	struct RetiredContext
 	{
@@ -259,7 +267,7 @@ struct Bridge
 	};
 
 	// Cached D3D12 -> Vulkan shared imports keyed by ID3D12Resource*
-	std::unordered_map<ID3D12Resource*, SharedImport> imports;
+	std::unordered_map<ID3D12Resource*, std::shared_ptr<SharedImport>> imports;
 	std::unordered_map<ID3D12Resource*, bool> directOutEligible;
 	// Deferred retirement queues for contexts/imports whose 500ms drain timed out (never destroy while GPU may still read them)
 	std::vector<RetiredImport> retiredImports;
@@ -540,11 +548,17 @@ void ReapRetiredLocked(bool forceAll = false) noexcept
 	if (!gBridge.retiredImports.empty())
 	{
 		auto it = gBridge.retiredImports.begin();
+		const auto now = std::chrono::steady_clock::now();
 		while (it != gBridge.retiredImports.end())
 		{
-			if (forceAll || FenceValueCompletedLocked(it->retireFence))
+			if (!it->imp)
 			{
-				DestroyImport(gBridge, it->imp);
+				it = gBridge.retiredImports.erase(it);
+				continue;
+			}
+			if (forceAll || (it->imp.use_count() == 1 && now >= it->retireAfter && FenceValueCompletedLocked(it->retireFence)))
+			{
+				DestroyImport(gBridge, *it->imp);
 				it = gBridge.retiredImports.erase(it);
 			}
 			else
@@ -574,14 +588,14 @@ void ReapRetiredLocked(bool forceAll = false) noexcept
 
 // Imports a D3D12_HEAP_FLAG_SHARED texture into Vulkan via VK_KHR_external_memory_win32 and creates
 // its companion xvk texture on b.xvkDevice. Caller holds b.mutex.
-SharedImport* GetOrImportLocked(Bridge& b, ID3D12Resource* d3dRes, bool isOutput) noexcept
+std::shared_ptr<SharedImport> GetOrImportLocked(Bridge& b, ID3D12Resource* d3dRes, bool isOutput) noexcept
 {
 	if (!d3dRes)
 		return nullptr;
 
 	auto it = b.imports.find(d3dRes);
 	if (it != b.imports.end())
-		return &it->second;
+		return it->second;
 
 	auto logImportFail = [](const char* step, const D3D12_RESOURCE_DESC& d, int64_t code) noexcept {
 		static std::atomic<bool> logged{ false };
@@ -723,9 +737,10 @@ SharedImport* GetOrImportLocked(Bridge& b, ID3D12Resource* d3dRes, bool isOutput
 		imp.zeroCopy = false;
 	}
 
-	auto [inserted, _] = b.imports.emplace(d3dRes, std::move(imp));
+	auto sp = std::make_shared<SharedImport>(std::move(imp));
+	auto [inserted, _] = b.imports.emplace(d3dRes, std::move(sp));
 	b.importCount.store(b.imports.size(), std::memory_order_release);
-	return &inserted->second;
+	return inserted->second;
 }
 
 VkImageMemoryBarrier MakeImageBarrier(VkImage img,
@@ -867,7 +882,8 @@ void RunRealFrameFallbackLocked(ID3D12CommandQueue* queue, ExecuteCommandListsFn
 		ID3D12CommandList* postLists[1] = { ring.list[slot].Get() };
 		origExec(queue, 1, postLists);
 		const uint64_t doneVal = gBridge.fenceValue.fetch_add(1, std::memory_order_acq_rel) + 1;
-		queue->Signal(useFence, doneVal);
+		if (SUCCEEDED(queue->Signal(useFence, doneVal)))
+			gBridge.lastSignaledBridgeFence.store(doneVal, std::memory_order_release);
 		ring.doneFence[slot] = doneVal;
 	}
 }
@@ -900,7 +916,7 @@ bool IsDirectGameOutputEligibleLocked(Bridge& b, ID3D12Resource* gameOut, D3D12_
 			heapProps.Type == D3D12_HEAP_TYPE_DEFAULT &&
 			(heapFlags & D3D12_HEAP_FLAG_SHARED) != 0)
 		{
-			SharedImport* imp = GetOrImportLocked(b, gameOut, true);
+			auto imp = GetOrImportLocked(b, gameOut, true);
 			eligible = (imp != nullptr && imp->zeroCopy);
 		}
 	}
@@ -918,8 +934,19 @@ bool RecordVulkanBatchLocked(PendingBatch& batch) noexcept
 	if (!gBridge.active.load(std::memory_order_acquire) || !gBridge.xefgContext)
 		return false;
 
+	if (!gBridge.retiredImports.empty() || !gBridge.retiredContexts.empty())
+		ReapRetiredLocked();
+
+	std::vector<std::shared_ptr<SharedImport>> batchImports;
+	batchImports.reserve(8u + batch.frameCount);
 	auto importOrNull = [&](ID3D12Resource* r, bool isOut) -> SharedImport* {
-		return r ? GetOrImportLocked(gBridge, r, isOut) : nullptr;
+		if (!r)
+			return nullptr;
+		auto sp = GetOrImportLocked(gBridge, r, isOut);
+		if (!sp)
+			return nullptr;
+		batchImports.push_back(sp);
+		return sp.get();
 	};
 
 	SharedImport* prevBB = importOrNull(batch.prevBackbuffer.Get(), false);
@@ -1144,6 +1171,7 @@ bool RecordVulkanBatchLocked(PendingBatch& batch) noexcept
 	if (slotToken == 0)
 		slotToken = gBridge.nextSlotToken++;
 	gBridge.vkSlotOwner[vkSlot] = slotToken;
+	batch.keptImports = std::move(batchImports);
 	batch.preRecorded = true;
 	batch.anyOutputCopy = anyOutputCopy;
 	batch.vkSlot = vkSlot;
@@ -1250,10 +1278,14 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 		return;
 	}
 	gBridge.vkSlotDoneFence[vkSlot] = signalVal;
-	gBridge.lastSubmittedVkFence.store(signalVal, std::memory_order_release);
+	const uint64_t prevSubmitted = gBridge.lastSubmittedVkFence.exchange(signalVal, std::memory_order_acq_rel);
+	gBridge.prevSubmittedVkFence.store(prevSubmitted, std::memory_order_release);
+	gBridge.lastSignaledBridgeFence.store(signalVal, std::memory_order_release);
 
 	// 3) D3D12 waits on Vulkan completion (GPU-side wait, zero CPU stall).
 	queue->Wait(useFence, signalVal);
+
+	uint64_t batchDoneFence = signalVal;
 
 	// 4) Copy generated shared outputs into the game's output texture(s) on D3D12.
 	if (!batch.copies.empty())
@@ -1297,10 +1329,42 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 				origExec(queue, 1, postLists);
 
 				const uint64_t doneVal = gBridge.fenceValue.fetch_add(1, std::memory_order_acq_rel) + 1;
-				queue->Signal(useFence, doneVal);
+				if (SUCCEEDED(queue->Signal(useFence, doneVal)))
+				{
+					gBridge.lastSignaledBridgeFence.store(doneVal, std::memory_order_release);
+					batchDoneFence = doneVal;
+				}
 				ring.doneFence[slot] = doneVal;
 			}
 		}
+	}
+
+	// If ForgetResource evicted any import while this batch was outside gBridge.pending (between record and push,
+	// or between pop and submit), bind its deferred destruction to THIS batch's exact GPU completion fence.
+	if (!batch.keptImports.empty())
+	{
+		const auto retireAfter = std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
+		for (auto& imp : batch.keptImports)
+		{
+			if (!imp || !imp->evicted)
+				continue;
+			bool updated = false;
+			for (auto& r : gBridge.retiredImports)
+			{
+				if (r.imp.get() == imp.get())
+				{
+					if (batchDoneFence > r.retireFence)
+						r.retireFence = batchDoneFence;
+					if (retireAfter > r.retireAfter)
+						r.retireAfter = retireAfter;
+					updated = true;
+					break;
+				}
+			}
+			if (!updated)
+				gBridge.retiredImports.push_back({ batchDoneFence, retireAfter, imp });
+		}
+		batch.keptImports.clear();
 	}
 
 	gBridge.batches.fetch_add(1, std::memory_order_relaxed);
@@ -1373,8 +1437,12 @@ void TeardownVulkanLocked() noexcept
 	gBridge.active.store(false, std::memory_order_release);
 
 	for (auto& kv : gBridge.imports)
-		DestroyImport(gBridge, kv.second);
+	{
+		if (kv.second)
+			DestroyImport(gBridge, *kv.second);
+	}
 	gBridge.imports.clear();
+	ReapRetiredLocked(true);
 	gBridge.directOutEligible.clear();
 	gBridge.importCount.store(0, std::memory_order_release);
 
@@ -1424,6 +1492,8 @@ void TeardownVulkanLocked() noexcept
 	}
 	gBridge.fenceValue.store(0, std::memory_order_release);
 	gBridge.lastSubmittedVkFence.store(0, std::memory_order_release);
+	gBridge.prevSubmittedVkFence.store(0, std::memory_order_release);
+	gBridge.lastSignaledBridgeFence.store(0, std::memory_order_release);
 	gBridge.vkCursor = 0;
 
 	ResetPostCopyRing(gBridge.directRing);
@@ -1550,6 +1620,25 @@ bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
 	std::vector<VkExtensionProperties> exts(extCount);
 	if (enumExts(matchedPhys, nullptr, &extCount, exts.data()) != VK_SUCCESS)
 		return fail("no_extensions");
+
+	// Optional diagnostic query: VK_AMD_shader_core_properties2 (active compute units & core features)
+	uint32_t amdActiveCUs = 0;
+	uint32_t amdCoreFeatures = 0;
+	const bool hasAmdShaderCoreProps2 = HasExtension(exts, "VK_AMD_shader_core_properties2");
+	if (hasAmdShaderCoreProps2)
+	{
+		struct LocalAmdShaderCoreProps2
+		{
+			VkStructureType sType;
+			void* pNext;
+			VkFlags shaderCoreFeatures;
+			uint32_t activeComputeUnitCount;
+		} amdCore2{ static_cast<VkStructureType>(1000227000), nullptr, 0, 0 };
+		VkPhysicalDeviceProperties2 coreProps2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &amdCore2 };
+		getProps2(matchedPhys, &coreProps2);
+		amdCoreFeatures = amdCore2.shaderCoreFeatures;
+		amdActiveCUs = amdCore2.activeComputeUnitCount;
+	}
 
 	uint32_t coopSpec = 0;
 	if (!HasExtension(exts, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME) ||
@@ -1788,6 +1877,9 @@ bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
 
 	Log::Info("D3D12->Vulkan WMMA bridge ready (vendor {:#06x}, queue family {}, VK_KHR_cooperative_matrix {}x{}x{} s8->s32, {} hardware WMMA shaders)",
 		matchedVendor, chosenFamily, gBridge.tileM, gBridge.tileN, gBridge.tileK, gBridge.coopLayers);
+	if (hasAmdShaderCoreProps2)
+		Log::Info("D3D12->Vulkan WMMA bridge AMD core props: activeCUs={}, shaderCoreFeatures={:#x}",
+			amdActiveCUs, amdCoreFeatures);
 	return true;
 }
 
@@ -2150,26 +2242,12 @@ bool ScheduleBatch(
 		return false;
 	}
 
-	// Overlap-preserving 1-batch-in-flight pacing: wait for the previous Vulkan batch (Batch N)
-	// right before recording Batch N+1. Because D3D12 has already recorded Frame N+1 in parallel
-	// with Vulkan Batch N, Batch N is typically already complete (0 ms stall, full overlap kept);
-	// this only activates if CPU ran ahead >1 real frame (e.g. Anti-Lag 2.0 blind to Vulkan queue),
-	// cutting +15-20 ms PCL bloat without sacrificing hardware WMMA throughput.
-	if (!skipCpuPaceWait)
-	if (const uint64_t prevVkFence = gBridge.lastSubmittedVkFence.load(std::memory_order_acquire);
-		prevVkFence && gBridge.device && gBridge.sharedSemaphore && gBridge.vkWaitSemaphores)
-	{
-		VkSemaphoreWaitInfo paceWait{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
-		paceWait.semaphoreCount = 1;
-		paceWait.pSemaphores = &gBridge.sharedSemaphore;
-		paceWait.pValues = &prevVkFence;
-		const auto waitStart = std::chrono::steady_clock::now();
-		(void)gBridge.vkWaitSemaphores(gBridge.device, &paceWait, 50'000'000ull);
-		const auto waitUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-			std::chrono::steady_clock::now() - waitStart).count());
-		gBridge.totalCpuWaitUs.fetch_add(waitUs, std::memory_order_relaxed);
-		gBridge.cpuWaitSamples.fetch_add(1u, std::memory_order_relaxed);
-	}
+	// Snapshot the N-1 Vulkan batch fence (2 batches ago) rather than N (currently executing on GPU)
+	// so normal 1-frame-in-flight CPU/GPU overlap stays intact (0 ms RenderSubmit stall, no -2..3 FPS drop
+	// or base-FPS pacing clumping) while still capping Vulkan queue depth if CPU ever runs >2 frames ahead.
+	const uint64_t prevVkFence = !skipCpuPaceWait
+		? gBridge.prevSubmittedVkFence.load(std::memory_order_acquire)
+		: 0ull;
 
 	PendingBatch batch{};
 	batch.cmdList = cmdList;
@@ -2254,6 +2332,22 @@ bool ScheduleBatch(
 		}
 	}
 
+	// Overlap-preserving 1-batch-in-flight pacing (outside gBridge.mutex): wait for Batch N after
+	// Batch N+1 is already recorded into its own ring slot, capping queue depth without stalling recording.
+	if (prevVkFence && gBridge.device && gBridge.sharedSemaphore && gBridge.vkWaitSemaphores)
+	{
+		VkSemaphoreWaitInfo paceWait{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+		paceWait.semaphoreCount = 1;
+		paceWait.pSemaphores = &gBridge.sharedSemaphore;
+		paceWait.pValues = &prevVkFence;
+		const auto waitStart = std::chrono::steady_clock::now();
+		(void)gBridge.vkWaitSemaphores(gBridge.device, &paceWait, 50'000'000ull);
+		const auto waitUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now() - waitStart).count());
+		gBridge.totalCpuWaitUs.fetch_add(waitUs, std::memory_order_relaxed);
+		gBridge.cpuWaitSamples.fetch_add(1u, std::memory_order_relaxed);
+	}
+
 	{
 		std::lock_guard lock(gBridge.pendingMutex);
 		gBridge.pending.push_back(std::move(batch));
@@ -2287,25 +2381,68 @@ void ForgetResource(ID3D12Resource* resource) noexcept
 {
 	if (!resource || gBridge.importCount.load(std::memory_order_acquire) == 0)
 		return;
+
+	// 1) Invalidate any unsubmitted PendingBatch referencing this resource BEFORE retiring its VkImage/VkDeviceMemory
+	//    so HookExecuteCommandLists never submits a pre-recorded VkCommandBuffer with destroyed Vulkan handles
+	//    (fixes 0x887A0005 DXGI_ERROR_DEVICE_REMOVED when switching WMMA -> XMX Port).
+	struct StaleSlotRef { uint32_t slot = 0; uint64_t token = 0; };
+	StaleSlotRef staleSlots[kRingSize]{};
+	uint32_t staleSlotCount = 0;
+	{
+		std::lock_guard plock(gBridge.pendingMutex);
+		for (auto& b : gBridge.pending)
+		{
+			bool references = (b.prevBackbuffer.Get() == resource || b.prevHudless.Get() == resource ||
+				b.prevDepth.Get() == resource || b.prevMvecs.Get() == resource ||
+				b.nextBackbuffer.Get() == resource || b.nextHudless.Get() == resource ||
+				b.nextDepth.Get() == resource || b.nextMvecs.Get() == resource ||
+				b.directFirstGameOutput.Get() == resource);
+			if (!references)
+			{
+				for (uint32_t i = 0; i < b.frameCount && i < kMaxFrames; ++i)
+					if (b.sharedOutputs[i].Get() == resource) { references = true; break; }
+			}
+			if (!references)
+			{
+				for (const auto& cp : b.copies)
+					if (cp.sharedOutput.Get() == resource || cp.gameOutput.Get() == resource) { references = true; break; }
+			}
+			if (references)
+			{
+				if (b.preRecorded && b.vkSlot < kRingSize && b.vkSlotToken != 0 && staleSlotCount < kRingSize)
+					staleSlots[staleSlotCount++] = { b.vkSlot, b.vkSlotToken };
+				b.preRecorded = false;
+				b.vkSlotToken = 0;
+				b.contextEpoch = 0;
+			}
+		}
+	}
+
+	// 2) Always defer DestroyImport until BOTH the latest signaled D3D12+Vulkan bridge fence (including PostCopyRing)
+	//    AND a 150 ms grace period have elapsed, avoiding synchronous vkFreeMemory while D3D12 still reads the shared texture.
 	std::lock_guard lock(gBridge.mutex);
-	auto it = gBridge.imports.find(resource);
+	for (uint32_t i = 0; i < staleSlotCount; ++i)
+	{
+		if (gBridge.vkSlotOwner[staleSlots[i].slot] == staleSlots[i].token)
+			gBridge.vkSlotOwner[staleSlots[i].slot] = 0;
+	}
 	gBridge.directOutEligible.erase(resource);
+	auto it = gBridge.imports.find(resource);
 	if (it != gBridge.imports.end())
 	{
-		if (DrainVulkanQueueLocked(500'000'000ull))
+		const uint64_t fence = std::max(
+			gBridge.lastSubmittedVkFence.load(std::memory_order_acquire),
+			gBridge.lastSignaledBridgeFence.load(std::memory_order_acquire));
+		const auto retireAfter = std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
+		if (it->second)
 		{
-			DestroyImport(gBridge, it->second);
-			ReapRetiredLocked();
-		}
-		else
-		{
-			const uint64_t fence = gBridge.lastSubmittedVkFence.load(std::memory_order_acquire);
-			gBridge.retiredImports.push_back({ fence, std::move(it->second) });
-			Log::Warn("D3D12->Vulkan WMMA bridge: ForgetResource drain timed out; deferring Vulkan import destroy until fence {} completes", fence);
+			it->second->evicted = true;
+			gBridge.retiredImports.push_back({ fence, retireAfter, std::move(it->second) });
 		}
 		gBridge.imports.erase(it);
 		gBridge.importCount.store(gBridge.imports.size(), std::memory_order_release);
 	}
+	ReapRetiredLocked();
 }
 
 Status Snapshot() noexcept
