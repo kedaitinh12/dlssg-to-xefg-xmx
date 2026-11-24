@@ -1270,7 +1270,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 
 	// XMX Port / CUDA / WMMA (model 16) payload omits JitteredMV reconstruction shader variants (e.g. 35112441167526893749578).
 	// Unjitter motion vectors in-place on our private mvecs copy and clear XEFGD_INIT_FLAG_JITTERED_MV so model 16 works cleanly.
-	if (mvecJittered && wanted.model == MfgKernels::PortedModel && hudComputeReady &&
+	if (mvecJittered && wanted.model == MfgKernels::MfgModel && hudComputeReady &&
 		mvecs && hudTierPass.CanUnjitterMotionVectors(mvecs->GetDesc().Format))
 	{
 		wanted.initFlags &= ~XEFGD_INIT_FLAG_JITTERED_MV;
