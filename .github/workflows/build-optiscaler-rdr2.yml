@@ -15,10 +15,10 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: mod
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: optiscaler/OptiScaler
           ref: 03b37db73979e042bce4be59f44d37f348ac6905
@@ -34,7 +34,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git diff --check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - uses: microsoft/setup-msbuild@v2
+      - uses: microsoft/setup-msbuild@v3
       - name: Build patched OptiScaler
         shell: pwsh
         working-directory: optiscaler
@@ -54,12 +54,12 @@ jobs:
           'OptiScaler base: 03b37db73979e042bce4be59f44d37f348ac6905' | Set-Content output/BUILD.txt
           'Patch repository commit: ${{ github.sha }}' | Add-Content output/BUILD.txt
           Get-FileHash output/OptiScaler.dll -Algorithm SHA256 | Format-List | Out-String | Add-Content output/BUILD.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: OptiScaler-RDR2-Vulkan-fix
           path: output/
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: OptiScaler-RDR2-build-log

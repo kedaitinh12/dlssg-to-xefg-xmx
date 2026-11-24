@@ -41,9 +41,9 @@ jobs:
     timeout-minutes: 40
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: microsoft/setup-msbuild@v2
+      - uses: microsoft/setup-msbuild@v3
 
       - name: Vulkan headers
         id: vulkan
@@ -273,7 +273,7 @@ jobs:
             "- Artifact: ``custom\XeMFG XMX\dlssg\dlssg_to_xefg_intel_is_better.dll`` with ``xefg_mfg_programs`` beside it"
           ) -join "`n" >> $env:GITHUB_STEP_SUMMARY
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: dlssg-to-xefg-${{ github.run_number }}
           path: staging
@@ -281,7 +281,7 @@ jobs:
           retention-days: 30
 
       # The build log has the compiler's own messages when something above failed
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: failure()
         with:
           name: msbuild-log-${{ github.run_number }}
@@ -297,7 +297,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Newer kernels map memory where the sanitizers expect their shadow memory; lowering this is the usual workaround.
       - name: Allow the sanitizers
@@ -329,7 +329,7 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Allow the sanitizers
         run: sudo sysctl vm.mmap_rnd_bits=28 || true
@@ -391,7 +391,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Allow the sanitizers
         run: sudo sysctl vm.mmap_rnd_bits=28 || true
