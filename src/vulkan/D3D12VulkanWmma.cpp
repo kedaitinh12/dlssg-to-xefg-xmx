@@ -1039,7 +1039,7 @@ bool RecordVulkanBatchLocked(PendingBatch& batch) noexcept
 			// simply fall back to D3D12 for this frame instead of tearing down an active device.
 			static std::atomic<uint64_t> lastTimeoutLogMs{ 0 };
 			const uint64_t nowMs = GetTickCount64();
-			const uint64_t prevMs = lastTimeoutLogMs.load(std::memory_order_relaxed);
+			uint64_t prevMs = lastTimeoutLogMs.load(std::memory_order_relaxed);
 			if (nowMs - prevMs >= 5000u && lastTimeoutLogMs.compare_exchange_strong(prevMs, nowMs, std::memory_order_relaxed))
 				Log::Warn("D3D12->Vulkan WMMA bridge: slot fence wait timed out (result {}), falling back to D3D12 for this frame without device teardown",
 					static_cast<int>(waitRes));
