@@ -20,6 +20,7 @@ void Log::Write(std::string_view, std::string_view) {}
 
 static uint64_t gFakeMissingProgramCount = 0;
 static bool gSimulateMissingProgramOnInit = false;
+static bool gFakeWaitRecordedIdleResult = true;
 
 namespace xvk
 {
@@ -31,6 +32,7 @@ namespace xvk
         return reinterpret_cast<VkImageView>(0x100);
     }
     VkBuffer BufferOf(ID3D12Resource*) noexcept { return VK_NULL_HANDLE; }
+    bool WaitRecordedIdle(ID3D12Device*, uint64_t) noexcept { return gFakeWaitRecordedIdleResult; }
 }
 
 static int gCreateContextCalls = 0;

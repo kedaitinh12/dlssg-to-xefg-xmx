@@ -42,6 +42,8 @@ namespace D3D12VulkanWmma
 		ID3D12Resource* depth = nullptr;
 		ID3D12Resource* mvecs = nullptr;
 		xefgd_frame_t data{};
+		ID3D12Resource* realBackbuffer = nullptr;
+		D3D12_RESOURCE_STATES realBackbufferState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 	};
 
 	struct ContextSettings

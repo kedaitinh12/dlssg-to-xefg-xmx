@@ -698,32 +698,37 @@ VkDescriptorSet Device::AcquireDescriptorSet(const PipelineState& pso, const std
             std::fill(descTable_.begin(), descTable_.end(), DescCacheSlot{});
             descItemsArena_.clear();
         };
+        bool poolOk = true;
         if (!descPool_ || descPoolUsed_ >= kMaxCachedDescSets) {
             if (descPool_) rotatePoolLocked();
             descPool_ = CreateDescriptorCachePoolLocked();
             if (!descPool_) {
                 if (failReason) *failReason = "descriptor_pool";
-                return VK_NULL_HANDLE;
+                poolOk = false;
             }
         }
-        VkDescriptorSetLayout layout = pso.setLayout();
-        VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        allocInfo.descriptorPool = descPool_;
-        allocInfo.descriptorSetCount = 1;
-        allocInfo.pSetLayouts = &layout;
-        VkResult allocRes = vk_.vkAllocateDescriptorSets(device_, &allocInfo, &result);
-        if (allocRes == VK_ERROR_OUT_OF_POOL_MEMORY || allocRes == VK_ERROR_FRAGMENTED_POOL) {
-            rotatePoolLocked();
-            descPool_ = CreateDescriptorCachePoolLocked();
-            if (!descPool_) {
-                if (failReason) *failReason = "descriptor_pool";
-                return VK_NULL_HANDLE;
-            }
+        VkResult allocRes = VK_ERROR_UNKNOWN;
+        if (poolOk) {
+            VkDescriptorSetLayout layout = pso.setLayout();
+            VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
             allocInfo.descriptorPool = descPool_;
+            allocInfo.descriptorSetCount = 1;
+            allocInfo.pSetLayouts = &layout;
             allocRes = vk_.vkAllocateDescriptorSets(device_, &allocInfo, &result);
+            if (allocRes == VK_ERROR_OUT_OF_POOL_MEMORY || allocRes == VK_ERROR_FRAGMENTED_POOL) {
+                rotatePoolLocked();
+                descPool_ = CreateDescriptorCachePoolLocked();
+                if (!descPool_) {
+                    if (failReason) *failReason = "descriptor_pool";
+                    poolOk = false;
+                } else {
+                    allocInfo.descriptorPool = descPool_;
+                    allocRes = vk_.vkAllocateDescriptorSets(device_, &allocInfo, &result);
+                }
+            }
         }
-        if (allocRes != VK_SUCCESS || !result) {
-            if (failReason) *failReason = "descriptor_alloc";
+        if (!poolOk || allocRes != VK_SUCCESS || !result) {
+            if (poolOk && failReason) *failReason = "descriptor_alloc";
             result = VK_NULL_HANDLE;
         } else {
             std::array<VkWriteDescriptorSet, 64> writes;

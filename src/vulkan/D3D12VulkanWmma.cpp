@@ -137,9 +137,14 @@ struct PendingBatch
 	xefgd_2d_t outputBases[kMaxFrames]{};
 	uint32_t frameCount = 1;
 	std::vector<OutputCopy> copies;
+	ComPtr<ID3D12Resource> directFirstGameOutput;
+	D3D12_RESOURCE_STATES directFirstOutputState = D3D12_RESOURCE_STATE_COMMON;
+	ComPtr<ID3D12Resource> fallbackRealFrame;
+	D3D12_RESOURCE_STATES fallbackRealFrameState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 	bool preRecorded = false;
 	bool anyOutputCopy = false;
 	uint32_t vkSlot = 0;
+	uint64_t vkSlotToken = 0;
 	uint64_t contextEpoch = 0;
 };
 
@@ -212,6 +217,8 @@ struct Bridge
 	VkCommandPool cmdPool = VK_NULL_HANDLE;
 	VkCommandBuffer cmdBufs[kRingSize]{};
 	uint64_t vkSlotDoneFence[kRingSize]{};
+	uint64_t vkSlotOwner[kRingSize]{};
+	uint64_t nextSlotToken = 1;
 	std::atomic<uint64_t> lastSubmittedVkFence{ 0 };
 	uint32_t vkCursor = 0;
 	VkSemaphore sharedSemaphore = VK_NULL_HANDLE;
@@ -350,6 +357,16 @@ bool PatchQueueVtable(ID3D12CommandQueue* queue, ExecuteCommandListsFn hookFn) n
 }
 
 // Forward declaration
+bool SameContextSettings(const ContextSettings& a, const ContextSettings& b) noexcept
+{
+	return a.width == b.width &&
+		a.height == b.height &&
+		a.format == b.format &&
+		a.initFlags == b.initFlags &&
+		a.uiMode == b.uiMode &&
+		a.model == b.model;
+}
+
 void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExec, PendingBatch& batch) noexcept;
 
 void STDMETHODCALLTYPE HookExecuteCommandLists(
@@ -769,6 +786,92 @@ void RecordD3D12CopiesBatched(ID3D12GraphicsCommandList* list, const std::vector
 		list->ResourceBarrier(count, barriers);
 }
 
+void RecordD3D12RealFrameFallbackCopies(ID3D12GraphicsCommandList* list, ID3D12Resource* realFrame,
+	D3D12_RESOURCE_STATES realFrameState, const std::vector<OutputCopy>& copies) noexcept
+{
+	if (!realFrame || copies.empty())
+		return;
+	D3D12_RESOURCE_BARRIER barriers[kMaxFrames + 1]{};
+	UINT count = 0;
+	// Transition the real backbuffer source ONCE from its tracked capture state (XeFGInputState) to COPY_SOURCE.
+	if (realFrameState != D3D12_RESOURCE_STATE_COPY_SOURCE)
+	{
+		barriers[count].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		barriers[count].Transition = { realFrame, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, realFrameState, D3D12_RESOURCE_STATE_COPY_SOURCE };
+		++count;
+	}
+	const size_t n = std::min<size_t>(copies.size(), kMaxFrames);
+	for (size_t i = 0; i < n; ++i)
+	{
+		const auto& cp = copies[i];
+		if (cp.outputState != D3D12_RESOURCE_STATE_COPY_DEST)
+		{
+			barriers[count].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			barriers[count].Transition = { cp.gameOutput.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, cp.outputState, D3D12_RESOURCE_STATE_COPY_DEST };
+			++count;
+		}
+	}
+	if (count)
+		list->ResourceBarrier(count, barriers);
+	for (size_t i = 0; i < n; ++i)
+		list->CopyResource(copies[i].gameOutput.Get(), realFrame);
+	for (UINT i = 0; i < count; ++i)
+		std::swap(barriers[i].Transition.StateBefore, barriers[i].Transition.StateAfter);
+	if (count)
+		list->ResourceBarrier(count, barriers);
+}
+
+void RunRealFrameFallbackLocked(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExec, const PendingBatch& batch) noexcept
+{
+	ID3D12Resource* realFrame = batch.fallbackRealFrame ? batch.fallbackRealFrame.Get() : batch.nextBackbuffer.Get();
+	if (!queue || !origExec || !realFrame)
+		return;
+	const D3D12_RESOURCE_DESC srcDesc = realFrame->GetDesc();
+	std::vector<OutputCopy> fallbackCopies;
+	auto tryPush = [&](ID3D12Resource* dst, D3D12_RESOURCE_STATES dstState) {
+		if (!dst || dst == realFrame) return;
+		for (const auto& existing : fallbackCopies)
+			if (existing.gameOutput.Get() == dst) return;
+		const D3D12_RESOURCE_DESC d = dst->GetDesc();
+		if (d.Dimension == srcDesc.Dimension && d.Width == srcDesc.Width && d.Height == srcDesc.Height &&
+			d.Format == srcDesc.Format && d.SampleDesc.Count == srcDesc.SampleDesc.Count)
+		{
+			fallbackCopies.push_back({ realFrame, dst, dstState });
+		}
+	};
+	tryPush(batch.directFirstGameOutput.Get(), batch.directFirstOutputState);
+	for (const auto& cp : batch.copies)
+		tryPush(cp.gameOutput.Get(), cp.outputState);
+	if (fallbackCopies.empty())
+		return;
+	ComPtr<ID3D12Device> queueDev;
+	const bool isNativeQueue = SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&queueDev))) && queueDev &&
+		gBridge.nativeD3DDevice && queueDev.Get() == gBridge.nativeD3DDevice.Get() &&
+		gBridge.nativeD3DDevice.Get() != gBridge.d3dDevice.Get();
+	ID3D12Fence* useFence = (isNativeQueue && gBridge.nativeSharedFence) ? gBridge.nativeSharedFence.Get() : gBridge.sharedFence.Get();
+	ID3D12Device* ringDev = (isNativeQueue && gBridge.nativeD3DDevice) ? gBridge.nativeD3DDevice.Get() : gBridge.d3dDevice.Get();
+	const D3D12_COMMAND_LIST_TYPE qType = queue->GetDesc().Type;
+	const D3D12_COMMAND_LIST_TYPE useType = (qType == D3D12_COMMAND_LIST_TYPE_COMPUTE) ? D3D12_COMMAND_LIST_TYPE_COMPUTE : D3D12_COMMAND_LIST_TYPE_DIRECT;
+	PostCopyRing& ring = isNativeQueue
+		? ((useType == D3D12_COMMAND_LIST_TYPE_COMPUTE) ? gBridge.nativeComputeRing : gBridge.nativeDirectRing)
+		: ((useType == D3D12_COMMAND_LIST_TYPE_COMPUTE) ? gBridge.computeRing : gBridge.directRing);
+	if (!useFence || !ringDev || !EnsurePostCopyRing(ringDev, useType, ring))
+		return;
+	const uint32_t slot = ring.cursor++ % kRingSize;
+	if (WaitFenceCpu(useFence, gBridge.fenceEvent, ring.doneFence[slot], 500u) &&
+		SUCCEEDED(ring.alloc[slot]->Reset()) &&
+		SUCCEEDED(ring.list[slot]->Reset(ring.alloc[slot].Get(), nullptr)))
+	{
+		RecordD3D12RealFrameFallbackCopies(ring.list[slot].Get(), realFrame, batch.fallbackRealFrameState, fallbackCopies);
+		ring.list[slot]->Close();
+		ID3D12CommandList* postLists[1] = { ring.list[slot].Get() };
+		origExec(queue, 1, postLists);
+		const uint64_t doneVal = gBridge.fenceValue.fetch_add(1, std::memory_order_acq_rel) + 1;
+		queue->Signal(useFence, doneVal);
+		ring.doneFence[slot] = doneVal;
+	}
+}
+
 // Strict, cached-once qualification for writing directly into the game/OptiScaler output texture (zero-copy).
 // Runs at most once per unique ID3D12Resource* (cached true/false in b.directOutEligible) so hot-path overhead is zero.
 bool IsDirectGameOutputEligibleLocked(Bridge& b, ID3D12Resource* gameOut, D3D12_RESOURCE_STATES outputState) noexcept
@@ -842,8 +945,20 @@ bool RecordVulkanBatchLocked(PendingBatch& batch) noexcept
 		xvkOutPtrs[i] = outImports[i]->xvkResource.Get();
 	}
 
-	// Select Vulkan command buffer slot and ensure previous submission on this slot finished.
-	const uint32_t vkSlot = gBridge.vkCursor++ % kRingSize;
+	// Select an unreserved Vulkan command buffer slot and ensure previous submission on this slot finished.
+	uint32_t vkSlot = kRingSize;
+	for (uint32_t probe = 0; probe < kRingSize; ++probe)
+	{
+		const uint32_t candidate = (gBridge.vkCursor + probe) % kRingSize;
+		if (gBridge.vkSlotOwner[candidate] == 0)
+		{
+			vkSlot = candidate;
+			break;
+		}
+	}
+	if (vkSlot >= kRingSize)
+		return false;
+	gBridge.vkCursor = (vkSlot + 1u) % kRingSize;
 	if (gBridge.vkSlotDoneFence[vkSlot])
 	{
 		VkSemaphoreWaitInfo waitInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
@@ -1025,9 +1140,14 @@ bool RecordVulkanBatchLocked(PendingBatch& batch) noexcept
 	if (gBridge.vkEndCommandBuffer(cmd) != VK_SUCCESS)
 		return false;
 
+	uint64_t slotToken = gBridge.nextSlotToken++;
+	if (slotToken == 0)
+		slotToken = gBridge.nextSlotToken++;
+	gBridge.vkSlotOwner[vkSlot] = slotToken;
 	batch.preRecorded = true;
 	batch.anyOutputCopy = anyOutputCopy;
 	batch.vkSlot = vkSlot;
+	batch.vkSlotToken = slotToken;
 	batch.contextEpoch = gBridge.contextEpoch;
 	return true;
 }
@@ -1035,16 +1155,43 @@ bool RecordVulkanBatchLocked(PendingBatch& batch) noexcept
 void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExec, PendingBatch& batch) noexcept
 {
 	std::lock_guard lock(gBridge.mutex);
-	if (!gBridge.active.load(std::memory_order_acquire) || !gBridge.xefgContext)
-		return;
-
-	if (!batch.preRecorded || batch.contextEpoch != gBridge.contextEpoch)
+	struct SlotReleaseGuard
 	{
+		uint32_t slot = kRingSize;
+		uint64_t token = 0;
+		void ReleaseNow() noexcept
+		{
+			if (slot < kRingSize && token != 0 && gBridge.vkSlotOwner[slot] == token)
+				gBridge.vkSlotOwner[slot] = 0;
+			slot = kRingSize;
+			token = 0;
+		}
+		~SlotReleaseGuard() { ReleaseNow(); }
+	} slotGuard{ batch.preRecorded ? batch.vkSlot : kRingSize, batch.preRecorded ? batch.vkSlotToken : 0 };
+
+	// If the bridge is temporarily inactive/rebuilding or a concurrent context change invalidated this batch,
+	// never execute or re-record stale frame data onto a mismatched context; copy the real frame (nextBackbuffer)
+	// into every matching output texture via PostCopyRing so the game always presents a valid frame.
+	if (!gBridge.active.load(std::memory_order_acquire) || !gBridge.xefgContext ||
+		batch.contextEpoch != gBridge.contextEpoch || !SameContextSettings(gBridge.contextSettings, batch.settings))
+	{
+		slotGuard.ReleaseNow();
+		gBridge.fallbacks.fetch_add(1, std::memory_order_relaxed);
+		RunRealFrameFallbackLocked(queue, origExec, batch);
+		return;
+	}
+	const bool validOwnership = batch.preRecorded &&
+		batch.vkSlot < kRingSize && batch.vkSlotToken != 0 && gBridge.vkSlotOwner[batch.vkSlot] == batch.vkSlotToken;
+	if (!validOwnership)
+	{
+		slotGuard.ReleaseNow();
 		if (!RecordVulkanBatchLocked(batch))
 		{
 			gBridge.fallbacks.fetch_add(1, std::memory_order_relaxed);
 			return;
 		}
+		slotGuard.slot = batch.vkSlot;
+		slotGuard.token = batch.vkSlotToken;
 	}
 	const uint32_t vkSlot = batch.vkSlot;
 	const bool anyOutputCopy = batch.anyOutputCopy;
@@ -1255,6 +1402,7 @@ void TeardownVulkanLocked() noexcept
 	{
 		gBridge.cmdBufs[i] = VK_NULL_HANDLE;
 		gBridge.vkSlotDoneFence[i] = 0;
+		gBridge.vkSlotOwner[i] = 0;
 	}
 	gBridge.device = VK_NULL_HANDLE;
 	gBridge.queue = VK_NULL_HANDLE;
@@ -1649,15 +1797,6 @@ bool Install(ID3D12Device* d3dDevice, std::string& reason) noexcept
 	return InstallLocked(d3dDevice, reason);
 }
 
-bool SameContextSettings(const ContextSettings& a, const ContextSettings& b) noexcept
-{
-	return a.width == b.width &&
-		a.height == b.height &&
-		a.format == b.format &&
-		a.initFlags == b.initFlags &&
-		a.uiMode == b.uiMode &&
-		a.model == b.model;
-}
 
 bool EnsureContext(const ContextSettings& settings) noexcept
 {
@@ -1708,8 +1847,21 @@ bool EnsureContext(const ContextSettings& settings) noexcept
 			gBridge.failedContextSettings = settings;
 			return false;
 		}
+		++gBridge.contextEpoch;
+		{
+			std::lock_guard plock(gBridge.pendingMutex);
+			for (auto& b : gBridge.pending)
+			{
+				b.preRecorded = false;
+				b.vkSlotToken = 0;
+				b.contextEpoch = 0;
+			}
+		}
 		for (uint32_t i = 0; i < kRingSize; ++i)
+		{
 			gBridge.vkSlotDoneFence[i] = 0;
+			gBridge.vkSlotOwner[i] = 0;
+		}
 
 		ReapRetiredLocked();
 		oldCtx = gBridge.xefgContext;
@@ -2032,6 +2184,8 @@ bool ScheduleBatch(
 	batch.nextDepth = next.depth;
 	batch.nextMvecs = next.mvecs;
 	batch.nextData = next.data;
+	batch.fallbackRealFrame = next.realBackbuffer ? next.realBackbuffer : next.backbuffer;
+	batch.fallbackRealFrameState = next.realBackbufferState;
 	batch.frameCount = frameCount;
 	for (uint32_t i = 0; i < frameCount; ++i)
 	{
@@ -2039,10 +2193,37 @@ bool ScheduleBatch(
 		batch.outputBases[i] = outputBases[i];
 	}
 
+	// Drop any stale unsubmitted entry for the same command list first and free its owned slot only if token matches.
+	struct StaleSlotRef { uint32_t slot = 0; uint64_t token = 0; };
+	StaleSlotRef staleSlots[kRingSize]{};
+	uint32_t staleSlotCount = 0;
+	{
+		std::lock_guard plock(gBridge.pendingMutex);
+		for (auto it = gBridge.pending.begin(); it != gBridge.pending.end();)
+		{
+			if (it->cmdList == cmdList)
+			{
+				if (it->preRecorded && it->vkSlot < kRingSize && it->vkSlotToken != 0 && staleSlotCount < kRingSize)
+					staleSlots[staleSlotCount++] = { it->vkSlot, it->vkSlotToken };
+				it = gBridge.pending.erase(it);
+			}
+			else
+			{
+				++it;
+			}
+		}
+		gBridge.pendingCount.store(static_cast<uint32_t>(gBridge.pending.size()), std::memory_order_release);
+	}
+
 	// Verify context settings, check cached zero-copy eligibility for firstGameOutput, and pre-record
 	// the Vulkan command buffer now so HookExecuteCommandLists never stalls on CPU XeFG::Execute recording.
 	{
 		std::lock_guard lock(gBridge.mutex);
+		for (uint32_t i = 0; i < staleSlotCount; ++i)
+		{
+			if (gBridge.vkSlotOwner[staleSlots[i].slot] == staleSlots[i].token)
+				gBridge.vkSlotOwner[staleSlots[i].slot] = 0;
+		}
 		if (!gBridge.xefgContext || !SameContextSettings(gBridge.contextSettings, settings))
 		{
 			const bool alreadyFailed = gBridge.contextFailed && SameContextSettings(gBridge.failedContextSettings, settings) &&
@@ -2057,6 +2238,8 @@ bool ScheduleBatch(
 		if (directFirstOut)
 		{
 			batch.sharedOutputs[0] = firstGameOutput;
+			batch.directFirstGameOutput = firstGameOutput;
+			batch.directFirstOutputState = outputState;
 			gBridge.directZeroCopyOuts.fetch_add(1, std::memory_order_relaxed);
 		}
 		else
@@ -2073,11 +2256,6 @@ bool ScheduleBatch(
 
 	{
 		std::lock_guard lock(gBridge.pendingMutex);
-		// Drop any stale entry for the same command list if the game discarded it without executing.
-		gBridge.pending.erase(
-			std::remove_if(gBridge.pending.begin(), gBridge.pending.end(),
-				[cmdList](const PendingBatch& b) { return b.cmdList == cmdList; }),
-			gBridge.pending.end());
 		gBridge.pending.push_back(std::move(batch));
 		gBridge.pendingCount.store(static_cast<uint32_t>(gBridge.pending.size()), std::memory_order_release);
 	}

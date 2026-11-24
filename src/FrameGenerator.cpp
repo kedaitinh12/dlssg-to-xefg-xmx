@@ -1215,12 +1215,19 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	wanted.format = TypedFormat(outputDesc.Format);
 	wanted.initFlags = (depthInverted ? XEFGD_INIT_FLAG_INVERTED_DEPTH : 0) |
 		(mvecJittered ? XEFGD_INIT_FLAG_JITTERED_MV : 0);
+	const int32_t curPath = static_cast<int32_t>(Plugin::options.path.load(std::memory_order_relaxed));
+	if (loggedPath != -1 && curPath != loggedPath)
+		portedModelInitFailed = false;
+	wanted.model = PickModel(device.Get());
+	if (portedModelInitFailed && wanted.model != MfgKernels::Dp4aModel)
+		wanted.model = MfgKernels::Dp4aModel;
+
 	// 3-Tier Adaptive HUD Protection (Tier 3 Hybrid = Tone-Map Match + Static HUD Mask): poll readbacks & evaluate.
 	const auto requestedHudMode = static_cast<HudTier::Mode>(
 		std::clamp(Plugin::options.hudTierMode.load(std::memory_order_relaxed), 0, 4));
 	const bool needHudCompute = (requestedHudMode != HudTier::Mode::Off) ||
 		Plugin::options.hudSplitCompare.load(std::memory_order_relaxed) ||
-		mvecJittered;
+		(mvecJittered && wanted.model == MfgKernels::MfgModel);
 	const bool hudComputeReady = needHudCompute && hudTierPass.EnsureInitialized(device.Get(), wanted.width, wanted.height);
 	if (hudComputeReady && requestedHudMode != HudTier::Mode::Off)
 	{
@@ -1261,20 +1268,26 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	}
 
 	wanted.uiMode = hudDecision.useXeFgNativeUi ? XEFGD_UI_MODE_BACKBUFFER_HUDLESS : XEFGD_UI_MODE_AUTO;
-	const int32_t curPath = static_cast<int32_t>(Plugin::options.path.load(std::memory_order_relaxed));
-	if (loggedPath != -1 && curPath != loggedPath)
-		portedModelInitFailed = false;
-	wanted.model = PickModel(device.Get());
-	if (portedModelInitFailed && wanted.model != MfgKernels::Dp4aModel)
-		wanted.model = MfgKernels::Dp4aModel;
 
 	// XMX Port / CUDA / WMMA (model 16) payload omits JitteredMV reconstruction shader variants (e.g. 35112441167526893749578).
-	// Unjitter motion vectors in-place on our private mvecs copy and clear XEFGD_INIT_FLAG_JITTERED_MV so model 16 works cleanly.
-	if (mvecJittered && wanted.model == MfgKernels::MfgModel && hudComputeReady &&
-		mvecs && hudTierPass.CanUnjitterMotionVectors(mvecs->GetDesc().Format))
+	// Unjitter motion vectors in-place on our private single-sampled UAV mvecs copy and clear XEFGD_INIT_FLAG_JITTERED_MV.
+	// If the motion vector resource cannot be unjittered safely, fall back to DP4a (model 18) with JITTERED_MV intact.
+	if (mvecJittered && wanted.model == MfgKernels::MfgModel)
 	{
-		wanted.initFlags &= ~XEFGD_INIT_FLAG_JITTERED_MV;
-		wanted.softwareUnjitterMvecs = true;
+		const auto mvDesc = mvecs ? mvecs->GetDesc() : D3D12_RESOURCE_DESC{};
+		const bool canUnjitter = hudComputeReady && mvecs &&
+			mvDesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+			mvDesc.SampleDesc.Count == 1 &&
+			hudTierPass.CanUnjitterMotionVectors(mvDesc.Format);
+		if (canUnjitter)
+		{
+			wanted.initFlags &= ~XEFGD_INIT_FLAG_JITTERED_MV;
+			wanted.softwareUnjitterMvecs = true;
+		}
+		else
+		{
+			wanted.model = MfgKernels::Dp4aModel;
+		}
 	}
 
 	// The menu path can change without a context change: XMX Port, CUDA, and WMMA all run the ported model (16), only the
@@ -1829,7 +1842,8 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 		D3D12VulkanWmma::FrameInputs vkNext{
 			useHudlessScene ? nextEffectiveHudless : nextFrame.backbuffer.Get(),
 			hudDecision.useXeFgNativeUi ? nextEffectiveHudless : nullptr,
-			nextFrame.depth.Get(), nextFrame.mvecs.Get(), nextFrame.data
+			nextFrame.depth.Get(), nextFrame.mvecs.Get(), nextFrame.data,
+			nextFrame.backbuffer.Get(), XeFGInputState
 		};
 		if (D3D12VulkanWmma::ScheduleBatch(cmdList, vkSettings, vkPrev, vkNext,
 			reinterpret_cast<ID3D12Resource* const*>(context->outputs), context->outputBases, frameCount,

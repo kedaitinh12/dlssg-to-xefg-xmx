@@ -1070,10 +1070,28 @@ bool HudTierPass::CreatePipelines(ID3D12Device* device) noexcept
 	}
 	(void)makePso(kHudTierHlsl, sizeof(kHudTierHlsl) - 1, "SplitCompareCS", psoSplitCompare_);
 
-	// Check TypedUAVLoadAdditionalFormats for in-place float2/float4 motion-vector unjittering
+	// Check per-format UAV_TYPED_LOAD + UAV_TYPED_STORE for in-place float2/float4 motion-vector unjittering
 	D3D12_FEATURE_DATA_D3D12_OPTIONS d3dOpts{};
 	typedUavLoadSupported_ = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &d3dOpts, sizeof(d3dOpts))) &&
 		d3dOpts.TypedUAVLoadAdditionalFormats != FALSE;
+	static constexpr DXGI_FORMAT kUnjitterFmts[4] = {
+		DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R32G32_FLOAT,
+		DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT
+	};
+	for (uint32_t i = 0; i < 4u; ++i)
+	{
+		unjitterFormatSupported_[i] = false;
+		if (!typedUavLoadSupported_)
+			continue;
+		D3D12_FEATURE_DATA_FORMAT_SUPPORT fmtSup{};
+		fmtSup.Format = kUnjitterFmts[i];
+		if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fmtSup, sizeof(fmtSup))))
+		{
+			constexpr D3D12_FORMAT_SUPPORT2 kNeed =
+				D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+			unjitterFormatSupported_[i] = (fmtSup.Support2 & kNeed) == kNeed;
+		}
+	}
 	if (typedUavLoadSupported_)
 	{
 		D3D12_DESCRIPTOR_RANGE uRange{};
@@ -2599,7 +2617,17 @@ bool HudTierPass::CanUnjitterMotionVectors(DXGI_FORMAT format) const noexcept
 	if (!Available() || !typedUavLoadSupported_ || !unjitterRootSig_)
 		return false;
 	bool is4Ch = false;
-	if (MotionVectorUavFormat(format, is4Ch) == DXGI_FORMAT_UNKNOWN)
+	const DXGI_FORMAT uavFmt = MotionVectorUavFormat(format, is4Ch);
+	int fmtIdx = -1;
+	switch (uavFmt)
+	{
+	case DXGI_FORMAT_R16G16_FLOAT:         fmtIdx = 0; break;
+	case DXGI_FORMAT_R32G32_FLOAT:         fmtIdx = 1; break;
+	case DXGI_FORMAT_R16G16B16A16_FLOAT:   fmtIdx = 2; break;
+	case DXGI_FORMAT_R32G32B32A32_FLOAT:   fmtIdx = 3; break;
+	default: return false;
+	}
+	if (!unjitterFormatSupported_[fmtIdx])
 		return false;
 	return is4Ch ? (psoUnjitterMv4_.Get() != nullptr) : (psoUnjitterMv2_.Get() != nullptr);
 }

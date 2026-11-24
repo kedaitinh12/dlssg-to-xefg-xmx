@@ -119,6 +119,12 @@ namespace
 		VkInstance instance = VK_NULL_HANDLE;
 		VkPhysicalDevice physical = VK_NULL_HANDLE;
 		VkDevice device = VK_NULL_HANDLE;
+		struct RetiredFeature
+		{
+			VkQueryPool profPool = VK_NULL_HANDLE;
+			xefgd_handle_t context = nullptr;
+		};
+		std::vector<RetiredFeature> retiredFeatures;
 		PFN_vkGetInstanceProcAddr gipa = nullptr;
 		uint32_t family = 0;
 		uint32_t vendor = 0;
@@ -1124,6 +1130,8 @@ namespace
 	// The tensor-core route replaces layers while the ported model runs on the CUDA path (VulkanPolicy::UseTensorCores).
 	// The path can change without a new context, CUDA, WMMA, and XMX Port run the same model and only what executes the
 	// layers differs, so this is set on every batch. A layer the route can't take stays a SPIR-V program in the same frame
+	void DrainRetiredFeaturesLocked(Device& d, uint64_t timeoutNs) noexcept;
+
 	void ApplyTensorGate(const Device& d, int32_t model)
 	{
 		const auto path = Plugin::options.path.load();
@@ -1231,7 +1239,17 @@ namespace
 
 		if (f.context)
 		{
-			CallXeFG("Destroy", [&] { return XeFG::Destroy(f.context); });
+			const bool idle = !d.d3d || xvk::WaitRecordedIdle(d.d3d.Get(), 150'000'000ull);
+			if (idle)
+			{
+				DrainRetiredFeaturesLocked(d, 0ull);
+				CallXeFG("Destroy", [&] { return XeFG::Destroy(f.context); });
+			}
+			else
+			{
+				Log::Warn("Vulkan: context settings change idle wait timed out (150 ms); deferring old XeFG context destroy");
+				d.retiredFeatures.push_back({ VK_NULL_HANDLE, f.context });
+			}
 			f.context = nullptr;
 		}
 
@@ -2614,6 +2632,9 @@ namespace
 			if (!d.ready)
 				return NGX_FAIL_NOT_INITIALIZED;
 
+			if (!d.retiredFeatures.empty())
+				DrainRetiredFeaturesLocked(d, 0ull);
+
 			const uint32_t count = VulkanPolicy::ClampCount(parameters->GetOr<uint32_t>("DLSSG.MultiFrameCount", 1u));
 			const uint32_t index = VulkanPolicy::ClampIndex(parameters->GetOr<uint32_t>("DLSSG.MultiFrameIndex", 1u), count);
 
@@ -2833,6 +2854,22 @@ namespace
 		}
 	}
 
+	void DrainRetiredFeaturesLocked(Device& d, uint64_t timeoutNs) noexcept
+	{
+		if (d.retiredFeatures.empty())
+			return;
+		if (d.d3d && !xvk::WaitRecordedIdle(d.d3d.Get(), timeoutNs))
+			return;
+		for (auto& rf : d.retiredFeatures)
+		{
+			if (rf.profPool && d.device && d.vkDestroyQueryPool)
+				d.vkDestroyQueryPool(d.device, rf.profPool, nullptr);
+			if (rf.context)
+				CallXeFG("Destroy", [&] { return XeFG::Destroy(rf.context); });
+		}
+		d.retiredFeatures.clear();
+	}
+
 	NGXResult ReleaseFeature(void* handle)
 	{
 		if (!handle)
@@ -2846,24 +2883,36 @@ namespace
 
 			// Drain in-flight recorded command buffers before destroying XeFG's context and internal xvk resources,
 			// preventing deferred-resource buildup and XeFG "Invalid internal state" (init_-1000) after rapid
-			// multiplier toggles on Vulkan.
-			if (gDevice.d3d)
-				xvk::WaitRecordedIdle(gDevice.d3d.Get(), 150'000'000ull);
-
-			if (f->profPool && gDevice.device && gDevice.vkDestroyQueryPool)
+			// multiplier toggles on Vulkan. If GPU work has not finished within 150 ms, defer destruction
+			// rather than freeing an in-use query pool or XeFG context.
+			const bool idle = !gDevice.d3d || xvk::WaitRecordedIdle(gDevice.d3d.Get(), 150'000'000ull);
+			if (idle)
 			{
-				gDevice.vkDestroyQueryPool(gDevice.device, f->profPool, nullptr);
-				f->profPool = VK_NULL_HANDLE;
+				DrainRetiredFeaturesLocked(gDevice, 0ull);
+				if (f->profPool && gDevice.device && gDevice.vkDestroyQueryPool)
+				{
+					gDevice.vkDestroyQueryPool(gDevice.device, f->profPool, nullptr);
+					f->profPool = VK_NULL_HANDLE;
+				}
+
+				if (f->context)
+					CallXeFG("Destroy", [&] { return XeFG::Destroy(f->context); });
+
+				f->context = nullptr;
+				delete f;
+
+				if (gDevice.d3d)
+					xvk::WaitRecordedIdle(gDevice.d3d.Get(), 50'000'000ull);
 			}
-
-			if (f->context)
-				CallXeFG("Destroy", [&] { return XeFG::Destroy(f->context); });
-
-			f->context = nullptr;
-			delete f;
-
-			if (gDevice.d3d)
-				xvk::WaitRecordedIdle(gDevice.d3d.Get(), 50'000'000ull);
+			else
+			{
+				Log::Warn("Vulkan: ReleaseFeature idle wait timed out (150 ms); deferring query pool and XeFG context destroy");
+				if (f->profPool || f->context)
+					gDevice.retiredFeatures.push_back({ f->profPool, f->context });
+				f->profPool = VK_NULL_HANDLE;
+				f->context = nullptr;
+				delete f;
+			}
 
 			return NGX_SUCCESS;
 		}
@@ -2879,6 +2928,7 @@ namespace
 		{
 			std::scoped_lock lock(gDevice.mutex);
 
+			DrainRetiredFeaturesLocked(gDevice, 2'000'000'000ull);
 			if (gDevice.d3d)
 				xvk::WaitRecordedIdle(gDevice.d3d.Get(), 2'000'000'000ull);
 

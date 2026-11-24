@@ -156,6 +156,7 @@ private:
 	Microsoft::WRL::ComPtr<ID3D12PipelineState> psoUnjitterMv2_;
 	Microsoft::WRL::ComPtr<ID3D12PipelineState> psoUnjitterMv4_;
 	bool typedUavLoadSupported_ = false;
+	bool unjitterFormatSupported_[4]{}; // R16G16F, R32G32F, R16G16B16A16F, R32G32B32A32F
 	Microsoft::WRL::ComPtr<ID3D12PipelineState> psoSplitCompare_;
 	Microsoft::WRL::ComPtr<ID3D12RootSignature> hybridRootSig_;
 	Microsoft::WRL::ComPtr<ID3D12PipelineState> psoHybridComposite_;
