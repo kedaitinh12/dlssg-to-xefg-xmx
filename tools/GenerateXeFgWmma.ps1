@@ -133,3 +133,33 @@ foreach ($k in $kernels) {
 
 Set-Content -Path (Join-Path $Output "wmma_layers.tsv") -Value ($tsvLines -join "`n") -Encoding UTF8
 Write-Host "Built 16 unique D3D12 WMMA kernels (17 layer overrides) into $Output"
+
+# Also build byte-identical motion-aware splat DXIL replacements (splat.1 / splat.2) into <Output>\..\replacements
+$splatSource = Join-Path $PSScriptRoot "..\src\MfgPort\splat_motion_aware.hlsl"
+if (Test-Path $splatSource) {
+    $replOut = Join-Path (Split-Path -Path $Output -Parent) "replacements"
+    New-Item -ItemType Directory -Path $replOut -Force | Out-Null
+    $splatVariants = @(
+        @{ Name = "splat_motion_aware";          Defines = @() },
+        @{ Name = "splat_motion_aware_inverted"; Defines = @("-DSPLAT_INVERTED_DEPTH=1") }
+    )
+    foreach ($sv in $splatVariants) {
+        $dxilOut = Join-Path $replOut "$($sv.Name).dxil"
+        $splatArgs = @(
+            "-nologo",
+            "-T", "cs_6_0",
+            "-E", "main",
+            "-O3",
+            "-Qstrip_reflect",
+            "-Qstrip_debug"
+        ) + $sv.Defines + @("-Fo", $dxilOut, $splatSource)
+
+        & $dxc @splatArgs
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $dxilOut)) {
+            throw "dxc.exe failed compiling $($sv.Name) (exit code $LASTEXITCODE)"
+        }
+        $sBytes = (Get-Item $dxilOut).Length
+        $sHash = (Get-FileHash -Path $dxilOut -Algorithm SHA256).Hash.ToLowerInvariant()
+        Write-Host ("ok   {0,-28} ({1} bytes, sha256={2}...)" -f "$($sv.Name).dxil", $sBytes, $sHash.Substring(0, 12))
+    }
+}

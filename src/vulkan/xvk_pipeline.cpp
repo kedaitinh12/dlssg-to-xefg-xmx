@@ -136,9 +136,10 @@ HRESULT PipelineState::Init(RootSignature* rootSignature, const Program& program
     VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module, "main"};
     info.layout = layout_;
-    const VkResult result = vk.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline_);
+    const VkResult result = vk.vkCreateComputePipelines(device, device_->basePipelineCache(), 1, &info, nullptr, &pipeline_);
     vk.vkDestroyShaderModule(device, module, nullptr);
     if (result != VK_SUCCESS) return fail("vkCreateComputePipelines " + std::to_string(int(result)));
+    device_->MarkBasePipelineCacheDirty();
     return S_OK;
 }
 

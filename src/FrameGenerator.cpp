@@ -867,41 +867,43 @@ void FrameGenerator::ProbeSupport(ID3D12Device* device)
 				}
 			}
 
+			// Enable lightweight DX12 compute PSO blob cache + disk persistence on AMD/Intel/non-CUDA too
+			if (Plugin::cudaSupport != Plugin::CudaSupport::Supported)
+			{
+				if (xefg_cuda::InstallBlobCacheOnly(device, XeFG::Module()))
+					Log::Info("D3D12 compute PSO blob cache active (disk-backed)");
+			}
+
 			std::string wmmaReason;
 			if (xefg_wmma::Install(device, XeFG::Module(), MfgKernels::ProgramsDirectory() / L"wmma", wmmaReason))
 			{
-				Plugin::wmmaSupport = Plugin::WmmaSupport::Supported;
 				xefg_wmma::SetEnabled(false);
 				const auto st = xefg_wmma::Snapshot();
 				const char* archName = st.arch == xefg_wmma::Arch::Rdna4 ? "RDNA 4 (gfx12)" : "RDNA 3 (gfx11)";
 				if (st.dxgiSpoofed)
 				{
-					Log::Info("WMMA route ready: {} ({}, device 0x{:04X}, WaveMMA tier {}, {}/{} shader overrides, source: {}, bypassed DXGI spoof 0x{:04X}:0x{:04X})",
+					Log::Info("WMMA hardware probe ready: {} ({}, device 0x{:04X}, WaveMMA tier {}, source: {}, bypassed DXGI spoof 0x{:04X}:0x{:04X})",
 						st.gpuName.empty() ? "AMD GPU" : st.gpuName, archName, st.deviceId, st.waveMmaTier,
-						st.overrideLayers, st.layers, st.probeSource, st.dxgiVendorId, st.dxgiDeviceId);
+						st.probeSource, st.dxgiVendorId, st.dxgiDeviceId);
 				}
 				else
 				{
-					Log::Info("WMMA route ready: {} ({}, device 0x{:04X}, WaveMMA tier {}, {}/{} shader overrides, source: {})",
+					Log::Info("WMMA hardware probe ready: {} ({}, device 0x{:04X}, WaveMMA tier {}, source: {})",
 						st.gpuName.empty() ? "AMD GPU" : st.gpuName, archName, st.deviceId, st.waveMmaTier,
-						st.overrideLayers, st.layers, st.probeSource);
+						st.probeSource);
 				}
 				std::string vkWmmaReason;
 				if (D3D12VulkanWmma::Install(device, vkWmmaReason))
 				{
+					Plugin::wmmaSupport = Plugin::WmmaSupport::Supported;
 					const auto vkSt = D3D12VulkanWmma::Snapshot();
 					Log::Info("WMMA hardware bridge active: D3D12 -> Vulkan VK_KHR_cooperative_matrix ({}x{}x{} s8->s32, {} hardware WMMA shaders)",
 						vkSt.tileM, vkSt.tileN, vkSt.tileK, vkSt.coopLayers);
 				}
 				else
 				{
-					Log::Info("WMMA D3D12->Vulkan hardware bridge unavailable ({}); falling back to D3D12 cs_6_6 overrides",
+					Log::Info("WMMA D3D12->Vulkan hardware bridge unavailable ({}); XMX Port runs stock D3D12 DXIL directly",
 						vkWmmaReason.empty() ? "unknown" : vkWmmaReason);
-				}
-				if (st.overrideLayers == 0 && !D3D12VulkanWmma::Active())
-				{
-					Log::Warn("WMMA route active, but 0/{} compiled .dxbc shaders were found in {}; layers will run on XMX DP4a until wmma/*.dxbc shaders are installed",
-						st.layers, (MfgKernels::ProgramsDirectory() / L"wmma").string());
 				}
 			}
 			else
@@ -910,11 +912,6 @@ void FrameGenerator::ProbeSupport(ID3D12Device* device)
 				Log::Info("WMMA route inactive: {} (real GPU: {}, vendor 0x{:04X}, device 0x{:04X}, source: {}, DXGI spoofed: {}, WaveMMA tier: {})",
 					wmmaReason, st.gpuName.empty() ? "unknown" : st.gpuName, st.vendorId, st.deviceId,
 					st.probeSource.empty() ? "none" : st.probeSource, st.dxgiSpoofed ? "true" : "false", st.waveMmaTier);
-				if (xefg_wmma::SharedTileSupported())
-				{
-					Log::Info("XMX Port 3x3 shared-tile DP4a acceleration ready ({}/{} cs_6_6 shader overrides loaded)",
-						st.overrideLayers, st.layers);
-				}
 			}
 
 			// Normalize unsupported default/saved path (e.g. XMX (native) on AMD/NVIDIA) to the GPU's preferred path.
@@ -984,15 +981,6 @@ static bool UseWmma(int32_t model)
 	return EffectiveD3D12Path(Plugin::xmxSupport.load(std::memory_order_relaxed) == Plugin::XmxSupport::Supported) == Plugin::Path::Wmma;
 }
 
-// Any SM 6.6 + Wave32-capable GPU running XMX Port uses the 17 cs_6_6 shared-tile 3x3 DP4a overrides when available.
-static bool UseSharedTileXmxPort(int32_t model)
-{
-	if (model != MfgKernels::MfgModel || !xefg_wmma::SharedTileSupported())
-		return false;
-
-	return EffectiveD3D12Path(Plugin::xmxSupport.load(std::memory_order_relaxed) == Plugin::XmxSupport::Supported) == Plugin::Path::XmxPort;
-}
-
 static Plugin::Network CurrentNetwork(int32_t model)
 {
 	if (model == XeFGXmxModel)
@@ -1004,7 +992,7 @@ static Plugin::Network CurrentNetwork(int32_t model)
 	if (xefg_cuda::Enabled())
 		return Plugin::Network::Cuda;
 
-	if (xefg_wmma::Enabled())
+	if (UseWmma(model))
 		return Plugin::Network::Wmma;
 
 	return Plugin::Network::XmxPort;
@@ -1028,7 +1016,7 @@ bool FrameGenerator::CreateContext()
 	}
 
 	xefg_cuda::SetEnabled(UseCuda(settings.model));
-	xefg_wmma::SetEnabled(UseWmma(settings.model) || UseSharedTileXmxPort(settings.model));
+	xefg_wmma::SetEnabled(UseWmma(settings.model));
 
 	// Process wide, they also affect other XeFG contexts. Must happen before the context picks its model
 	XeFG::SetMaxInterpolatedFrames(MaxFrames);
@@ -1111,7 +1099,7 @@ bool FrameGenerator::CreateContext()
 	return true;
 }
 
-bool FrameGenerator::PollVramGuard() noexcept
+bool FrameGenerator::PollVramGuard(uint32_t requestedCount) noexcept
 {
 	if (!Plugin::options.vramGuard.load(std::memory_order_relaxed))
 	{
@@ -1120,6 +1108,7 @@ bool FrameGenerator::PollVramGuard() noexcept
 			vramGuardActive = false;
 			vramGuardStepDown = 0u;
 			vramReleasePending = false;
+			vramTightStreak = 0u;
 			Log::Info("Adaptive VRAM guard disabled by user, restoring full MFG multiplier");
 		}
 		return false;
@@ -1156,15 +1145,29 @@ bool FrameGenerator::PollVramGuard() noexcept
 	constexpr uint64_t kSafetyMarginBytes = 200ull * 1024ull * 1024ull;   // 200 MiB safety -> step down gradually
 	constexpr uint64_t kReleaseMarginBytes = 400ull * 1024ull * 1024ull;  // 400 MiB hysteresis + 3s dwell before stepping up
 	constexpr auto kReleaseDwell = std::chrono::seconds(3);
+	// Toggling libxess_fg.dll between 1 (2x) and 2 (3x) generated frames triggers a ~112 ms pipeline rebuild,
+	// whereas 2 <-> 3+ is 0 ms; require stronger hysteresis across the 1 <-> 2 boundary.
+	constexpr auto kCrossOneToTwoReleaseDwell = std::chrono::seconds(10);
 
 	const bool critical = memInfo.Budget > kCriticalMarginBytes && memInfo.CurrentUsage + kCriticalMarginBytes >= memInfo.Budget;
 	const bool tight = memInfo.Budget > kSafetyMarginBytes && memInfo.CurrentUsage + kSafetyMarginBytes >= memInfo.Budget;
 	const bool comfortable = memInfo.Budget > kReleaseMarginBytes && memInfo.CurrentUsage + kReleaseMarginBytes < memInfo.Budget;
 
+	auto effectiveForStep = [&](uint32_t step) noexcept -> uint32_t {
+		if (requestedCount <= 1u || step == 0u) return requestedCount;
+		return requestedCount > step ? (requestedCount - step) : 1u;
+	};
+	const uint32_t curEffective = effectiveForStep(vramGuardActive ? vramGuardStepDown : 0u);
+
 	if (critical || tight)
 	{
 		vramReleasePending = false;
 		const uint32_t nextStep = critical ? 4u : std::min(vramGuardStepDown + 1u, 4u);
+		const uint32_t nextEffective = effectiveForStep(nextStep);
+		const bool crossesTwoToOne = !critical && curEffective >= 2u && nextEffective == 1u;
+		if (crossesTwoToOne && ++vramTightStreak < 2u)
+			return vramGuardActive;
+		vramTightStreak = 0u;
 		if (!vramGuardActive || nextStep != vramGuardStepDown)
 		{
 			vramGuardActive = true;
@@ -1175,13 +1178,17 @@ bool FrameGenerator::PollVramGuard() noexcept
 	}
 	else if (vramGuardActive && comfortable)
 	{
+		vramTightStreak = 0u;
+		const uint32_t nextStep = (vramGuardStepDown > 1u) ? (vramGuardStepDown - 1u) : 0u;
+		const uint32_t nextEffective = effectiveForStep(nextStep);
+		const auto requiredDwell = (curEffective == 1u && nextEffective >= 2u) ? kCrossOneToTwoReleaseDwell : kReleaseDwell;
 		const auto now = std::chrono::steady_clock::now();
 		if (!vramReleasePending)
 		{
 			vramReleasePending = true;
 			vramReleaseSince = now;
 		}
-		else if ((now - vramReleaseSince) >= kReleaseDwell)
+		else if ((now - vramReleaseSince) >= requiredDwell)
 		{
 			vramReleasePending = false;
 			if (vramGuardStepDown > 1u)
@@ -1201,6 +1208,7 @@ bool FrameGenerator::PollVramGuard() noexcept
 	}
 	else
 	{
+		vramTightStreak = 0u;
 		vramReleasePending = false;
 	}
 
@@ -1445,7 +1453,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 		return;
 
 	xefg_cuda::SetEnabled(UseCuda(settings.model));
-	xefg_wmma::SetEnabled(UseWmma(settings.model) || UseSharedTileXmxPort(settings.model));
+	xefg_wmma::SetEnabled(UseWmma(settings.model));
 	const bool debugLines = Plugin::options.debugLines.load(std::memory_order_relaxed);
 	static std::atomic<int> sLastDebugLines{ -1 };
 	if (sLastDebugLines.exchange(debugLines ? 1 : 0, std::memory_order_relaxed) != (debugLines ? 1 : 0))
@@ -1473,11 +1481,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 				route.probeSource.empty() ? std::string("none") : route.probeSource,
 				route.dxgiSpoofed ? "true" : "false");
 		}
-		else if (route.overrideLayers == 0)
-		{
-			Log::Warn("WMMA path selected on {} (0x{:04X}), but 0/{} WMMA .dxbc overrides are loaded; layers fall back to XMX DP4a INT8",
-				route.gpuName.empty() ? std::string("AMD GPU") : route.gpuName, route.deviceId, route.layers);
-		}
+
 	}
 	else if (pathChanged && !UseWmma(settings.model))
 	{
@@ -1878,7 +1882,7 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 		{
 			if (!context->outputs[i])
 				context->outputs[i] = CreateTexture(device.Get(), outputDesc, OutputState, L"dlssg-to-xefg output",
-					"XeFG output", useVulkanWmma);
+					"XeFG output", context->sharedTexturesMode || useVulkanWmma);
 
 			if (!context->outputs[i])
 				return InterpolateResult::Failed;
@@ -1963,17 +1967,12 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 	}
 	else if (UseWmma(settings.model))
 	{
+		// Fallback to stock D3D12 DXIL when Vulkan hardware WMMA cannot run this frame
+		// (avoids slower software cs_6_6 shared-tile DP4a overrides).
 		currentExecRoute = ActiveExecRoute::D3D12WmmaFallback;
 		currentExecRouteReason = needsSplitCompare ? "hud_split_compare"
 			: (needsPostHudComposite ? "hud_post_composite"
 			: (customInterpTime ? "custom_interp_time" : "vk_bridge_fallback"));
-		xefg_wmma::Adopt(cmdList);
-	}
-	else if (UseSharedTileXmxPort(settings.model))
-	{
-		currentExecRoute = ActiveExecRoute::D3D12SharedTile;
-		currentExecRouteReason = "xmx_port_shared_tile";
-		xefg_wmma::Adopt(cmdList);
 	}
 	else
 	{
@@ -2185,7 +2184,7 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 	if (frameIndex == 1)
 	{
 		HangWatchdog::Beat("DX12::CaptureRealFrame", true);
-		vramGuarded = PollVramGuard();
+		vramGuarded = PollVramGuard(requestedCount);
 		CaptureRealFrame(cmdList, params);
 	}
 	else
@@ -2255,19 +2254,17 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 				Log::Warn("CUDA route: no tensor-core kernel launched ({} layer binds, {} layers recognized), the DXIL port is running",
 					route.binds, route.layers);
 		}
-		else if (UseWmma(settings.model) || UseSharedTileXmxPort(settings.model))
+		else if (UseWmma(settings.model))
 		{
 			routeReported = true;
 			const auto vkWmma = D3D12VulkanWmma::Snapshot();
-			const auto route = xefg_wmma::Snapshot();
 
 			if (currentExecRoute == ActiveExecRoute::VulkanWmma)
 				Log::Info("WMMA hardware route: {} Vulkan VK_KHR_cooperative_matrix ({}x{}x{}) batches executed ({} hardware WMMA shaders, {} fallbacks, paceWait {:.2f} ms, slotWait {:.2f} ms, skipPace={})",
 					vkWmma.batches, vkWmma.tileM, vkWmma.tileN, vkWmma.tileK, vkWmma.coopLayers, vkWmma.fallbacks,
 					vkWmma.avgCpuWaitMs, vkWmma.avgSlotWaitMs, vkWmma.lastSkipCpuPaceWait ? "true" : "false");
-			else if (route.launches > routeLaunches)
-				Log::Info("WMMA D3D12 route ({}): {} cs_6_6 INT8 dispatches accelerated ({} layer binds, {} layers recognized)",
-					currentExecRouteReason, route.launches - routeLaunches, route.binds, route.layers);
+			else
+				Log::Info("WMMA D3D12 fallback ({}): running stock D3D12 DXIL", currentExecRouteReason);
 		}
 	}
 
@@ -2281,8 +2278,7 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 				switch (r)
 				{
 				case ActiveExecRoute::VulkanWmma: return "Vulkan hardware WMMA";
-				case ActiveExecRoute::D3D12WmmaFallback: return "D3D12 WMMA fallback (cs_6_6)";
-				case ActiveExecRoute::D3D12SharedTile: return "D3D12 XMX Port (3x3 shared-tile)";
+				case ActiveExecRoute::D3D12WmmaFallback: return "D3D12 DXIL fallback";
 				case ActiveExecRoute::D3D12Dxil: return "D3D12 DXIL";
 				case ActiveExecRoute::Cuda: return "CUDA tensor cores";
 				default: return "none";

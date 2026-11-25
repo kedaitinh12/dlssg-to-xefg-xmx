@@ -6,6 +6,7 @@
 #include "../Log.h"
 #include "../Plugin.h"
 #include "../MfgPort/Cuda/cuda_route.h"
+#include "../MfgKernels.h"
 #include "../VulkanPrograms.h"
 #include "../XeFG.h"
 #include "xvk.h"
@@ -20,6 +21,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -814,6 +816,15 @@ std::shared_ptr<SharedImport> GetOrImportLocked(Bridge& b, ID3D12Resource* d3dRe
 	if (vkFmt == VK_FORMAT_UNDEFINED)
 	{
 		logImportFail("DxgiToVkFormat", desc, static_cast<int64_t>(desc.Format));
+		return nullptr;
+	}
+
+	D3D12_HEAP_PROPERTIES heapProps{};
+	D3D12_HEAP_FLAGS heapFlags = D3D12_HEAP_FLAG_NONE;
+	if (SUCCEEDED(d3dRes->GetHeapProperties(&heapProps, &heapFlags)) &&
+		(heapFlags & D3D12_HEAP_FLAG_SHARED) == 0)
+	{
+		logImportFail("GetHeapProperties(non_shared)", desc, static_cast<int64_t>(heapFlags));
 		return nullptr;
 	}
 
@@ -1778,6 +1789,12 @@ bool TeardownVulkanLocked() noexcept
 			return false;
 	}
 
+	// Verify any timed-out matC probe on gBridge.device has completed BEFORE tearing down any
+	// Vulkan resource, VkDevice, or parent VkInstance; if still in flight (and device not lost),
+	// abort teardown cleanly so a later recovery pass can retry with intact device & instance.
+	if (gBridge.device && !VulkanCoopMat::ReapPendingProbes(gBridge.device, true) && !deviceLost)
+		return false;
+
 	// Clean up any remaining pendingInitUploads (only reachable here if deviceLost == true).
 	for (auto& pi : gBridge.pendingInitUploads)
 	{
@@ -1864,6 +1881,17 @@ bool TeardownVulkanLocked() noexcept
 	gBridge.contextFailCount = 0;
 	++gBridge.contextEpoch;
 	return true;
+}
+
+
+// Runs a one-time 1-workgroup (32-thread) Wave32 16x16x16 cooperative-matrix accumulator layout probe
+// during bridge initialization (0 runtime cost per frame) and logs whether the driver's matC[i] lane
+// mapping matches RADV's register-only layout (g = lane >> 4, p = lane & 15, C[g + i * 2][p]).
+xvk::MatCLayout RunMatCRegisterProbe(PFN_vkGetDeviceProcAddr gdpa, bool requireSubgroupSize) noexcept
+{
+	return VulkanCoopMat::ProbeMatCLayout(
+		gBridge.instance, gBridge.physical, gBridge.device, gBridge.queueFamily, gBridge.queue,
+		gBridge.gipa, gdpa, requireSubgroupSize, "D3D12->Vulkan WMMA bridge");
 }
 
 bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
@@ -2009,8 +2037,14 @@ bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
 		return fail("missing_interop_or_coopmat_ext");
 	}
 
+	const bool hasPipeExecExt = HasExtension(exts, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+
 	// Query supported features so we only enable features the driver actually advertises.
-	VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopFeats{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR };
+	VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pipeExecFeats{
+		VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
+	VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopFeats{
+		VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
+		hasPipeExecExt ? &pipeExecFeats : nullptr };
 	VkPhysicalDeviceVulkan13Features vk13{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &coopFeats };
 	VkPhysicalDeviceVulkan12Features vk12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &vk13 };
 	VkPhysicalDeviceVulkan11Features vk11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &vk12 };
@@ -2052,8 +2086,16 @@ bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
 	if (chosenFamily == UINT32_MAX)
 		return fail("no_compute_queue");
 
+	const bool enablePipeExecProps = hasPipeExecExt && (pipeExecFeats.pipelineExecutableInfo == VK_TRUE);
+
 	// Build minimal enabled feature chain for private VkDevice.
-	VkPhysicalDeviceCooperativeMatrixFeaturesKHR enableCoop{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR };
+	VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR enablePipeExec{
+		VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
+	enablePipeExec.pipelineExecutableInfo = VK_TRUE;
+
+	VkPhysicalDeviceCooperativeMatrixFeaturesKHR enableCoop{
+		VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
+		enablePipeExecProps ? &enablePipeExec : nullptr };
 	enableCoop.cooperativeMatrix = VK_TRUE;
 
 	VkPhysicalDeviceVulkan13Features enable13{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &enableCoop };
@@ -2080,12 +2122,14 @@ bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
 	enableFeats.features.shaderStorageImageExtendedFormats = VK_TRUE;
 	enableFeats.features.shaderInt16 = feats2.features.shaderInt16;
 
-	const char* enabledExts[] = {
+	std::vector<const char*> enabledExts = {
 		VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
 		VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
 		VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
 		VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
 	};
+	if (enablePipeExecProps)
+		enabledExts.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
 
 	const float priority = 1.0f;
 	VkDeviceQueueCreateInfo qInfo{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
@@ -2096,8 +2140,8 @@ bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
 	VkDeviceCreateInfo devInfo{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enableFeats };
 	devInfo.queueCreateInfoCount = 1;
 	devInfo.pQueueCreateInfos = &qInfo;
-	devInfo.enabledExtensionCount = static_cast<uint32_t>(std::size(enabledExts));
-	devInfo.ppEnabledExtensionNames = enabledExts;
+	devInfo.enabledExtensionCount = static_cast<uint32_t>(enabledExts.size());
+	devInfo.ppEnabledExtensionNames = enabledExts.data();
 
 	if (createDevice(matchedPhys, &devInfo, nullptr, &gBridge.device) != VK_SUCCESS || !gBridge.device)
 		return fail("create_device_failed");
@@ -2132,6 +2176,14 @@ bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
 	cbInfo.commandBufferCount = kRingSize;
 	if (gBridge.vkAllocateCommandBuffers(gBridge.device, &cbInfo, gBridge.cmdBufs) != VK_SUCCESS)
 		return fail("command_buffers_failed");
+
+	xvk::MatCLayout probedMatCLayout = xvk::MatCLayout::Unknown;
+	if (matchedVendor == 0x1002u)
+	{
+		probedMatCLayout = RunMatCRegisterProbe(gdpa, vk13.subgroupSizeControl == VK_TRUE);
+		if (probedMatCLayout == xvk::MatCLayout::Emulated)
+			return fail("emulated_coopmat_skipped");
+	}
 
 	// Create D3D12 shared fence and import it into Vulkan as a timeline semaphore.
 	if (FAILED(d3dDevice->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&gBridge.sharedFence))))
@@ -2180,6 +2232,7 @@ bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
 	xvkDesc.recordedFamily = chosenFamily;
 	xvkDesc.coopMatrixExtensions = true;
 	xvkDesc.coopMatrixSpec = coopSpec;
+	xvkDesc.pipelineExecutableProperties = enablePipeExecProps;
 
 	if (FAILED(xvk::CreateDevice(xvkDesc, IID_PPV_ARGS(&gBridge.xvkDevice))) || !gBridge.xvkDevice)
 		return fail("xvk_device_failed");
@@ -2192,7 +2245,7 @@ bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
 	}
 
 	std::string coopReason;
-	if (!VulkanCoopMat::Install(gBridge.xvkDevice.Get(), coopReason))
+	if (!VulkanCoopMat::Install(gBridge.xvkDevice.Get(), coopReason, probedMatCLayout))
 		return fail(coopReason.empty() ? "coopmat_install_failed" : coopReason.c_str());
 
 	const auto coopStatus = xefg_cuda::CoopMatrixSnapshot();

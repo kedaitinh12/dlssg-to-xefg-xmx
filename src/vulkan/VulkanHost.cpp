@@ -1,8 +1,8 @@
 #include "VulkanHost.h"
+#include "VulkanCoopMat.h"
 
 #include "../Log.h"
 #include "../Plugin.h"
-#include "VulkanCoopMat.h"
 #include "../WineCompat.h"
 #include "VulkanPolicy.h"
 #include "VulkanFeatureChain.h"
@@ -943,6 +943,7 @@ namespace
 		State::DestroyInstanceFn next = s.gipaDestroyInstance.load(std::memory_order_acquire);
 		DestroyInstanceImpl(next ? next : s.destroyInstance, instance, allocator);
 	}
+
 
 	// ------------------------------------------------------------------------------------------------ device
 

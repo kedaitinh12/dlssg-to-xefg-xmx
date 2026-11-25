@@ -1,4 +1,5 @@
 #include "Log.h"
+#include "PeVersion.h"
 #include "Util.h"
 
 #include <Windows.h>
@@ -239,6 +240,8 @@ void Log::WarnForeignFgMods(bool isVulkan, bool usingExternalVulkanProvider) noe
 			return s;
 		};
 
+		std::string runtimeVersions;
+
 		for (HMODULE mod : modules)
 		{
 			if (!mod || mod == self)
@@ -251,6 +254,14 @@ void Log::WarnForeignFgMods(bool isVulkan, bool usingExternalVulkanProvider) noe
 			const auto filename = p.filename().u8string();
 			const std::string displayName(filename.begin(), filename.end());
 			const std::wstring name = toLower(p.filename().wstring());
+			if (name == L"sl.dlss_g.dll" || name == L"sl.interposer.dll" ||
+				name == L"nvngx_dlssg.dll" || name == L"libxess_fg.dll")
+			{
+				if (!runtimeVersions.empty())
+					runtimeVersions += ", ";
+				runtimeVersions += displayName + "=" + PeVersion::QueryModuleFileVersionString(mod);
+			}
+
 			const char* kind = nullptr;
 
 			if (name.ends_with(L".addon64") &&
@@ -280,10 +291,13 @@ void Log::WarnForeignFgMods(bool isVulkan, bool usingExternalVulkanProvider) noe
 
 			if (kind)
 			{
-				Warn("foreign_fg_mod detected: {} ({}) — running two frame generation mods together can cause hook conflicts or prevent frame generation",
-					displayName, kind);
+				Warn("foreign_fg_mod detected: {} ({}, PE FileVersion={}) — running two frame generation mods together can cause hook conflicts or prevent frame generation",
+					displayName, kind, PeVersion::QueryModuleFileVersionString(mod));
 			}
 		}
+
+		if (!runtimeVersions.empty())
+			Info("Runtime DLL PE versions: {}", runtimeVersions);
 	}
 	catch (...)
 	{

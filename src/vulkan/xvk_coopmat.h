@@ -59,6 +59,7 @@ public:
 private:
     enum class GpuArch : uint8_t { Generic, Rdna3, Rdna4 };
     uint32_t SelectWorkgroupSize(size_t layerIdx) const noexcept;
+    void LogPipelineStats(size_t layerIdx, uint32_t localSizeX, VkPipeline pipeline) const noexcept;
     bool EnsureLayerPipeline(Device& device, uint8_t layerIdx, PipelineState& basePso) noexcept;
 
     VkDevice device_ = VK_NULL_HANDLE;
@@ -77,12 +78,16 @@ private:
     PFN_vkCmdPushConstants pushConstants_{};
     PFN_vkCmdDispatch dispatch_{};
     PFN_vkCmdPipelineBarrier2 barrier_{};
+    PFN_vkGetPipelineExecutablePropertiesKHR getPipelineExecProps_{};
+    PFN_vkGetPipelineExecutableStatisticsKHR getPipelineExecStats_{};
+    bool pipelineExecStats_{false};
 
     CoopMatrixOptions options_{};
     uint32_t tileM_{}, tileN_{}, tileK_{};
     uint32_t subgroupSize_{};
     bool requireSubgroupSize_{};
     GpuArch gpuArch_{GpuArch::Generic};
+    bool rdna3LegacyLlpc_ = false;
     uint32_t installedLayers_{};
     std::array<std::vector<uint32_t>, 17> spirvModules_{};
     std::array<VkPipeline, 17> pipelines_{};

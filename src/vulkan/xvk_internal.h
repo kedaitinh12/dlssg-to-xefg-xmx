@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
@@ -83,7 +84,8 @@ void Unimplemented(const char* what);          // logged once per name
     X(vkGetCalibratedTimestampsEXT)                          \
     X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) \
     X(vkAcquireNextImageKHR) X(vkQueuePresentKHR) X(vkSetHdrMetadataEXT) \
-    X(vkCreateEvent) X(vkDestroyEvent) X(vkCmdSetEvent) X(vkGetEventStatus) X(vkResetEvent)
+    X(vkCreateEvent) X(vkDestroyEvent) X(vkCmdSetEvent) X(vkGetEventStatus) X(vkResetEvent) \
+    X(vkCreatePipelineCache) X(vkDestroyPipelineCache) X(vkGetPipelineCacheData)
 // The host's low-latency outputs (NVIDIA Reflex, AMD Anti-Lag 2). With a deviceProcOverride they come from
 // it alone: OptiScaler's vkGetDeviceProcAddr hands out its own Reflex and Anti-Lag input wrappers for these names.
 #define XVK_LATENCY_DEVICE_FNS(X)                            \
@@ -709,6 +711,9 @@ public:
     // layer internals
     const VkFns& vk() const { return vk_; }
     VkDevice vkDevice() const { return device_; }
+    VkPipelineCache basePipelineCache() const noexcept { return basePipelineCache_; }
+    void MarkBasePipelineCacheDirty() noexcept { baseCacheDirty_.store(true, std::memory_order_release); }
+    void SaveBasePipelineCache() noexcept;
     VkPhysicalDevice physical() const { return physical_; }
     uint32_t queueFamily() const { return queueFamily_; }
     const VkPhysicalDeviceProperties& properties() const { return properties_; }
@@ -847,6 +852,9 @@ private:
 
     std::mutex samplerMutex_;
     std::map<std::array<uint8_t, sizeof(VkSamplerCreateInfo)>, VkSampler> samplers_;
+    VkPipelineCache basePipelineCache_ = VK_NULL_HANDLE;
+    std::filesystem::path baseCachePath_;
+    std::atomic<bool> baseCacheDirty_{false};
 
     std::mutex waitMutex_;
     std::condition_variable waitChanged_;

@@ -28,10 +28,10 @@
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_EXT_samplerless_texture_functions : enable
 
-// Optional Linux Mesa RADV Wave32 register-only accumulator epilogue (zero sAcc LDS, zero subgroupBarrier).
-// Relies on RADV's fixed 16x16x16 Wave32 layout (radv_nir_lower_cooperative_matrix.c):
-//   invocation (g = lane >> 4, p = lane & 15) owns C[g + i * 2][p] in matC[i] (i = 0..7).
-// Strictly gated at runtime in xvk_coopmat.cpp to Wine/Proton + VK_DRIVER_ID_MESA_RADV + Wave32.
+// Optional AMD Wave32 register-only accumulator epilogue (zero sAcc LDS, zero subgroupBarrier).
+//   RADV_REG_ONLY == 1 (RDNA 3 / gfx11, LLPC & RADV): lane (g = lane >> 4, p = lane & 15) owns C[g + i * 2][p].
+//   RADV_REG_ONLY == 2 (RDNA 4 / gfx12, LLPC & RADV): lane (g = lane >> 4, p = lane & 15) owns C[g * 8 + i][p].
+// Strictly gated at runtime in xvk_coopmat.cpp / D3D12VulkanWmma.cpp via hardware matC probe.
 #ifndef RADV_REG_ONLY
 #define RADV_REG_ONLY 0
 #endif
@@ -323,6 +323,21 @@ void emitPoolRowRadv(int r, int z, int X0, int Y0, int limitW, int limitH,
                      coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC1)
 {
 	int Y = Y0 + int(warp) + r * int(gl_WorkGroupSize.x >> 5u);
+#if RADV_REG_ONLY == 2
+	// RDNA 4 (gfx12): lane (g, p) holds rows g*8 + 0..7, so adjacent pixels 2*k and 2*k+1 live in the same lane.
+	uint g = lane >> 4u;
+	for (int k = 0; k < 4; ++k)
+	{
+		int v0 = max(matC0[2 * k],     matC1[2 * k]);
+		int v1 = max(matC0[2 * k + 1], matC1[2 * k + 1]);
+		int pooled = max(v0, v1);
+		uint q = requantFloat(pooled, sLane, biLane, lo);
+		uvec4 words = radvPack16Ch(q, lane);
+		int X = X0 + int(g) * 4 + k;
+		if ((lane & 15u) == 0u && Y < limitH && X < limitW)
+			imageStore(uDst, ivec3(X, Y, z), words);
+	}
+#else
 	for (int i = 0; i < 8; ++i)
 	{
 		int vy = max(matC0[i], matC1[i]);
@@ -333,6 +348,7 @@ void emitPoolRowRadv(int r, int z, int X0, int Y0, int limitW, int limitH,
 		if (lane == 0u && Y < limitH && (X0 + i) < limitW)
 			imageStore(uDst, ivec3(X0 + i, Y, z), words);
 	}
+#endif
 }
 #else
 void emitPoolRowRadv(int r, int z, int X0, int Y0, int limitW, int limitH,
@@ -345,7 +361,11 @@ void emitPoolRowRadv(int r, int z, int X0, int Y0, int limitW, int limitH,
 	{
 		uint q = requantFloat(matC0[i], sLane, biLane, lo);
 		uvec4 words = radvPack16Ch(q, lane);
+#if RADV_REG_ONLY == 2
+		int X = X0 + int(g) * 8 + i;
+#else
 		int X = X0 + int(g) + i * 2;
+#endif
 		if ((lane & 15u) == 0u && Y < limitH && X < limitW)
 			imageStore(uDst, ivec3(X, Y, z), words);
 	}
@@ -466,7 +486,11 @@ void emitFlowHalfRadv(int r, int h, int n0, int X0, int Y0, int limitW, int limi
 	{
 		uint q = requantFlow(matC[i], ibLane, ngLane, lim, posMul, s1, s2, roundPos, roundNeg);
 		uvec4 words = radvPack16Ch(q, lane);
+#if RADV_REG_ONLY == 2
+		int x = X0 + int(g) * 8 + i;
+#else
 		int x = X0 + int(g) + i * 2;
+#endif
 		if ((lane & 15u) == 0u && y < limitH && x < limitW)
 		{
 #if LAYER_OUT == 8

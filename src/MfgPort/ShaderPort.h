@@ -41,6 +41,7 @@ class ShaderPort
 	bool active{};
 	std::atomic<unsigned> callers{};
 	std::map<std::string, std::vector<unsigned char>> programs;
+	std::vector<xess_payload::Replacement> replacements;
 
 	std::mutex reportedMutex;
 	std::set<std::string> reported;
@@ -90,6 +91,60 @@ class ShaderPort
 		return out;
 	}
 
+	// Replace a provider-decoded native program ONLY when its exact byte size and SHA-256
+	// match a verified byte-identical replacement (e.g., splat_motion_aware).
+	void native(const std::string& key, void* output)
+	{
+		if (replacements.empty())
+			return;
+
+		const auto o = reinterpret_cast<uintptr_t>(output);
+		const auto start = get<uintptr_t>(o);
+		const auto end = get<uintptr_t>(o + 8);
+		if (!start || end < start || end - start > 1000000)
+			return;
+
+		const size_t decodedSize = static_cast<size_t>(end - start);
+		bool sizeMatch = false;
+		for (const auto& r : replacements)
+		{
+			if (r.nativeBytes == decodedSize)
+			{
+				sizeMatch = true;
+				break;
+			}
+		}
+		if (!sizeMatch)
+			return;
+
+		std::vector<unsigned char> decoded(decodedSize);
+		if (!decoded.empty())
+			read(start, decoded.data(), decoded.size());
+
+		const auto hash = xess_payload::Hash(decoded);
+		for (const auto& r : replacements)
+		{
+			if (r.nativeBytes != decoded.size() || r.nativeHash != hash)
+				continue;
+
+			resize(output, r.bytes.size());
+			const auto at = get<uintptr_t>(o);
+			const auto stop = get<uintptr_t>(o + 8);
+			const auto cap = get<uintptr_t>(o + 16);
+			if (!at || stop - at != r.bytes.size() || cap < stop)
+				throw std::runtime_error("shader_port_output_allocation");
+
+			memcpy(reinterpret_cast<void*>(at), r.bytes.data(), r.bytes.size());
+			{
+				std::scoped_lock lock(reportedMutex);
+				mfg_port::Event("shader_replaced",
+					"\"key\":\"" + key + "\",\"replacement\":\"" + r.name +
+					"\",\"bytes\":" + std::to_string(r.bytes.size()));
+			}
+			return;
+		}
+	}
+
 	static void dispatch(void* store, const void* keyObject, void* output)
 	{
 		auto self = instance;
@@ -120,6 +175,7 @@ class ShaderPort
 					mfg_port::Event("shader_miss", "\"key\":\"" + key + "\"");
 			}
 			self->decode(store, keyObject, output);
+			self->native(key, output);
 			return;
 		}
 
@@ -198,6 +254,7 @@ public:
 		decode = reinterpret_cast<Decode>(base + layout.Rva(0x19fda0));
 		resize = reinterpret_cast<Resize>(base + layout.Rva(0x1a09c0));
 		programs = xess_payload::LoadPrograms(programsRoot);
+		replacements = xess_payload::LoadReplacements(programsRoot);
 
 		// The jump to dispatch has to be reachable from the call site with a rel32
 		const auto callEnd = reinterpret_cast<uintptr_t>(site + 5);

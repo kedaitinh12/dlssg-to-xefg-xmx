@@ -121,7 +121,7 @@ private:
 	};
 
 	bool CreateContext();
-	bool PollVramGuard() noexcept;
+	bool PollVramGuard(uint32_t requestedCount) noexcept;
 	void CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const NGXParameter& params);
 	InterpolateResult Interpolate(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* output,
 		D3D12_RESOURCE_DESC outputDesc, uint32_t frameIndex, uint32_t frameCount,
@@ -139,7 +139,7 @@ private:
 	uint64_t routeLaunches = 0;
 	uint32_t routeFrames = 0;
 	bool routeReported = false;
-	enum class ActiveExecRoute : uint8_t { None, VulkanWmma, D3D12WmmaFallback, D3D12SharedTile, D3D12Dxil, Cuda };
+	enum class ActiveExecRoute : uint8_t { None, VulkanWmma, D3D12WmmaFallback, D3D12Dxil, Cuda };
 	ActiveExecRoute lastExecRoute = ActiveExecRoute::None;
 	ActiveExecRoute currentExecRoute = ActiveExecRoute::None;
 	const char* currentExecRouteReason = "";
@@ -152,6 +152,7 @@ private:
 	std::chrono::steady_clock::time_point vramReleaseSince{};
 	bool vramReleasePending = false;
 	uint32_t vramPollCounter = 0;
+	uint32_t vramTightStreak = 0;
 
 	// 3-Tier Adaptive HUD Protection (persists across XeFG context recreations when tier changes)
 	HudTier::StateMachine hudTierState;

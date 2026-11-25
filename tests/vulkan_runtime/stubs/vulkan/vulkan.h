@@ -40,6 +40,9 @@
 #define VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME "VK_NVX_image_view_handle"
 #define VK_KHR_COOPERATIVE_MATRIX_SPEC_VERSION 2
 #define VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME "VK_KHR_cooperative_matrix"
+#define VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME "VK_KHR_pipeline_executable_properties"
+#define VK_MAX_DESCRIPTION_SIZE 256
+#define VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR 0x00000040
 
 typedef uint32_t VkFlags;
 typedef uint64_t VkFlags64;
@@ -143,6 +146,11 @@ typedef enum VkStructureType
 	VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR = 1000506000,
 	VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR = 1000506001,
 	VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR = 1000506002,
+	VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR = 1000269000,
+	VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR = 1000269001,
+	VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR = 1000269002,
+	VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR = 1000269003,
+	VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR = 1000269004,
 } VkStructureType;
 
 typedef enum VkComponentTypeKHR
@@ -1102,3 +1110,240 @@ typedef VkResult(VKAPI_PTR* PFN_vkCreateSwapchainKHR)(VkDevice device, const VkS
 typedef void(VKAPI_PTR* PFN_vkDestroySwapchainKHR)(VkDevice device, VkSwapchainKHR swapchain,
 	const VkAllocationCallbacks* pAllocator);
 typedef VkResult(VKAPI_PTR* PFN_vkQueuePresentKHR)(VkQueue queue, const VkPresentInfoKHR* pPresentInfo);
+
+typedef enum VkPipelineExecutableStatisticFormatKHR
+{
+	VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR = 0,
+	VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR = 1,
+	VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR = 2,
+	VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR = 3,
+} VkPipelineExecutableStatisticFormatKHR;
+
+typedef struct VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR
+{
+	VkStructureType sType;
+	void* pNext;
+	VkBool32 pipelineExecutableInfo;
+} VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR;
+
+typedef struct VkPipelineInfoKHR
+{
+	VkStructureType sType;
+	const void* pNext;
+	VkPipeline pipeline;
+} VkPipelineInfoKHR;
+
+typedef struct VkPipelineExecutablePropertiesKHR
+{
+	VkStructureType sType;
+	void* pNext;
+	VkShaderStageFlags stages;
+	char name[VK_MAX_DESCRIPTION_SIZE];
+	char description[VK_MAX_DESCRIPTION_SIZE];
+	uint32_t subgroupSize;
+} VkPipelineExecutablePropertiesKHR;
+
+typedef struct VkPipelineExecutableInfoKHR
+{
+	VkStructureType sType;
+	const void* pNext;
+	VkPipeline pipeline;
+	uint32_t executableIndex;
+} VkPipelineExecutableInfoKHR;
+
+typedef union VkPipelineExecutableStatisticValueKHR
+{
+	VkBool32 b32;
+	int64_t i64;
+	uint64_t u64;
+	double f64;
+} VkPipelineExecutableStatisticValueKHR;
+
+typedef struct VkPipelineExecutableStatisticKHR
+{
+	VkStructureType sType;
+	void* pNext;
+	char name[VK_MAX_DESCRIPTION_SIZE];
+	char description[VK_MAX_DESCRIPTION_SIZE];
+	VkPipelineExecutableStatisticFormatKHR format;
+	VkPipelineExecutableStatisticValueKHR value;
+} VkPipelineExecutableStatisticKHR;
+
+typedef VkResult(VKAPI_PTR* PFN_vkGetPipelineExecutablePropertiesKHR)(
+	VkDevice, const VkPipelineInfoKHR*, uint32_t*, VkPipelineExecutablePropertiesKHR*);
+typedef VkResult(VKAPI_PTR* PFN_vkGetPipelineExecutableStatisticsKHR)(
+	VkDevice, const VkPipelineExecutableInfoKHR*, uint32_t*, VkPipelineExecutableStatisticKHR*);
+
+// Vulkan 1.3 compute probe stubs for VulkanCoopMat::ProbeMatCLayout
+#ifndef VK_MAX_MEMORY_TYPES
+#define VK_MAX_MEMORY_TYPES 32
+#endif
+#ifndef VK_MAX_MEMORY_HEAPS
+#define VK_MAX_MEMORY_HEAPS 16
+#endif
+
+typedef struct VkDeviceMemory_T* VkDeviceMemory;
+typedef struct VkCommandPool_T* VkCommandPool;
+typedef struct VkFence_T* VkFence;
+typedef VkFlags VkMemoryPropertyFlags;
+typedef VkFlags VkMemoryHeapFlags;
+typedef VkFlags VkBufferUsageFlags;
+typedef VkFlags VkBufferCreateFlags;
+typedef VkFlags VkCommandPoolCreateFlags;
+typedef VkFlags VkCommandBufferUsageFlags;
+typedef VkFlags VkFenceCreateFlags;
+typedef VkFlags VkMemoryMapFlags;
+typedef VkFlags VkSubmitFlags;
+
+static constexpr VkStructureType VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO = static_cast<VkStructureType>(12);
+static constexpr VkStructureType VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO = static_cast<VkStructureType>(5);
+static constexpr VkStructureType VK_STRUCTURE_TYPE_FENCE_CREATE_INFO = static_cast<VkStructureType>(8);
+static constexpr VkStructureType VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO = static_cast<VkStructureType>(39);
+static constexpr VkStructureType VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO = static_cast<VkStructureType>(40);
+static constexpr VkStructureType VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO = static_cast<VkStructureType>(42);
+static constexpr VkStructureType VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO = static_cast<VkStructureType>(1000314006);
+static constexpr VkStructureType VK_STRUCTURE_TYPE_SUBMIT_INFO_2 = static_cast<VkStructureType>(1000314004);
+static constexpr VkStructureType VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO = static_cast<VkStructureType>(1000225001);
+
+enum
+{
+	VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT = 0x00000002,
+	VK_BUFFER_USAGE_STORAGE_BUFFER_BIT = 0x00000020,
+	VK_SHARING_MODE_EXCLUSIVE = 0,
+	VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT = 0x00000002,
+	VK_MEMORY_PROPERTY_HOST_COHERENT_BIT = 0x00000004,
+	VK_COMMAND_POOL_CREATE_TRANSIENT_BIT = 0x00000001,
+	VK_COMMAND_BUFFER_LEVEL_PRIMARY = 0,
+	VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT = 0x00000001,
+};
+
+typedef uint32_t VkSharingMode;
+typedef uint32_t VkCommandBufferLevel;
+
+typedef struct VkPipelineShaderStageRequiredSubgroupSizeCreateInfo
+{
+	VkStructureType sType;
+	void* pNext;
+	uint32_t requiredSubgroupSize;
+} VkPipelineShaderStageRequiredSubgroupSizeCreateInfo;
+
+typedef struct VkBufferCreateInfo
+{
+	VkStructureType sType;
+	const void* pNext;
+	VkBufferCreateFlags flags;
+	VkDeviceSize size;
+	VkBufferUsageFlags usage;
+	VkSharingMode sharingMode;
+	uint32_t queueFamilyIndexCount;
+	const uint32_t* pQueueFamilyIndices;
+} VkBufferCreateInfo;
+
+typedef struct VkMemoryType
+{
+	VkMemoryPropertyFlags propertyFlags;
+	uint32_t heapIndex;
+} VkMemoryType;
+
+typedef struct VkMemoryHeap
+{
+	VkDeviceSize size;
+	VkMemoryHeapFlags flags;
+} VkMemoryHeap;
+
+typedef struct VkPhysicalDeviceMemoryProperties
+{
+	uint32_t memoryTypeCount;
+	VkMemoryType memoryTypes[VK_MAX_MEMORY_TYPES];
+	uint32_t memoryHeapCount;
+	VkMemoryHeap memoryHeaps[VK_MAX_MEMORY_HEAPS];
+} VkPhysicalDeviceMemoryProperties;
+
+typedef struct VkMemoryRequirements
+{
+	VkDeviceSize size;
+	VkDeviceSize alignment;
+	uint32_t memoryTypeBits;
+} VkMemoryRequirements;
+
+typedef struct VkMemoryAllocateInfo
+{
+	VkStructureType sType;
+	const void* pNext;
+	VkDeviceSize allocationSize;
+	uint32_t memoryTypeIndex;
+} VkMemoryAllocateInfo;
+
+typedef struct VkCommandPoolCreateInfo
+{
+	VkStructureType sType;
+	const void* pNext;
+	VkCommandPoolCreateFlags flags;
+	uint32_t queueFamilyIndex;
+} VkCommandPoolCreateInfo;
+
+typedef struct VkCommandBufferAllocateInfo
+{
+	VkStructureType sType;
+	const void* pNext;
+	VkCommandPool commandPool;
+	VkCommandBufferLevel level;
+	uint32_t commandBufferCount;
+} VkCommandBufferAllocateInfo;
+
+typedef struct VkFenceCreateInfo
+{
+	VkStructureType sType;
+	const void* pNext;
+	VkFenceCreateFlags flags;
+} VkFenceCreateInfo;
+
+typedef struct VkCommandBufferBeginInfo
+{
+	VkStructureType sType;
+	const void* pNext;
+	VkCommandBufferUsageFlags flags;
+	const void* pInheritanceInfo;
+} VkCommandBufferBeginInfo;
+
+typedef struct VkCommandBufferSubmitInfo
+{
+	VkStructureType sType;
+	const void* pNext;
+	VkCommandBuffer commandBuffer;
+	uint32_t deviceMask;
+} VkCommandBufferSubmitInfo;
+
+typedef struct VkSubmitInfo2
+{
+	VkStructureType sType;
+	const void* pNext;
+	VkSubmitFlags flags;
+	uint32_t waitSemaphoreInfoCount;
+	const void* pWaitSemaphoreInfos;
+	uint32_t commandBufferInfoCount;
+	const VkCommandBufferSubmitInfo* pCommandBufferInfos;
+	uint32_t signalSemaphoreInfoCount;
+	const void* pSignalSemaphoreInfos;
+} VkSubmitInfo2;
+
+typedef void(VKAPI_PTR* PFN_vkGetDeviceQueue)(VkDevice, uint32_t, uint32_t, VkQueue*);
+typedef void(VKAPI_PTR* PFN_vkGetPhysicalDeviceMemoryProperties)(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties*);
+typedef VkResult(VKAPI_PTR* PFN_vkCreateBuffer)(VkDevice, const VkBufferCreateInfo*, const VkAllocationCallbacks*, VkBuffer*);
+typedef void(VKAPI_PTR* PFN_vkDestroyBuffer)(VkDevice, VkBuffer, const VkAllocationCallbacks*);
+typedef void(VKAPI_PTR* PFN_vkGetBufferMemoryRequirements)(VkDevice, VkBuffer, VkMemoryRequirements*);
+typedef VkResult(VKAPI_PTR* PFN_vkAllocateMemory)(VkDevice, const VkMemoryAllocateInfo*, const VkAllocationCallbacks*, VkDeviceMemory*);
+typedef void(VKAPI_PTR* PFN_vkFreeMemory)(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*);
+typedef VkResult(VKAPI_PTR* PFN_vkBindBufferMemory)(VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize);
+typedef VkResult(VKAPI_PTR* PFN_vkMapMemory)(VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize, VkMemoryMapFlags, void**);
+typedef void(VKAPI_PTR* PFN_vkUnmapMemory)(VkDevice, VkDeviceMemory);
+typedef VkResult(VKAPI_PTR* PFN_vkCreateCommandPool)(VkDevice, const VkCommandPoolCreateInfo*, const VkAllocationCallbacks*, VkCommandPool*);
+typedef void(VKAPI_PTR* PFN_vkDestroyCommandPool)(VkDevice, VkCommandPool, const VkAllocationCallbacks*);
+typedef VkResult(VKAPI_PTR* PFN_vkAllocateCommandBuffers)(VkDevice, const VkCommandBufferAllocateInfo*, VkCommandBuffer*);
+typedef VkResult(VKAPI_PTR* PFN_vkBeginCommandBuffer)(VkCommandBuffer, const VkCommandBufferBeginInfo*);
+typedef VkResult(VKAPI_PTR* PFN_vkEndCommandBuffer)(VkCommandBuffer);
+typedef VkResult(VKAPI_PTR* PFN_vkCreateFence)(VkDevice, const VkFenceCreateInfo*, const VkAllocationCallbacks*, VkFence*);
+typedef void(VKAPI_PTR* PFN_vkDestroyFence)(VkDevice, VkFence, const VkAllocationCallbacks*);
+typedef VkResult(VKAPI_PTR* PFN_vkWaitForFences)(VkDevice, uint32_t, const VkFence*, VkBool32, uint64_t);
+typedef VkResult(VKAPI_PTR* PFN_vkGetFenceStatus)(VkDevice, VkFence);
+typedef VkResult(VKAPI_PTR* PFN_vkQueueSubmit2)(VkQueue, uint32_t, const VkSubmitInfo2*, VkFence);

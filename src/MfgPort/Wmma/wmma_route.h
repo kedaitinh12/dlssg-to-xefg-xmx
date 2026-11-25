@@ -1,6 +1,9 @@
 #pragma once
-// AMD WMMA INT8 acceleration route for XeFG's ported XMX MFG model (Model 16), built on top of the
-// XMX DP4a INT8 graph (one optical flow field per generated frame batch) for D3D12 and Vulkan.
+// AMD RDNA 3 / RDNA 4 WMMA capability probe for XeFG's ported XMX MFG model (Model 16).
+// Hardware 16x16x16 INT8 WMMA runs via D3D12VulkanWmma (Vulkan VK_KHR_cooperative_matrix);
+// D3D12 fallback frames and XMX Port run stock D3D12 DXIL directly (the software cs_6_6
+// shared-tile DP4a overrides are disabled because they lack hardware matrix acceleration
+// and regress LDS/VGPR occupancy vs. stock DXIL).
 #include <d3d12.h>
 #include <cstdint>
 #include <filesystem>
@@ -34,14 +37,14 @@ struct Status
 using LogFunction = void (*)(const char* stage, const std::string& fields);
 void SetLog(LogFunction log) noexcept;
 
-// Installs the D3D12 WMMA INT8 route on an AMD RDNA 3 / RDNA 4 adapter. Loads optional precompiled
-// WaveMatrix/WMMA DXIL overrides from wmmaDir (<program>.dxbc) and tracks the 17 INT8 layers of Model 16.
+// Probes whether the underlying D3D12 adapter is an AMD RDNA 3 / RDNA 4 GPU capable of hardware WMMA
+// (bypassing OptiScaler/Streamline device wrappers and DXGI spoofing). Does not install D3D12
+// command-list hooks or software cs_6_6 DP4a overrides.
 bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem::path& wmmaDir, std::string& reason) noexcept;
 void Disable(const char* reason) noexcept;
 void SetEnabled(bool enabled) noexcept;
 bool Enabled() noexcept;
 bool Supported() noexcept;
-bool SharedTileSupported() noexcept;
 bool IsRdna4() noexcept;
 void Adopt(ID3D12GraphicsCommandList* list) noexcept;
 void ForgetLayers() noexcept;

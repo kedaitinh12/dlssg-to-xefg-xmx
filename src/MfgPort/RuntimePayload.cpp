@@ -2,6 +2,12 @@
 #include "Sha256.h"
 
 #include <algorithm>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+#else
+#include <cstdlib>
+#endif
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -97,5 +103,82 @@ namespace xess_payload
 		return programs;
 	}
 
-	std::vector<Replacement> LoadReplacements(const std::filesystem::path&) { return {}; }
+	std::vector<Replacement> LoadReplacements(const std::filesystem::path& root)
+	{
+		// Allow A/B benchmarking or opt-out via environment variable.
+#ifdef _WIN32
+		{
+			char envBuf[8]{};
+			const DWORD envLen = GetEnvironmentVariableA("XEFG_DISABLE_SPLAT_REPLACEMENT", envBuf, sizeof(envBuf));
+			if (envLen == 1 && envBuf[0] == '1')
+				return {};
+		}
+#else
+		if (const char* disable = std::getenv("XEFG_DISABLE_SPLAT_REPLACEMENT");
+			disable && disable[0] == '1' && disable[1] == '\0')
+		{
+			return {};
+		}
+#endif
+
+		struct Spec
+		{
+			const char* name;
+			const char* relFile;
+			const char* nativeHash;
+			size_t nativeBytes;
+		};
+
+		// Byte-identical motion-aware splat replacements (splat.1 / splat.2 from MFG-Unlocker, MIT).
+		// Matched strictly by exact native Intel DXIL size + SHA-256 before swapping.
+		static constexpr Spec kSpecs[] = {
+			{
+				"splat_motion_aware",
+				"splat_motion_aware.dxil",
+				"3f3f91d2ecd4345042f0519f7455776314be9e7730453a3fcb42c57f0acb49b5",
+				4008,
+			},
+			{
+				"splat_motion_aware_inverted",
+				"splat_motion_aware_inverted.dxil",
+				"c3649191906bdd300462dbafe6add8f82b09e8e10c41e92784a209d99513224b",
+				4012,
+			},
+		};
+
+		const auto dir = root / "replacements";
+		std::error_code ec;
+		if (!std::filesystem::is_directory(dir, ec))
+			return {};
+
+		std::vector<Replacement> out;
+		for (const auto& spec : kSpecs)
+		{
+			const auto path = dir / spec.relFile;
+			if (!std::filesystem::is_regular_file(path, ec))
+				continue;
+
+			try
+			{
+				auto bytes = ReadFile(path);
+				uint32_t containerSize = 0;
+				if (bytes.size() >= 28)
+					memcpy(&containerSize, bytes.data() + 24, sizeof(containerSize));
+				if (bytes.size() < 32 || memcmp(bytes.data(), "DXBC", 4) != 0 || containerSize != bytes.size())
+					continue;
+
+				Replacement r;
+				r.name = spec.name;
+				r.nativeHash = spec.nativeHash;
+				r.nativeBytes = spec.nativeBytes;
+				r.bytes = std::move(bytes);
+				out.push_back(std::move(r));
+			}
+			catch (...)
+			{
+				// Strictly optional: skip unreadable replacements without affecting startup.
+			}
+		}
+		return out;
+	}
 } // namespace xess_payload

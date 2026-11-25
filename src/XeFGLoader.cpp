@@ -1,5 +1,6 @@
 #include "XeFG.h"
 #include "Log.h"
+#include "PeVersion.h"
 #include "Util.h"
 
 #include <Psapi.h>
@@ -29,7 +30,7 @@ namespace
 
 	bool TryModule(HMODULE module)
 	{
-		Log::Info("Trying {}", ModulePath(module).string());
+		Log::Info("Trying {} (PE FileVersion={})", ModulePath(module).string(), PeVersion::QueryModuleFileVersionString(module));
 
 		if (XeFG::Resolve(module))
 			return true;

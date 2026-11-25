@@ -53,11 +53,15 @@ inline constexpr Layer kLayers[] = {
     {{"cb391582", "a60f7488872a675d66afd2bec02b0b89e3cc38c1c4ed1d25d745a7b2fe677412", "L_cb391582",
         "7a29fbf311cd8dee5b8c1cfdadf31ee983092a512cf9c10845a079b457eb62a9"}, 10, Family::Decoder, 32, 8, 1, 16, 16, 1, 3, 57372, 38124},
     {{"fc1b8a04", "8c1d7667722c8692b376ed7511723b5e58efd61d4a4b8c4b61a1233f75df76ee", "L_fc1b8a04"}, 11, Family::Flow, 8, 8, 28, 16, 8, 7, kFlowConstants, 13704, 0},
-    {{"3459485", "51667b6d9955036a10cbd4e363881252de8ca5d3b6f210a7a3ee6cab719629a6", "L_3459485"}, 12, Family::Flow, 8, 8, 28, 16, 8, 7, kFlowConstants, 15948, 0},
-    {{"3452733", "f4aa535a6fc74410ae8b684eb881b9fd511c6a1ac1c784cc95bd8f7fd8ea0f61", "L_3452733"}, 13, Family::Flow, 8, 8, 28, 16, 8, 7, kFlowConstants, 15948, 0},
+    {{"3459485", "51667b6d9955036a10cbd4e363881252de8ca5d3b6f210a7a3ee6cab719629a6", "L_3459485",
+        "8c4a23058529dd0f5a7aab90c42d9d9e50cb0d13d261031d783b11b3f81562bb"}, 12, Family::Flow, 8, 8, 28, 16, 8, 7, kFlowConstants, 15948, 14264},
+    {{"3452733", "f4aa535a6fc74410ae8b684eb881b9fd511c6a1ac1c784cc95bd8f7fd8ea0f61", "L_3452733",
+        "3577b7537200e869aff122f06d1ff9310f07b67b351931b685451de616c6496d"}, 13, Family::Flow, 8, 8, 28, 16, 8, 7, kFlowConstants, 15948, 14264},
     {{"55e5d6b9", "09887269759ef4d7588315f29e71126c899fde79f9edb336eedd598c662d4aea", "L_flow16_acc17"}, 14, Family::Flow, 8, 8, 4, 16, 8, 2, kFlowConstants, 23912, 0},
-    {{"34517926", "1bebcab193714ee264da7dc0a96e313d74ad4c71017fdea5314c8b07f6b56394", "L_flow16_acc17"}, 14, Family::Flow, 8, 8, 4, 16, 8, 2, kFlowConstants, 26164, 0},
-    {{"3453044", "13abff5d769ef56f99cb9ee7825968872e28395d77a6d344053c06cb08b8064c", "L_3453044"}, 15, Family::Flow, 8, 8, 4, 16, 8, 2, kFlowConstants, 26164, 0},
+    {{"34517926", "1bebcab193714ee264da7dc0a96e313d74ad4c71017fdea5314c8b07f6b56394", "L_flow16_acc17",
+        "6acf82efd2a0c95c342a154f1f13cc8dc8450bcef6044175b3c91b17e21bedc0"}, 14, Family::Flow, 8, 8, 4, 16, 8, 2, kFlowConstants, 26164, 23028},
+    {{"3453044", "13abff5d769ef56f99cb9ee7825968872e28395d77a6d344053c06cb08b8064c", "L_3453044",
+        "c8b778ce1332e0f4f0c31b6985a4f77f88d01305602e932f78dac0157a7de840"}, 15, Family::Flow, 8, 8, 4, 16, 8, 2, kFlowConstants, 26164, 23028},
 };
 inline constexpr bool LayerSizes()
 {

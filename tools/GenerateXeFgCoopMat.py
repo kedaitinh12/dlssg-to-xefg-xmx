@@ -158,6 +158,33 @@ def main() -> int:
     rc = build_set(args.source, args.output / "radv_reg", "16x16x16-radv-reg", ["-DRADV_REG_ONLY=1"])
     if rc != 0:
         return rc
+    rc = build_set(args.source, args.output / "gfx12_reg", "16x16x16-gfx12-reg", ["-DRADV_REG_ONLY=2"])
+    if rc != 0:
+        return rc
+    probe_source = args.source.parent / "xefg_coopmat_probe.comp"
+    if probe_source.is_file():
+        probe_spv = args.output / "matc_probe_16x16x16.spv"
+        probe_spv.unlink(missing_ok=True)
+        probe_cmd = [
+            str(args.glslang),
+            "-V",
+            "--target-env",
+            "vulkan1.3",
+            "-S",
+            "comp",
+            "-o",
+            str(probe_spv),
+            str(probe_source),
+        ]
+        probe_res = subprocess.run(probe_cmd, capture_output=True, text=True)
+        if probe_res.returncode != 0:
+            print(f"FAIL [probe] matc_probe_16x16x16.spv: {probe_res.stderr or probe_res.stdout}", file=sys.stderr)
+            return probe_res.returncode
+        probe_data = probe_spv.read_bytes()
+        if len(probe_data) < 20 or len(probe_data) % 4 or struct.unpack_from("<I", probe_data)[0] != 0x07230203:
+            print(f"error: invalid SPIR-V output: {probe_spv}", file=sys.stderr)
+            return 1
+        print(f"ok   [probe] {probe_spv.name} ({len(probe_data)} bytes)")
     xmx_source = args.source.parent / "xefg_coopmat_layers_xmx8x8x32.comp"
     if xmx_source.is_file():
         rc = build_set(xmx_source, args.output / "xmx_8x8x32", "8x8x32")

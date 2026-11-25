@@ -1,0 +1,38 @@
+// SPDX-License-Identifier: MIT
+//
+// One-time startup micro-probe for AMD Wave32 16x16x16 VK_KHR_cooperative_matrix accumulator (matC)
+// register layout verification on Windows AMDVLK vs Linux Mesa RADV.
+// Loads cell IDs (r * 16 + c) into a 16x16 int32 accumulator and writes matC[0..7] per lane to outVals.
+#version 460
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) writeonly buffer OutBuf
+{
+	int outVals[];
+};
+
+shared int sIn[256];
+
+void main()
+{
+	const uint lane = gl_SubgroupInvocationID;
+	for (uint idx = lane; idx < 256u; idx += 32u)
+		sIn[idx] = int(idx);
+	barrier();
+
+	coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC;
+	coopMatLoad(matC, sIn, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+
+	const uint len = uint(matC.length());
+	if (lane == 0u)
+		outVals[256] = int(len);
+	for (uint i = 0u; i < len && i < 8u; ++i)
+		outVals[lane * 8u + i] = matC[i];
+}

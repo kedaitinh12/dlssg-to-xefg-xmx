@@ -45,6 +45,10 @@ enum class State : uint32_t { NotAttempted = 0, Active = 1, Unavailable = 2, Dis
 bool Install(ID3D12Device* device, HMODULE providerModule, std::span<const unsigned char> fatbin,
     std::string& reason) noexcept;
 
+// Installs only the lightweight DX12 compute PSO blob cache hooks (CreateRootSignature + CreateComputePipelineState)
+// with disk persistence for non-CUDA GPUs (AMD, Intel, or NVIDIA with Tensor Cores disabled).
+bool InstallBlobCacheOnly(ID3D12Device* device, HMODULE providerModule) noexcept;
+
 // The configuration turned the route off (OptiScaler.ini [XeFG] XeFGTensorCores = off).
 void Disable(const char* reason) noexcept;
 

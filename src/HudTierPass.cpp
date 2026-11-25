@@ -62,7 +62,7 @@ namespace
 	// Root signature layout:
 	//   b0: 4 root 32-bit constants (width, height, tolerance, flags)
 	//   t0, t1: 2 SRV textures
-	//   u0, u1: 2 UAVs (texture + RWByteAddressBuffer counter)
+	//   u0, u1: 2 UAVs (texture + RWStructuredBuffer<uint> counter)
 	constexpr char kHudTierHlsl[] = R"(
 bool IsFiniteF(float v) { return (asuint(v) & 0x7F800000u) != 0x7F800000u; }
 bool3 IsFiniteF3(float3 v) { return (asuint(v) & 0x7F800000u) != 0x7F800000u; }
@@ -450,8 +450,8 @@ cbuffer Match : register(b0)
 Texture2D<float4> hudless : register(t0);
 Texture2D<float4> backBuffer : register(t1);
 RWTexture2D<float4> output : register(u0);
-RWByteAddressBuffer histogram : register(u1);
-RWByteAddressBuffer lut : register(u2);
+RWStructuredBuffer<uint> histogram : register(u1);
+RWStructuredBuffer<uint> lut : register(u2);
 
 uint BinOf(float v)
 {
@@ -464,7 +464,7 @@ uint BinOf(float v)
 [numthreads(64, 1, 1)]
 void clear(uint3 id : SV_DispatchThreadID)
 {
-    if (id.x < 3 * bins * codes) histogram.Store(id.x * 4u, 0u);
+    if (id.x < 3 * bins * codes) histogram[id.x] = 0u;
 }
 
 [numthreads(8, 8, 1)]
@@ -478,7 +478,7 @@ void accumulate(uint3 id : SV_DispatchThreadID)
     {
         const uint code = (uint)(saturate(b[c]) * (codes - 1) + 0.5);
         uint previous;
-        histogram.InterlockedAdd(((c * bins + BinOf(h[c])) * codes + code) * 4u, 1u, previous);
+        InterlockedAdd(histogram[(c * bins + BinOf(h[c])) * codes + code], 1u, previous);
     }
 }
 
@@ -490,7 +490,7 @@ void median(uint3 group : SV_GroupID, uint gi : SV_GroupIndex)
     const uint base = (c * bins + bin) * codes + gi * 4;
     uint counts[4];
     uint sum = 0;
-    [unroll] for (uint k = 0; k < 4; ++k) { counts[k] = histogram.Load((base + k) * 4u); sum += counts[k]; }
+    [unroll] for (uint k = 0; k < 4; ++k) { counts[k] = histogram[base + k]; sum += counts[k]; }
     partial[gi] = sum;
     GroupMemoryBarrierWithGroupSync();
     [unroll] for (uint offset = 1; offset < 256; offset <<= 1)
@@ -503,14 +503,14 @@ void median(uint3 group : SV_GroupID, uint gi : SV_GroupIndex)
     }
     const uint total = partial[255];
     const uint before = gi ? partial[gi - 1] : 0;
-    const uint slot = (c * bins + bin) * 4;
-    if (total < minimumCount) { if (gi == 0) lut.Store(slot, asuint(-1.0)); return; }
+    const uint slot = c * bins + bin;
+    if (total < minimumCount) { if (gi == 0) lut[slot] = asuint(-1.0); return; }
     const uint middle = (total + 1) / 2;
     if (before < middle && partial[gi] >= middle)
     {
         uint seen = before, code = gi * 4 + 3;
         for (uint j = 0; j < 4; ++j) { seen += counts[j]; if (seen >= middle) { code = gi * 4 + j; break; } }
-        lut.Store(slot, asuint((float)code / (float)(codes - 1)));
+        lut[slot] = asuint((float)code / (float)(codes - 1));
     }
 }
 
@@ -520,7 +520,7 @@ groupshared float fillLut[256];
 void fill(uint3 group : SV_GroupID, uint gi : SV_GroupIndex)
 {
     const uint c = group.x, base = c * bins;
-    const float rawVal = asfloat(lut.Load((base + gi) * 4));
+    const float rawVal = asfloat(lut[base + gi]);
     fillRaw[gi] = rawVal;
     fillLut[gi] = rawVal;
     GroupMemoryBarrierWithGroupSync();
@@ -571,7 +571,7 @@ void fill(uint3 group : SV_GroupID, uint gi : SV_GroupIndex)
     }
     GroupMemoryBarrierWithGroupSync();
 
-    lut.Store((base + gi) * 4, asuint(fillLut[gi]));
+    lut[base + gi] = asuint(fillLut[gi]);
 }
 
 groupshared float g_applyLut[768];
@@ -581,7 +581,7 @@ void apply(uint3 id : SV_DispatchThreadID, uint gidx : SV_GroupIndex)
 {
     const uint totalLut = min(3u * bins, 768u);
     for (uint li = gidx; li < totalLut; li += 64u)
-        g_applyLut[li] = asfloat(lut.Load(li * 4u));
+        g_applyLut[li] = asfloat(lut[li]);
     GroupMemoryBarrierWithGroupSync();
 
     if (id.x >= width || id.y >= height) return;
@@ -678,8 +678,8 @@ cbuffer BilateralParams : register(b0)
 Texture2D<float4> hudless : register(t0);
 Texture2D<float4> backBuffer : register(t1);
 RWTexture2D<float4> output : register(u0);
-RWByteAddressBuffer statsBuf : register(u1);
-RWByteAddressBuffer modelBuf : register(u2);
+RWStructuredBuffer<uint> statsBuf : register(u1);
+RWStructuredBuffer<float4> modelBuf : register(u2);
 
 float3 SafeSaturateRgb(float3 c)
 {
@@ -699,35 +699,35 @@ void AccumBin(uint cellIdx, uint b, float w, float3 x, float3 y)
     if (w <= 1e-4f) return;
     uint base = (cellIdx * bins + b) * 22u;
     uint dummy;
-    statsBuf.InterlockedAdd((base + 0u) * 4u, (uint)(w * B_SCALE + 0.5f), dummy);
-    statsBuf.InterlockedAdd((base + 1u) * 4u, (uint)(w * x.r * B_SCALE + 0.5f), dummy);
-    statsBuf.InterlockedAdd((base + 2u) * 4u, (uint)(w * x.g * B_SCALE + 0.5f), dummy);
-    statsBuf.InterlockedAdd((base + 3u) * 4u, (uint)(w * x.b * B_SCALE + 0.5f), dummy);
-    statsBuf.InterlockedAdd((base + 4u) * 4u, (uint)(w * x.r * x.r * B_SCALE + 0.5f), dummy);
-    statsBuf.InterlockedAdd((base + 5u) * 4u, (uint)(w * x.r * x.g * B_SCALE + 0.5f), dummy);
-    statsBuf.InterlockedAdd((base + 6u) * 4u, (uint)(w * x.r * x.b * B_SCALE + 0.5f), dummy);
-    statsBuf.InterlockedAdd((base + 7u) * 4u, (uint)(w * x.g * x.g * B_SCALE + 0.5f), dummy);
-    statsBuf.InterlockedAdd((base + 8u) * 4u, (uint)(w * x.g * x.b * B_SCALE + 0.5f), dummy);
-    statsBuf.InterlockedAdd((base + 9u) * 4u, (uint)(w * x.b * x.b * B_SCALE + 0.5f), dummy);
-    statsBuf.InterlockedAdd((base + 10u) * 4u, (uint)(w * x.r * y.r * B_SCALE + 0.5f), dummy);
-    statsBuf.InterlockedAdd((base + 11u) * 4u, (uint)(w * x.r * y.g * B_SCALE + 0.5f), dummy);
-    statsBuf.InterlockedAdd((base + 12u) * 4u, (uint)(w * x.r * y.b * B_SCALE + 0.5f), dummy);
-    statsBuf.InterlockedAdd((base + 13u) * 4u, (uint)(w * x.g * y.r * B_SCALE + 0.5f), dummy);
-    statsBuf.InterlockedAdd((base + 14u) * 4u, (uint)(w * x.g * y.g * B_SCALE + 0.5f), dummy);
-    statsBuf.InterlockedAdd((base + 15u) * 4u, (uint)(w * x.g * y.b * B_SCALE + 0.5f), dummy);
-    statsBuf.InterlockedAdd((base + 16u) * 4u, (uint)(w * x.b * y.r * B_SCALE + 0.5f), dummy);
-    statsBuf.InterlockedAdd((base + 17u) * 4u, (uint)(w * x.b * y.g * B_SCALE + 0.5f), dummy);
-    statsBuf.InterlockedAdd((base + 18u) * 4u, (uint)(w * x.b * y.b * B_SCALE + 0.5f), dummy);
-    statsBuf.InterlockedAdd((base + 19u) * 4u, (uint)(w * y.r * B_SCALE + 0.5f), dummy);
-    statsBuf.InterlockedAdd((base + 20u) * 4u, (uint)(w * y.g * B_SCALE + 0.5f), dummy);
-    statsBuf.InterlockedAdd((base + 21u) * 4u, (uint)(w * y.b * B_SCALE + 0.5f), dummy);
+    InterlockedAdd(statsBuf[base + 0u], (uint)(w * B_SCALE + 0.5f), dummy);
+    InterlockedAdd(statsBuf[base + 1u], (uint)(w * x.r * B_SCALE + 0.5f), dummy);
+    InterlockedAdd(statsBuf[base + 2u], (uint)(w * x.g * B_SCALE + 0.5f), dummy);
+    InterlockedAdd(statsBuf[base + 3u], (uint)(w * x.b * B_SCALE + 0.5f), dummy);
+    InterlockedAdd(statsBuf[base + 4u], (uint)(w * x.r * x.r * B_SCALE + 0.5f), dummy);
+    InterlockedAdd(statsBuf[base + 5u], (uint)(w * x.r * x.g * B_SCALE + 0.5f), dummy);
+    InterlockedAdd(statsBuf[base + 6u], (uint)(w * x.r * x.b * B_SCALE + 0.5f), dummy);
+    InterlockedAdd(statsBuf[base + 7u], (uint)(w * x.g * x.g * B_SCALE + 0.5f), dummy);
+    InterlockedAdd(statsBuf[base + 8u], (uint)(w * x.g * x.b * B_SCALE + 0.5f), dummy);
+    InterlockedAdd(statsBuf[base + 9u], (uint)(w * x.b * x.b * B_SCALE + 0.5f), dummy);
+    InterlockedAdd(statsBuf[base + 10u], (uint)(w * x.r * y.r * B_SCALE + 0.5f), dummy);
+    InterlockedAdd(statsBuf[base + 11u], (uint)(w * x.r * y.g * B_SCALE + 0.5f), dummy);
+    InterlockedAdd(statsBuf[base + 12u], (uint)(w * x.r * y.b * B_SCALE + 0.5f), dummy);
+    InterlockedAdd(statsBuf[base + 13u], (uint)(w * x.g * y.r * B_SCALE + 0.5f), dummy);
+    InterlockedAdd(statsBuf[base + 14u], (uint)(w * x.g * y.g * B_SCALE + 0.5f), dummy);
+    InterlockedAdd(statsBuf[base + 15u], (uint)(w * x.g * y.b * B_SCALE + 0.5f), dummy);
+    InterlockedAdd(statsBuf[base + 16u], (uint)(w * x.b * y.r * B_SCALE + 0.5f), dummy);
+    InterlockedAdd(statsBuf[base + 17u], (uint)(w * x.b * y.g * B_SCALE + 0.5f), dummy);
+    InterlockedAdd(statsBuf[base + 18u], (uint)(w * x.b * y.b * B_SCALE + 0.5f), dummy);
+    InterlockedAdd(statsBuf[base + 19u], (uint)(w * y.r * B_SCALE + 0.5f), dummy);
+    InterlockedAdd(statsBuf[base + 20u], (uint)(w * y.g * B_SCALE + 0.5f), dummy);
+    InterlockedAdd(statsBuf[base + 21u], (uint)(w * y.b * B_SCALE + 0.5f), dummy);
 }
 
 [numthreads(64, 1, 1)]
 void BilateralClearCS(uint3 id : SV_DispatchThreadID)
 {
     if (id.x < totalStatsUints)
-        statsBuf.Store(id.x * 4u, 0u);
+        statsBuf[id.x] = 0u;
 }
 
 [numthreads(8, 8, 1)]
@@ -784,7 +784,7 @@ void BilateralSolveCS(uint3 id : SV_DispatchThreadID)
             float w = (float)((2 - abs(dx)) * (2 - abs(dy)));
             uint nBase = (((uint)ny * cellsX + (uint)nx) * bins + b) * 22u;
             for (uint m = 0u; m < 22u; ++m)
-                s[m] += w * ((float)statsBuf.Load((nBase + m) * 4u) * B_INV_SCALE);
+                s[m] += w * ((float)statsBuf[nBase + m] * B_INV_SCALE);
         }
     }
 
@@ -848,10 +848,10 @@ void BilateralSolveCS(uint3 id : SV_DispatchThreadID)
         }
     }
 
-    uint mBase = id.x * 12u;
-    modelBuf.Store4((mBase + 0u) * 4u, asuint(row0));
-    modelBuf.Store4((mBase + 4u) * 4u, asuint(row1));
-    modelBuf.Store4((mBase + 8u) * 4u, asuint(row2));
+    uint mBase = id.x * 3u;
+    modelBuf[mBase + 0u] = row0;
+    modelBuf[mBase + 1u] = row1;
+    modelBuf[mBase + 2u] = row2;
 }
 
 // 4 spatial corners x 8 luma bins x 3 float4 rows = 96 float4 (1.5 KB LDS):
@@ -879,8 +879,8 @@ void BilateralApplyCS(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, ui
         const uint sc = cb / cachedBins;
         const uint cx = (uint)(((sc & 1u) != 0u) ? gx1 : gx0);
         const uint cy = (uint)(((sc & 2u) != 0u) ? gy1 : gy0);
-        const uint mBase = ((cy * cellsX + cx) * bins + cz) * 12u;
-        g_cellModels[v] = asfloat(modelBuf.Load4((mBase + row * 4u) * 4u));
+        const uint mBase = ((cy * cellsX + cx) * bins + cz) * 3u;
+        g_cellModels[v] = modelBuf[mBase + row];
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -2501,16 +2501,18 @@ ID3D12Resource* HudTierPass::RecordToneMapMatch(ID3D12GraphicsCommandList* cmdLi
 		device_->CreateUnorderedAccessView(outTex, nullptr, &uavOut, cpu);
 		cpu.ptr += descSize_;
 
-		D3D12_UNORDERED_ACCESS_VIEW_DESC uavRaw{};
-		uavRaw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-		uavRaw.Format = DXGI_FORMAT_R32_TYPELESS;
-		uavRaw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-		uavRaw.Buffer.NumElements = totalStatsUints;
-		device_->CreateUnorderedAccessView(bilateralStats_.Get(), nullptr, &uavRaw, cpu);
+		D3D12_UNORDERED_ACCESS_VIEW_DESC uavStruct{};
+		uavStruct.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+		uavStruct.Format = DXGI_FORMAT_UNKNOWN;
+		uavStruct.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+		uavStruct.Buffer.StructureByteStride = sizeof(uint32_t);
+		uavStruct.Buffer.NumElements = totalStatsUints;
+		device_->CreateUnorderedAccessView(bilateralStats_.Get(), nullptr, &uavStruct, cpu);
 		cpu.ptr += descSize_;
 
-		uavRaw.Buffer.NumElements = totalModelUints;
-		device_->CreateUnorderedAccessView(bilateralModel_.Get(), nullptr, &uavRaw, cpu);
+		uavStruct.Buffer.StructureByteStride = sizeof(float) * 4u;
+		uavStruct.Buffer.NumElements = totalModelUints / 4u;
+		device_->CreateUnorderedAccessView(bilateralModel_.Get(), nullptr, &uavStruct, cpu);
 
 		TransitionBarrier(cmdList, realTex, realState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 		TransitionBarrier(cmdList, hudlessTex, hudlessState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -2601,16 +2603,17 @@ ID3D12Resource* HudTierPass::RecordToneMapMatch(ID3D12GraphicsCommandList* cmdLi
 	device_->CreateUnorderedAccessView(outTex, nullptr, &uavOut, cpu);
 	cpu.ptr += descSize_;
 
-	D3D12_UNORDERED_ACCESS_VIEW_DESC uavRaw{};
-	uavRaw.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-	uavRaw.Format = DXGI_FORMAT_R32_TYPELESS;
-	uavRaw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-	uavRaw.Buffer.NumElements = 3u * kToneMatchBins * kToneMatchCodes;
-	device_->CreateUnorderedAccessView(toneMatchHistogram_.Get(), nullptr, &uavRaw, cpu);
+	D3D12_UNORDERED_ACCESS_VIEW_DESC uavStruct{};
+	uavStruct.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+	uavStruct.Format = DXGI_FORMAT_UNKNOWN;
+	uavStruct.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+	uavStruct.Buffer.StructureByteStride = sizeof(uint32_t);
+	uavStruct.Buffer.NumElements = 3u * kToneMatchBins * kToneMatchCodes;
+	device_->CreateUnorderedAccessView(toneMatchHistogram_.Get(), nullptr, &uavStruct, cpu);
 	cpu.ptr += descSize_;
 
-	uavRaw.Buffer.NumElements = 3u * kToneMatchBins;
-	device_->CreateUnorderedAccessView(toneMatchLut_.Get(), nullptr, &uavRaw, cpu);
+	uavStruct.Buffer.NumElements = 3u * kToneMatchBins;
+	device_->CreateUnorderedAccessView(toneMatchLut_.Get(), nullptr, &uavStruct, cpu);
 
 	TransitionBarrier(cmdList, realTex, realState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 	TransitionBarrier(cmdList, hudlessTex, hudlessState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);

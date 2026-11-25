@@ -1,4 +1,6 @@
 #include "xvk_internal.h"
+#include <cstdio>
+#include <fstream>
 #include "../MfgPort/Cuda/cuda_layers.h"
 
 namespace xvk {
@@ -87,6 +89,39 @@ Device::~Device()
     if (wakeSemaphore_) vk_.vkDestroySemaphore(device_, wakeSemaphore_, nullptr);
     if (latencySemaphore_) vk_.vkDestroySemaphore(device_, latencySemaphore_, nullptr);
     for (auto& [key, sampler] : samplers_) vk_.vkDestroySampler(device_, sampler, nullptr);
+    SaveBasePipelineCache();
+    if (basePipelineCache_ && vk_.vkDestroyPipelineCache) {
+        vk_.vkDestroyPipelineCache(device_, basePipelineCache_, nullptr);
+        basePipelineCache_ = VK_NULL_HANDLE;
+    }
+}
+
+void Device::SaveBasePipelineCache() noexcept
+{
+    if (!device_ || !basePipelineCache_ || !vk_.vkGetPipelineCacheData || baseCachePath_.empty())
+        return;
+    if (!baseCacheDirty_.exchange(false, std::memory_order_acq_rel))
+        return;
+    try {
+        size_t bytes = 0;
+        if (vk_.vkGetPipelineCacheData(device_, basePipelineCache_, &bytes, nullptr) != VK_SUCCESS || !bytes || bytes > 32 * 1024 * 1024)
+            return;
+        std::vector<uint8_t> blob(bytes);
+        if (vk_.vkGetPipelineCacheData(device_, basePipelineCache_, &bytes, blob.data()) != VK_SUCCESS || !bytes)
+            return;
+        std::filesystem::path tmpPath = baseCachePath_;
+        tmpPath += L".tmp";
+        {
+            std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
+            if (!out.write(reinterpret_cast<const char*>(blob.data()), static_cast<std::streamsize>(bytes)))
+                return;
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmpPath, baseCachePath_, ec);
+        if (ec)
+            std::filesystem::remove(tmpPath, ec);
+    } catch (...) {
+    }
 }
 
 VkSemaphore Device::LatencySemaphore()
@@ -197,6 +232,39 @@ HRESULT Device::Init(const DeviceDesc& desc)
         }
     }
     programs_.Load(desc.programModule);
+
+    // Load persistent VkPipelineCache for base SPIR-V shaders (%LOCALAPPDATA%\dlssg-to-xefg)
+    if (vk_.vkCreatePipelineCache && vk_.vkDestroyPipelineCache && vk_.vkGetPipelineCacheData) {
+        char disableBuf[8]{};
+        const DWORD disableLen = GetEnvironmentVariableA("XEFG_DISABLE_PSO_DISK_CACHE", disableBuf, sizeof(disableBuf));
+        const bool diskDisabled = (disableLen == 1 && disableBuf[0] == '1');
+        std::vector<uint8_t> initialData;
+        if (!diskDisabled) {
+            wchar_t localAppData[MAX_PATH]{};
+            const DWORD envLen = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH);
+            if (envLen > 0 && envLen < MAX_PATH) {
+                const std::filesystem::path cacheDir = std::filesystem::path(localAppData) / L"dlssg-to-xefg";
+                std::error_code ec;
+                std::filesystem::create_directories(cacheDir, ec);
+                char fname[96]{};
+                std::snprintf(fname, sizeof(fname), "vk_base_cache_v1_%04x_%04x.bin",
+                    properties_.vendorID, properties_.deviceID);
+                baseCachePath_ = cacheDir / fname;
+                const auto sz = std::filesystem::file_size(baseCachePath_, ec);
+                if (!ec && sz > 0 && sz <= 32 * 1024 * 1024) {
+                    std::ifstream in(baseCachePath_, std::ios::binary);
+                    initialData.resize(static_cast<size_t>(sz));
+                    if (!in.read(reinterpret_cast<char*>(initialData.data()), static_cast<std::streamsize>(sz)))
+                        initialData.clear();
+                }
+            }
+        }
+        VkPipelineCacheCreateInfo cacheInfo{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        cacheInfo.initialDataSize = initialData.size();
+        cacheInfo.pInitialData = initialData.empty() ? nullptr : initialData.data();
+        if (vk_.vkCreatePipelineCache(device_, &cacheInfo, nullptr, &basePipelineCache_) != VK_SUCCESS)
+            basePipelineCache_ = VK_NULL_HANDLE;
+    }
 
     VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, queueFamily_};
     if (vk_.vkCreateCommandPool(device_, &pool, nullptr, &initPool_) != VK_SUCCESS) return E_FAIL;

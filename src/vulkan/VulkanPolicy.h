@@ -330,6 +330,7 @@ namespace VulkanPolicy
 			{ "device_functions", "the device lacks compute pipeline functions for cooperative matrices" },
 			{ "no_int8_tile", "the GPU offers no subgroup SINT8 x SINT8 -> SINT32 cooperative matrix tile" },
 			{ "no_s8_matrix_shape", "the GPU offers no subgroup SINT8 x SINT8 -> SINT32 cooperative matrix shape" },
+			{ "emulated_coopmat_skipped", "the GPU reports emulated cooperative matrices (skipped to avoid VGPR spills)" },
 			{ "layout_create", "the cooperative-matrix descriptor or pipeline layout couldn't be created" },
 			{ "shader_dir_missing", "the SPV_KHR_cooperative_matrix shaders aren't installed in xefg_mfg_programs\\vulkan\\coopmat" },
 			{ "exception", "the cooperative-matrix route failed while installing" },

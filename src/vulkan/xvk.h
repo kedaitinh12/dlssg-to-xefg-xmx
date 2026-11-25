@@ -54,6 +54,8 @@ struct DeviceDesc
     // VK_KHR_cooperative_matrix enablement (AMD WMMA / Intel XMX)
     bool coopMatrixExtensions = false;
     uint32_t coopMatrixSpec = 0;
+    // Optional VK_KHR_pipeline_executable_properties (zero-runtime-cost init ISA stats logging)
+    bool pipelineExecutableProperties = false;
 };
 
 struct TensorOptions
@@ -65,9 +67,18 @@ struct TensorOptions
     bool argumentParams = false;
 };
 
+enum class MatCLayout : uint8_t
+{
+    Unknown = 0,
+    Gfx11Reg = 1, // RDNA 3 Wave32 16x16x16: C[g + i*2][p] (verified 256/256)
+    Gfx12Reg = 2, // RDNA 4 Wave32 16x16x16: C[g*8 + i][p] (verified 256/256)
+    Emulated = 3, // Non-Wave32 or emulated coopmat (e.g. RDNA 2 len=16, heavy VGPR spill)
+};
+
 struct CoopMatrixOptions
 {
     bool fullBarriers = false;
+    MatCLayout matCLayout = MatCLayout::Unknown;
 };
 
 bool InstallTensorCores(ID3D12Device*, const void* fatbin, size_t bytes, const TensorOptions&, std::string& reason) noexcept;

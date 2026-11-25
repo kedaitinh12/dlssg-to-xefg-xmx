@@ -214,6 +214,11 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
             reason = "no_s8_matrix_shape";
             return false;
         }
+        if (options.matCLayout == MatCLayout::Emulated)
+        {
+            reason = "no_s8_matrix_shape";
+            return false;
+        }
         device_ = desc.device;
         options_ = options;
         tileM_ = m;
@@ -245,6 +250,20 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
                 gpuArch_ = GpuArch::Rdna4;
             else if (isRdna3)
                 gpuArch_ = GpuArch::Rdna3;
+
+            // RX 7700 XT probe on Adrenalin 26.6.2 (LLPC) showed radv_reg + local=256 inflates VGPRs
+            // on L_9481d452 (57->78), L_06e97933 (66->96), and L_3ed03daf (57->78), whereas 26.11.2
+            // compiles them to 33-35 VGPRs. Keep those 3 layers on local=128 for AMD LLPC < 26.10.
+            rdna3LegacyLlpc_ = false;
+            if (gpuArch_ == GpuArch::Rdna3 && driverProps.driverID == VK_DRIVER_ID_AMD_PROPRIETARY)
+            {
+                unsigned drvMajor = 0, drvMinor = 0;
+                if (std::sscanf(driverProps.driverInfo, "%u.%u", &drvMajor, &drvMinor) == 2 &&
+                    (drvMajor < 26u || (drvMajor == 26u && drvMinor < 10u)))
+                {
+                    rdna3LegacyLlpc_ = true;
+                }
+            }
         }
 
 #define LOAD_FN(member, name) member = reinterpret_cast<PFN_##name>(gdpa(device_, #name))
@@ -260,6 +279,12 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
         LOAD_FN(pushConstants_, vkCmdPushConstants);
         LOAD_FN(dispatch_, vkCmdDispatch);
         LOAD_FN(barrier_, vkCmdPipelineBarrier2);
+        if (desc.pipelineExecutableProperties)
+        {
+            LOAD_FN(getPipelineExecProps_, vkGetPipelineExecutablePropertiesKHR);
+            LOAD_FN(getPipelineExecStats_, vkGetPipelineExecutableStatisticsKHR);
+            pipelineExecStats_ = (getPipelineExecProps_ != nullptr && getPipelineExecStats_ != nullptr);
+        }
 #undef LOAD_FN
 
         if (!createShaderModule_ || !destroyShaderModule_ || !createComputePipelines_ || !destroyPipeline_ ||
@@ -269,34 +294,63 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
             return false;
         }
 
-        // Enable register-only (zero-sAcc) WMMA shaders strictly on Linux Mesa RADV Wave32 16x16x16.
-        // Never enabled on Windows (AMDVLK/NVIDIA/Intel) because matC[i] lane mapping is RADV-specific.
-        bool allowRadvReg = true;
+        // Enable register-only (zero-sAcc) WMMA shaders when the Wave32 16x16x16 matC register layout
+        // is verified (gfx11 -> radv_reg, gfx12 -> gfx12_reg). Can be disabled via XEFG_COOP_MATRIX_RADV_REG=0.
+        bool allowRegOnly = true;
         {
             wchar_t envBuf[16]{};
             const DWORD n = GetEnvironmentVariableW(L"XEFG_COOP_MATRIX_RADV_REG", envBuf, static_cast<DWORD>(std::size(envBuf)));
             if (n > 0 && n < std::size(envBuf) && (envBuf[0] == L'0' || envBuf[0] == L'f' || envBuf[0] == L'F' || envBuf[0] == L'n' || envBuf[0] == L'N'))
-                allowRadvReg = false;
+                allowRegOnly = false;
         }
-        const std::filesystem::path radvRegDir = moduleDir / L"radv_reg";
+        MatCLayout activeLayout = MatCLayout::Unknown;
+        if (allowRegOnly && tileM_ == 16u && tileN_ == 16u && tileK_ == 16u && subgroupSize_ == 32u)
+        {
+            if (options.matCLayout == MatCLayout::Gfx11Reg || options.matCLayout == MatCLayout::Gfx12Reg)
+            {
+                activeLayout = options.matCLayout;
+            }
+            // Do not guess register-only layout from GPU arch when MatCLayout::Unknown (e.g. native Vulkan
+            // without a verified matC probe); keep standard sAcc shaders unless the hardware probe confirmed
+            // Gfx11Reg or Gfx12Reg (which D3D12VulkanWmma always runs on both Windows and Wine/Proton RADV).
+        }
+        const std::filesystem::path regDir = (activeLayout == MatCLayout::Gfx12Reg)
+            ? (moduleDir / L"gfx12_reg")
+            : ((activeLayout == MatCLayout::Gfx11Reg) ? (moduleDir / L"radv_reg") : std::filesystem::path{});
         std::error_code dirEc;
-        const bool useRadvReg = allowRadvReg &&
-            WineCompat::IsWineOrProton() &&
-            driverProps.driverID == VK_DRIVER_ID_MESA_RADV &&
-            tileM_ == 16u && tileN_ == 16u && tileK_ == 16u && subgroupSize_ == 32u &&
-            std::filesystem::is_directory(radvRegDir, dirEc);
+        const bool useRegDir = !regDir.empty() && std::filesystem::is_directory(regDir, dirEc);
+        const bool useRadvReg = useRegDir;
 
-        const std::filesystem::path spvDir = (tileM_ == 8u && tileN_ == 8u && tileK_ == 32u)
-            ? (moduleDir / L"xmx_8x8x32")
-            : (useRadvReg ? radvRegDir : moduleDir);
+        // Per-kernel reg-only gate backed by RDNA 3 & RDNA 4 ISA probe data (Windows LLPC + Linux RADV ACO):
+        // - RDNA 3 (gfx11): reg_only cuts VGPRs and 5-10 KB LDS across all 16 kernels.
+        // - RDNA 4 (gfx12): reg_only yields major VGPR/LDS/occupancy gains on heavy PoolConv (aa016078, 198d6bf8,
+        //   dcd8becf, efbe3788, a3c3caa1) and all 5 Flow layers, while sAcc stays faster (fewer VMEM clauses /
+        //   lower VGPRs) on the 6 lighter Pool/Decoder layers (50f0c205, 9481d452, 06e97933, 3ed03daf, 748b0baf, cb391582).
+        const auto layerWantsReg = [&](size_t idx, const xefg_cuda::LayerSpec& l) -> bool {
+            if (!useRegDir)
+                return false;
+            if (activeLayout == MatCLayout::Gfx11Reg)
+                return true;
+            if (activeLayout == MatCLayout::Gfx12Reg)
+            {
+                if (l.family == xefg_cuda::Family::Flow)
+                    return true;
+                return idx == 0u || idx == 1u || idx == 2u || idx == 3u || idx == 5u;
+            }
+            return false;
+        };
+
+        const bool isXmx = (tileM_ == 8u && tileN_ == 8u && tileK_ == 32u);
+        const std::filesystem::path xmxDir = moduleDir / L"xmx_8x8x32";
         uint32_t loadedCount = 0;
         for (size_t i = 0; i < std::size(xefg_cuda::kLayers); ++i)
         {
             const auto& layer = xefg_cuda::kLayers[i];
-            auto words = LoadSpirvFile(spvDir / (std::string(layer.info.program) + ".spv"));
+            const std::filesystem::path primaryDir = isXmx ? xmxDir : (layerWantsReg(i, layer) ? regDir : moduleDir);
+            auto words = LoadSpirvFile(primaryDir / (std::string(layer.info.program) + ".spv"));
             if (words.empty())
-                words = LoadSpirvFile(spvDir / (std::string(layer.info.kernel) + ".spv"));
-            if (words.empty() && useRadvReg)
+                words = LoadSpirvFile(primaryDir / (std::string(layer.info.kernel) + ".spv"));
+            if (words.empty() && primaryDir != moduleDir && !isXmx)
             {
                 words = LoadSpirvFile(moduleDir / (std::string(layer.info.program) + ".spv"));
                 if (words.empty())
@@ -354,12 +408,29 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
         const char* archTag = (gpuArch_ == GpuArch::Rdna4) ? "rdna4_gfx12"
                             : (gpuArch_ == GpuArch::Rdna3) ? "rdna3_gfx11"
                                                            : "generic";
+        std::string s8Shapes;
+        for (uint32_t i = 0; i < propCount; ++i)
+        {
+            const auto& p = props[i];
+            if (p.scope == VK_SCOPE_SUBGROUP_KHR &&
+                p.AType == VK_COMPONENT_TYPE_SINT8_KHR &&
+                p.BType == VK_COMPONENT_TYPE_SINT8_KHR &&
+                p.CType == VK_COMPONENT_TYPE_SINT32_KHR &&
+                p.ResultType == VK_COMPONENT_TYPE_SINT32_KHR)
+            {
+                if (!s8Shapes.empty())
+                    s8Shapes += ",";
+                s8Shapes += std::to_string(p.MSize) + "x" + std::to_string(p.NSize) + "x" + std::to_string(p.KSize);
+            }
+        }
         xefg_cuda::Report("coopmat_route_vk",
             "\"state\":\"active\",\"vendor\":" + std::to_string(devProps.properties.vendorID) +
             ",\"arch\":\"" + std::string(archTag) +
             "\",\"tile\":\"" + std::to_string(tileM_) + "x" + std::to_string(tileN_) + "x" + std::to_string(tileK_) +
+            "\",\"s8_shapes\":\"" + s8Shapes +
             "\",\"subgroup\":" + std::to_string(subgroupSize_) +
             ",\"modules\":" + std::to_string(installedLayers_) +
+            ",\"isa_stats\":" + (pipelineExecStats_ ? "true" : "false") +
             ",\"full_barriers\":" + (options_.fullBarriers ? "true" : "false"));
         (void)owner;
         reason.clear();
@@ -380,19 +451,102 @@ uint32_t CoopMatrixRoute::SelectWorkgroupSize(size_t layerIdx) const noexcept
     if (layer.family == xefg_cuda::Family::Flow || layer.tileH < 16u)
         return 128u;
 
-    if (gpuArch_ == GpuArch::Rdna3)
+    if (gpuArch_ == GpuArch::Rdna3 && rdna3LegacyLlpc_ &&
+        (layer.kernel == 6u || layer.kernel == 7u || layer.kernel == 8u))
     {
-        // RDNA 3 (gfx11): wider WMMA fragments double accumulator VGPR pressure on 16-row tiles.
-        // 8 Wave32s (256 threads) halve per-wave accumulators (4->2 rows) to raise SIMD32 occupancy.
+        // AMD proprietary LLPC < 26.10 on RDNA 3: keep L_9481d452 / L_06e97933 / L_3ed03daf at local=128
+        // (57-66 VGPRs, full occupancy) while keeping local=256 on L_aa016078 / L_dcd8becf / L_cb391582.
+        return 128u;
+    }
+    if (gpuArch_ == GpuArch::Rdna3 || gpuArch_ == GpuArch::Rdna4)
+    {
+        // RDNA 3 (gfx11) & RDNA 4 (gfx12): 8 Wave32s (256 threads) halve per-wave accumulators on 16-row tiles,
+        // cutting VGPR pressure and improving inverse throughput by 24%-50% across all 6 tileH=16 layers.
         return 256u;
     }
-    if (gpuArch_ == GpuArch::Rdna4)
-    {
-        // RDNA 4 (gfx12): Dynamic VGPRs handle 4-row tiles at 128 threads; use 256 threads on multi-slice
-        // PoolConv 16-row layers (L_dcd8becf, L_06e97933) to maximize winWords/wsmWords sharing across warps.
-        return (layer.family == xefg_cuda::Family::Pool && (layerIdx == 2u || layerIdx == 7u)) ? 256u : 128u;
-    }
     return 128u;
+}
+
+void CoopMatrixRoute::LogPipelineStats(size_t layerIdx, uint32_t localSizeX, VkPipeline pipeline) const noexcept
+{
+    if (!pipelineExecStats_ || !device_ || !pipeline || layerIdx >= std::size(xefg_cuda::kLayers))
+        return;
+    try
+    {
+        VkPipelineInfoKHR pipeInfo{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, nullptr, pipeline};
+        uint32_t execCount = 0;
+        if (getPipelineExecProps_(device_, &pipeInfo, &execCount, nullptr) != VK_SUCCESS || !execCount)
+            return;
+        if (execCount > 8u)
+            execCount = 8u;
+        std::vector<VkPipelineExecutablePropertiesKHR> execs(
+            execCount, VkPipelineExecutablePropertiesKHR{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
+        if (getPipelineExecProps_(device_, &pipeInfo, &execCount, execs.data()) != VK_SUCCESS || !execCount)
+            return;
+
+        VkPipelineExecutableInfoKHR execInfo{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, nullptr, pipeline, 0u};
+        uint32_t statCount = 0;
+        if (getPipelineExecStats_(device_, &execInfo, &statCount, nullptr) != VK_SUCCESS || !statCount)
+            return;
+        if (statCount > 64u)
+            statCount = 64u;
+        std::vector<VkPipelineExecutableStatisticKHR> stats(
+            statCount, VkPipelineExecutableStatisticKHR{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
+        if (getPipelineExecStats_(device_, &execInfo, &statCount, stats.data()) != VK_SUCCESS || !statCount)
+            return;
+
+        auto sanitize = [](const char* s) -> std::string {
+            std::string out;
+            for (; s && *s; ++s)
+            {
+                if (*s == '"' || *s == '\\')
+                    out.push_back('_');
+                else if (*s >= 32 && *s < 127)
+                    out.push_back(*s);
+            }
+            return out;
+        };
+        std::string fields;
+        for (uint32_t i = 0; i < statCount; ++i)
+        {
+            const auto& st = stats[i];
+            if (!fields.empty())
+                fields += "; ";
+            fields += sanitize(st.name) + "=";
+            switch (st.format)
+            {
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
+                fields += st.value.b32 ? "1" : "0";
+                break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:
+                fields += std::to_string(st.value.i64);
+                break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
+                fields += std::to_string(st.value.u64);
+                break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR:
+            {
+                char buf[32]{};
+                std::snprintf(buf, sizeof(buf), "%.2f", st.value.f64);
+                fields += buf;
+                break;
+            }
+            default:
+                fields += "?";
+                break;
+            }
+        }
+        const auto& layer = xefg_cuda::kLayers[layerIdx];
+        xefg_cuda::Report("coopmat_isa_stats",
+            "\"program\":\"" + std::string(layer.info.program) +
+            "\",\"kernel\":\"" + std::string(layer.info.kernel) +
+            "\",\"local_x\":" + std::to_string(localSizeX) +
+            ",\"wave\":" + std::to_string(execs[0].subgroupSize) +
+            ",\"stats\":\"" + fields + "\"");
+    }
+    catch (...)
+    {
+    }
 }
 
 bool CoopMatrixRoute::EnsureLayerPipeline(Device& device, uint8_t layerIdx, PipelineState& basePso) noexcept
@@ -451,6 +605,8 @@ bool CoopMatrixRoute::EnsureLayerPipeline(Device& device, uint8_t layerIdx, Pipe
         subgroupSize_
     };
     VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    if (pipelineExecStats_)
+        pipelineInfo.flags = VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
     pipelineInfo.stage = {
         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
         requireSubgroupSize_ ? &reqSubgroup : nullptr,
@@ -474,6 +630,7 @@ bool CoopMatrixRoute::EnsureLayerPipeline(Device& device, uint8_t layerIdx, Pipe
     }
 
     (void)device;
+    LogPipelineStats(idx, localSizeX, created);
     pipelines_[idx] = created;
     pipelineReady_[idx].store(true, std::memory_order_release);
     cacheDirty_.store(true, std::memory_order_relaxed);
