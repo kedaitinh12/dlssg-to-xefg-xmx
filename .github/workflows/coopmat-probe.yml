@@ -1,0 +1,50 @@
+name: Build CoopMat Offline Probe Tool
+
+on:
+  push:
+    branches: [bat-test]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  build-coopmat-probe:
+    name: Windows x64 CoopMat Probe
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Vulkan headers
+        id: vulkan
+        uses: ./.github/actions/vulkan-headers
+
+      - name: Build Vulkan cooperative-matrix shaders (for offline probe)
+        shell: pwsh
+        run: |
+          ./tools/BuildXeFgCoopMat.ps1 -Output stage_probe/xefg_mfg_programs/vulkan/coopmat
+
+      - name: Build xefg_coopmat_probe.exe
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw "Visual Studio C++ tools not found" }
+          $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
+          $vkInc = "${{ steps.vulkan.outputs.include }}"
+          New-Item -ItemType Directory -Path obj\Probe -Force | Out-Null
+          cmd /c "`"$vcvars`" && cl /nologo /O2 /EHsc /std:c++20 /DVK_NO_PROTOTYPES /I`"$vkInc`" tools\CoopMatProbe.cpp /Fe:stage_probe\xefg_coopmat_probe.exe /Fo:obj\Probe\CoopMatProbe.obj"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item tools\RunCoopMatProbe.bat stage_probe\RunCoopMatProbe.bat
+
+      - name: Upload standalone CoopMat Probe artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: xefg-coopmat-probe-tool
+          path: stage_probe/
+          retention-days: 14
