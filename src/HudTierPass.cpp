@@ -1586,6 +1586,8 @@ void HudTierPass::RecordHudDiffComposite(ID3D12GraphicsCommandList* cmdList,
 	AddTransition(pre, preCount, hudlessTex, hudlessState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 	AddTransition(pre, preCount, outputTex, outputState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 	FlushBarriers(cmdList, pre, preCount);
+	if (outputState == D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+		UavBarrier(cmdList, outputTex);
 
 	ID3D12DescriptorHeap* heaps[] = { srvUavHeap_.Get() };
 	cmdList->SetDescriptorHeaps(1, heaps);
@@ -1776,6 +1778,8 @@ void HudTierPass::RecordStaticHudComposite(ID3D12GraphicsCommandList* cmdList,
 	TransitionBarrier(cmdList, currRealTex, currState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 	TransitionBarrier(cmdList, staticCountTex_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 	TransitionBarrier(cmdList, outputTex, outputState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	if (outputState == D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+		UavBarrier(cmdList, outputTex);
 
 	ID3D12DescriptorHeap* heaps[] = { srvUavHeap_.Get() };
 	cmdList->SetDescriptorHeaps(1, heaps);
@@ -1857,6 +1861,8 @@ void HudTierPass::RecordHybridHudComposite(ID3D12GraphicsCommandList* cmdList,
 	AddTransition(pre, preCount, staticCountTex_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 	AddTransition(pre, preCount, outputTex, outputState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 	FlushBarriers(cmdList, pre, preCount);
+	if (outputState == D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+		UavBarrier(cmdList, outputTex);
 
 	ID3D12DescriptorHeap* heaps[] = { srvUavHeap_.Get() };
 	cmdList->SetDescriptorHeaps(1, heaps);
@@ -2017,6 +2023,8 @@ void HudTierPass::RecordSplitCompare(ID3D12GraphicsCommandList* cmdList,
 
 	TransitionBarrier(cmdList, realTex, realState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 	TransitionBarrier(cmdList, outputTex, outputState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	if (outputState == D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+		UavBarrier(cmdList, outputTex);
 
 	ID3D12DescriptorHeap* heaps[] = { srvUavHeap_.Get() };
 	cmdList->SetDescriptorHeaps(1, heaps);

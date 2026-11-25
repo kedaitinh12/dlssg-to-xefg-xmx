@@ -1,4 +1,6 @@
 #include "FrameGenerator.h"
+#include "ContextLifecycle.h"
+#include "D3D12QueueFence.h"
 #include "HangWatchdog.h"
 #include "Log.h"
 #include "MfgKernels.h"
@@ -133,6 +135,18 @@ static bool IsSupportedXeFGColorFormat(DXGI_FORMAT format) noexcept
 // more than one generated frame, so it gets forced. The XMX port publishes 16, and then Init loads the cheaper MFG
 // model: one optical flow field for the whole batch instead of one per generated frame
 
+static ContextOwnershipCoordinator& ContextOwner() noexcept
+{
+	static ContextOwnershipCoordinator* coordinator = new ContextOwnershipCoordinator;
+	return *coordinator;
+}
+
+std::shared_ptr<DeferredDestroy::FenceSignal> FrameGenerator::LastGpuSignal() const noexcept
+{
+	std::lock_guard lock(lastSignalMutex);
+	return lastGpuSignal;
+}
+
 FrameGenerator::Context::~Context()
 {
 	for (auto& out : outputs)
@@ -146,11 +160,10 @@ FrameGenerator::Context::~Context()
 		D3D12VulkanWmma::ForgetResource(f.mvecs.Get());
 		D3D12VulkanWmma::ForgetResource(f.spareMotion.Get());
 	}
-	if (!retiredForReplacement)
-	{
+	ContextOwner().ResetIfOwner(generation, retiredForReplacement, []() noexcept {
 		D3D12VulkanWmma::ResetContext();
 		xefg_cuda::InvalidateCache();
-	}
+	});
 
 	if (handle)
 	{
@@ -1072,23 +1085,27 @@ bool FrameGenerator::CreateContext()
 	}
 
 	newContext->sharedTexturesMode = UseWmma(settings.model) && D3D12VulkanWmma::WantsSharedTextures();
-	if (context)
-	{
-		context->retiredForReplacement = true;
-		DeferredDestroy::Add(std::move(context));
-	}
-	context = std::move(newContext);
-
-	// Warm up the Vulkan WMMA bridge context asynchronously on a background thread so CreateContext
-	// returns immediately after D3D12 XeFG::Init and never stalls Streamline's 500ms waitCPUFence deadline
-	// (first 1-2 frames run seamlessly on D3D12 cs_6_6 overrides until Vulkan context init completes).
-	if (UseWmma(settings.model) && D3D12VulkanWmma::Active())
-	{
-		const D3D12VulkanWmma::ContextSettings vkSettings{
-			settings.width, settings.height, settings.format, settings.initFlags, settings.uiMode, settings.model
-		};
-		D3D12VulkanWmma::WarmupContextAsync(vkSettings);
-	}
+	// Transfer global bridge/cache ownership ONLY AFTER XeFG::CreateContext() and XeFG::Init() succeeded,
+	// serialized against any deferred ~Context() so an old destructor can never reset the new live bridge.
+	std::shared_ptr<Context> retiredOld;
+	ContextOwner().Commit([&](uint64_t gen) noexcept {
+		newContext->generation = gen;
+		if (context)
+		{
+			context->retiredForReplacement = true;
+			retiredOld = std::move(context);
+		}
+		context = std::move(newContext);
+		if (UseWmma(settings.model) && D3D12VulkanWmma::Active())
+		{
+			const D3D12VulkanWmma::ContextSettings vkSettings{
+				settings.width, settings.height, settings.format, settings.initFlags, settings.uiMode, settings.model
+			};
+			D3D12VulkanWmma::WarmupContextAsync(vkSettings);
+		}
+	});
+	if (retiredOld)
+		DeferredDestroy::Add(std::move(retiredOld), /*heavy=*/true);
 
 	routeLaunches = UseWmma(settings.model) ? xefg_wmma::Snapshot().launches : xefg_cuda::Snapshot().launches;
 	routeFrames = 0;
@@ -1430,12 +1447,14 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 
 		if (context)
 		{
-			// Reset global WMMA/CUDA context state now (before new context creation) so the old context's
-			// deferred destructor 32 evaluations later never wipes the new active context's bridge/cache.
-			D3D12VulkanWmma::ResetContext();
-			xefg_cuda::InvalidateCache();
+			// Reset global WMMA/CUDA context state now under the ownership lock (before new context creation)
+			// so the old context's deferred destructor never races with or wipes the new active bridge/cache.
+			ContextOwner().ResetBeforeReplacement(context->generation, []() noexcept {
+				D3D12VulkanWmma::ResetContext();
+				xefg_cuda::InvalidateCache();
+			});
 			context->retiredForReplacement = true;
-			DeferredDestroy::Add(std::move(context));
+			DeferredDestroy::Add(std::move(context), /*heavy=*/true);
 		}
 	}
 
@@ -2127,6 +2146,14 @@ void FrameGenerator::GpuProfiler::ResolveSlot(ID3D12GraphicsCommandList* cmdList
 
 NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGXParameter& params)
 {
+	D3D12QueueFence::Install(device.Get());
+	DeferredDestroy::ScopedCommandList deferredScope(cmdList);
+	if (deferredScope.current)
+	{
+		std::lock_guard lock(lastSignalMutex);
+		lastGpuSignal = deferredScope.current;
+	}
+
 	auto backbuffer = params.GetOr<ID3D12Resource*>("DLSSG.Backbuffer", nullptr);
 	auto output = params.GetOr<ID3D12Resource*>("DLSSG.OutputInterpolated", nullptr);
 	auto outputReal = params.GetOr<ID3D12Resource*>("DLSSG.OutputReal", nullptr);
@@ -2358,7 +2385,7 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 				}
 			}
 
-			if (!context->directOutput)
+			if (!context->directOutput && context->outputs[frameIndex - 1])
 				Copy(cmdList, output, OutputState, context->outputs[frameIndex - 1].Get(), OutputState);
 		}
 		else

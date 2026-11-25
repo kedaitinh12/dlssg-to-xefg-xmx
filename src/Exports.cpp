@@ -4,6 +4,7 @@
 #include "FrameGenerator.h"
 #include "HangWatchdog.h"
 #include "Log.h"
+#include "MfgPort/Cuda/cuda_route.h"
 #include "Util.h"
 
 #include <dxgi.h>
@@ -53,6 +54,7 @@ NGX_EXPORT NGXResult NVSDK_NGX_D3D12_Shutdown()
 {
 	HangWatchdog::Shutdown();
 	DeferredDestroy::Collect(true);
+	xefg_cuda::FlushBlobCache();
 	return NGX_SUCCESS;
 }
 
@@ -118,7 +120,8 @@ NGX_EXPORT NGXResult NVSDK_NGX_D3D12_ReleaseFeature(NGXHandle* handle)
 		return NGX_FAIL_FEATURE_NOT_FOUND;
 
 	auto feature = static_cast<FeatureHandle*>(handle);
-	DeferredDestroy::Add(std::move(feature->generator));
+	auto lastSignal = feature->generator ? feature->generator->LastGpuSignal() : nullptr;
+	DeferredDestroy::Add(std::move(feature->generator), /*heavy=*/true, std::move(lastSignal));
 	delete feature;
 
 	return NGX_SUCCESS;

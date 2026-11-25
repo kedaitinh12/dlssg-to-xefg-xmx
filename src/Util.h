@@ -6,19 +6,44 @@
 #include <algorithm>
 #include <atomic>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <vector>
 
-// Keeps objects a recorded command list may still use alive for a while, Collect is called once per evaluation.
-// ponytail: counts evaluations instead of waiting on a fence, enough for the usual 2-3 frames in flight at 6x
+// Keeps objects a recorded command list may still use alive until the submitting D3D12 command queue's private
+// fence completes (or, when queue-fence tracking is unavailable, for `Delay` evaluations).
+// - Lightweight entries (textures/heaps) drain completely once GPU-ready so backlog never grows unbounded.
+// - Heavy entries (XeFG contexts / FrameGenerators) pace to 1 per Collect() call while ready backlog <= MaxHeavyBacklog
+//   so teardown bursts never stall Streamline's 500ms pacer flush window, yet still stay strictly bounded.
 namespace DeferredDestroy
 {
-	constexpr uint64_t Delay = 32;
+	constexpr uint64_t Delay = 64;
+	constexpr uint64_t SubmitFallbackDelay = 256;
+	constexpr size_t MaxHeavyBacklog = 4;
+
+	struct FenceSignal
+	{
+		const void* cmdList = nullptr;
+		std::atomic<bool> submitted{ false };
+		std::mutex mutex;
+		std::function<bool()> isComplete;
+
+		bool IsGpuComplete() noexcept
+		{
+			if (!submitted.load(std::memory_order_acquire))
+				return false;
+			std::lock_guard lock(mutex);
+			return isComplete ? isComplete() : true;
+		}
+	};
 
 	struct Entry
 	{
-		uint64_t destroyAt;
+		uint64_t destroyAt = 0;
+		uint64_t submitFallbackAt = 0;
+		bool heavy = false;
+		std::shared_ptr<FenceSignal> signal;
 		std::shared_ptr<void> object;
 	};
 
@@ -26,14 +51,133 @@ namespace DeferredDestroy
 	// Leaked on purpose: destroying XeFG contexts from our static destructors at process exit would call into a
 	// libxess_fg.dll that may already be torn down
 	inline std::vector<Entry>& entries = *new std::vector<Entry>;
+	inline std::vector<std::shared_ptr<FenceSignal>>& awaitingSubmit = *new std::vector<std::shared_ptr<FenceSignal>>;
 	inline std::atomic<uint64_t> evaluations{ 0 };
 	inline std::atomic<size_t> pendingCount{ 0 };
+	inline std::atomic<size_t> awaitingSubmitCount{ 0 };
+	inline std::atomic<bool> queueFenceTrackingEnabled{ false };
+	inline thread_local std::shared_ptr<FenceSignal> tActiveSignal;
 
-	inline void Add(std::shared_ptr<void> object)
+	inline void SetQueueFenceTrackingEnabled(bool enabled) noexcept
 	{
+		queueFenceTrackingEnabled.store(enabled, std::memory_order_release);
+	}
+
+	inline size_t AwaitingSubmitCount() noexcept
+	{
+		return awaitingSubmitCount.load(std::memory_order_acquire);
+	}
+
+	inline std::shared_ptr<FenceSignal> RegisterCommandList(const void* cmdList)
+	{
+		if (!cmdList || !queueFenceTrackingEnabled.load(std::memory_order_acquire))
+			return nullptr;
+		auto sig = std::make_shared<FenceSignal>();
+		sig->cmdList = cmdList;
 		std::scoped_lock lock(mutex);
-		entries.push_back({ evaluations.load(std::memory_order_relaxed) + Delay, std::move(object) });
+		// Bound awaitingSubmit in case a caller repeatedly records and discards command lists without submitting.
+		if (awaitingSubmit.size() >= 64)
+			awaitingSubmit.erase(awaitingSubmit.begin());
+		awaitingSubmit.push_back(sig);
+		awaitingSubmitCount.store(awaitingSubmit.size(), std::memory_order_release);
+		return sig;
+	}
+
+	inline bool HasAwaitingSubmitFor(const void* const* lists, UINT count) noexcept
+	{
+		if (!lists || count == 0 || awaitingSubmitCount.load(std::memory_order_acquire) == 0)
+			return false;
+		std::scoped_lock lock(mutex);
+		for (const auto& sig : awaitingSubmit)
+		{
+			for (UINT i = 0; i < count; ++i)
+			{
+				if (sig->cmdList == lists[i])
+					return true;
+			}
+		}
+		return false;
+	}
+
+	inline void MarkCommandListsSubmitted(const void* const* lists, UINT count,
+		std::function<bool()> isComplete) noexcept
+	{
+		if (!lists || count == 0)
+			return;
+		std::vector<std::shared_ptr<FenceSignal>> matched;
+		{
+			std::scoped_lock lock(mutex);
+			auto split = std::partition(awaitingSubmit.begin(), awaitingSubmit.end(),
+				[lists, count](const std::shared_ptr<FenceSignal>& sig) {
+					for (UINT i = 0; i < count; ++i)
+						if (sig->cmdList == lists[i])
+							return false;
+					return true;
+				});
+			matched.assign(std::make_move_iterator(split), std::make_move_iterator(awaitingSubmit.end()));
+			awaitingSubmit.erase(split, awaitingSubmit.end());
+			awaitingSubmitCount.store(awaitingSubmit.size(), std::memory_order_release);
+		}
+		for (auto& sig : matched)
+		{
+			{
+				std::lock_guard slock(sig->mutex);
+				sig->isComplete = isComplete;
+			}
+			sig->submitted.store(true, std::memory_order_release);
+		}
+	}
+
+	struct ScopedCommandList
+	{
+		std::shared_ptr<FenceSignal> prev;
+		std::shared_ptr<FenceSignal> current;
+
+		explicit ScopedCommandList(const void* cmdList)
+			: prev(std::move(tActiveSignal)), current(RegisterCommandList(cmdList))
+		{
+			tActiveSignal = current;
+		}
+
+		~ScopedCommandList()
+		{
+			tActiveSignal = std::move(prev);
+		}
+
+		ScopedCommandList(const ScopedCommandList&) = delete;
+		ScopedCommandList& operator=(const ScopedCommandList&) = delete;
+	};
+
+	inline std::shared_ptr<FenceSignal> MakeCompletedFenceSignal(std::function<bool()> isComplete)
+	{
+		auto sig = std::make_shared<FenceSignal>();
+		sig->isComplete = std::move(isComplete);
+		sig->submitted.store(true, std::memory_order_release);
+		return sig;
+	}
+
+	inline void Add(std::shared_ptr<void> object, bool heavy = false, std::shared_ptr<FenceSignal> signal = nullptr)
+	{
+		if (!object)
+			return;
+		if (!signal)
+			signal = tActiveSignal;
+		std::scoped_lock lock(mutex);
+		const uint64_t now = evaluations.load(std::memory_order_relaxed);
+		entries.push_back({ now + Delay, now + SubmitFallbackDelay, heavy, std::move(signal), std::move(object) });
 		pendingCount.store(entries.size(), std::memory_order_release);
+	}
+
+	inline bool IsEntryReady(Entry& e, uint64_t now) noexcept
+	{
+		if (e.signal)
+		{
+			if (e.signal->submitted.load(std::memory_order_acquire))
+				return e.signal->IsGpuComplete();
+			// Command list was recorded but never observed on ExecuteCommandLists; only fall back after a long grace window.
+			return now >= e.submitFallbackAt;
+		}
+		return now >= e.destroyAt;
 	}
 
 	inline void Collect(bool all = false)
@@ -45,13 +189,66 @@ namespace DeferredDestroy
 		std::vector<Entry> due;
 		{
 			std::scoped_lock lock(mutex);
-			auto split = std::partition(entries.begin(), entries.end(),
-				[all, now](const Entry& e) { return !all && e.destroyAt > now; });
-			due.assign(std::make_move_iterator(split), std::make_move_iterator(entries.end()));
-			entries.erase(split, entries.end());
+			if (all)
+			{
+				due.swap(entries);
+				awaitingSubmit.clear();
+				awaitingSubmitCount.store(0, std::memory_order_release);
+			}
+			else
+			{
+				std::vector<Entry> keep;
+				std::vector<Entry> readyHeavy;
+				keep.reserve(entries.size());
+				for (auto& e : entries)
+				{
+					if (!IsEntryReady(e, now))
+					{
+						keep.push_back(std::move(e));
+					}
+					else if (e.heavy)
+					{
+						readyHeavy.push_back(std::move(e));
+					}
+					else
+					{
+						due.push_back(std::move(e));
+					}
+				}
+				if (!readyHeavy.empty())
+				{
+					// Pace heavy teardowns (XeFG::Destroy) to 1 per Collect() while backlog <= MaxHeavyBacklog,
+					// draining excess if backlog exceeds MaxHeavyBacklog so memory stays strictly bounded.
+					const size_t heavyToDrain = (readyHeavy.size() > MaxHeavyBacklog)
+						? (readyHeavy.size() - MaxHeavyBacklog + 1)
+						: 1;
+					for (size_t i = 0; i < heavyToDrain; ++i)
+						due.push_back(std::move(readyHeavy[i]));
+					for (size_t i = heavyToDrain; i < readyHeavy.size(); ++i)
+						keep.push_back(std::move(readyHeavy[i]));
+				}
+				entries.swap(keep);
+			}
 			pendingCount.store(entries.size(), std::memory_order_release);
 		}
 		// Destroyed here, outside the lock
+	}
+
+	inline size_t PendingCount() noexcept
+	{
+		return pendingCount.load(std::memory_order_acquire);
+	}
+
+	inline void ResetForTests() noexcept
+	{
+		std::scoped_lock lock(mutex);
+		entries.clear();
+		awaitingSubmit.clear();
+		evaluations.store(0, std::memory_order_relaxed);
+		pendingCount.store(0, std::memory_order_release);
+		awaitingSubmitCount.store(0, std::memory_order_release);
+		queueFenceTrackingEnabled.store(false, std::memory_order_release);
+		tActiveSignal.reset();
 	}
 } // namespace DeferredDestroy
 
@@ -111,6 +308,9 @@ inline void Barrier(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* resource
 inline void Copy(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* destination, D3D12_RESOURCE_STATES destinationState,
 	ID3D12Resource* source, D3D12_RESOURCE_STATES sourceState)
 {
+	if (!cmdList || !destination || !source || destination == source)
+		return;
+
 	D3D12_RESOURCE_BARRIER before[2]{};
 	UINT beforeCount = 0;
 	if (destinationState != D3D12_RESOURCE_STATE_COPY_DEST)

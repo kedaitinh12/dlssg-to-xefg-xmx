@@ -73,6 +73,7 @@ void ForgetLayers() noexcept;
 void InvalidateCache() noexcept;
 // Notify CUDA pipeline table & DX12 PSO blob cache when a XeFG context is retired (MFG-Unlocker V1.7.2 #174).
 void ContextRetired() noexcept;
+void FlushBlobCache() noexcept;
 
 struct Status
 {
