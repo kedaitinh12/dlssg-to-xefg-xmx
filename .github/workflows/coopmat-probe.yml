@@ -2,7 +2,7 @@ name: Build CoopMat Offline Probe Tool
 
 on:
   push:
-    branches: [bat-test]
+    branches: [AMD-bat-test]
   workflow_dispatch:
 
 permissions:
