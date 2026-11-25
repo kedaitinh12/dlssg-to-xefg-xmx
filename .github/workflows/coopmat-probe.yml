@@ -24,10 +24,18 @@ jobs:
         id: vulkan
         uses: ./.github/actions/vulkan-headers
 
-      - name: Build Vulkan cooperative-matrix shaders (for offline probe)
+      - name: Build Vulkan cooperative-matrix shaders and matC probe
         shell: pwsh
         run: |
-          ./tools/BuildXeFgCoopMat.ps1 -Output stage_probe/xefg_mfg_programs/vulkan/coopmat
+          $outDir = "stage_probe/xefg_mfg_programs/vulkan/coopmat"
+          ./tools/BuildXeFgCoopMat.ps1 -Output $outDir
+          $probeSrc = "src/vulkan/shaders/xefg_coopmat_probe.comp"
+          $probeSpv = "$outDir/matc_probe_16x16x16.spv"
+          if (-not (Test-Path $probeSrc -PathType Leaf)) { throw "Missing probe shader source: $probeSrc" }
+          & "third_party/glslang/glslang.exe" -V --target-env vulkan1.3 -S comp -o $probeSpv $probeSrc
+          if ($LASTEXITCODE -ne 0) { throw "Failed to compile $probeSpv" }
+          if (-not (Test-Path $probeSpv -PathType Leaf)) { throw "Missing compiled probe shader: $probeSpv" }
+          Write-Host "Built $probeSpv ($((Get-Item $probeSpv).Length) bytes)"
 
       - name: Build xefg_coopmat_probe.exe
         shell: pwsh
