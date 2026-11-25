@@ -12,7 +12,7 @@ env:
   PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
-  build-coopmat-probe:
+  build-coopmat-probe-windows:
     name: Windows x64 CoopMat Probe
     runs-on: windows-latest
     timeout-minutes: 15
@@ -50,9 +50,56 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Copy-Item tools\RunCoopMatProbe.bat stage_probe\RunCoopMatProbe.bat
 
-      - name: Upload standalone CoopMat Probe artifact
+      - name: Upload Windows CoopMat Probe artifact
         uses: actions/upload-artifact@v6
         with:
-          name: xefg-coopmat-probe-tool
+          name: xefg-coopmat-probe-windows
           path: stage_probe/
+          retention-days: 14
+
+  build-coopmat-probe-linux:
+    name: Linux x64 CoopMat Probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Fetch Vulkan headers (Linux)
+        id: vulkan
+        run: |
+          VK_DIR="$RUNNER_TEMP/Vulkan-Headers"
+          rm -rf "$VK_DIR"
+          if ! git clone --quiet --depth 1 --branch v1.4.363 https://github.com/KhronosGroup/Vulkan-Headers.git "$VK_DIR" 2>/dev/null; then
+            git clone --quiet --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git "$VK_DIR"
+          fi
+          test -f "$VK_DIR/include/vulkan/vulkan.h"
+          echo "include=$VK_DIR/include" >> "$GITHUB_OUTPUT"
+
+      - name: Install glslang-tools and spirv-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools spirv-tools
+
+      - name: Build Vulkan cooperative-matrix shaders and matC probe
+        run: |
+          OUT_DIR="stage_probe_linux/xefg_mfg_programs/vulkan/coopmat"
+          python3 tools/GenerateXeFgCoopMat.py --glslang glslangValidator --output "$OUT_DIR"
+          glslangValidator -V --target-env vulkan1.3 -S comp -o "$OUT_DIR/matc_probe_16x16x16.spv" src/vulkan/shaders/xefg_coopmat_probe.comp
+          test -s "$OUT_DIR/matc_probe_16x16x16.spv"
+          ls -la "$OUT_DIR/matc_probe_16x16x16.spv"
+
+      - name: Build xefg_coopmat_probe (Linux)
+        run: |
+          g++ -O2 -std=c++20 -Wall -Wextra -Wno-missing-field-initializers -DVK_NO_PROTOTYPES \
+            -I"${{ steps.vulkan.outputs.include }}" \
+            tools/CoopMatProbe.cpp -ldl -o stage_probe_linux/xefg_coopmat_probe
+          cp tools/RunCoopMatProbe.sh stage_probe_linux/RunCoopMatProbe.sh
+          chmod +x stage_probe_linux/xefg_coopmat_probe stage_probe_linux/RunCoopMatProbe.sh
+
+      - name: Upload Linux CoopMat Probe artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: xefg-coopmat-probe-linux
+          path: stage_probe_linux/
           retention-days: 14

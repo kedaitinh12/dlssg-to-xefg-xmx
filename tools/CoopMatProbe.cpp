@@ -1,16 +1,24 @@
 // SPDX-License-Identifier: MIT
 //
-// Standalone Vulkan cooperative-matrix diagnostic tool (no game / D3D12 / OptiScaler required).
+// Cross-platform (Windows + Linux) standalone Vulkan cooperative-matrix diagnostic tool.
+// No game / D3D12 / OptiScaler required.
 // Queries all SINT8->SINT32 subgroup shapes, runs the 16x16x16 Wave32 matC register-layout probe,
 // and dumps VK_KHR_pipeline_executable_properties ISA stats (VGPR/SGPR/LDS/Scratch) for all 16
 // XeFG cooperative-matrix kernels (standard sAcc vs radv_reg, local_x=128 vs 256).
 //
-// Build (MSVC x64):
+// Build Windows (MSVC x64):
 //   cl /nologo /O2 /EHsc /std:c++20 /DVK_NO_PROTOTYPES /I<vulkan_include> tools/CoopMatProbe.cpp /Fe:xefg_coopmat_probe.exe
+// Build Linux (GCC/Clang):
+//   g++ -O2 -std=c++20 -DVK_NO_PROTOTYPES tools/CoopMatProbe.cpp -ldl -o xefg_coopmat_probe
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
 #include <vulkan/vulkan.h>
 
 #include <array>
@@ -52,6 +60,47 @@ constexpr KernelSpec kKernels[] = {
 	{"L_3453044",      "Flow",     8, false, 48},
 };
 
+struct VulkanLib
+{
+#ifdef _WIN32
+	HMODULE handle = nullptr;
+	bool Load()
+	{
+		handle = LoadLibraryW(L"vulkan-1.dll");
+		return handle != nullptr;
+	}
+	void* Sym(const char* name) const { return reinterpret_cast<void*>(GetProcAddress(handle, name)); }
+	~VulkanLib() { if (handle) FreeLibrary(handle); }
+#else
+	void* handle = nullptr;
+	bool Load()
+	{
+		handle = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+		if (!handle)
+			handle = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+		return handle != nullptr;
+	}
+	void* Sym(const char* name) const { return dlsym(handle, name); }
+	~VulkanLib() { if (handle) dlclose(handle); }
+#endif
+};
+
+std::filesystem::path ExeDirectory()
+{
+	std::error_code ec;
+#ifdef _WIN32
+	wchar_t buf[MAX_PATH]{};
+	const DWORD len = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+	if (len > 0 && len < MAX_PATH)
+		return std::filesystem::path(buf).parent_path();
+#else
+	const auto exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+	if (!ec && !exe.empty())
+		return exe.parent_path();
+#endif
+	return std::filesystem::current_path(ec);
+}
+
 std::vector<uint32_t> LoadSpv(const std::filesystem::path& path)
 {
 	std::error_code ec;
@@ -83,7 +132,7 @@ uint32_t FindMemType(const VkPhysicalDeviceMemoryProperties& props, uint32_t typ
 	return UINT32_MAX;
 }
 
-std::filesystem::path FindCoopMatDir(const wchar_t* argPath)
+std::filesystem::path FindCoopMatDir(const char* argPath)
 {
 	std::error_code ec;
 	if (argPath && *argPath)
@@ -92,18 +141,14 @@ std::filesystem::path FindCoopMatDir(const wchar_t* argPath)
 		if (std::filesystem::is_directory(p, ec))
 			return p;
 	}
-	wchar_t exeBuf[MAX_PATH]{};
-	const DWORD len = GetModuleFileNameW(nullptr, exeBuf, MAX_PATH);
-	const std::filesystem::path exeDir = (len > 0 && len < MAX_PATH)
-		? std::filesystem::path(exeBuf).parent_path()
-		: std::filesystem::current_path(ec);
-
+	const std::filesystem::path exeDir = ExeDirectory();
+	const std::filesystem::path cwd = std::filesystem::current_path(ec);
 	const std::filesystem::path candidates[] = {
-		exeDir / L"xefg_mfg_programs" / L"vulkan" / L"coopmat",
-		exeDir / L"coopmat",
-		exeDir / L"third_party" / L"xefg_mfg_programs" / L"vulkan" / L"coopmat",
-		std::filesystem::current_path(ec) / L"xefg_mfg_programs" / L"vulkan" / L"coopmat",
-		std::filesystem::current_path(ec) / L"coopmat",
+		exeDir / "xefg_mfg_programs" / "vulkan" / "coopmat",
+		exeDir / "coopmat",
+		exeDir / "third_party" / "xefg_mfg_programs" / "vulkan" / "coopmat",
+		cwd / "xefg_mfg_programs" / "vulkan" / "coopmat",
+		cwd / "coopmat",
 	};
 	for (const auto& c : candidates)
 		if (std::filesystem::is_directory(c, ec))
@@ -112,7 +157,7 @@ std::filesystem::path FindCoopMatDir(const wchar_t* argPath)
 }
 } // namespace
 
-int wmain(int argc, wchar_t** argv)
+int main(int argc, char** argv)
 {
 	std::printf("=== XeFG Vulkan Cooperative-Matrix Offline Probe ===\n");
 	const std::filesystem::path coopDir = FindCoopMatDir(argc > 1 ? argv[1] : nullptr);
@@ -121,13 +166,13 @@ int wmain(int argc, wchar_t** argv)
 	else
 		std::printf("CoopMat directory: %s\n", coopDir.string().c_str());
 
-	HMODULE vkDll = LoadLibraryW(L"vulkan-1.dll");
-	if (!vkDll)
+	VulkanLib vkLib;
+	if (!vkLib.Load())
 	{
-		std::printf("[error] Failed to load vulkan-1.dll (err=%lu)\n", GetLastError());
+		std::printf("[error] Failed to load Vulkan loader library\n");
 		return 1;
 	}
-	const auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(vkDll, "vkGetInstanceProcAddr"));
+	const auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(vkLib.Sym("vkGetInstanceProcAddr"));
 	if (!gipa)
 	{
 		std::printf("[error] vkGetInstanceProcAddr not found\n");
@@ -353,10 +398,9 @@ int wmain(int argc, wchar_t** argv)
 			(subCtrl.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
 			subCtrl.minSubgroupSize <= 32u && subCtrl.maxSubgroupSize >= 32u;
 
-		// 1. Run matC register layout probe if matc_probe_16x16x16.spv is present
 		if (!coopDir.empty())
 		{
-			const auto probeSpv = LoadSpv(coopDir / L"matc_probe_16x16x16.spv");
+			const auto probeSpv = LoadSpv(coopDir / "matc_probe_16x16x16.spv");
 			if (probeSpv.empty())
 			{
 				std::printf("matC probe: skipped (matc_probe_16x16x16.spv not found in coopmat folder)\n");
@@ -495,7 +539,6 @@ int wmain(int argc, wchar_t** argv)
 			}
 		}
 
-		// 2. Compile all 16 kernels (std sAcc + radv_reg, local_x=128 & 256) and dump ISA stats
 		if (!coopDir.empty() && usePipeExec && getExecProps && getExecStats)
 		{
 			std::printf("\nISA statistics (VK_KHR_pipeline_executable_properties):\n");
@@ -595,11 +638,11 @@ int wmain(int argc, wchar_t** argv)
 			{
 				const std::string fname = std::string(ks.name) + ".spv";
 				dumpKernel(ks, coopDir / fname, "sAcc", 128u);
-				dumpKernel(ks, coopDir / L"radv_reg" / fname, "radv_reg", 128u);
+				dumpKernel(ks, coopDir / "radv_reg" / fname, "radv_reg", 128u);
 				if (ks.tileH >= 16u && std::strcmp(ks.family, "Flow") != 0)
 				{
 					dumpKernel(ks, coopDir / fname, "sAcc", 256u);
-					dumpKernel(ks, coopDir / L"radv_reg" / fname, "radv_reg", 256u);
+					dumpKernel(ks, coopDir / "radv_reg" / fname, "radv_reg", 256u);
 				}
 			}
 		}
@@ -608,7 +651,6 @@ int wmain(int argc, wchar_t** argv)
 	}
 
 	destroyInstance(instance, nullptr);
-	FreeLibrary(vkDll);
 	std::printf("\nDone.\n");
 	return 0;
 }
