@@ -141,10 +141,10 @@ static ContextOwnershipCoordinator& ContextOwner() noexcept
 	return *coordinator;
 }
 
-std::shared_ptr<DeferredDestroy::FenceSignal> FrameGenerator::LastGpuSignal() const noexcept
+std::vector<std::shared_ptr<DeferredDestroy::FenceSignal>> FrameGenerator::ActiveGpuSignals() const
 {
-	std::lock_guard lock(lastSignalMutex);
-	return lastGpuSignal;
+	std::lock_guard lock(activeSignalsMutex);
+	return activeGpuSignals;
 }
 
 FrameGenerator::Context::~Context()
@@ -1105,7 +1105,7 @@ bool FrameGenerator::CreateContext()
 		}
 	});
 	if (retiredOld)
-		DeferredDestroy::Add(std::move(retiredOld), /*heavy=*/true);
+		DeferredDestroy::Add(std::move(retiredOld), /*heavy=*/true, ActiveGpuSignals());
 
 	routeLaunches = UseWmma(settings.model) ? xefg_wmma::Snapshot().launches : xefg_cuda::Snapshot().launches;
 	routeFrames = 0;
@@ -1454,7 +1454,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 				xefg_cuda::InvalidateCache();
 			});
 			context->retiredForReplacement = true;
-			DeferredDestroy::Add(std::move(context), /*heavy=*/true);
+			DeferredDestroy::Add(std::move(context), /*heavy=*/true, ActiveGpuSignals());
 		}
 	}
 
@@ -2150,8 +2150,14 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 	DeferredDestroy::ScopedCommandList deferredScope(cmdList);
 	if (deferredScope.current)
 	{
-		std::lock_guard lock(lastSignalMutex);
-		lastGpuSignal = deferredScope.current;
+		std::lock_guard lock(activeSignalsMutex);
+		activeGpuSignals.erase(
+			std::remove_if(activeGpuSignals.begin(), activeGpuSignals.end(),
+				[](const std::shared_ptr<DeferredDestroy::FenceSignal>& s) noexcept {
+					return !s || s->IsGpuComplete();
+				}),
+			activeGpuSignals.end());
+		activeGpuSignals.push_back(deferredScope.current);
 	}
 
 	auto backbuffer = params.GetOr<ID3D12Resource*>("DLSSG.Backbuffer", nullptr);

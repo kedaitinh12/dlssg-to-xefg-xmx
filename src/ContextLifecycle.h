@@ -10,7 +10,7 @@
 // 1. A new context claims ownership ONLY AFTER XeFG::CreateContext() and XeFG::Init() both succeed.
 //    A failed context stays unowned (generation == 0) and never resets an active context's bridge/cache.
 // 2. Ownership transfer (Commit) and global teardown (ResetIfOwner / ResetBeforeReplacement) are strictly
-//    serialized under the same mutex, preventing a deferred destructor from racing with a new Commit().
+//    serialized under the same mutex, preventing a stale context or deferred destructor from resetting a newer owner.
 class ContextOwnershipCoordinator
 {
 public:
@@ -34,13 +34,14 @@ public:
 	}
 
 	// Explicitly reset global state before replacing an active context (e.g. settings/format change).
-	// Clears active ownership if `generation` is still the current owner so its deferred destructor won't double-reset.
+	// Runs `resetGlobal()` ONLY if `generation` is non-zero and still the current active owner.
 	template <class ResetFn>
 	bool ResetBeforeReplacement(uint64_t generation, ResetFn&& resetGlobal) noexcept
 	{
 		std::lock_guard lock(mutex_);
-		if (generation != 0 && generation == activeGeneration_)
-			activeGeneration_ = 0;
+		if (generation == 0 || generation != activeGeneration_)
+			return false;
+		activeGeneration_ = 0;
 		resetGlobal();
 		return true;
 	}

@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 // Lightweight, chain-safe ID3D12CommandQueue::ExecuteCommandLists observer that attaches a per-queue private
 // ID3D12Fence signal to DeferredDestroy entries recorded on a submitted command list.
@@ -186,5 +188,40 @@ namespace D3D12QueueFence
 			DeferredDestroy::SetQueueFenceTrackingEnabled(true);
 		}
 		return patchedAny;
+	}
+
+	// Best-effort bounded wait for all tracked per-queue fences during shutdown before DeferredDestroy::Collect(true).
+	inline void WaitAllPending(DWORD timeoutMs = 1000) noexcept
+	{
+		detail::State& s = detail::S();
+		std::vector<std::pair<Microsoft::WRL::ComPtr<ID3D12Fence>, uint64_t>> snapshot;
+		{
+			std::lock_guard lock(s.fenceMutex);
+			snapshot.reserve(s.queueFences.size());
+			for (const auto& kv : s.queueFences)
+			{
+				if (kv.second.fence && kv.second.nextValue > 0)
+					snapshot.emplace_back(kv.second.fence, kv.second.nextValue);
+			}
+		}
+		if (snapshot.empty())
+			return;
+
+		HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+		const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(timeoutMs);
+		for (const auto& item : snapshot)
+		{
+			const uint64_t done = item.first->GetCompletedValue();
+			if (done == UINT64_MAX || done >= item.second)
+				continue;
+			const ULONGLONG now = GetTickCount64();
+			if (now >= deadline)
+				break;
+			const DWORD remaining = static_cast<DWORD>(deadline - now);
+			if (ev && SUCCEEDED(item.first->SetEventOnCompletion(item.second, ev)))
+				WaitForSingleObject(ev, remaining);
+		}
+		if (ev)
+			CloseHandle(ev);
 	}
 } // namespace D3D12QueueFence
