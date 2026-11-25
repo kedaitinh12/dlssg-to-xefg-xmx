@@ -20,12 +20,12 @@ namespace VulkanCoopMat
 	// Uses a transient VkCommandPool/VkCommandBuffer/VkFence so caller command buffers remain untouched.
 	xvk::MatCLayout ProbeMatCLayout(VkInstance instance, VkPhysicalDevice physical, VkDevice device,
 		uint32_t queueFamily, VkQueue queue, PFN_vkGetInstanceProcAddr gipa,
-		PFN_vkGetDeviceProcAddr gdpa, bool requireSubgroupSize, const char* logPrefix) noexcept;
+		PFN_vkGetDeviceProcAddr gdpa, const char* logPrefix) noexcept;
 
 	// Polls (or bounded-waits on teardown) any matC probe resources that timed out while still in flight
 	// on the GPU, destroying them only after vkGetFenceStatus reports completion (or device lost).
 	// Returns true if no pending probe remains for `device` (safe to destroy `device`).
-	bool ReapPendingProbes(VkDevice device, bool waitBounded = false) noexcept;
+	bool ReapPendingProbes(VkDevice device, bool waitBounded = false, bool deviceLost = false) noexcept;
 
 	// Installs the cooperative-matrix route on the layer's device (`device` is what xvk::CreateDevice gave).
 	bool Install(ID3D12Device* device, std::string& reason, xvk::MatCLayout matCLayout = xvk::MatCLayout::Unknown);

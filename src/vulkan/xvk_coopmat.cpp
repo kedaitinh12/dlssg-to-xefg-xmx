@@ -4,6 +4,7 @@
 #include "../MfgPort/Cuda/cuda_layers.h"
 #include "../MfgPort/Sha256.h"
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -258,7 +259,11 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
             if (gpuArch_ == GpuArch::Rdna3 && driverProps.driverID == VK_DRIVER_ID_AMD_PROPRIETARY)
             {
                 unsigned drvMajor = 0, drvMinor = 0;
-                if (std::sscanf(driverProps.driverInfo, "%u.%u", &drvMajor, &drvMinor) == 2 &&
+                const std::string_view version(driverProps.driverInfo);
+                const char* end = version.data() + version.size();
+                const auto major = std::from_chars(version.data(), end, drvMajor);
+                if (major.ec == std::errc{} && major.ptr != end && *major.ptr == '.' &&
+                    std::from_chars(major.ptr + 1, end, drvMinor).ec == std::errc{} &&
                     (drvMajor < 26u || (drvMajor == 26u && drvMinor < 10u)))
                 {
                     rdna3LegacyLlpc_ = true;
@@ -326,7 +331,7 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
         // - RDNA 4 (gfx12): reg_only yields major VGPR/LDS/occupancy gains on heavy PoolConv (aa016078, 198d6bf8,
         //   dcd8becf, efbe3788, a3c3caa1) and all 5 Flow layers, while sAcc stays faster (fewer VMEM clauses /
         //   lower VGPRs) on the 6 lighter Pool/Decoder layers (50f0c205, 9481d452, 06e97933, 3ed03daf, 748b0baf, cb391582).
-        const auto layerWantsReg = [&](size_t idx, const xefg_cuda::LayerSpec& l) -> bool {
+        const auto layerWantsReg = [&](size_t idx, const xefg_cuda::Layer& l) -> bool {
             if (!useRegDir)
                 return false;
             if (activeLayout == MatCLayout::Gfx11Reg)

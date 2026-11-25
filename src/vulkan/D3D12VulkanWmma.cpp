@@ -1792,7 +1792,7 @@ bool TeardownVulkanLocked() noexcept
 	// Verify any timed-out matC probe on gBridge.device has completed BEFORE tearing down any
 	// Vulkan resource, VkDevice, or parent VkInstance; if still in flight (and device not lost),
 	// abort teardown cleanly so a later recovery pass can retry with intact device & instance.
-	if (gBridge.device && !VulkanCoopMat::ReapPendingProbes(gBridge.device, true) && !deviceLost)
+	if (gBridge.device && !VulkanCoopMat::ReapPendingProbes(gBridge.device, true, deviceLost))
 		return false;
 
 	// Clean up any remaining pendingInitUploads (only reachable here if deviceLost == true).
@@ -1887,11 +1887,37 @@ bool TeardownVulkanLocked() noexcept
 // Runs a one-time 1-workgroup (32-thread) Wave32 16x16x16 cooperative-matrix accumulator layout probe
 // during bridge initialization (0 runtime cost per frame) and logs whether the driver's matC[i] lane
 // mapping matches RADV's register-only layout (g = lane >> 4, p = lane & 15, C[g + i * 2][p]).
-xvk::MatCLayout RunMatCRegisterProbe(PFN_vkGetDeviceProcAddr gdpa, bool requireSubgroupSize) noexcept
+xvk::MatCLayout RunMatCRegisterProbe(PFN_vkGetDeviceProcAddr gdpa,
+	PFN_vkGetPhysicalDeviceProperties2 getProps2) noexcept
 {
+	const auto getMatrixProps = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
+		gBridge.gipa(gBridge.instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
+	if (!getMatrixProps)
+		return xvk::MatCLayout::Unknown;
+
+	VkPhysicalDeviceCooperativeMatrixPropertiesKHR matrix{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR };
+	VkPhysicalDeviceSubgroupSizeControlProperties sizes{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES, &matrix };
+	VkPhysicalDeviceProperties2 props{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sizes };
+	getProps2(gBridge.physical, &props);
+	if (!(matrix.cooperativeMatrixSupportedStages & VK_SHADER_STAGE_COMPUTE_BIT) ||
+		!(sizes.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) ||
+		sizes.minSubgroupSize > 32 || sizes.maxSubgroupSize < 32)
+		return xvk::MatCLayout::Unknown;
+
+	std::array<VkCooperativeMatrixPropertiesKHR, 256> shapes{};
+	for (auto& shape : shapes)
+		shape.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+	uint32_t count = static_cast<uint32_t>(shapes.size());
+	if (getMatrixProps(gBridge.physical, &count, shapes.data()) != VK_SUCCESS ||
+		std::none_of(shapes.begin(), shapes.begin() + count, [](const auto& shape) {
+			return shape.scope == VK_SCOPE_SUBGROUP_KHR && shape.MSize == 16 && shape.NSize == 16 &&
+				shape.CType == VK_COMPONENT_TYPE_SINT32_KHR;
+		}))
+		return xvk::MatCLayout::Unknown;
+
 	return VulkanCoopMat::ProbeMatCLayout(
 		gBridge.instance, gBridge.physical, gBridge.device, gBridge.queueFamily, gBridge.queue,
-		gBridge.gipa, gdpa, requireSubgroupSize, "D3D12->Vulkan WMMA bridge");
+		gBridge.gipa, gdpa, "D3D12->Vulkan WMMA bridge");
 }
 
 bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
@@ -2178,9 +2204,9 @@ bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
 		return fail("command_buffers_failed");
 
 	xvk::MatCLayout probedMatCLayout = xvk::MatCLayout::Unknown;
-	if (matchedVendor == 0x1002u)
+	if (matchedVendor == 0x1002u && enable13.subgroupSizeControl && enable13.computeFullSubgroups)
 	{
-		probedMatCLayout = RunMatCRegisterProbe(gdpa, vk13.subgroupSizeControl == VK_TRUE);
+		probedMatCLayout = RunMatCRegisterProbe(gdpa, getProps2);
 		if (probedMatCLayout == xvk::MatCLayout::Emulated)
 			return fail("emulated_coopmat_skipped");
 	}

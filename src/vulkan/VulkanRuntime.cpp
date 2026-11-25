@@ -962,8 +962,7 @@ namespace
 		}
 		else
 		{
-			// Native Vulkan uses MatCLayout::Unknown (RADV still auto-selects reg-only; Windows LLPC stays
-			// on standard sAcc without submitting probe work on the game's unsynchronized queue).
+			// Native Vulkan keeps the standard accumulator layout on every driver.
 			d.coopInstalled = VulkanCoopMat::Install(d.d3d.Get(), coopStatusReason);
 		}
 

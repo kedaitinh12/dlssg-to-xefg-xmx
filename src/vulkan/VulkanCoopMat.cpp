@@ -145,7 +145,7 @@ bool VulkanCoopMat::Install(ID3D12Device* device, std::string& reason, xvk::MatC
 
 xvk::MatCLayout VulkanCoopMat::ProbeMatCLayout(VkInstance instance, VkPhysicalDevice physical, VkDevice device,
 	uint32_t queueFamily, VkQueue queue, PFN_vkGetInstanceProcAddr gipa,
-	PFN_vkGetDeviceProcAddr gdpa, bool requireSubgroupSize, const char* logPrefix) noexcept
+	PFN_vkGetDeviceProcAddr gdpa, const char* logPrefix) noexcept
 {
 	const char* prefix = (logPrefix && *logPrefix) ? logPrefix : "Vulkan coopmat";
 	try
@@ -194,6 +194,7 @@ xvk::MatCLayout VulkanCoopMat::ProbeMatCLayout(VkInstance instance, VkPhysicalDe
 		const auto endCmdBuf = reinterpret_cast<PFN_vkEndCommandBuffer>(load("vkEndCommandBuffer"));
 		const auto cmdBindPipeline = reinterpret_cast<PFN_vkCmdBindPipeline>(load("vkCmdBindPipeline"));
 		const auto cmdPushDesc = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(load("vkCmdPushDescriptorSetKHR"));
+		const auto cmdBarrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(load("vkCmdPipelineBarrier"));
 		const auto cmdDispatch = reinterpret_cast<PFN_vkCmdDispatch>(load("vkCmdDispatch"));
 		const auto createFence = reinterpret_cast<PFN_vkCreateFence>(load("vkCreateFence"));
 		const auto destroyFence = reinterpret_cast<PFN_vkDestroyFence>(load("vkDestroyFence"));
@@ -205,7 +206,7 @@ xvk::MatCLayout VulkanCoopMat::ProbeMatCLayout(VkInstance instance, VkPhysicalDe
 			!createPipeLayout || !destroyPipeLayout || !createComputePipelines || !destroyPipeline ||
 			!createBuffer || !destroyBuffer || !getBufMemReq || !allocateMemory || !freeMemory ||
 			!bindBufMem || !mapMem || !unmapMem || !createCmdPool || !destroyCmdPool || !allocCmdBufs ||
-			!beginCmdBuf || !endCmdBuf || !cmdBindPipeline || !cmdPushDesc || !cmdDispatch ||
+			!beginCmdBuf || !endCmdBuf || !cmdBindPipeline || !cmdPushDesc || !cmdBarrier || !cmdDispatch ||
 			!createFence || !destroyFence || !waitForFences || !getFenceStatus || !queueSubmit2)
 			return xvk::MatCLayout::Unknown;
 
@@ -287,8 +288,8 @@ xvk::MatCLayout VulkanCoopMat::ProbeMatCLayout(VkInstance instance, VkPhysicalDe
 		VkComputePipelineCreateInfo cpInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
 		cpInfo.stage = {
 			VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-			requireSubgroupSize ? &reqSub : nullptr,
-			requireSubgroupSize ? VkPipelineShaderStageCreateFlags(VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT) : 0u,
+			&reqSub,
+			VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT,
 			VK_SHADER_STAGE_COMPUTE_BIT,
 			shader,
 			"main",
@@ -372,6 +373,13 @@ xvk::MatCLayout VulkanCoopMat::ProbeMatCLayout(VkInstance instance, VkPhysicalDe
 		write.pBufferInfo = &descBuf;
 		cmdPushDesc(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 0, 1, &write);
 		cmdDispatch(cmd, 1, 1, 1);
+
+		// Make the storage-buffer writes visible to the CPU before reading the mapped result.
+		VkMemoryBarrier readback{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+		readback.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		readback.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+		cmdBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+			1, &readback, 0, nullptr, 0, nullptr);
 
 		if (endCmdBuf(cmd) != VK_SUCCESS)
 			return xvk::MatCLayout::Unknown;
@@ -481,7 +489,7 @@ xvk::MatCLayout VulkanCoopMat::ProbeMatCLayout(VkInstance instance, VkPhysicalDe
 	}
 }
 
-bool VulkanCoopMat::ReapPendingProbes(VkDevice device, bool waitBounded) noexcept
+bool VulkanCoopMat::ReapPendingProbes(VkDevice device, bool waitBounded, bool deviceLost) noexcept
 {
 	if (!gHasPendingProbes.load(std::memory_order_acquire))
 		return true;
@@ -495,7 +503,9 @@ bool VulkanCoopMat::ReapPendingProbes(VkDevice device, bool waitBounded) noexcep
 			++it;
 			continue;
 		}
-		VkResult st = it->getFenceStatus ? it->getFenceStatus(it->dev, it->fence) : VK_NOT_READY;
+		VkResult st = VK_ERROR_DEVICE_LOST;
+		if (!deviceLost || it->dev != device)
+			st = it->getFenceStatus ? it->getFenceStatus(it->dev, it->fence) : VK_NOT_READY;
 		if (st == VK_NOT_READY && waitBounded && it->waitForFences)
 		{
 			const VkResult w = it->waitForFences(it->dev, 1, &it->fence, VK_TRUE, 500'000'000ull);
