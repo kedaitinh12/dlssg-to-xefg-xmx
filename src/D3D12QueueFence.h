@@ -54,7 +54,7 @@ namespace D3D12QueueFence
 			ID3D12Device* ownerDevice = nullptr; // identity tag only; never dereferenced
 			uint64_t queueToken = 0;
 			bool hasPrivateToken = false;
-			uint64_t nextValue = 0;
+			uint64_t lastSignaledValue = 0;
 		};
 
 		struct State
@@ -134,17 +134,17 @@ namespace D3D12QueueFence
 
 		inline void RetireSlotFenceLocked(State& s, PerQueueFence& slot) noexcept
 		{
-			if (slot.fence && slot.nextValue > 0)
+			if (slot.fence && slot.lastSignaledValue > 0)
 			{
 				const uint64_t done = slot.fence->GetCompletedValue();
-				if (done != UINT64_MAX && done < slot.nextValue)
-					s.retiredFences.emplace_back(slot.fence, slot.nextValue);
+				if (done != UINT64_MAX && done < slot.lastSignaledValue)
+					s.retiredFences.emplace_back(slot.fence, slot.lastSignaledValue);
 			}
 			slot.fence.Reset();
 			slot.ownerDevice = nullptr;
 			slot.queueToken = 0;
 			slot.hasPrivateToken = false;
-			slot.nextValue = 0;
+			slot.lastSignaledValue = 0;
 
 			// Prune completed retired fences so the list stays tiny.
 			s.retiredFences.erase(
@@ -183,9 +183,10 @@ namespace D3D12QueueFence
 			auto& slot = s.queueFences[queue];
 
 			const bool deviceChanged = slot.fence && slot.ownerDevice != dev.Get();
-			const bool queueInstanceChanged = slot.fence && slot.hasPrivateToken &&
-				(!gotToken || observedToken != slot.queueToken);
-			if (deviceChanged || queueInstanceChanged)
+			// A raw address and device can both match after the queue is recreated.
+			const bool queueInstanceUnverified = slot.fence &&
+				(!slot.hasPrivateToken || !gotToken || observedToken != slot.queueToken);
+			if (deviceChanged || queueInstanceUnverified)
 				RetireSlotFenceLocked(s, slot);
 
 			bool createdFresh = false;
@@ -194,7 +195,7 @@ namespace D3D12QueueFence
 				if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&slot.fence))) || !slot.fence)
 					return false;
 				slot.ownerDevice = dev.Get();
-				slot.nextValue = 0;
+				slot.lastSignaledValue = 0;
 				const uint64_t newToken = ++s.nextQueueToken;
 				if (SUCCEEDED(queue->SetPrivateData(kQueueTokenGuid, sizeof(newToken), &newToken)))
 				{
@@ -209,9 +210,10 @@ namespace D3D12QueueFence
 				createdFresh = true;
 			}
 
-			uint64_t val = ++slot.nextValue;
+			const uint64_t val = slot.lastSignaledValue + 1;
 			if (SUCCEEDED(queue->Signal(slot.fence.Get(), val)))
 			{
+				slot.lastSignaledValue = val;
 				outFence = slot.fence;
 				outValue = val;
 				return true;
@@ -225,7 +227,6 @@ namespace D3D12QueueFence
 				if (SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&slot.fence))) && slot.fence)
 				{
 					slot.ownerDevice = dev.Get();
-					slot.nextValue = 1;
 					const uint64_t newToken = ++s.nextQueueToken;
 					if (SUCCEEDED(queue->SetPrivateData(kQueueTokenGuid, sizeof(newToken), &newToken)))
 					{
@@ -234,6 +235,7 @@ namespace D3D12QueueFence
 					}
 					if (SUCCEEDED(queue->Signal(slot.fence.Get(), 1)))
 					{
+						slot.lastSignaledValue = 1;
 						outFence = slot.fence;
 						outValue = 1;
 						return true;
@@ -410,8 +412,8 @@ namespace D3D12QueueFence
 			snapshot.reserve(s.queueFences.size() + s.retiredFences.size());
 			for (const auto& kv : s.queueFences)
 			{
-				if (kv.second.fence && kv.second.nextValue > 0)
-					snapshot.emplace_back(kv.second.fence, kv.second.nextValue);
+				if (kv.second.fence && kv.second.lastSignaledValue > 0)
+					snapshot.emplace_back(kv.second.fence, kv.second.lastSignaledValue);
 			}
 			for (const auto& item : s.retiredFences)
 			{
