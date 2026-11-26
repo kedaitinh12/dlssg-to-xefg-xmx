@@ -1270,7 +1270,9 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 				Log::Info("UnityUpscalerBridge: using Opti.Hudless as HUD-less source (SDR)");
 		}
 	}
-	auto hudless = (Plugin::options.hudlessUi && !Plugin::options.debugHideHudless) ? rawHudless : nullptr;
+	const bool hudlessUiEnabled = Plugin::options.hudlessUi.load(std::memory_order_relaxed);
+	const bool hideHudless = Plugin::options.debugHideHudless.load(std::memory_order_relaxed);
+	auto hudless = (hudlessUiEnabled && !hideHudless) ? rawHudless : nullptr;
 	auto depth = params.GetOr<ID3D12Resource*>("DLSSG.Depth", nullptr);
 	auto mvecs = params.GetOr<ID3D12Resource*>("DLSSG.MVecs", nullptr);
 	auto output = params.GetOr<ID3D12Resource*>("DLSSG.OutputInterpolated", nullptr);
@@ -1370,8 +1372,8 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 
 	HudTier::Inputs hudInputs{};
 	hudInputs.mode = requestedHudMode;
-	hudInputs.hudlessUiEnabled = Plugin::options.hudlessUi.load(std::memory_order_relaxed);
-	hudInputs.hasGameHudless = rawHudless != nullptr;
+	hudInputs.hudlessUiEnabled = hudlessUiEnabled;
+	hudInputs.hasGameHudless = !hideHudless && rawHudless != nullptr;
 	hudInputs.hudlessStructurallyValid = hudless != nullptr && !hudlessFormatMismatch;
 	hudInputs.hudlessFormatMismatch = hudless != nullptr && hudlessFormatMismatch;
 	hudInputs.hasSeparateUiPlane = false;

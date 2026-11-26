@@ -2099,9 +2099,11 @@ namespace
 		const NgxResource* rawGameUi = ImageParameter(parameters, "DLSSG.UI");
 		const auto vkHudMode = static_cast<HudTier::Mode>(
 			std::clamp(Plugin::options.hudTierMode.load(std::memory_order_relaxed), 0, 4));
-		if (Plugin::options.hudlessUi && !Plugin::options.debugHideHudless)
+		const bool hudlessUiEnabled = Plugin::options.hudlessUi.load(std::memory_order_relaxed);
+		const bool hideHudless = Plugin::options.debugHideHudless.load(std::memory_order_relaxed);
+		if (hudlessUiEnabled)
 		{
-			in.hudless = rawGameHudless;
+			in.hudless = hideHudless ? nullptr : rawGameHudless;
 			in.ui = rawGameUi;
 		}
 
@@ -2235,8 +2237,8 @@ namespace
 
 		HudTier::Inputs vkHudInputs{};
 		vkHudInputs.mode = vkHudMode;
-		vkHudInputs.hudlessUiEnabled = Plugin::options.hudlessUi.load(std::memory_order_relaxed) && !Plugin::options.debugHideHudless.load(std::memory_order_relaxed);
-		vkHudInputs.hasGameHudless = rawGameHudless != nullptr;
+		vkHudInputs.hudlessUiEnabled = hudlessUiEnabled;
+		vkHudInputs.hasGameHudless = !hideHudless && rawGameHudless != nullptr;
 		vkHudInputs.hudlessStructurallyValid = in.hudless != nullptr;
 		vkHudInputs.hudlessFormatMismatch = vkHudlessFormatMismatch;
 		vkHudInputs.hasSeparateUiPlane = in.ui != nullptr;

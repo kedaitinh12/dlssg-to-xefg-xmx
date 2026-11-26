@@ -59,7 +59,10 @@ New-Item -ItemType Directory -Path $Output -Force | Out-Null
 $manifestPath = Join-Path $Output "wmma_layers.tsv"
 $splitOutDir = Join-Path $Output "dot4_split"
 $splitManifestPath = Join-Path $splitOutDir "wmma_layers.tsv"
+$scriptTime = (Get-Item $PSCommandPath).LastWriteTimeUtc
 $srcTime = (Get-Item $Source).LastWriteTimeUtc
+if ($scriptTime -gt $srcTime) { $srcTime = $scriptTime }
+$allCurrent = $false
 $expectedProgs = @("aa016078","198d6bf8","dcd8becf","efbe3788","50f0c205","a3c3caa1","9481d452","06e97933","3ed03daf","748b0baf","cb391582","fc1b8a04","3459485","3452733","55e5d6b9","34517926","3453044")
 if ((Test-Path $manifestPath) -and (Test-Path $splitManifestPath) -and
     ((Get-Item $manifestPath).LastWriteTimeUtc -ge $srcTime) -and
@@ -75,10 +78,7 @@ if ((Test-Path $manifestPath) -and (Test-Path $splitManifestPath) -and
         }
         if (-not $allCurrent) { break }
     }
-    if ($allCurrent) {
-        Write-Host "D3D12 WMMA/dot4 shaders in $Output (and dot4_split) are up to date; skipping DXC compilation."
-        exit 0
-    }
+
 }
 
 $kernels = @(
@@ -141,8 +141,10 @@ function Build-Dot4Set {
     Write-Host "Built 16 unique D3D12 dot4 kernels (17 layer overrides) [$Label] into $OutDir"
 }
 
-Build-Dot4Set -OutDir $Output -Label "dot4-acc" -ExtraDefines @()
-Build-Dot4Set -OutDir (Join-Path $Output "dot4_split") -Label "dot4-split" -ExtraDefines @("-DDOT4_SPLIT=1")
+if (-not $allCurrent) {
+    Build-Dot4Set -OutDir $Output -Label "dot4-acc" -ExtraDefines @()
+    Build-Dot4Set -OutDir (Join-Path $Output "dot4_split") -Label "dot4-split" -ExtraDefines @("-DDOT4_SPLIT=1")
+}
 
 # Also build byte-identical motion-aware splat DXIL replacements (splat.1 / splat.2) into <Output>\..\replacements
 $splatSource = Join-Path $PSScriptRoot "..\src\MfgPort\splat_motion_aware.hlsl"
@@ -155,6 +157,9 @@ if (Test-Path $splatSource) {
     )
     foreach ($sv in $splatVariants) {
         $dxilOut = Join-Path $replOut "$($sv.Name).dxil"
+        if ((Test-Path $dxilOut) -and
+            ((Get-Item $dxilOut).LastWriteTimeUtc -ge (Get-Item $splatSource).LastWriteTimeUtc) -and
+            ((Get-Item $dxilOut).LastWriteTimeUtc -ge $scriptTime)) { continue }
         $splatArgs = @(
             "-nologo",
             "-T", "cs_6_0",
