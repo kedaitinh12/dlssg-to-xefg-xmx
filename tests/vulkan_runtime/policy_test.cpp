@@ -672,14 +672,15 @@ int main()
 
 	// Intel Arc Battlemage (0x8086) 4 KiB alignment guard for pooled compute buffers in [4 KiB, 64 KiB]
 	{
-		CHECK(VulkanPolicy::SafeBufferAlignment(0x8086u, 4096ull, 64ull) == 4096ull);
-		CHECK(VulkanPolicy::SafeBufferAlignment(0x8086u, 32768ull, 256ull) == 4096ull);
-		CHECK(VulkanPolicy::SafeBufferAlignment(0x8086u, 65536ull, 64ull) == 4096ull);
-		CHECK(VulkanPolicy::SafeBufferAlignment(0x8086u, 65536ull, 65536ull) == 65536ull);
-		CHECK(VulkanPolicy::SafeBufferAlignment(0x8086u, 2048ull, 64ull) == 64ull);
-		CHECK(VulkanPolicy::SafeBufferAlignment(0x8086u, 131072ull, 64ull) == 64ull);
-		CHECK(VulkanPolicy::SafeBufferAlignment(0x1002u, 16384ull, 64ull) == 64ull);
-		CHECK(VulkanPolicy::SafeBufferAlignment(0x10DEu, 16384ull, 64ull) == 64ull);
+		CHECK(VulkanPolicy::SafeBufferAlignment(0x8086u, 0xE20Bu, 4096ull, 64ull) == 4096ull);
+		CHECK(VulkanPolicy::SafeBufferAlignment(0x8086u, 0xE20Bu, 32768ull, 256ull) == 4096ull);
+		CHECK(VulkanPolicy::SafeBufferAlignment(0x8086u, 0xE20Bu, 65536ull, 64ull) == 4096ull);
+		CHECK(VulkanPolicy::SafeBufferAlignment(0x8086u, 0xE20Bu, 65536ull, 65536ull) == 65536ull);
+		CHECK(VulkanPolicy::SafeBufferAlignment(0x8086u, 0xE20Bu, 2048ull, 64ull) == 64ull);
+		CHECK(VulkanPolicy::SafeBufferAlignment(0x8086u, 0xE20Bu, 131072ull, 64ull) == 64ull);
+		CHECK(VulkanPolicy::SafeBufferAlignment(0x1002u, 0xE20Bu, 16384ull, 64ull) == 64ull);
+		CHECK(VulkanPolicy::SafeBufferAlignment(0x10DEu, 0xE20Bu, 16384ull, 64ull) == 64ull);
+		CHECK(VulkanPolicy::SafeBufferAlignment(0x8086u, 0x56A0u, 8192ull, 64ull) == 64ull);
 	}
 
 	// Coarse optical-flow 4K+ recommendation policy

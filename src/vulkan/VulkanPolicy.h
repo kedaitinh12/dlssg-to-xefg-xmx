@@ -296,16 +296,20 @@ namespace VulkanPolicy
 		return portModel && (xmxPortPath || xmxNativePath || cudaPath || wmmaPath);
 	}
 
-	// Identifies AMD RDNA 4 (gfx1200/gfx1201: RX 9070 XT / 9070 / 9060 XT, PCI DeviceID 0x7550..0x75FF), where 3rd-gen
-	// Matrix Cores deliver 2048 INT8 ops/clock/CU (4x DP4a's 512 ops/clock/CU).
-	// Intel Arc Battlemage (B580/B570, vendor 0x8086): pooled compute buffers in [4 KiB, 64 KiB]
-	// sub-allocated at 64-byte alignment trigger BMG_VULKANCOMPUTE_BBHANG driver TDRs.
-	// Raising alignment (and size granularity) to 4 KiB prevents the hang with zero change on AMD/NVIDIA.
-	inline uint64_t SafeBufferAlignment(uint32_t vendorId, uint64_t bufferSize, uint64_t driverAlignment) noexcept
+	// Increase placement alignment only for small suballocated Battlemage buffers.
+	inline uint64_t SafeBufferAlignment(uint32_t vendorId, uint32_t deviceId, uint64_t size, uint64_t alignment) noexcept
 	{
-		if (vendorId == 0x8086u && bufferSize >= 4096ull && bufferSize <= 65536ull)
-			return driverAlignment < 4096ull ? 4096ull : driverAlignment;
-		return driverAlignment;
+		if (vendorId != 0x8086 || size < 4096 || size > 65536 || alignment >= 4096)
+			return alignment;
+		switch (deviceId)
+		{
+		case 0xE202: case 0xE209: case 0xE20B: case 0xE20C: case 0xE20D:
+		case 0xE210: case 0xE211: case 0xE212: case 0xE216:
+		case 0xE220: case 0xE221: case 0xE222: case 0xE223:
+			return 4096;
+		default:
+			return alignment;
+		}
 	}
 
 	// Recommends coarse optical-flow pyramid budgeting at 4K+ (>= 3840x2160) to reclaim GPU headroom.
@@ -314,6 +318,8 @@ namespace VulkanPolicy
 		return static_cast<uint64_t>(width) * static_cast<uint64_t>(height) >= 3840ull * 2160ull;
 	}
 
+	// Identifies AMD RDNA 4 (gfx1200/gfx1201: RX 9070 XT / 9070 / 9060 XT, PCI DeviceID 0x7550..0x75FF), where 3rd-gen
+	// Matrix Cores deliver 2048 INT8 ops/clock/CU (4x DP4a's 512 ops/clock/CU).
 	inline bool IsAmdRdna4Device(uint32_t vendorId, uint32_t deviceId, std::string_view deviceName = {}) noexcept
 	{
 		if (vendorId != 0x1002)

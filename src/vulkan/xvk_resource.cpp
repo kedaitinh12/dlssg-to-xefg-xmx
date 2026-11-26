@@ -97,11 +97,10 @@ HRESULT Resource::Init(Heap* placedHeap, UINT64 placedOffset)
         const VkBufferCreateInfo info = BufferCreateInfo(desc_);
         if (vk.vkCreateBuffer(device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
         vk.vkGetBufferMemoryRequirements(device, buffer_, &requirements);
-        const uint64_t safeAlign = VulkanPolicy::SafeBufferAlignment(
-            device_->properties().vendorID, requirements.size, requirements.alignment);
-        if (safeAlign > requirements.alignment) {
-            requirements.alignment = safeAlign;
-            requirements.size = AlignUp(requirements.size, safeAlign);
+        if (placedHeap) {
+            const auto& gpu = device_->properties();
+            requirements.alignment = VulkanPolicy::SafeBufferAlignment(
+                gpu.vendorID, gpu.deviceID, requirements.size, requirements.alignment);
         }
         size_ = desc_.Width;
     } else {
@@ -124,7 +123,7 @@ HRESULT Resource::Init(Heap* placedHeap, UINT64 placedOffset)
     uint8_t* hostBase = nullptr;
     if (placedHeap) {
         const D3D12_HEAP_DESC heap = placedHeap->GetDesc();
-        if (placedOffset % requirements.alignment || placedOffset + requirements.size > heap.SizeInBytes ||
+        if (placedOffset % requirements.alignment || placedOffset > heap.SizeInBytes || requirements.size > heap.SizeInBytes - placedOffset ||
             !(requirements.memoryTypeBits & (1u << placedHeap->memoryType()))) {
             Log("CreatePlacedResource: offset %llu size %llu align %llu does not fit heap %llu (type bits 0x%x, heap type %u)", placedOffset,
                 requirements.size, requirements.alignment, heap.SizeInBytes, requirements.memoryTypeBits, placedHeap->memoryType());

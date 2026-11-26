@@ -953,7 +953,7 @@ D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE Device::GetResourceAllocationIn
             VkDeviceBufferMemoryRequirements query{VK_STRUCTURE_TYPE_DEVICE_BUFFER_MEMORY_REQUIREMENTS, nullptr, &info};
             vk_.vkGetDeviceBufferMemoryRequirements(device_, &query, &requirements);
             const uint64_t safeAlign = VulkanPolicy::SafeBufferAlignment(
-                properties_.vendorID, requirements.memoryRequirements.size, requirements.memoryRequirements.alignment);
+                properties_.vendorID, properties_.deviceID, requirements.memoryRequirements.size, requirements.memoryRequirements.alignment);
             if (safeAlign > requirements.memoryRequirements.alignment) {
                 requirements.memoryRequirements.alignment = safeAlign;
                 requirements.memoryRequirements.size = AlignUp(requirements.memoryRequirements.size, safeAlign);
