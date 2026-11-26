@@ -12,7 +12,6 @@
 #include <iterator>
 #include <mutex>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 namespace xefg_wmma
@@ -44,37 +43,52 @@ std::atomic<uint64_t> gBinds{0};
 
 std::array<std::vector<uint8_t>, std::size(xefg_cuda::kLayers)> gOverrideBlobs{};
 
-struct OverrideEntry
-{
-    ComPtr<ID3D12PipelineState> overridePso;
-    uint8_t layerIdx{};
-};
-std::mutex gPsoMutex;
-std::unordered_map<ID3D12PipelineState*, OverrideEntry> gPsoMap;
+// Stock owns its replacement until the provider releases the stock PSO after GPU use.
+constexpr GUID kDot4Override = {0x2bed9bc4, 0xa21f, 0x4828, {0x92,0x17,0x96,0xa1,0x72,0xe0,0x10,0xc9}};
+constexpr GUID kDot4Layer = {0x19c744a2, 0x1d55, 0x4c82, {0x88,0x10,0xec,0x99,0x65,0x36,0x7d,0x13}};
 
-struct ActiveListLayer
+struct Recording
 {
-    ID3D12PipelineState* stockPso{};
-    ID3D12PipelineState* overridePso{};
-    uint8_t layerIdx{};
+    ID3D12GraphicsCommandList* list{};
+    ComPtr<ID3D12PipelineState> stock;
+    ComPtr<ID3D12PipelineState> replacement;
+    uint8_t layer{};
+    bool dispatched{};
+
+    void Bind(ID3D12PipelineState* pso)
+    {
+        stock.Reset();
+        replacement.Reset();
+        layer = 0;
+        UINT size = sizeof(ID3D12PipelineState*);
+        if (!pso || FAILED(pso->GetPrivateData(kDot4Override, &size, replacement.GetAddressOf())) || !replacement)
+            return;
+        size = sizeof(layer);
+        if (FAILED(replacement->GetPrivateData(kDot4Layer, &size, &layer)) ||
+            layer == 0 || layer > std::size(xefg_cuda::kLayers))
+        {
+            layer = 0;
+            replacement.Reset();
+            return;
+        }
+        stock = pso;
+        gBinds.fetch_add(1, std::memory_order_relaxed);
+    }
 };
+thread_local Recording* gRecording{};
+
 using ResetFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*, ID3D12PipelineState*);
+using BindFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
 using DispatchFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT);
-using SetPipelineStateFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
-
+using BundleFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12GraphicsCommandList*);
 struct ListVtableOrig
 {
     ResetFn reset{};
+    BindFn clear{};
     DispatchFn dispatch{};
-    SetPipelineStateFn setPso{};
+    BindFn bind{};
+    BundleFn bundle{};
 };
-std::mutex gListMutex;
-std::unordered_map<void**, ListVtableOrig> gListVtables;
-std::unordered_map<ID3D12GraphicsCommandList*, ActiveListLayer> gActiveListLayers;
-
-constexpr int kListResetSlot = 10;
-constexpr int kListDispatchSlot = 14;
-constexpr int kListSetPipelineStateSlot = 25;
 
 bool IsEnvOff(const wchar_t* name) noexcept
 {
@@ -126,110 +140,63 @@ bool MatchesKnownLayerSize(size_t byteSize) noexcept
     return false;
 }
 
-ListVtableOrig LookupListOrig(ID3D12GraphicsCommandList* self) noexcept
+// Hook just the provider's first table. A different wrapper or table uses stock DXIL.
+std::mutex gInstallMutex;
+std::atomic<void**> gListTable{};
+ListVtableOrig gOriginal;
+
+HRESULT STDMETHODCALLTYPE HookReset(ID3D12GraphicsCommandList* list, ID3D12CommandAllocator* allocator, ID3D12PipelineState* pso)
 {
-    if (!self)
-        return {};
-    void** vtable = *reinterpret_cast<void***>(self);
-    std::lock_guard lock(gListMutex);
-    const auto it = gListVtables.find(vtable);
-    return it != gListVtables.end() ? it->second : ListVtableOrig{};
+    if (gRecording && gRecording->list == list)
+        gRecording->Bind(nullptr);
+    return gOriginal.reset(list, allocator, pso);
 }
 
-HRESULT STDMETHODCALLTYPE HookListReset(ID3D12GraphicsCommandList* self, ID3D12CommandAllocator* alloc, ID3D12PipelineState* initialState)
+void STDMETHODCALLTYPE HookClear(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso)
 {
-    const auto orig = LookupListOrig(self);
-    {
-        std::lock_guard lock(gListMutex);
-        gActiveListLayers.erase(self);
-    }
-    const HRESULT hr = orig.reset ? orig.reset(self, alloc, initialState) : E_FAIL;
-    if (SUCCEEDED(hr) && initialState && gUseD3D12Dot4.load(std::memory_order_acquire))
-    {
-        ID3D12PipelineState* ov = nullptr;
-        uint8_t idx = 0;
-        {
-            std::lock_guard lock(gPsoMutex);
-            const auto it = gPsoMap.find(initialState);
-            if (it != gPsoMap.end() && it->second.overridePso)
-            {
-                ov = it->second.overridePso.Get();
-                idx = it->second.layerIdx;
-            }
-        }
-        if (ov && idx)
-        {
-            std::lock_guard lock(gListMutex);
-            gActiveListLayers[self] = {initialState, ov, idx};
-        }
-    }
-    return hr;
+    if (gRecording && gRecording->list == list)
+        gRecording->Bind(nullptr);
+    gOriginal.clear(list, pso);
 }
 
-void STDMETHODCALLTYPE HookListSetPipelineState(ID3D12GraphicsCommandList* self, ID3D12PipelineState* pso)
+void STDMETHODCALLTYPE HookBundle(ID3D12GraphicsCommandList* list, ID3D12GraphicsCommandList* bundle)
 {
-    const auto orig = LookupListOrig(self);
-    if (gUseD3D12Dot4.load(std::memory_order_acquire))
-    {
-        ID3D12PipelineState* ov = nullptr;
-        uint8_t idx = 0;
-        if (pso)
-        {
-            std::lock_guard lock(gPsoMutex);
-            const auto it = gPsoMap.find(pso);
-            if (it != gPsoMap.end() && it->second.overridePso)
-            {
-                ov = it->second.overridePso.Get();
-                idx = it->second.layerIdx;
-            }
-        }
-        std::lock_guard lock(gListMutex);
-        if (ov && idx)
-        {
-            gActiveListLayers[self] = {pso, ov, idx};
-            gBinds.fetch_add(1, std::memory_order_relaxed);
-        }
-        else
-        {
-            gActiveListLayers.erase(self);
-        }
-    }
-    if (orig.setPso)
-        orig.setPso(self, pso);
+    if (gRecording && gRecording->list == list)
+        gRecording->Bind(nullptr);
+    gOriginal.bundle(list, bundle);
 }
 
-void STDMETHODCALLTYPE HookListDispatch(ID3D12GraphicsCommandList* self, UINT x, UINT y, UINT z)
+void STDMETHODCALLTYPE HookBind(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso)
 {
-    const auto orig = LookupListOrig(self);
-    if (!orig.dispatch)
-        return;
+    if (gRecording && gRecording->list == list)
+        gRecording->Bind(pso);
+    gOriginal.bind(list, pso);
+}
 
-    if (gUseD3D12Dot4.load(std::memory_order_acquire) && gActive.load(std::memory_order_acquire))
+void STDMETHODCALLTYPE HookDispatch(ID3D12GraphicsCommandList* list, UINT x, UINT y, UINT z)
+{
+    auto* recording = gRecording;
+    if (recording && recording->list == list && recording->layer)
     {
-        ActiveListLayer active{};
+        const auto& layer = xefg_cuda::kLayers[recording->layer - 1];
+        const UINT width = x * layer.intelW;
+        const UINT height = y * layer.intelH;
+        const UINT gx = width / layer.tileW;
+        const UINT gy = height / layer.tileH;
+        // A partial stock grid must never acquire additional rows or columns.
+        if (xefg_cuda::DispatchShapeOk(layer, x, y, z) && width % layer.tileW == 0 &&
+            height % layer.tileH == 0 && gx <= 65535 && gy <= 65535)
         {
-            std::lock_guard lock(gListMutex);
-            const auto it = gActiveListLayers.find(self);
-            if (it != gActiveListLayers.end())
-                active = it->second;
+            gOriginal.bind(list, recording->replacement.Get());
+            gOriginal.dispatch(list, gx, gy, layer.gridZ);
+            gOriginal.bind(list, recording->stock.Get());
+            recording->dispatched = true;
+            gLaunches.fetch_add(1, std::memory_order_relaxed);
+            return;
         }
-        if (active.overridePso && active.layerIdx >= 1 && active.layerIdx <= std::size(xefg_cuda::kLayers))
-        {
-            const auto& layer = xefg_cuda::kLayers[active.layerIdx - 1];
-            if (xefg_cuda::DispatchShapeOk(layer, x, y, z) && orig.setPso)
-            {
-                const UINT gx = (x * layer.intelW + layer.tileW - 1) / layer.tileW;
-                const UINT gy = (y * layer.intelH + layer.tileH - 1) / layer.tileH;
-                orig.setPso(self, active.overridePso);
-                orig.dispatch(self, gx, gy, layer.gridZ);
-                orig.setPso(self, active.stockPso);
-                gLaunches.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
-            gFallbacks.fetch_add(1, std::memory_order_relaxed);
-        }
+        gFallbacks.fetch_add(1, std::memory_order_relaxed);
     }
-    orig.dispatch(self, x, y, z);
+    gOriginal.dispatch(list, x, y, z);
 }
 
 void Log(const char* stage, const std::string& fields) noexcept
@@ -272,7 +239,7 @@ Arch DetectAmdArch(uint32_t vendorId, uint32_t deviceId, std::wstring_view descr
 
     if ((deviceId >= 0x7440 && deviceId <= 0x74FF) ||
         deviceId == 0x15BF || deviceId == 0x15C8 || deviceId == 0x150E ||
-        deviceId == 0x1506 || deviceId == 0x1586 || deviceId == 0x1681 ||
+        deviceId == 0x1506 || deviceId == 0x1586 ||
         description.find(L"RX 7") != std::wstring_view::npos ||
         description.find(L"780M") != std::wstring_view::npos ||
         description.find(L"880M") != std::wstring_view::npos ||
@@ -286,8 +253,7 @@ Arch DetectAmdArch(uint32_t vendorId, uint32_t deviceId, std::wstring_view descr
     }
 
     if ((deviceId >= 0x73A0 && deviceId <= 0x73FF) ||
-        deviceId == 0x163F || deviceId == 0x164D || deviceId == 0x164E ||
-        description.find(L"RX 6") != std::wstring_view::npos ||
+        deviceId == 0x1681 || deviceId == 0x163F || deviceId == 0x164D || deviceId == 0x164E ||
         description.find(L"680M") != std::wstring_view::npos ||
         description.find(L"660M") != std::wstring_view::npos ||
         description.find(L"610M") != std::wstring_view::npos ||
@@ -457,17 +423,8 @@ bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem
             return false;
         }
 
-        // Query D3D12_FEATURE_D3D12_OPTIONS9 (27) for WaveMMA support before architecture gating so diagnostics include it.
-        struct Options9Stub
-        {
-            BOOL MeshShaderPipelineStatsSupported;
-            BOOL MeshShaderSupportsFullRangeRenderTargetArrayIndex;
-            BOOL AtomicInt64OnTypedResourceSupported;
-            BOOL AtomicInt64OnGroupSharedSupported;
-            BOOL DerivativesInMeshAndAmplificationShadersSupported;
-            uint32_t WaveMMATier;
-        } options9{};
-        if (SUCCEEDED(device->CheckFeatureSupport(static_cast<D3D12_FEATURE>(27), &options9, sizeof(options9))))
+        D3D12_FEATURE_DATA_D3D12_OPTIONS9 options9{};
+        if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9, &options9, sizeof(options9))))
             gWaveMmaTier = options9.WaveMMATier;
 
         const Arch arch = (probe.vendorId == 0x1002)
@@ -660,61 +617,91 @@ void OnCreateComputePipelineState(ID3D12Device* device, const D3D12_COMPUTE_PIPE
         if (FAILED(origCreate(device, &ovDesc, IID_PPV_ARGS(&ovPso))) || !ovPso)
             return;
 
-        std::lock_guard lock(gPsoMutex);
-        gPsoMap[stockPso.Get()] = {std::move(ovPso), layerIdx};
+        if (SUCCEEDED(ovPso->SetPrivateData(kDot4Layer, sizeof(layerIdx), &layerIdx)))
+            stockPso->SetPrivateDataInterface(kDot4Override, ovPso.Get());
     }
     catch (...)
     {
     }
 }
 
-void Adopt(ID3D12GraphicsCommandList* list) noexcept
+static bool InstallRecordingHooks(ID3D12GraphicsCommandList* list)
 {
-    if (!UsesD3D12Dot4Override() || !list)
-        return;
-    try
-    {
-        void** vtable = *reinterpret_cast<void***>(list);
-        if (!vtable)
-            return;
-        std::lock_guard lock(gListMutex);
-        if (gListVtables.find(vtable) != gListVtables.end())
-            return;
+    if (!list)
+        return false;
+    void** table = *reinterpret_cast<void***>(list);
+    if (const auto installed = gListTable.load(std::memory_order_acquire))
+        return installed == table;
+    std::lock_guard lock(gInstallMutex);
+    if (const auto installed = gListTable.load(std::memory_order_acquire))
+        return installed == table;
 
-        ListVtableOrig orig{
-            reinterpret_cast<ResetFn>(vtable[kListResetSlot]),
-            reinterpret_cast<DispatchFn>(vtable[kListDispatchSlot]),
-            reinterpret_cast<SetPipelineStateFn>(vtable[kListSetPipelineStateSlot])
-        };
-        if (!orig.reset || !orig.dispatch || !orig.setPso)
-            return;
-
-        DWORD oldProt = 0;
-        const size_t patchBytes = (kListSetPipelineStateSlot + 1) * sizeof(void*);
-        if (!VirtualProtect(vtable, patchBytes, PAGE_EXECUTE_READWRITE, &oldProt))
-            return;
-        gListVtables.emplace(vtable, orig);
-        vtable[kListResetSlot] = reinterpret_cast<void*>(&HookListReset);
-        vtable[kListDispatchSlot] = reinterpret_cast<void*>(&HookListDispatch);
-        vtable[kListSetPipelineStateSlot] = reinterpret_cast<void*>(&HookListSetPipelineState);
-        DWORD ignored = 0;
-        VirtualProtect(vtable, patchBytes, oldProt, &ignored);
-    }
-    catch (...)
+    // ID3D12GraphicsCommandList slots for Reset, ClearState, Dispatch, SetPipelineState and ExecuteBundle.
+    constexpr size_t reset = 10, clear = 11, dispatch = 14, bind = 25, bundle = 27;
+    if (!table || !table[reset] || !table[clear] || !table[dispatch] || !table[bind] || !table[bundle])
+        return false;
+    // Other objects can share this table after Execute returns. Only patch a module-backed
+    // table and keep the implementation and forwarding hooks mapped for those callers.
+    constexpr DWORD fromAddress = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS;
+    HMODULE owner{};
+    if (!GetModuleHandleExW(fromAddress | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(table), &owner))
+        return false;
+    const size_t slots[] = {reset, clear, dispatch, bind, bundle};
+    void* originals[std::size(slots)]{};
+    for (size_t i = 0; i < std::size(slots); ++i)
     {
+        originals[i] = table[slots[i]];
+        HMODULE methodOwner{};
+        if (!GetModuleHandleExW(fromAddress | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                reinterpret_cast<LPCWSTR>(originals[i]), &methodOwner) || methodOwner != owner)
+            return false; // An overlay owns the forwarding chain. Leave it intact.
     }
+    HMODULE keep{};
+    if (!GetModuleHandleExW(fromAddress | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(table), &keep) ||
+        !GetModuleHandleExW(fromAddress | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&HookDispatch), &keep))
+        return false;
+    const size_t bytes = (bundle + 1) * sizeof(void*);
+    DWORD oldProtect{};
+    if (!VirtualProtect(table, bytes, PAGE_READWRITE, &oldProtect))
+        return false;
+    gOriginal = {reinterpret_cast<ResetFn>(originals[0]), reinterpret_cast<BindFn>(originals[1]),
+        reinterpret_cast<DispatchFn>(originals[2]), reinterpret_cast<BindFn>(originals[3]),
+        reinterpret_cast<BundleFn>(originals[4])};
+    const std::array<void*, std::size(slots)> hooks{reinterpret_cast<void*>(&HookReset), reinterpret_cast<void*>(&HookClear),
+        reinterpret_cast<void*>(&HookDispatch), reinterpret_cast<void*>(&HookBind), reinterpret_cast<void*>(&HookBundle)};
+    bool complete = true;
+    for (size_t i = 0; i < hooks.size(); ++i)
+    {
+        if (InterlockedCompareExchangePointer(&table[slots[i]], hooks[i], originals[i]) != originals[i])
+        {
+            complete = false;
+            break;
+        }
+    }
+    DWORD ignored{};
+    VirtualProtect(table, bytes, oldProtect, &ignored);
+    // Publish only a fully installed table. After a concurrent hook collision, the installed
+    // subset remains pass-through and its original forwarding addresses remain immutable.
+    static void* disabledTable{};
+    gListTable.store(complete ? table : &disabledTable, std::memory_order_release);
+    return complete;
 }
 
-void ForgetLayers() noexcept
+xefgd_result_t ExecuteDot4(xefgd_handle_t context, ID3D12GraphicsCommandList* list,
+                           const xefgd_exec_params_t& params, float interpolationTime, bool& usedDot4)
 {
+    Recording recording{};
+    recording.list = InstallRecordingHooks(list) ? list : nullptr;
+    struct Scope
     {
-        std::lock_guard lock(gListMutex);
-        gActiveListLayers.clear();
-    }
-    {
-        std::lock_guard lock(gPsoMutex);
-        gPsoMap.clear();
-    }
+        Recording* previous;
+        ~Scope() { gRecording = previous; }
+    } scope{gRecording};
+    gRecording = &recording;
+    const auto result = XeFG::Execute(context, list, params, interpolationTime);
+    usedDot4 = recording.dispatched;
+    return result;
 }
 
 Status Snapshot() noexcept

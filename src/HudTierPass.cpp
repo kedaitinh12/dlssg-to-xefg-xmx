@@ -170,11 +170,11 @@ void HudDiffCompositeCS(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThr
     {
         uint base = gtid.y * 10u + gtid.x;
         // 1px anti-speckle filter (Intrinsic 4K-Oracle hygiene, 0 extra VRAM reads via 10x10 LDS):
-        // reject isolated 1-pixel specular shimmers (count3x3 <= 1) while preserving real HUD text/crosshairs (>= 2).
+        // Keep the center pixel for single-pixel crosshairs. Only dilate corroborated edges.
         uint count3x3 = g_sDiff[base + 0u]  + g_sDiff[base + 1u]  + g_sDiff[base + 2u]
                       + g_sDiff[base + 10u] + g_sDiff[base + 11u] + g_sDiff[base + 12u]
                       + g_sDiff[base + 20u] + g_sDiff[base + 21u] + g_sDiff[base + 22u];
-        bool hud = (count3x3 >= 2u);
+        bool hud = g_sDiff[base + 11u] != 0u || count3x3 >= 2u;
 
         if ((Flags & 1u) != 0u && hud && (id.x & 3u) == 0u && (id.y & 3u) == 0u)
         {
@@ -405,7 +405,7 @@ void HybridHudCompositeCS(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupT
             count3x3 = g_sDiffHybrid[base + 0u]  + g_sDiffHybrid[base + 1u]  + g_sDiffHybrid[base + 2u]
                      + g_sDiffHybrid[base + 10u] + g_sDiffHybrid[base + 11u] + g_sDiffHybrid[base + 12u]
                      + g_sDiffHybrid[base + 20u] + g_sDiffHybrid[base + 21u] + g_sDiffHybrid[base + 22u];
-            hudDiff = (count3x3 >= 2u);
+            hudDiff = g_sDiffHybrid[base + 11u] != 0u || count3x3 >= 2u;
         }
 
         if ((Flags & 1u) != 0u && hudDiff && (id.x & 3u) == 0u && (id.y & 3u) == 0u)

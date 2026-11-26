@@ -37,7 +37,7 @@ namespace HwFlipQueue
 	{
 		using NTSTATUS = long;
 		using D3DKMT_HANDLE = uint32_t;
-		constexpr uint32_t kKmtQaiTypeWddm30Caps = 71u; // KMTQAITYPE_WDDM_3_0_CAPS
+		constexpr uint32_t kKmtQaiTypeWddm30Caps = 77u; // KMTQAITYPE_WDDM_3_0_CAPS
 
 		struct OpenAdapterFromLuid
 		{
@@ -55,7 +55,7 @@ namespace HwFlipQueue
 
 		struct Wddm30Caps
 		{
-			uint32_t Value; // bit 0 = HwFlipQueueEnabled
+			uint32_t Value; // bit 2 = HwFlipQueueEnabled
 		};
 
 		struct CloseAdapter
@@ -102,7 +102,7 @@ namespace HwFlipQueue
 					queryArg.Type = detail::kKmtQaiTypeWddm30Caps;
 					queryArg.pPrivateDriverData = &caps;
 					queryArg.PrivateDriverDataSize = sizeof(caps);
-					if (queryFn(&queryArg) >= 0 && (caps.Value & 1u) != 0u)
+					if (queryFn(&queryArg) >= 0 && (caps.Value & (1u << 2)) != 0u)
 						result = State::Enabled;
 
 					detail::CloseAdapter closeArg{ openArg.hAdapter };

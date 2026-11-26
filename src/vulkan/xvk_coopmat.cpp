@@ -1,5 +1,6 @@
 #include "xvk_coopmat.h"
 #include "xvk_internal.h"
+#include "VulkanPolicy.h"
 #include "../WineCompat.h"
 #include "../MfgPort/Cuda/cuda_layers.h"
 #include "../MfgPort/Sha256.h"
@@ -96,7 +97,7 @@ bool CoopMatrixRoute::SelectTile(const VkCooperativeMatrixPropertiesKHR* propert
     for (uint32_t i = 0; i < count; ++i)
     {
         const auto& p = properties[i];
-        if (p.scope != VK_SCOPE_SUBGROUP_KHR ||
+        if (p.scope != VK_SCOPE_SUBGROUP_KHR || p.saturatingAccumulation ||
             p.AType != VK_COMPONENT_TYPE_SINT8_KHR ||
             p.BType != VK_COMPONENT_TYPE_SINT8_KHR ||
             p.CType != VK_COMPONENT_TYPE_SINT32_KHR ||
@@ -204,6 +205,15 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
             return false;
         }
 
+        VkPhysicalDeviceSubgroupSizeControlProperties subgroupCtrl{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+        VkPhysicalDeviceDriverProperties driverProps{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES, &subgroupCtrl};
+        VkPhysicalDeviceSubgroupProperties subgroup{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, &driverProps};
+        VkPhysicalDeviceProperties2 devProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &subgroup};
+        props2(desc.physicalDevice, &devProps);
+
         bool allowK32 = true;
         {
             wchar_t envBuf[16]{};
@@ -216,7 +226,9 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
         }
         std::error_code k32DirEc;
         const std::filesystem::path k32Dir = moduleDir / L"k32_16x16x32";
-        const bool preferK32 = allowK32 && std::filesystem::is_regular_file(k32Dir / L"coopmat_layers.tsv", k32DirEc);
+        const auto& gpu = devProps.properties;
+        const bool preferK32 = allowK32 && VulkanPolicy::IsAmdRdna4Device(gpu.vendorID, gpu.deviceID, gpu.deviceName) &&
+            std::filesystem::is_regular_file(k32Dir / L"coopmat_layers.tsv", k32DirEc);
 
         uint32_t m = 0, n = 0, k = 0;
         if (!SelectTile(props.data(), propCount, m, n, k, preferK32))
@@ -224,15 +236,6 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
             reason = "no_s8_matrix_shape";
             return false;
         }
-
-        VkPhysicalDeviceSubgroupSizeControlProperties subgroupCtrl{
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
-        VkPhysicalDeviceDriverProperties driverProps{
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES, &subgroupCtrl};
-        VkPhysicalDeviceSubgroupProperties subgroup{
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, &driverProps};
-        VkPhysicalDeviceProperties2 devProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &subgroup};
-        props2(desc.physicalDevice, &devProps);
 
         const uint32_t wantedSubgroup = (m == 8u && n == 8u && k == 32u) ? 16u : 32u;
         const bool supportsWantedSubgroup =

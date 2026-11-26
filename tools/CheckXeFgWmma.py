@@ -32,8 +32,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     try:
         check(args.directory)
-        split_dir = args.directory / "dot4_split"
-        if split_dir.is_dir():
-            check(split_dir)
+        check(args.directory / "dot4_split")
     except (OSError, ValueError, KeyError) as exc:
         parser.exit(1, f"error: {exc}\n")

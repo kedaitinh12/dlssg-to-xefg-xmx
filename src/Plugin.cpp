@@ -739,7 +739,7 @@ namespace
 			}
 		}
 		HelpMarker("Keeps Vulkan frame pacing just under your monitor refresh rate (Hz - 3)\n"
-				   "so FreeSync / G-Sync stays smooth without V-Sync input lag."
+				   "so FreeSync / G-Sync stays smooth without V-Sync input lag.\n"
 				   "Avoid combining with RTSS / NVCP / AMD Chill FPS caps to prevent double-limiting stutter.");
 
 		bool vkWmmaBridge = Plugin::options.d3d12VulkanWmmaBridge;

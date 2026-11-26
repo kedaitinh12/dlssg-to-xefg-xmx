@@ -25,13 +25,11 @@ namespace XeFgEnabler
 	{
 		float prevAxis[3]{};
 		bool hasPrevAxis = false;
-		uint32_t turnStreak = 0;
 
 		void Reset() noexcept
 		{
 			prevAxis[0] = prevAxis[1] = prevAxis[2] = 0.0f;
 			hasPrevAxis = false;
-			turnStreak = 0;
 		}
 
 		// Returns true when the current frame continues a smooth same-direction camera rotation (e.g. fast mouse flick)
@@ -58,20 +56,7 @@ namespace XeFgEnabler
 			const float ny = ay * invLen;
 			const float nz = az * invLen;
 
-			bool sustained = false;
-			if (hasPrevAxis)
-			{
-				const float axisDot = nx * prevAxis[0] + ny * prevAxis[1] + nz * prevAxis[2];
-				if (axisDot > 0.65f)
-				{
-					++turnStreak;
-					sustained = (turnStreak >= 1u);
-				}
-				else
-				{
-					turnStreak = 0;
-				}
-			}
+			const bool sustained = hasPrevAxis && nx * prevAxis[0] + ny * prevAxis[1] + nz * prevAxis[2] > 0.65f;
 			prevAxis[0] = nx;
 			prevAxis[1] = ny;
 			prevAxis[2] = nz;

@@ -2352,15 +2352,18 @@ namespace
 					   std::sqrt(fwdLenSq * prevLenSq))
 					: 1.0f;
 
-				const float invCur = 1.0f / std::sqrt(fwdLenSq);
-				const float curFwdArr[3] = { fx * invCur, fy * invCur, fz * invCur };
-				const float invPrev = (prevLenSq > 1e-6f) ? (1.0f / std::sqrt(prevLenSq)) : 0.0f;
-				const float prevFwdArr[3] = {
-					f.prevCameraFwd[0] * invPrev,
-					f.prevCameraFwd[1] * invPrev,
-					f.prevCameraFwd[2] * invPrev
-				};
-				sustainedTurn = f.cameraTurnGuard.ObserveAndCheckSustainedTurn(curFwdArr, prevFwdArr, fwdDot);
+				if (ghostBusterOn && !reset)
+				{
+					const float invCur = 1.0f / std::sqrt(fwdLenSq);
+					const float curFwdArr[3] = { fx * invCur, fy * invCur, fz * invCur };
+					const float invPrev = (prevLenSq > 1e-6f) ? (1.0f / std::sqrt(prevLenSq)) : 0.0f;
+					const float prevFwdArr[3] = {
+						f.prevCameraFwd[0] * invPrev,
+						f.prevCameraFwd[1] * invPrev,
+						f.prevCameraFwd[2] * invPrev
+					};
+					sustainedTurn = f.cameraTurnGuard.ObserveAndCheckSustainedTurn(curFwdArr, prevFwdArr, fwdDot);
+				}
 				const float cutThresholdSq = f.cameraMotionScale.CutThresholdSq();
 				const float hardTeleportSq = f.cameraMotionScale.HardTeleportThresholdSq();
 				const bool quietActive = f.syntheticResetQuietFrames > 0u;
@@ -2383,6 +2386,8 @@ namespace
 				}
 			}
 
+			if (reset || !hasCamera || !ghostBusterOn)
+				f.cameraTurnGuard.Reset();
 			if (hasCamera && f.hasPrevCamera)
 				f.cameraMotionScale.ObserveCandidate(std::sqrt(distSq), reset);
 

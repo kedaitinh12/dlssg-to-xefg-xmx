@@ -1,10 +1,9 @@
 #pragma once
-// AMD RDNA 3 / RDNA 4 WMMA capability probe for XeFG's ported XMX MFG model (Model 16).
-// Hardware 16x16x16 INT8 WMMA runs via D3D12VulkanWmma (Vulkan VK_KHR_cooperative_matrix);
-// D3D12 fallback frames and XMX Port run stock D3D12 DXIL directly (the software cs_6_6
-// shared-tile DP4a overrides are disabled because they lack hardware matrix acceleration
-// and regress LDS/VGPR occupancy vs. stock DXIL).
+// AMD model routes: scoped D3D12 dot4 on RDNA 2 and Vulkan cooperative matrices on RDNA 3/4.
 #include <d3d12.h>
+#ifdef _WIN32
+#include "../../XeFG.h"
+#endif
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -37,9 +36,6 @@ struct Status
 using LogFunction = void (*)(const char* stage, const std::string& fields);
 void SetLog(LogFunction log) noexcept;
 
-// Probes whether the underlying D3D12 adapter is an AMD RDNA 3 / RDNA 4 GPU capable of hardware WMMA
-// (bypassing OptiScaler/Streamline device wrappers and DXGI spoofing). Does not install D3D12
-// command-list hooks or software cs_6_6 DP4a overrides.
 bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem::path& wmmaDir, std::string& reason) noexcept;
 void Disable(const char* reason) noexcept;
 void SetEnabled(bool enabled) noexcept;
@@ -52,8 +48,8 @@ bool Dot4SplitActive() noexcept;
 #if defined(_WIN32)
 using CreateComputePsoFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
 void OnCreateComputePipelineState(ID3D12Device* device, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID iid, void* stockPso, CreateComputePsoFn origCreate) noexcept;
+xefgd_result_t ExecuteDot4(xefgd_handle_t context, ID3D12GraphicsCommandList* list, const xefgd_exec_params_t& params,
+                           float interpolationTime, bool& usedDot4);
 #endif
-void Adopt(ID3D12GraphicsCommandList* list) noexcept;
-void ForgetLayers() noexcept;
 Status Snapshot() noexcept;
 } // namespace xefg_wmma

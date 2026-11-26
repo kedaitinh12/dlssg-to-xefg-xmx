@@ -3,6 +3,7 @@
 #include "D3D12QueueFence.h"
 #include "HangWatchdog.h"
 #include "HwFlipQueue.h"
+#include "WineCompat.h"
 #include "Log.h"
 #include "MfgKernels.h"
 #include "MfgPort/Cuda/cuda_route.h"
@@ -824,16 +825,11 @@ void FrameGenerator::ProbeSupport(ID3D12Device* device)
 	if (!device)
 		return;
 
-	static bool loggedHwFlipQueue = false;
-	if (!std::exchange(loggedHwFlipQueue, true))
-	{
-		const auto hwfq = HwFlipQueue::QueryOnce(device, WineCompat::IsWineOrProton());
-		Log::Info("WDDM 3.0 Hardware Flip Queue (HwFlipQueueEnabled): {}", HwFlipQueue::StateName(hwfq));
-	}
-
 	static std::once_flag once;
 	std::call_once(once, [device]
 		{
+			const auto hwfq = HwFlipQueue::QueryOnce(device, WineCompat::IsWineOrProton());
+			Log::Info("WDDM 3.0 Hardware Flip Queue (HwFlipQueueEnabled): {}", HwFlipQueue::StateName(hwfq));
 			const int32_t native = NativeModel(device);
 
 			// XeFG's own XMX network works here; the port and its CUDA/WMMA routes are only needed when it doesn't.
@@ -1744,14 +1740,17 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 				    curFwd.z * context->prevCameraFwd[2]) * invCur / std::sqrt(prevLenSq))
 				: 1.0f;
 
-			const float curFwdArr[3] = { curFwd.x * invCur, curFwd.y * invCur, curFwd.z * invCur };
-			const float invPrev = (prevLenSq > 1e-6f) ? (1.0f / std::sqrt(prevLenSq)) : 0.0f;
-			const float prevFwdArr[3] = {
-				context->prevCameraFwd[0] * invPrev,
-				context->prevCameraFwd[1] * invPrev,
-				context->prevCameraFwd[2] * invPrev
-			};
-			sustainedTurn = context->cameraTurnGuard.ObserveAndCheckSustainedTurn(curFwdArr, prevFwdArr, fwdDot);
+			if (ghostBusterOn && !reset)
+			{
+				const float curFwdArr[3] = { curFwd.x * invCur, curFwd.y * invCur, curFwd.z * invCur };
+				const float invPrev = (prevLenSq > 1e-6f) ? (1.0f / std::sqrt(prevLenSq)) : 0.0f;
+				const float prevFwdArr[3] = {
+					context->prevCameraFwd[0] * invPrev,
+					context->prevCameraFwd[1] * invPrev,
+					context->prevCameraFwd[2] * invPrev
+				};
+				sustainedTurn = context->cameraTurnGuard.ObserveAndCheckSustainedTurn(curFwdArr, prevFwdArr, fwdDot);
+			}
 			const float cutThresholdSq = context->cameraMotionScale.CutThresholdSq();
 			const float hardTeleportSq = context->cameraMotionScale.HardTeleportThresholdSq();
 			const bool quietActive = context->syntheticResetQuietFrames > 0u;
@@ -1775,6 +1774,8 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 			}
 		}
 
+		if (reset || !hasCamera || !ghostBusterOn)
+			context->cameraTurnGuard.Reset();
 		if (hasCamera && context->hasPrevCamera)
 			context->cameraMotionScale.ObserveCandidate(std::sqrt(distSq), reset);
 
@@ -2024,18 +2025,20 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 	else
 	{
 		currentExecRoute = ActiveExecRoute::D3D12Dxil;
-		if (settings.model == MfgKernels::MfgModel && xefg_wmma::UsesD3D12Dot4Override())
-		{
-			currentExecRouteReason = xefg_wmma::Dot4SplitActive() ? "rdna2_dot4_split" : "rdna2_dot4";
-			xefg_wmma::Adopt(cmdList);
-		}
-		else
-		{
-			currentExecRouteReason = "d3d12_dxil";
-		}
+		currentExecRouteReason = "d3d12_dxil";
 	}
 
-	auto result = XeFG::Execute(context->handle, cmdList, params, interpolationTime);
+	bool usedDot4 = false;
+	const bool tryDot4 = currentExecRoute == ActiveExecRoute::D3D12Dxil &&
+		settings.model == MfgKernels::MfgModel && xefg_wmma::UsesD3D12Dot4Override();
+	const auto result = tryDot4
+		? xefg_wmma::ExecuteDot4(context->handle, cmdList, params, interpolationTime, usedDot4)
+		: XeFG::Execute(context->handle, cmdList, params, interpolationTime);
+	if (usedDot4)
+	{
+		currentExecRoute = ActiveExecRoute::D3D12Dot4;
+		currentExecRouteReason = xefg_wmma::Dot4SplitActive() ? "rdna2_dot4_split" : "rdna2_dot4";
+	}
 
 	if (result == XEFGD_RESULT_SUCCESS)
 	{
@@ -2358,6 +2361,7 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 				{
 				case ActiveExecRoute::VulkanWmma: return "Vulkan hardware WMMA";
 				case ActiveExecRoute::D3D12WmmaFallback: return "D3D12 DXIL fallback";
+				case ActiveExecRoute::D3D12Dot4: return "RDNA 2 D3D12 dot4";
 				case ActiveExecRoute::D3D12Dxil: return "D3D12 DXIL";
 				case ActiveExecRoute::Cuda: return "CUDA tensor cores";
 				default: return "none";
