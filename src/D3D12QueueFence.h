@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -17,8 +18,11 @@
 // Lightweight, chain-safe ID3D12CommandQueue::ExecuteCommandLists observer that attaches a per-queue private
 // ID3D12Fence signal to DeferredDestroy entries recorded on a submitted command list.
 // - Fast path when no entries await submission or queue-signal retry: atomic loads (~0 overhead).
-// - If queue->Signal() fails on a submission, remembers the accepting queue so a later successful Signal() on
-//   the same queue (or WaitAllPending() during shutdown) completes the earlier submission cleanly.
+// - Claims awaiting signals BEFORE forwarding ExecuteCommandLists so concurrent recordings reusing the same
+//   command list address allocate a fresh FenceSignal and never inherit the older fence.
+// - Serializes per-queue ExecuteCommandLists + Signal + submitSeq so an earlier fence can never satisfy a newer
+//   submission on the same queue whose Signal() failed, and retains ComPtr<ID3D12CommandQueue> while retry work
+//   remains pending so shutdown WaitAllPending() never dereferences a released queue.
 // - Chain-safe with D3D12VulkanWmma's vtable hook regardless of installation order.
 namespace D3D12QueueFence
 {
@@ -36,6 +40,7 @@ namespace D3D12QueueFence
 
 		struct PerQueueFence
 		{
+			std::shared_ptr<std::mutex> submitMutex;
 			Microsoft::WRL::ComPtr<ID3D12Fence> fence;
 			uint64_t nextValue = 0;
 		};
@@ -49,6 +54,8 @@ namespace D3D12QueueFence
 
 			std::mutex fenceMutex;
 			std::unordered_map<ID3D12CommandQueue*, PerQueueFence> queueFences;
+			// Strong references kept ONLY while a queue has pending failed-Signal retry entries.
+			std::unordered_map<ID3D12CommandQueue*, Microsoft::WRL::ComPtr<ID3D12CommandQueue>> retryQueues;
 		};
 
 		// Intentionally immortal to avoid static-destructor COM release races during DLL_PROCESS_DETACH.
@@ -69,6 +76,46 @@ namespace D3D12QueueFence
 					return s.hooks[i].original;
 			}
 			return nullptr;
+		}
+
+		inline std::shared_ptr<std::mutex> GetQueueSubmitMutex(ID3D12CommandQueue* queue)
+		{
+			State& s = S();
+			std::lock_guard lock(s.fenceMutex);
+			auto& slot = s.queueFences[queue];
+			if (!slot.submitMutex)
+				slot.submitMutex = std::make_shared<std::mutex>();
+			return slot.submitMutex;
+		}
+
+		inline void RetainRetryQueue(ID3D12CommandQueue* queue) noexcept
+		{
+			if (!queue)
+				return;
+			State& s = S();
+			std::lock_guard lock(s.fenceMutex);
+			s.retryQueues[queue] = queue;
+		}
+
+		inline void ReleaseRetryQueueIfEmpty(ID3D12CommandQueue* queue) noexcept
+		{
+			if (!queue || DeferredDestroy::HasAwaitingQueueSignalFor(queue))
+				return;
+			Microsoft::WRL::ComPtr<ID3D12CommandQueue> released;
+			{
+				State& s = S();
+				std::lock_guard lock(s.fenceMutex);
+				// Re-check under fenceMutex in case another thread just retained it.
+				if (DeferredDestroy::HasAwaitingQueueSignalFor(queue))
+					return;
+				auto it = s.retryQueues.find(queue);
+				if (it != s.retryQueues.end())
+				{
+					released = std::move(it->second);
+					s.retryQueues.erase(it);
+				}
+			}
+			// ComPtr released outside fenceMutex.
 		}
 
 		inline bool SignalQueuePrivateFence(ID3D12CommandQueue* queue,
@@ -108,31 +155,47 @@ namespace D3D12QueueFence
 				return;
 			}
 
-			orig(self, numCommandLists, ppCommandLists);
-
+			// Claim awaiting signals for these command lists BEFORE forwarding ExecuteCommandLists so any concurrent
+			// recording reusing the same cmdList address starts a fresh FenceSignal instead of inheriting this fence.
 			const void* const* rawLists = reinterpret_cast<const void* const*>(ppCommandLists);
-			const bool hasCmds = numCommandLists != 0 && ppCommandLists != nullptr &&
-				DeferredDestroy::HasAwaitingSubmitFor(rawLists, numCommandLists);
-			const bool hasQueueRetry = DeferredDestroy::HasAwaitingQueueSignalFor(self);
-			if (!hasCmds && !hasQueueRetry)
-				return;
+			std::vector<std::shared_ptr<DeferredDestroy::FenceSignal>> claimed;
+			if (numCommandLists != 0 && ppCommandLists != nullptr)
+				claimed = DeferredDestroy::ClaimAwaitingSubmits(rawLists, numCommandLists);
 
+			const bool hasQueueRetry = DeferredDestroy::HasAwaitingQueueSignalFor(self);
+			if (claimed.empty() && !hasQueueRetry)
+			{
+				orig(self, numCommandLists, ppCommandLists);
+				return;
+			}
+
+			auto submitMutex = GetQueueSubmitMutex(self);
 			Microsoft::WRL::ComPtr<ID3D12Fence> fence;
 			uint64_t value = 0;
-			if (SignalQueuePrivateFence(self, fence, value))
+			uint64_t submitSeq = 0;
+			bool signaled = false;
+			{
+				std::lock_guard qlock(*submitMutex);
+				orig(self, numCommandLists, ppCommandLists);
+				submitSeq = DeferredDestroy::NextQueueSubmitSeq();
+				signaled = SignalQueuePrivateFence(self, fence, value);
+				if (!signaled && !claimed.empty())
+				{
+					// Retain queue lifetime and record failed-Signal submission while still holding submitMutex
+					// so any subsequent submission on this queue observes it with a strictly greater submitSeq.
+					RetainRetryQueue(self);
+					DeferredDestroy::MarkSignalsAcceptedWithoutFence(self, std::move(claimed), submitSeq);
+				}
+			}
+
+			if (signaled)
 			{
 				auto pred = [fence = std::move(fence), value]() noexcept -> bool {
 					const uint64_t done = fence->GetCompletedValue();
 					return done == UINT64_MAX || done >= value;
 				};
-				if (hasCmds)
-					DeferredDestroy::MarkCommandListsSubmitted(rawLists, numCommandLists, std::move(pred), self);
-				else
-					DeferredDestroy::AttachFenceToQueueSignals(self, std::move(pred));
-			}
-			else if (hasCmds)
-			{
-				DeferredDestroy::MarkCommandListsAcceptedWithoutFence(self, rawLists, numCommandLists);
+				DeferredDestroy::CompleteClaimedSubmits(std::move(claimed), std::move(pred), self, submitSeq);
+				ReleaseRetryQueueIfEmpty(self);
 			}
 		}
 
@@ -203,26 +266,46 @@ namespace D3D12QueueFence
 		return patchedAny;
 	}
 
-	// Best-effort retry for any queues whose Signal() previously failed, followed by a bounded wait for all
+	// Best-effort retry for any retained queues whose Signal() previously failed, followed by a bounded wait for all
 	// tracked per-queue fences during shutdown before DeferredDestroy::Collect(true).
 	inline void WaitAllPending(DWORD timeoutMs = 1000) noexcept
 	{
-		for (const void* rawQueue : DeferredDestroy::AwaitingQueueSignalQueues())
+		detail::State& s = detail::S();
+
+		std::vector<Microsoft::WRL::ComPtr<ID3D12CommandQueue>> retrySnapshot;
 		{
-			auto* queue = const_cast<ID3D12CommandQueue*>(static_cast<const ID3D12CommandQueue*>(rawQueue));
-			Microsoft::WRL::ComPtr<ID3D12Fence> fence;
-			uint64_t value = 0;
-			if (detail::SignalQueuePrivateFence(queue, fence, value))
+			std::lock_guard lock(s.fenceMutex);
+			retrySnapshot.reserve(s.retryQueues.size());
+			for (const auto& kv : s.retryQueues)
 			{
-				DeferredDestroy::AttachFenceToQueueSignals(queue,
-					[fence = std::move(fence), value]() noexcept -> bool {
-						const uint64_t done = fence->GetCompletedValue();
-						return done == UINT64_MAX || done >= value;
-					});
+				if (kv.second)
+					retrySnapshot.push_back(kv.second);
 			}
 		}
 
-		detail::State& s = detail::S();
+		for (auto& queue : retrySnapshot)
+		{
+			auto submitMutex = detail::GetQueueSubmitMutex(queue.Get());
+			Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+			uint64_t value = 0;
+			uint64_t seq = 0;
+			bool signaled = false;
+			{
+				std::lock_guard qlock(*submitMutex);
+				seq = DeferredDestroy::NextQueueSubmitSeq();
+				signaled = detail::SignalQueuePrivateFence(queue.Get(), fence, value);
+			}
+			if (signaled)
+			{
+				DeferredDestroy::AttachFenceToQueueSignals(queue.Get(),
+					[fence = std::move(fence), value]() noexcept -> bool {
+						const uint64_t done = fence->GetCompletedValue();
+						return done == UINT64_MAX || done >= value;
+					}, seq);
+				detail::ReleaseRetryQueueIfEmpty(queue.Get());
+			}
+		}
+
 		std::vector<std::pair<Microsoft::WRL::ComPtr<ID3D12Fence>, uint64_t>> snapshot;
 		{
 			std::lock_guard lock(s.fenceMutex);

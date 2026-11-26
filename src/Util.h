@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -14,10 +15,11 @@
 
 // Keeps objects a recorded command list may still use alive until every submitting D3D12 command queue's private
 // fence completes (or, when queue-fence tracking is unavailable, for `Delay` evaluations).
-// - Multiple Evaluate() calls on the same open (unsubmitted) command list coalesce onto one recording FenceSignal;
-//   once submitted, subsequent recordings reusing the same command list address allocate a fresh FenceSignal.
-// - If a queue accepts command lists but Signal() fails, those signals are tracked against that exact queue so a
-//   subsequent successful Signal() on the same queue (or shutdown retry) completes them cleanly.
+// - Multiple Evaluate() calls on the same open (unsubmitted) command list coalesce onto one recording FenceSignal.
+// - ExecuteCommandLists hooks claim awaiting signals BEFORE forwarding to the runtime so concurrent recordings
+//   reusing the same command list address allocate a fresh FenceSignal and never inherit the older fence.
+// - If a queue accepts command lists but Signal() fails, those signals are tagged with a monotonic submitSeq on that
+//   queue; only a later successful Signal() with submitSeq >= theirs on the same queue can complete them.
 // - Multi-signal entries stay alive until EVERY associated queue fence confirms completion (including on Collect(true)).
 // - Lightweight entries (textures/heaps) drain completely once GPU-ready so backlog never grows unbounded.
 // - Heavy entries (XeFG contexts / FrameGenerators) pace to 1 per Collect() call while ready backlog <= MaxHeavyBacklog
@@ -44,6 +46,13 @@ namespace DeferredDestroy
 		}
 	};
 
+	struct QueuedSignalEntry
+	{
+		const void* queue = nullptr;
+		uint64_t submitSeq = 0;
+		std::shared_ptr<FenceSignal> signal;
+	};
+
 	struct Entry
 	{
 		uint64_t destroyAt = 0;
@@ -57,9 +66,9 @@ namespace DeferredDestroy
 	// libxess_fg.dll that may already be torn down
 	inline std::vector<Entry>& entries = *new std::vector<Entry>;
 	inline std::vector<std::shared_ptr<FenceSignal>>& awaitingSubmit = *new std::vector<std::shared_ptr<FenceSignal>>;
-	inline std::vector<std::pair<const void*, std::shared_ptr<FenceSignal>>>& awaitingQueueSignal =
-		*new std::vector<std::pair<const void*, std::shared_ptr<FenceSignal>>>;
+	inline std::vector<QueuedSignalEntry>& awaitingQueueSignal = *new std::vector<QueuedSignalEntry>;
 	inline uint64_t nextRecordingId = 0;
+	inline std::atomic<uint64_t> nextQueueSubmitSeq{ 0 };
 	inline std::atomic<uint64_t> evaluations{ 0 };
 	inline std::atomic<size_t> pendingCount{ 0 };
 	inline std::atomic<size_t> awaitingSubmitCount{ 0 };
@@ -67,6 +76,11 @@ namespace DeferredDestroy
 	inline std::atomic<bool> queueFenceTrackingEnabled{ false };
 	inline thread_local std::shared_ptr<FenceSignal> tActiveSignal;
 	inline thread_local std::vector<std::shared_ptr<FenceSignal>> tActiveSignals;
+
+	inline uint64_t NextQueueSubmitSeq() noexcept
+	{
+		return nextQueueSubmitSeq.fetch_add(1, std::memory_order_acq_rel) + 1;
+	}
 
 	inline void SetQueueFenceTrackingEnabled(bool enabled) noexcept
 	{
@@ -101,16 +115,16 @@ namespace DeferredDestroy
 
 		awaitingQueueSignal.erase(
 			std::remove_if(awaitingQueueSignal.begin(), awaitingQueueSignal.end(),
-				[](const std::pair<const void*, std::shared_ptr<FenceSignal>>& kv) noexcept {
-					return !kv.second || kv.second.use_count() == 1;
+				[](const QueuedSignalEntry& e) noexcept {
+					return !e.signal || e.signal.use_count() == 1;
 				}),
 			awaitingQueueSignal.end());
 		awaitingQueueSignalCount.store(awaitingQueueSignal.size(), std::memory_order_release);
 	}
 
 	// Coalesces multiple Evaluate() recordings on the SAME still-open (unsubmitted) command list into one FenceSignal.
-	// Once that command list is submitted (or accepted by a queue), any later recording on the same address creates a
-	// new FenceSignal with a strictly greater recordingId.
+	// Once that command list is claimed for submission (before ExecuteCommandLists forwards to the runtime), any later
+	// recording reusing the same command list address creates a new FenceSignal with a strictly greater recordingId.
 	inline std::shared_ptr<FenceSignal> RegisterCommandList(const void* cmdList)
 	{
 		if (!cmdList || !queueFenceTrackingEnabled.load(std::memory_order_acquire))
@@ -148,40 +162,13 @@ namespace DeferredDestroy
 		return false;
 	}
 
-	inline bool HasAwaitingQueueSignalFor(const void* queue) noexcept
+	// Atomically detaches the awaiting FenceSignals belonging to `lists[0..count-1]` BEFORE forwarding
+	// ExecuteCommandLists to the runtime, so any concurrent recording reusing the same cmdList address starts fresh.
+	inline std::vector<std::shared_ptr<FenceSignal>> ClaimAwaitingSubmits(const void* const* lists, UINT count)
 	{
-		if (!queue || awaitingQueueSignalCount.load(std::memory_order_acquire) == 0)
-			return false;
-		std::scoped_lock lock(mutex);
-		for (const auto& kv : awaitingQueueSignal)
-		{
-			if (kv.first == queue)
-				return true;
-		}
-		return false;
-	}
-
-	inline std::vector<const void*> AwaitingQueueSignalQueues()
-	{
-		std::vector<const void*> queues;
-		if (awaitingQueueSignalCount.load(std::memory_order_acquire) == 0)
-			return queues;
-		std::scoped_lock lock(mutex);
-		for (const auto& kv : awaitingQueueSignal)
-		{
-			if (kv.first && std::find(queues.begin(), queues.end(), kv.first) == queues.end())
-				queues.push_back(kv.first);
-		}
-		return queues;
-	}
-
-	// Records that `queue` accepted `lists[0..count-1]` via ExecuteCommandLists, but queue->Signal() failed.
-	// Moves matching signals out of awaitingSubmit into awaitingQueueSignal so a later Signal() on the same queue
-	// (or shutdown retry) can complete them cleanly, while subsequent recordings on the same cmdList get fresh signals.
-	inline void MarkCommandListsAcceptedWithoutFence(const void* queue, const void* const* lists, UINT count) noexcept
-	{
-		if (!queue || !lists || count == 0)
-			return;
+		std::vector<std::shared_ptr<FenceSignal>> claimed;
+		if (!lists || count == 0 || awaitingSubmitCount.load(std::memory_order_acquire) == 0)
+			return claimed;
 		std::scoped_lock lock(mutex);
 		for (UINT i = 0; i < count; ++i)
 		{
@@ -192,16 +179,56 @@ namespace DeferredDestroy
 				});
 			if (it != awaitingSubmit.end())
 			{
-				awaitingQueueSignal.emplace_back(queue, std::move(*it));
+				claimed.push_back(std::move(*it));
 				awaitingSubmit.erase(it);
 			}
 		}
 		awaitingSubmitCount.store(awaitingSubmit.size(), std::memory_order_release);
+		return claimed;
+	}
+
+	inline bool HasAwaitingQueueSignalFor(const void* queue) noexcept
+	{
+		if (!queue || awaitingQueueSignalCount.load(std::memory_order_acquire) == 0)
+			return false;
+		std::scoped_lock lock(mutex);
+		for (const auto& e : awaitingQueueSignal)
+		{
+			if (e.queue == queue)
+				return true;
+		}
+		return false;
+	}
+
+	// Records pre-claimed signals accepted by `queue` at `submitSeq` when queue->Signal() failed.
+	inline void MarkSignalsAcceptedWithoutFence(const void* queue,
+		std::vector<std::shared_ptr<FenceSignal>> signals, uint64_t submitSeq = 0) noexcept
+	{
+		if (!queue || signals.empty())
+			return;
+		if (submitSeq == 0)
+			submitSeq = NextQueueSubmitSeq();
+		std::scoped_lock lock(mutex);
+		for (auto& sig : signals)
+		{
+			if (sig)
+				awaitingQueueSignal.push_back({ queue, submitSeq, std::move(sig) });
+		}
 		awaitingQueueSignalCount.store(awaitingQueueSignal.size(), std::memory_order_release);
 	}
 
-	// Attaches a later successful fence on `queue` to all prior recordings accepted by `queue` whose Signal() failed.
-	inline void AttachFenceToQueueSignals(const void* queue, std::function<bool()> isComplete) noexcept
+	// Convenience overload when signals have not yet been claimed from awaitingSubmit.
+	inline void MarkCommandListsAcceptedWithoutFence(const void* queue, const void* const* lists, UINT count,
+		uint64_t submitSeq = 0) noexcept
+	{
+		auto claimed = ClaimAwaitingSubmits(lists, count);
+		MarkSignalsAcceptedWithoutFence(queue, std::move(claimed), submitSeq);
+	}
+
+	// Attaches a successful fence at `upToSubmitSeq` on `queue` ONLY to prior failed-Signal recordings on `queue`
+	// whose submitSeq <= upToSubmitSeq (so an older fence can never complete a newer submission on the same queue).
+	inline void AttachFenceToQueueSignals(const void* queue, std::function<bool()> isComplete,
+		uint64_t upToSubmitSeq = UINT64_MAX) noexcept
 	{
 		if (!queue || awaitingQueueSignalCount.load(std::memory_order_acquire) == 0)
 			return;
@@ -209,13 +236,13 @@ namespace DeferredDestroy
 		{
 			std::scoped_lock lock(mutex);
 			auto split = std::partition(awaitingQueueSignal.begin(), awaitingQueueSignal.end(),
-				[queue](const std::pair<const void*, std::shared_ptr<FenceSignal>>& kv) noexcept {
-					return kv.first != queue;
+				[queue, upToSubmitSeq](const QueuedSignalEntry& e) noexcept {
+					return !(e.queue == queue && e.submitSeq <= upToSubmitSeq);
 				});
 			for (auto it = split; it != awaitingQueueSignal.end(); ++it)
 			{
-				if (it->second)
-					matched.push_back(std::move(it->second));
+				if (it->signal)
+					matched.push_back(std::move(it->signal));
 			}
 			awaitingQueueSignal.erase(split, awaitingQueueSignal.end());
 			awaitingQueueSignalCount.store(awaitingQueueSignal.size(), std::memory_order_release);
@@ -230,54 +257,44 @@ namespace DeferredDestroy
 		}
 	}
 
-	// Matches awaiting recordings for `lists[0..count-1]` (FIFO) and, when `queue != nullptr`, also completes any
-	// earlier recordings accepted by the same `queue` whose Signal() previously failed.
-	inline void MarkCommandListsSubmitted(const void* const* lists, UINT count,
-		std::function<bool()> isComplete, const void* queue = nullptr) noexcept
+	// Marks pre-claimed signals submitted with `isComplete` and, when `queue != nullptr`, also completes any earlier
+	// failed-Signal submissions on `queue` with submitSeq <= upToSubmitSeq.
+	inline void CompleteClaimedSubmits(std::vector<std::shared_ptr<FenceSignal>> claimed,
+		std::function<bool()> isComplete, const void* queue = nullptr, uint64_t upToSubmitSeq = UINT64_MAX) noexcept
 	{
-		std::vector<std::shared_ptr<FenceSignal>> matched;
+		if (queue && awaitingQueueSignalCount.load(std::memory_order_acquire) != 0)
 		{
 			std::scoped_lock lock(mutex);
-			if (lists && count > 0)
+			auto split = std::partition(awaitingQueueSignal.begin(), awaitingQueueSignal.end(),
+				[queue, upToSubmitSeq](const QueuedSignalEntry& e) noexcept {
+					return !(e.queue == queue && e.submitSeq <= upToSubmitSeq);
+				});
+			for (auto it = split; it != awaitingQueueSignal.end(); ++it)
 			{
-				for (UINT i = 0; i < count; ++i)
-				{
-					const void* target = lists[i];
-					auto it = std::find_if(awaitingSubmit.begin(), awaitingSubmit.end(),
-						[target](const std::shared_ptr<FenceSignal>& sig) noexcept {
-							return sig && sig->cmdList == target;
-						});
-					if (it != awaitingSubmit.end())
-					{
-						matched.push_back(std::move(*it));
-						awaitingSubmit.erase(it);
-					}
-				}
-				awaitingSubmitCount.store(awaitingSubmit.size(), std::memory_order_release);
+				if (it->signal)
+					claimed.push_back(std::move(it->signal));
 			}
-			if (queue && !awaitingQueueSignal.empty())
-			{
-				auto split = std::partition(awaitingQueueSignal.begin(), awaitingQueueSignal.end(),
-					[queue](const std::pair<const void*, std::shared_ptr<FenceSignal>>& kv) noexcept {
-						return kv.first != queue;
-					});
-				for (auto it = split; it != awaitingQueueSignal.end(); ++it)
-				{
-					if (it->second)
-						matched.push_back(std::move(it->second));
-				}
-				awaitingQueueSignal.erase(split, awaitingQueueSignal.end());
-				awaitingQueueSignalCount.store(awaitingQueueSignal.size(), std::memory_order_release);
-			}
+			awaitingQueueSignal.erase(split, awaitingQueueSignal.end());
+			awaitingQueueSignalCount.store(awaitingQueueSignal.size(), std::memory_order_release);
 		}
-		for (auto& sig : matched)
+		for (auto& sig : claimed)
 		{
+			if (!sig)
+				continue;
 			{
 				std::lock_guard slock(sig->mutex);
 				sig->isComplete = isComplete;
 			}
 			sig->submitted.store(true, std::memory_order_release);
 		}
+	}
+
+	// Convenience helper for tests/callers that claim and complete in one step.
+	inline void MarkCommandListsSubmitted(const void* const* lists, UINT count,
+		std::function<bool()> isComplete, const void* queue = nullptr, uint64_t upToSubmitSeq = UINT64_MAX) noexcept
+	{
+		auto claimed = ClaimAwaitingSubmits(lists, count);
+		CompleteClaimedSubmits(std::move(claimed), std::move(isComplete), queue, upToSubmitSeq);
 	}
 
 	struct ScopedCommandList
@@ -452,6 +469,7 @@ namespace DeferredDestroy
 		awaitingSubmit.clear();
 		awaitingQueueSignal.clear();
 		nextRecordingId = 0;
+		nextQueueSubmitSeq.store(0, std::memory_order_release);
 		evaluations.store(0, std::memory_order_relaxed);
 		pendingCount.store(0, std::memory_order_release);
 		awaitingSubmitCount.store(0, std::memory_order_release);
