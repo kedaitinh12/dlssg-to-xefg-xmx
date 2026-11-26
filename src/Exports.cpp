@@ -1,9 +1,11 @@
 #include "Plugin.h"
 // The nvngx_dlssg exports for DX12. XeFG has no Vulkan API, the Vulkan exports are in ExportsVulkan.cpp and hand
 // the calls to MFG-Unlocker's provider
+#include "D3D12QueueFence.h"
 #include "FrameGenerator.h"
 #include "HangWatchdog.h"
 #include "Log.h"
+#include "MfgPort/Cuda/cuda_route.h"
 #include "Util.h"
 
 #include <dxgi.h>
@@ -52,7 +54,9 @@ NGX_EXPORT NGXResult NVSDK_NGX_D3D12_Init_Ext(unsigned long long, const wchar_t*
 NGX_EXPORT NGXResult NVSDK_NGX_D3D12_Shutdown()
 {
 	HangWatchdog::Shutdown();
+	D3D12QueueFence::WaitAllPending(1000);
 	DeferredDestroy::Collect(true);
+	xefg_cuda::FlushBlobCache();
 	return NGX_SUCCESS;
 }
 
@@ -118,7 +122,10 @@ NGX_EXPORT NGXResult NVSDK_NGX_D3D12_ReleaseFeature(NGXHandle* handle)
 		return NGX_FAIL_FEATURE_NOT_FOUND;
 
 	auto feature = static_cast<FeatureHandle*>(handle);
-	DeferredDestroy::Add(std::move(feature->generator));
+	std::vector<std::shared_ptr<DeferredDestroy::FenceSignal>> signals;
+	if (feature->generator)
+		signals = feature->generator->ActiveGpuSignals();
+	DeferredDestroy::Add(std::move(feature->generator), /*heavy=*/true, std::move(signals));
 	delete feature;
 
 	return NGX_SUCCESS;

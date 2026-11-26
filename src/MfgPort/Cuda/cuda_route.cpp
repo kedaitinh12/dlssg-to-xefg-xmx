@@ -1705,11 +1705,15 @@ bool InstallBlobCacheOnly(ID3D12Device* device, HMODULE providerModule) noexcept
 void ContextRetired() noexcept
 {
     gBlobCache.ContextRetired();
-    gBlobCache.SaveToDisk();
     if (gState.load(std::memory_order_acquire) != State::Active) return;
     std::lock_guard lock(gMutex);
     Prune();
     RetireDropped();
+}
+
+void FlushBlobCache() noexcept
+{
+    gBlobCache.SaveToDisk();
 }
 
 void ForgetLayers() noexcept
