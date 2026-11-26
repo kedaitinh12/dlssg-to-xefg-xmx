@@ -11,19 +11,21 @@
 #include <mutex>
 #include <vector>
 
-// Keeps objects a recorded command list may still use alive until the submitting D3D12 command queue's private
+// Keeps objects a recorded command list may still use alive until every submitting D3D12 command queue's private
 // fence completes (or, when queue-fence tracking is unavailable, for `Delay` evaluations).
+// - Per-recording FIFO matching ensures two recordings reusing the same command list address are tracked separately.
+// - Multi-signal entries stay alive until EVERY associated queue fence confirms completion (including on Collect(true)).
 // - Lightweight entries (textures/heaps) drain completely once GPU-ready so backlog never grows unbounded.
 // - Heavy entries (XeFG contexts / FrameGenerators) pace to 1 per Collect() call while ready backlog <= MaxHeavyBacklog
 //   so teardown bursts never stall Streamline's 500ms pacer flush window, yet still stay strictly bounded.
 namespace DeferredDestroy
 {
 	constexpr uint64_t Delay = 64;
-	constexpr uint64_t SubmitFallbackDelay = 256;
 	constexpr size_t MaxHeavyBacklog = 4;
 
 	struct FenceSignal
 	{
+		uint64_t recordingId = 0;
 		const void* cmdList = nullptr;
 		std::atomic<bool> submitted{ false };
 		std::mutex mutex;
@@ -41,9 +43,8 @@ namespace DeferredDestroy
 	struct Entry
 	{
 		uint64_t destroyAt = 0;
-		uint64_t submitFallbackAt = 0;
 		bool heavy = false;
-		std::shared_ptr<FenceSignal> signal;
+		std::vector<std::shared_ptr<FenceSignal>> signals;
 		std::shared_ptr<void> object;
 	};
 
@@ -52,6 +53,7 @@ namespace DeferredDestroy
 	// libxess_fg.dll that may already be torn down
 	inline std::vector<Entry>& entries = *new std::vector<Entry>;
 	inline std::vector<std::shared_ptr<FenceSignal>>& awaitingSubmit = *new std::vector<std::shared_ptr<FenceSignal>>;
+	inline uint64_t nextRecordingId = 0;
 	inline std::atomic<uint64_t> evaluations{ 0 };
 	inline std::atomic<size_t> pendingCount{ 0 };
 	inline std::atomic<size_t> awaitingSubmitCount{ 0 };
@@ -68,6 +70,17 @@ namespace DeferredDestroy
 		return awaitingSubmitCount.load(std::memory_order_acquire);
 	}
 
+	inline void PruneUnreferencedAwaitingLocked() noexcept
+	{
+		awaitingSubmit.erase(
+			std::remove_if(awaitingSubmit.begin(), awaitingSubmit.end(),
+				[](const std::shared_ptr<FenceSignal>& sig) noexcept {
+					return !sig || sig.use_count() == 1;
+				}),
+			awaitingSubmit.end());
+		awaitingSubmitCount.store(awaitingSubmit.size(), std::memory_order_release);
+	}
+
 	inline std::shared_ptr<FenceSignal> RegisterCommandList(const void* cmdList)
 	{
 		if (!cmdList || !queueFenceTrackingEnabled.load(std::memory_order_acquire))
@@ -75,9 +88,10 @@ namespace DeferredDestroy
 		auto sig = std::make_shared<FenceSignal>();
 		sig->cmdList = cmdList;
 		std::scoped_lock lock(mutex);
-		// Bound awaitingSubmit in case a caller repeatedly records and discards command lists without submitting.
+		sig->recordingId = ++nextRecordingId;
+		// Only prune abandoned recordings that no live Entry, FrameGenerator, or ScopedCommandList references.
 		if (awaitingSubmit.size() >= 64)
-			awaitingSubmit.erase(awaitingSubmit.begin());
+			PruneUnreferencedAwaitingLocked();
 		awaitingSubmit.push_back(sig);
 		awaitingSubmitCount.store(awaitingSubmit.size(), std::memory_order_release);
 		return sig;
@@ -99,6 +113,8 @@ namespace DeferredDestroy
 		return false;
 	}
 
+	// Matches at most ONE awaiting recording (FIFO, oldest first) per occurrence in `lists[0..count-1]` so
+	// two distinct recordings reusing the same command list address never collapse onto the first submission's fence.
 	inline void MarkCommandListsSubmitted(const void* const* lists, UINT count,
 		std::function<bool()> isComplete) noexcept
 	{
@@ -107,15 +123,19 @@ namespace DeferredDestroy
 		std::vector<std::shared_ptr<FenceSignal>> matched;
 		{
 			std::scoped_lock lock(mutex);
-			auto split = std::partition(awaitingSubmit.begin(), awaitingSubmit.end(),
-				[lists, count](const std::shared_ptr<FenceSignal>& sig) {
-					for (UINT i = 0; i < count; ++i)
-						if (sig->cmdList == lists[i])
-							return false;
-					return true;
-				});
-			matched.assign(std::make_move_iterator(split), std::make_move_iterator(awaitingSubmit.end()));
-			awaitingSubmit.erase(split, awaitingSubmit.end());
+			for (UINT i = 0; i < count; ++i)
+			{
+				const void* target = lists[i];
+				auto it = std::find_if(awaitingSubmit.begin(), awaitingSubmit.end(),
+					[target](const std::shared_ptr<FenceSignal>& sig) noexcept {
+						return sig && sig->cmdList == target;
+					});
+				if (it != awaitingSubmit.end())
+				{
+					matched.push_back(std::move(*it));
+					awaitingSubmit.erase(it);
+				}
+			}
 			awaitingSubmitCount.store(awaitingSubmit.size(), std::memory_order_release);
 		}
 		for (auto& sig : matched)
@@ -156,27 +176,45 @@ namespace DeferredDestroy
 		return sig;
 	}
 
-	inline void Add(std::shared_ptr<void> object, bool heavy = false, std::shared_ptr<FenceSignal> signal = nullptr)
+	inline void Add(std::shared_ptr<void> object, bool heavy,
+		std::vector<std::shared_ptr<FenceSignal>> signals)
 	{
 		if (!object)
 			return;
-		if (!signal)
-			signal = tActiveSignal;
+		signals.erase(
+			std::remove_if(signals.begin(), signals.end(),
+				[](const std::shared_ptr<FenceSignal>& s) noexcept { return !s; }),
+			signals.end());
+		if (signals.empty() && tActiveSignal)
+			signals.push_back(tActiveSignal);
 		std::scoped_lock lock(mutex);
 		const uint64_t now = evaluations.load(std::memory_order_relaxed);
-		entries.push_back({ now + Delay, now + SubmitFallbackDelay, heavy, std::move(signal), std::move(object) });
+		entries.push_back({ now + Delay, heavy, std::move(signals), std::move(object) });
 		pendingCount.store(entries.size(), std::memory_order_release);
 	}
 
-	inline bool IsEntryReady(Entry& e, uint64_t now) noexcept
+	inline void Add(std::shared_ptr<void> object, bool heavy = false, std::shared_ptr<FenceSignal> signal = nullptr)
 	{
-		if (e.signal)
+		std::vector<std::shared_ptr<FenceSignal>> signals;
+		if (signal)
+			signals.push_back(std::move(signal));
+		Add(std::move(object), heavy, std::move(signals));
+	}
+
+	inline bool AreAllSignalsComplete(const Entry& e) noexcept
+	{
+		for (const auto& sig : e.signals)
 		{
-			if (e.signal->submitted.load(std::memory_order_acquire))
-				return e.signal->IsGpuComplete();
-			// Command list was recorded but never observed on ExecuteCommandLists; only fall back after a long grace window.
-			return now >= e.submitFallbackAt;
+			if (!sig || !sig->IsGpuComplete())
+				return false;
 		}
+		return true;
+	}
+
+	inline bool IsEntryReady(const Entry& e, uint64_t now) noexcept
+	{
+		if (!e.signals.empty())
+			return AreAllSignalsComplete(e);
 		return now >= e.destroyAt;
 	}
 
@@ -191,9 +229,19 @@ namespace DeferredDestroy
 			std::scoped_lock lock(mutex);
 			if (all)
 			{
-				due.swap(entries);
-				awaitingSubmit.clear();
-				awaitingSubmitCount.store(0, std::memory_order_release);
+				// Even on shutdown (all == true), never destroy entries whose attached GPU fences are incomplete
+				// or whose command lists have not yet been confirmed submitted.
+				std::vector<Entry> keep;
+				keep.reserve(entries.size());
+				for (auto& e : entries)
+				{
+					if (e.signals.empty() || AreAllSignalsComplete(e))
+						due.push_back(std::move(e));
+					else
+						keep.push_back(std::move(e));
+				}
+				entries.swap(keep);
+				PruneUnreferencedAwaitingLocked();
 			}
 			else
 			{
@@ -244,6 +292,7 @@ namespace DeferredDestroy
 		std::scoped_lock lock(mutex);
 		entries.clear();
 		awaitingSubmit.clear();
+		nextRecordingId = 0;
 		evaluations.store(0, std::memory_order_relaxed);
 		pendingCount.store(0, std::memory_order_release);
 		awaitingSubmitCount.store(0, std::memory_order_release);

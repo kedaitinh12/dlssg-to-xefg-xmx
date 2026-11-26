@@ -25,7 +25,7 @@ public:
 
 	// Called once per generated frame, DLSSG.MultiFrameIndex 1 starts a new real frame
 	NGXResult Evaluate(ID3D12GraphicsCommandList* cmdList, const NGXParameter& params);
-	std::shared_ptr<DeferredDestroy::FenceSignal> LastGpuSignal() const noexcept;
+	std::vector<std::shared_ptr<DeferredDestroy::FenceSignal>> ActiveGpuSignals() const;
 
 	// Probes XeFG's own XMX network and the CUDA tensor-core route once, as soon as a device is available. Fills
 	// Plugin::xmxSupport and Plugin::cudaSupport so the menu can disable paths that would fail before the first FG
@@ -199,6 +199,6 @@ private:
 		void ResolveSlot(ID3D12GraphicsCommandList* cmdList) noexcept;
 	};
 	GpuProfiler gpuProfiler;
-	mutable std::mutex lastSignalMutex;
-	std::shared_ptr<DeferredDestroy::FenceSignal> lastGpuSignal;
+	mutable std::mutex activeSignalsMutex;
+	std::vector<std::shared_ptr<DeferredDestroy::FenceSignal>> activeGpuSignals;
 };
