@@ -2148,6 +2148,7 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 {
 	D3D12QueueFence::Install(device.Get());
 	DeferredDestroy::ScopedCommandList deferredScope(cmdList);
+	std::vector<std::shared_ptr<DeferredDestroy::FenceSignal>> evalSignals;
 	if (deferredScope.current)
 	{
 		std::lock_guard lock(activeSignalsMutex);
@@ -2157,8 +2158,17 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 					return !s || s->IsGpuComplete();
 				}),
 			activeGpuSignals.end());
-		activeGpuSignals.push_back(deferredScope.current);
+		if (std::find(activeGpuSignals.begin(), activeGpuSignals.end(), deferredScope.current) == activeGpuSignals.end())
+			activeGpuSignals.push_back(deferredScope.current);
+		evalSignals = activeGpuSignals;
 	}
+	else
+	{
+		evalSignals = ActiveGpuSignals();
+	}
+	// Bind ALL in-flight queue signals to every DeferredDestroy::Add inside Evaluate (including depth/motion/HUD
+	// texture replacements) so a faster Compute queue never frees a texture still read by a busy Direct queue.
+	DeferredDestroy::ScopedSignals deferredSignalsScope(std::move(evalSignals));
 
 	auto backbuffer = params.GetOr<ID3D12Resource*>("DLSSG.Backbuffer", nullptr);
 	auto output = params.GetOr<ID3D12Resource*>("DLSSG.OutputInterpolated", nullptr);

@@ -171,12 +171,13 @@ namespace
 		Check(DeferredDestroy::PendingCount() == 0, "Pending count drops to 0 after fence completion");
 	}
 
-	void TestMultiQueueRetirementWaitsForAllQueues()
+	void TestMultiQueueRetirementAndTextureReplacementWaitForAllQueues()
 	{
 		DeferredDestroy::ResetForTests();
 		DeferredDestroy::SetQueueFenceTrackingEnabled(true);
 
-		std::atomic<int> destroyed{ 0 };
+		std::atomic<int> genDestroyed{ 0 };
+		std::atomic<int> texDestroyed{ 0 };
 		std::atomic<bool> directDone{ false };
 		std::atomic<bool> computeDone{ false };
 		const void* directCmd = reinterpret_cast<const void*>(uintptr_t(0x20000000));
@@ -191,9 +192,13 @@ namespace
 			return directDone.load(std::memory_order_acquire);
 		});
 
+		// Second Evaluate runs on Compute queue and replaces depth/motion/HUD texture via plain DeferredDestroy::Add().
+		// ScopedSignals binds ALL active signals so the replaced texture also waits on the busy Direct queue.
 		{
 			DeferredDestroy::ScopedCommandList s2(computeCmd);
 			activeSignals.push_back(s2.current);
+			DeferredDestroy::ScopedSignals scoped(activeSignals);
+			DeferredDestroy::Add(std::make_shared<TrackedObject>(&texDestroyed), /*heavy=*/false);
 		}
 		DeferredDestroy::MarkCommandListsSubmitted(&computeCmd, 1, [&]() noexcept {
 			return computeDone.load(std::memory_order_acquire);
@@ -203,20 +208,57 @@ namespace
 		computeDone.store(true, std::memory_order_release);
 
 		// Simulate ReleaseFeature passing all active signals from the generator.
-		DeferredDestroy::Add(std::make_shared<TrackedObject>(&destroyed), /*heavy=*/true, activeSignals);
+		DeferredDestroy::Add(std::make_shared<TrackedObject>(&genDestroyed), /*heavy=*/true, activeSignals);
 
 		for (int i = 0; i < 10; ++i)
 			DeferredDestroy::Collect(false);
-		Check(destroyed.load() == 0, "Generator must NOT be freed while Direct queue is still busy even if Compute finished");
+		Check(texDestroyed.load() == 0, "Replaced texture must NOT be freed while Direct queue is still reading it");
+		Check(genDestroyed.load() == 0, "Generator must NOT be freed while Direct queue is still busy even if Compute finished");
 
-		// Now Direct queue also finishes -> freed on next Collect().
+		// Now Direct queue also finishes -> both replaced texture and generator are freed on next Collect().
 		directDone.store(true, std::memory_order_release);
 		DeferredDestroy::Collect(false);
-		Check(destroyed.load() == 1 && DeferredDestroy::PendingCount() == 0,
-			"Generator is freed once all involved queues complete");
+		Check(texDestroyed.load() == 1 && genDestroyed.load() == 1 && DeferredDestroy::PendingCount() == 0,
+			"Replaced texture and generator are freed once all involved queues complete");
 	}
 
-	void TestSameCommandListAddressTrackedPerRecording()
+	void TestMultipleEvaluatesPerOpenCommandListCoalesceWithZeroLeak()
+	{
+		DeferredDestroy::ResetForTests();
+		DeferredDestroy::SetQueueFenceTrackingEnabled(true);
+
+		std::atomic<int> destroyed{ 0 };
+		const void* cmdList = reinterpret_cast<const void*>(uintptr_t(0x40000000));
+
+		// Simulate 256 rounds where 2 Evaluate() calls record into the SAME open command list, then game submits ONCE.
+		for (int round = 0; round < 256; ++round)
+		{
+			std::shared_ptr<DeferredDestroy::FenceSignal> sig1;
+			std::shared_ptr<DeferredDestroy::FenceSignal> sig2;
+			{
+				DeferredDestroy::ScopedCommandList s1(cmdList);
+				sig1 = s1.current;
+				DeferredDestroy::Add(std::make_shared<TrackedObject>(&destroyed), /*heavy=*/false);
+			}
+			{
+				DeferredDestroy::ScopedCommandList s2(cmdList);
+				sig2 = s2.current;
+				DeferredDestroy::Add(std::make_shared<TrackedObject>(&destroyed), /*heavy=*/false);
+			}
+			if (round == 0)
+			{
+				Check(sig1 == sig2, "Two Evaluates on the same open command list coalesce onto one FenceSignal");
+				Check(DeferredDestroy::AwaitingSubmitCount() == 1, "Coalesced open recording occupies 1 awaitingSubmit slot");
+			}
+			DeferredDestroy::MarkCommandListsSubmitted(&cmdList, 1, []() noexcept { return true; });
+			DeferredDestroy::Collect(false);
+		}
+		Check(DeferredDestroy::AwaitingSubmitCount() == 0, "Zero orphaned signals left in awaitingSubmit after 256 rounds");
+		Check(destroyed.load() == 512 && DeferredDestroy::PendingCount() == 0,
+			"All 512 resources from 256 coalesced 2-eval batches freed cleanly");
+	}
+
+	void TestSameCommandListAddressAcrossSeparateSubmissionsTrackedSeparately()
 	{
 		DeferredDestroy::ResetForTests();
 		DeferredDestroy::SetQueueFenceTrackingEnabled(true);
@@ -227,34 +269,37 @@ namespace
 		std::atomic<bool> fence2Done{ false };
 		const void* reusedCmdList = reinterpret_cast<const void*>(uintptr_t(0x50000000));
 
-		// Two distinct recordings reuse the exact same command list pointer before the first submit is observed.
+		// Recording 1 on reusedCmdList -> submitted with fence1 (still busy on GPU).
+		std::shared_ptr<DeferredDestroy::FenceSignal> sig1;
 		{
 			DeferredDestroy::ScopedCommandList s1(reusedCmdList);
+			sig1 = s1.current;
 			DeferredDestroy::Add(std::make_shared<TrackedObject>(&destroyed1), /*heavy=*/false);
 		}
-		{
-			DeferredDestroy::ScopedCommandList s2(reusedCmdList);
-			DeferredDestroy::Add(std::make_shared<TrackedObject>(&destroyed2), /*heavy=*/false);
-		}
-		Check(DeferredDestroy::AwaitingSubmitCount() == 2, "Both recordings tracked separately in awaitingSubmit");
-
-		// First ExecuteCommandLists submission covers ONLY the first recording (FIFO).
 		DeferredDestroy::MarkCommandListsSubmitted(&reusedCmdList, 1, [&]() noexcept {
 			return fence1Done.load(std::memory_order_acquire);
 		});
-		Check(DeferredDestroy::AwaitingSubmitCount() == 1, "Second recording stays awaiting submission after first submit");
 
+		// Recording 2 resets and reuses the exact same command list address while fence1 is still in flight.
+		std::shared_ptr<DeferredDestroy::FenceSignal> sig2;
+		{
+			DeferredDestroy::ScopedCommandList s2(reusedCmdList);
+			sig2 = s2.current;
+			DeferredDestroy::Add(std::make_shared<TrackedObject>(&destroyed2), /*heavy=*/false);
+		}
+		Check(sig1 != sig2 && sig2->recordingId > sig1->recordingId,
+			"New recording after submit allocates a distinct FenceSignal with higher recordingId");
+
+		// Completing fence1 frees Recording 1 ONLY; Recording 2 is still awaiting its own submit.
 		fence1Done.store(true, std::memory_order_release);
 		DeferredDestroy::Collect(false);
 		Check(destroyed1.load() == 1, "First recording freed when fence 1 completes");
 		Check(destroyed2.load() == 0, "Second recording MUST NOT be marked complete by fence 1");
 
-		// Second ExecuteCommandLists submission attaches fence 2 to the second recording.
+		// Second submission attaches fence2 to Recording 2.
 		DeferredDestroy::MarkCommandListsSubmitted(&reusedCmdList, 1, [&]() noexcept {
 			return fence2Done.load(std::memory_order_acquire);
 		});
-		Check(DeferredDestroy::AwaitingSubmitCount() == 0, "Awaiting submit reaches 0 after second submit");
-
 		DeferredDestroy::Collect(false);
 		Check(destroyed2.load() == 0, "Second recording waits until fence 2 completes");
 
@@ -262,6 +307,57 @@ namespace
 		DeferredDestroy::Collect(false);
 		Check(destroyed2.load() == 1 && DeferredDestroy::PendingCount() == 0,
 			"Second recording freed once fence 2 completes");
+	}
+
+	void TestFailedQueueSignalRecoversOnLaterSubmissionOfSameQueue()
+	{
+		DeferredDestroy::ResetForTests();
+		DeferredDestroy::SetQueueFenceTrackingEnabled(true);
+
+		std::atomic<int> destroyed1{ 0 };
+		std::atomic<int> destroyed2{ 0 };
+		std::atomic<bool> queue1LaterFenceDone{ false };
+		const void* queue1 = reinterpret_cast<const void*>(uintptr_t(0xA0000001));
+		const void* queue2 = reinterpret_cast<const void*>(uintptr_t(0xA0000002));
+		const void* cmd1 = reinterpret_cast<const void*>(uintptr_t(0x61000000));
+		const void* cmd2 = reinterpret_cast<const void*>(uintptr_t(0x62000000));
+
+		// Recording 1 on cmd1 -> queue1 accepts cmd1, but queue1->Signal() fails!
+		{
+			DeferredDestroy::ScopedCommandList s1(cmd1);
+			DeferredDestroy::Add(std::make_shared<TrackedObject>(&destroyed1), /*heavy=*/false);
+		}
+		DeferredDestroy::MarkCommandListsAcceptedWithoutFence(queue1, &cmd1, 1);
+		Check(DeferredDestroy::AwaitingSubmitCount() == 0, "Accepted cmd1 moved out of awaitingSubmit");
+		Check(DeferredDestroy::AwaitingQueueSignalCount() == 1 && DeferredDestroy::HasAwaitingQueueSignalFor(queue1),
+			"Accepted cmd1 tracked against queue1 awaiting fence retry");
+
+		// Neither Collect(false), Collect(true), nor a DIFFERENT queue (queue2) completing may free obj1 prematurely.
+		DeferredDestroy::AttachFenceToQueueSignals(queue2, []() noexcept { return true; });
+		DeferredDestroy::Collect(false);
+		DeferredDestroy::Collect(true);
+		Check(destroyed1.load() == 0 && DeferredDestroy::AwaitingQueueSignalCount() == 1,
+			"Failed Signal() entry stays safe across Collect(true) and unrelated queue2 fences");
+
+		// Later submission on the SAME queue1 (with a different command list cmd2) succeeds with a fence.
+		{
+			DeferredDestroy::ScopedCommandList s2(cmd2);
+			DeferredDestroy::Add(std::make_shared<TrackedObject>(&destroyed2), /*heavy=*/false);
+		}
+		DeferredDestroy::MarkCommandListsSubmitted(&cmd2, 1, [&]() noexcept {
+			return queue1LaterFenceDone.load(std::memory_order_acquire);
+		}, queue1);
+		Check(DeferredDestroy::AwaitingQueueSignalCount() == 0, "queue1 retry list drained once later fence attached");
+
+		// While the later fence on queue1 is still incomplete, both obj1 and obj2 stay alive.
+		DeferredDestroy::Collect(true);
+		Check(destroyed1.load() == 0 && destroyed2.load() == 0, "Both submissions wait until queue1's later fence completes");
+
+		// Once queue1's later fence completes, both obj1 and obj2 are freed cleanly!
+		queue1LaterFenceDone.store(true, std::memory_order_release);
+		DeferredDestroy::Collect(true);
+		Check(destroyed1.load() == 1 && destroyed2.load() == 1 && DeferredDestroy::PendingCount() == 0,
+			"Earlier failed-Signal() submission is freed once a later fence on the same queue completes");
 	}
 
 	void TestUnconfirmedSubmitNeverBypassesFenceAt256()
@@ -378,8 +474,10 @@ int main()
 	TestReleaseFeatureThenCreateFeatureDoesNotWipeNewBridge();
 	TestConcurrentCommitAndDestructorSerialized();
 	TestDeferredDestroyWaitsForQueueFencePast64Evaluations();
-	TestMultiQueueRetirementWaitsForAllQueues();
-	TestSameCommandListAddressTrackedPerRecording();
+	TestMultiQueueRetirementAndTextureReplacementWaitForAllQueues();
+	TestMultipleEvaluatesPerOpenCommandListCoalesceWithZeroLeak();
+	TestSameCommandListAddressAcrossSeparateSubmissionsTrackedSeparately();
+	TestFailedQueueSignalRecoversOnLaterSubmissionOfSameQueue();
 	TestUnconfirmedSubmitNeverBypassesFenceAt256();
 	TestShutdownCollectAllRespectsIncompleteAndUnsubmittedFences();
 	TestDeferredDestroyNoUnboundedBacklogAtTwoAddsPerEval();

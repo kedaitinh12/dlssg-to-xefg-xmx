@@ -16,7 +16,9 @@
 
 // Lightweight, chain-safe ID3D12CommandQueue::ExecuteCommandLists observer that attaches a per-queue private
 // ID3D12Fence signal to DeferredDestroy entries recorded on a submitted command list.
-// - Fast path when no entries await submission: single atomic load (~0 overhead).
+// - Fast path when no entries await submission or queue-signal retry: atomic loads (~0 overhead).
+// - If queue->Signal() fails on a submission, remembers the accepting queue so a later successful Signal() on
+//   the same queue (or WaitAllPending() during shutdown) completes the earlier submission cleanly.
 // - Chain-safe with D3D12VulkanWmma's vtable hook regardless of installation order.
 namespace D3D12QueueFence
 {
@@ -100,7 +102,7 @@ namespace D3D12QueueFence
 			if (!orig)
 				return;
 
-			if (DeferredDestroy::AwaitingSubmitCount() == 0 || !numCommandLists || !ppCommandLists)
+			if (!DeferredDestroy::HasAnyPendingSubmitOrQueueSignal())
 			{
 				orig(self, numCommandLists, ppCommandLists);
 				return;
@@ -108,18 +110,29 @@ namespace D3D12QueueFence
 
 			orig(self, numCommandLists, ppCommandLists);
 
-			if (!DeferredDestroy::HasAwaitingSubmitFor(reinterpret_cast<const void* const*>(ppCommandLists), numCommandLists))
+			const void* const* rawLists = reinterpret_cast<const void* const*>(ppCommandLists);
+			const bool hasCmds = numCommandLists != 0 && ppCommandLists != nullptr &&
+				DeferredDestroy::HasAwaitingSubmitFor(rawLists, numCommandLists);
+			const bool hasQueueRetry = DeferredDestroy::HasAwaitingQueueSignalFor(self);
+			if (!hasCmds && !hasQueueRetry)
 				return;
 
 			Microsoft::WRL::ComPtr<ID3D12Fence> fence;
 			uint64_t value = 0;
 			if (SignalQueuePrivateFence(self, fence, value))
 			{
-				DeferredDestroy::MarkCommandListsSubmitted(reinterpret_cast<const void* const*>(ppCommandLists), numCommandLists,
-					[fence = std::move(fence), value]() noexcept -> bool {
-						const uint64_t done = fence->GetCompletedValue();
-						return done == UINT64_MAX || done >= value;
-					});
+				auto pred = [fence = std::move(fence), value]() noexcept -> bool {
+					const uint64_t done = fence->GetCompletedValue();
+					return done == UINT64_MAX || done >= value;
+				};
+				if (hasCmds)
+					DeferredDestroy::MarkCommandListsSubmitted(rawLists, numCommandLists, std::move(pred), self);
+				else
+					DeferredDestroy::AttachFenceToQueueSignals(self, std::move(pred));
+			}
+			else if (hasCmds)
+			{
+				DeferredDestroy::MarkCommandListsAcceptedWithoutFence(self, rawLists, numCommandLists);
 			}
 		}
 
@@ -190,9 +203,25 @@ namespace D3D12QueueFence
 		return patchedAny;
 	}
 
-	// Best-effort bounded wait for all tracked per-queue fences during shutdown before DeferredDestroy::Collect(true).
+	// Best-effort retry for any queues whose Signal() previously failed, followed by a bounded wait for all
+	// tracked per-queue fences during shutdown before DeferredDestroy::Collect(true).
 	inline void WaitAllPending(DWORD timeoutMs = 1000) noexcept
 	{
+		for (const void* rawQueue : DeferredDestroy::AwaitingQueueSignalQueues())
+		{
+			auto* queue = const_cast<ID3D12CommandQueue*>(static_cast<const ID3D12CommandQueue*>(rawQueue));
+			Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+			uint64_t value = 0;
+			if (detail::SignalQueuePrivateFence(queue, fence, value))
+			{
+				DeferredDestroy::AttachFenceToQueueSignals(queue,
+					[fence = std::move(fence), value]() noexcept -> bool {
+						const uint64_t done = fence->GetCompletedValue();
+						return done == UINT64_MAX || done >= value;
+					});
+			}
+		}
+
 		detail::State& s = detail::S();
 		std::vector<std::pair<Microsoft::WRL::ComPtr<ID3D12Fence>, uint64_t>> snapshot;
 		{
