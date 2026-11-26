@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include "XeFgEnabler.h"
+#include "HwFlipQueue.h"
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -667,6 +668,51 @@ int main()
 		CHECK(p.skipBatch);
 		const uint64_t followWait = p.ComputePresentWaitNs(step * 3 + 20'500'000ull, false);
 		CHECK(followWait == 0);
+	}
+
+	// Intel Arc Battlemage (0x8086) 4 KiB alignment guard for pooled compute buffers in [4 KiB, 64 KiB]
+	{
+		CHECK(VulkanPolicy::SafeBufferAlignment(0x8086u, 4096ull, 64ull) == 4096ull);
+		CHECK(VulkanPolicy::SafeBufferAlignment(0x8086u, 32768ull, 256ull) == 4096ull);
+		CHECK(VulkanPolicy::SafeBufferAlignment(0x8086u, 65536ull, 64ull) == 4096ull);
+		CHECK(VulkanPolicy::SafeBufferAlignment(0x8086u, 65536ull, 65536ull) == 65536ull);
+		CHECK(VulkanPolicy::SafeBufferAlignment(0x8086u, 2048ull, 64ull) == 64ull);
+		CHECK(VulkanPolicy::SafeBufferAlignment(0x8086u, 131072ull, 64ull) == 64ull);
+		CHECK(VulkanPolicy::SafeBufferAlignment(0x1002u, 16384ull, 64ull) == 64ull);
+		CHECK(VulkanPolicy::SafeBufferAlignment(0x10DEu, 16384ull, 64ull) == 64ull);
+	}
+
+	// Coarse optical-flow 4K+ recommendation policy
+	{
+		CHECK(VulkanPolicy::ShouldUseCoarseFlow(3840u, 2160u));
+		CHECK(VulkanPolicy::ShouldUseCoarseFlow(5120u, 2160u));
+		CHECK(!VulkanPolicy::ShouldUseCoarseFlow(2560u, 1440u));
+		CHECK(!VulkanPolicy::ShouldUseCoarseFlow(1920u, 1080u));
+	}
+
+	// CameraTurnGuard: sustained same-direction yaw flick suppresses false GhostBuster reset; instant cut still resets
+	{
+		XeFgEnabler::CameraTurnGuard guard;
+		const float f0[3] = { 0.0f, 0.0f, 1.0f };
+		const float f1[3] = { 0.766044f, 0.0f, 0.642788f }; // +50 deg yaw (cos=0.643 < 0.707)
+		const float f2[3] = { 0.984808f, 0.0f, -0.173648f }; // +50 deg more yaw in same direction
+		const bool t1 = guard.ObserveAndCheckSustainedTurn(f1, f0, 0.642788f);
+		CHECK(!t1); // first frame of turn isn't yet a sustained streak
+		const bool t2 = guard.ObserveAndCheckSustainedTurn(f2, f1, 0.642788f);
+		CHECK(t2);  // second consecutive same-axis frame IS a sustained mouse turn
+		// With sustainedTurn=true, 50 deg flick (cos=0.643 >= 0.342) does NOT false-reset GhostBuster:
+		CHECK(!XeFgEnabler::ShouldGhostBusterReset(true, true, true, 0.642788f, 1.0f, 1.0f, true, true, 0.0f, 4.0f, t2));
+		// Instant >70 deg cut (cos=0.20 < 0.342) STILL resets even if sustainedTurn=true:
+		CHECK(XeFgEnabler::ShouldGhostBusterReset(true, true, true, 0.20f, 1.0f, 1.0f, true, true, 0.0f, 4.0f, true));
+		// FOV jump STILL resets even during a sustained turn:
+		CHECK(XeFgEnabler::ShouldGhostBusterReset(true, true, true, 0.642788f, 1.4f, 1.0f, true, true, 0.0f, 4.0f, true));
+	}
+
+	// HwFlipQueue state helper
+	{
+		CHECK(std::string_view(HwFlipQueue::StateName(HwFlipQueue::State::Enabled)) == "enabled");
+		CHECK(std::string_view(HwFlipQueue::StateName(HwFlipQueue::State::Disabled)) == "disabled");
+		CHECK(std::string_view(HwFlipQueue::StateName(HwFlipQueue::State::Unknown)) == "unknown");
 	}
 
 	std::printf("%d checks, %d failed\n", checks, failures);

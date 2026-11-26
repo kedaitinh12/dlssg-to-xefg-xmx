@@ -312,6 +312,7 @@ namespace
 		bool hasPrevFov = false;
 		uint32_t syntheticResetQuietFrames = 0;
 		XeFgEnabler::CameraMotionScale cameraMotionScale;
+		XeFgEnabler::CameraTurnGuard cameraTurnGuard;
 		bool hasPrevUiState = false;
 		bool prevUiState = false;
 		uint32_t uiTransitionCooldown = 0;
@@ -2098,7 +2099,7 @@ namespace
 		const NgxResource* rawGameUi = ImageParameter(parameters, "DLSSG.UI");
 		const auto vkHudMode = static_cast<HudTier::Mode>(
 			std::clamp(Plugin::options.hudTierMode.load(std::memory_order_relaxed), 0, 4));
-		if (Plugin::options.hudlessUi)
+		if (Plugin::options.hudlessUi && !Plugin::options.debugHideHudless)
 		{
 			in.hudless = rawGameHudless;
 			in.ui = rawGameUi;
@@ -2234,7 +2235,7 @@ namespace
 
 		HudTier::Inputs vkHudInputs{};
 		vkHudInputs.mode = vkHudMode;
-		vkHudInputs.hudlessUiEnabled = Plugin::options.hudlessUi.load(std::memory_order_relaxed);
+		vkHudInputs.hudlessUiEnabled = Plugin::options.hudlessUi.load(std::memory_order_relaxed) && !Plugin::options.debugHideHudless.load(std::memory_order_relaxed);
 		vkHudInputs.hasGameHudless = rawGameHudless != nullptr;
 		vkHudInputs.hudlessStructurallyValid = in.hudless != nullptr;
 		vkHudInputs.hudlessFormatMismatch = vkHudlessFormatMismatch;
@@ -2335,6 +2336,7 @@ namespace
 
 			float distSq = 0.0f;
 			float fwdDot = 1.0f;
+			bool sustainedTurn = false;
 			if (hasCamera && f.hasPrevCamera)
 			{
 				const float dx = px - f.prevCameraPos[0];
@@ -2350,6 +2352,15 @@ namespace
 					   std::sqrt(fwdLenSq * prevLenSq))
 					: 1.0f;
 
+				const float invCur = 1.0f / std::sqrt(fwdLenSq);
+				const float curFwdArr[3] = { fx * invCur, fy * invCur, fz * invCur };
+				const float invPrev = (prevLenSq > 1e-6f) ? (1.0f / std::sqrt(prevLenSq)) : 0.0f;
+				const float prevFwdArr[3] = {
+					f.prevCameraFwd[0] * invPrev,
+					f.prevCameraFwd[1] * invPrev,
+					f.prevCameraFwd[2] * invPrev
+				};
+				sustainedTurn = f.cameraTurnGuard.ObserveAndCheckSustainedTurn(curFwdArr, prevFwdArr, fwdDot);
 				const float cutThresholdSq = f.cameraMotionScale.CutThresholdSq();
 				const float hardTeleportSq = f.cameraMotionScale.HardTeleportThresholdSq();
 				const bool quietActive = f.syntheticResetQuietFrames > 0u;
@@ -2365,7 +2376,7 @@ namespace
 				const bool camMvIncluded = parameters.GetOr<uint32_t>("DLSSG.CameraMotionIncluded", 1) != 0;
 				if (XeFgEnabler::ShouldGhostBusterReset(true, hasCamera, f.hasPrevCamera, fwdDot,
 					curFov, f.prevCameraFov, f.hasPrevFov, camMvIncluded, distSq,
-					f.cameraMotionScale.GhostBusterMoveThresholdSq()))
+					f.cameraMotionScale.GhostBusterMoveThresholdSq(), sustainedTurn))
 				{
 					reset = true;
 					f.syntheticResetQuietFrames = kSyntheticResetQuietFrames;

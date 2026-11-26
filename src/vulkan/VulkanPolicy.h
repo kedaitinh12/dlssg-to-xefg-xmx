@@ -298,6 +298,22 @@ namespace VulkanPolicy
 
 	// Identifies AMD RDNA 4 (gfx1200/gfx1201: RX 9070 XT / 9070 / 9060 XT, PCI DeviceID 0x7550..0x75FF), where 3rd-gen
 	// Matrix Cores deliver 2048 INT8 ops/clock/CU (4x DP4a's 512 ops/clock/CU).
+	// Intel Arc Battlemage (B580/B570, vendor 0x8086): pooled compute buffers in [4 KiB, 64 KiB]
+	// sub-allocated at 64-byte alignment trigger BMG_VULKANCOMPUTE_BBHANG driver TDRs.
+	// Raising alignment (and size granularity) to 4 KiB prevents the hang with zero change on AMD/NVIDIA.
+	inline uint64_t SafeBufferAlignment(uint32_t vendorId, uint64_t bufferSize, uint64_t driverAlignment) noexcept
+	{
+		if (vendorId == 0x8086u && bufferSize >= 4096ull && bufferSize <= 65536ull)
+			return driverAlignment < 4096ull ? 4096ull : driverAlignment;
+		return driverAlignment;
+	}
+
+	// Recommends coarse optical-flow pyramid budgeting at 4K+ (>= 3840x2160) to reclaim GPU headroom.
+	inline bool ShouldUseCoarseFlow(uint32_t width, uint32_t height) noexcept
+	{
+		return static_cast<uint64_t>(width) * static_cast<uint64_t>(height) >= 3840ull * 2160ull;
+	}
+
 	inline bool IsAmdRdna4Device(uint32_t vendorId, uint32_t deviceId, std::string_view deviceName = {}) noexcept
 	{
 		if (vendorId != 0x1002)

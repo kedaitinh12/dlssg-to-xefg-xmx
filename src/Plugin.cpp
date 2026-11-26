@@ -696,6 +696,15 @@ namespace
 		HelpMarker("Test mode: highlights detected HUD areas in bright pink so you can\n"
 				   "check if Tier 2 or Tier 3 is protecting your crosshair and UI accurately.");
 
+		bool hideHudless = Plugin::options.debugHideHudless;
+		if (api->Checkbox("Hide HUD-less (diagnostic)", &hideHudless))
+		{
+			Plugin::options.debugHideHudless = hideHudless;
+			NotifySettingChanged(NoticeKind::LiveTemp, "Hide HUD-less");
+		}
+		HelpMarker("Diagnostic toggle (not saved): temporarily hides the game's HUD-less texture\n"
+				   "from Frame Generation to isolate pre-FG judder vs HUD-less compositing issues.");
+
 		bool cameraCut = Plugin::options.cameraCutDetection;
 
 		if (api->Checkbox("Camera cut detection", &cameraCut))
@@ -730,7 +739,8 @@ namespace
 			}
 		}
 		HelpMarker("Keeps Vulkan frame pacing just under your monitor refresh rate (Hz - 3)\n"
-				   "so FreeSync / G-Sync stays smooth without V-Sync input lag.");
+				   "so FreeSync / G-Sync stays smooth without V-Sync input lag."
+				   "Avoid combining with RTSS / NVCP / AMD Chill FPS caps to prevent double-limiting stutter.");
 
 		bool vkWmmaBridge = Plugin::options.d3d12VulkanWmmaBridge;
 
@@ -1045,6 +1055,7 @@ namespace
 			Plugin::options.forceDred = false;
 			Log::SetEnabled(true);
 			Plugin::options.hudDebugMagenta = false;
+			Plugin::options.debugHideHudless = false;
 			Plugin::options.hudSplitCompare = false;
 			Plugin::options.hudSplitPos = 0.5f;
 			Plugin::options.gpuProfiler = false;

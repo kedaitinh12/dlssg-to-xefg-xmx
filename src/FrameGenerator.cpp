@@ -2,6 +2,7 @@
 #include "ContextLifecycle.h"
 #include "D3D12QueueFence.h"
 #include "HangWatchdog.h"
+#include "HwFlipQueue.h"
 #include "Log.h"
 #include "MfgKernels.h"
 #include "MfgPort/Cuda/cuda_route.h"
@@ -823,6 +824,13 @@ void FrameGenerator::ProbeSupport(ID3D12Device* device)
 	if (!device)
 		return;
 
+	static bool loggedHwFlipQueue = false;
+	if (!std::exchange(loggedHwFlipQueue, true))
+	{
+		const auto hwfq = HwFlipQueue::QueryOnce(device, WineCompat::IsWineOrProton());
+		Log::Info("WDDM 3.0 Hardware Flip Queue (HwFlipQueueEnabled): {}", HwFlipQueue::StateName(hwfq));
+	}
+
 	static std::once_flag once;
 	std::call_once(once, [device]
 		{
@@ -892,31 +900,42 @@ void FrameGenerator::ProbeSupport(ID3D12Device* device)
 			{
 				xefg_wmma::SetEnabled(false);
 				const auto st = xefg_wmma::Snapshot();
-				const char* archName = st.arch == xefg_wmma::Arch::Rdna4 ? "RDNA 4 (gfx12)" : "RDNA 3 (gfx11)";
-				if (st.dxgiSpoofed)
+				const char* archName = st.arch == xefg_wmma::Arch::Rdna4 ? "RDNA 4 (gfx12)"
+				                     : st.arch == xefg_wmma::Arch::Rdna3 ? "RDNA 3 (gfx11)"
+				                                                         : "RDNA 2 (gfx10.3)";
+				if (st.arch == xefg_wmma::Arch::Rdna2)
 				{
-					Log::Info("WMMA hardware probe ready: {} ({}, device 0x{:04X}, WaveMMA tier {}, source: {}, bypassed DXGI spoof 0x{:04X}:0x{:04X})",
-						st.gpuName.empty() ? "AMD GPU" : st.gpuName, archName, st.deviceId, st.waveMmaTier,
-						st.probeSource, st.dxgiVendorId, st.dxgiDeviceId);
+					Log::Info("AMD RDNA 2 D3D12 dot4 route ready: {} ({}, device 0x{:04X}, {} shaders, mode: {})",
+						st.gpuName.empty() ? "AMD RDNA 2" : st.gpuName, archName, st.deviceId, st.overrideLayers,
+						xefg_wmma::Dot4SplitActive() ? "dot4_split (safety lock)" : "dot4add_i8packed (standard accumulating)");
 				}
 				else
 				{
-					Log::Info("WMMA hardware probe ready: {} ({}, device 0x{:04X}, WaveMMA tier {}, source: {})",
-						st.gpuName.empty() ? "AMD GPU" : st.gpuName, archName, st.deviceId, st.waveMmaTier,
-						st.probeSource);
-				}
-				std::string vkWmmaReason;
-				if (D3D12VulkanWmma::Install(device, vkWmmaReason))
-				{
-					Plugin::wmmaSupport = Plugin::WmmaSupport::Supported;
-					const auto vkSt = D3D12VulkanWmma::Snapshot();
-					Log::Info("WMMA hardware bridge active: D3D12 -> Vulkan VK_KHR_cooperative_matrix ({}x{}x{} s8->s32, {} hardware WMMA shaders)",
-						vkSt.tileM, vkSt.tileN, vkSt.tileK, vkSt.coopLayers);
-				}
-				else
-				{
-					Log::Info("WMMA D3D12->Vulkan hardware bridge unavailable ({}); XMX Port runs stock D3D12 DXIL directly",
-						vkWmmaReason.empty() ? "unknown" : vkWmmaReason);
+					if (st.dxgiSpoofed)
+					{
+						Log::Info("WMMA hardware probe ready: {} ({}, device 0x{:04X}, WaveMMA tier {}, source: {}, bypassed DXGI spoof 0x{:04X}:0x{:04X})",
+							st.gpuName.empty() ? "AMD GPU" : st.gpuName, archName, st.deviceId, st.waveMmaTier,
+							st.probeSource, st.dxgiVendorId, st.dxgiDeviceId);
+					}
+					else
+					{
+						Log::Info("WMMA hardware probe ready: {} ({}, device 0x{:04X}, WaveMMA tier {}, source: {})",
+							st.gpuName.empty() ? "AMD GPU" : st.gpuName, archName, st.deviceId, st.waveMmaTier,
+							st.probeSource);
+					}
+					std::string vkWmmaReason;
+					if (D3D12VulkanWmma::Install(device, vkWmmaReason))
+					{
+						Plugin::wmmaSupport = Plugin::WmmaSupport::Supported;
+						const auto vkSt = D3D12VulkanWmma::Snapshot();
+						Log::Info("WMMA hardware bridge active: D3D12 -> Vulkan VK_KHR_cooperative_matrix ({}x{}x{} s8->s32, {} hardware WMMA shaders)",
+							vkSt.tileM, vkSt.tileN, vkSt.tileK, vkSt.coopLayers);
+					}
+					else
+					{
+						Log::Info("WMMA D3D12->Vulkan hardware bridge unavailable ({}); XMX Port runs stock D3D12 DXIL directly",
+							vkWmmaReason.empty() ? "unknown" : vkWmmaReason);
+					}
 				}
 			}
 			else
@@ -988,7 +1007,7 @@ static bool UseCuda(int32_t model)
 // The ported model runs on the AMD WMMA INT8 route when AMD resolves to WMMA (including safety fallback from XMX (native)).
 static bool UseWmma(int32_t model)
 {
-	if (model != MfgKernels::MfgModel || !xefg_wmma::Supported())
+	if (model != MfgKernels::MfgModel || !xefg_wmma::Supported() || xefg_wmma::IsRdna2())
 		return false;
 
 	return EffectiveD3D12Path(Plugin::xmxSupport.load(std::memory_order_relaxed) == Plugin::XmxSupport::Supported) == Plugin::Path::Wmma;
@@ -1029,7 +1048,7 @@ bool FrameGenerator::CreateContext()
 	}
 
 	xefg_cuda::SetEnabled(UseCuda(settings.model));
-	xefg_wmma::SetEnabled(UseWmma(settings.model));
+	xefg_wmma::SetEnabled(UseWmma(settings.model) || (settings.model == MfgKernels::MfgModel && xefg_wmma::UsesD3D12Dot4Override()));
 
 	// Process wide, they also affect other XeFG contexts. Must happen before the context picks its model
 	XeFG::SetMaxInterpolatedFrames(MaxFrames);
@@ -1255,7 +1274,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 				Log::Info("UnityUpscalerBridge: using Opti.Hudless as HUD-less source (SDR)");
 		}
 	}
-	auto hudless = Plugin::options.hudlessUi ? rawHudless : nullptr;
+	auto hudless = (Plugin::options.hudlessUi && !Plugin::options.debugHideHudless) ? rawHudless : nullptr;
 	auto depth = params.GetOr<ID3D12Resource*>("DLSSG.Depth", nullptr);
 	auto mvecs = params.GetOr<ID3D12Resource*>("DLSSG.MVecs", nullptr);
 	auto output = params.GetOr<ID3D12Resource*>("DLSSG.OutputInterpolated", nullptr);
@@ -1472,7 +1491,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 		return;
 
 	xefg_cuda::SetEnabled(UseCuda(settings.model));
-	xefg_wmma::SetEnabled(UseWmma(settings.model));
+	xefg_wmma::SetEnabled(UseWmma(settings.model) || (settings.model == MfgKernels::MfgModel && xefg_wmma::UsesD3D12Dot4Override()));
 	const bool debugLines = Plugin::options.debugLines.load(std::memory_order_relaxed);
 	static std::atomic<int> sLastDebugLines{ -1 };
 	if (sLastDebugLines.exchange(debugLines ? 1 : 0, std::memory_order_relaxed) != (debugLines ? 1 : 0))
@@ -1708,6 +1727,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 
 		float distSq = 0.0f;
 		float fwdDot = 1.0f;
+		bool sustainedTurn = false;
 		if (hasCamera && context->hasPrevCamera)
 		{
 			const float dx = curPos.x - context->prevCameraPos[0];
@@ -1724,6 +1744,14 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 				    curFwd.z * context->prevCameraFwd[2]) * invCur / std::sqrt(prevLenSq))
 				: 1.0f;
 
+			const float curFwdArr[3] = { curFwd.x * invCur, curFwd.y * invCur, curFwd.z * invCur };
+			const float invPrev = (prevLenSq > 1e-6f) ? (1.0f / std::sqrt(prevLenSq)) : 0.0f;
+			const float prevFwdArr[3] = {
+				context->prevCameraFwd[0] * invPrev,
+				context->prevCameraFwd[1] * invPrev,
+				context->prevCameraFwd[2] * invPrev
+			};
+			sustainedTurn = context->cameraTurnGuard.ObserveAndCheckSustainedTurn(curFwdArr, prevFwdArr, fwdDot);
 			const float cutThresholdSq = context->cameraMotionScale.CutThresholdSq();
 			const float hardTeleportSq = context->cameraMotionScale.HardTeleportThresholdSq();
 			const bool quietActive = context->syntheticResetQuietFrames > 0u;
@@ -1740,7 +1768,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 			const bool camMvIncluded = params.GetOr<uint32_t>("DLSSG.CameraMotionIncluded", 1) != 0;
 			if (XeFgEnabler::ShouldGhostBusterReset(true, hasCamera, context->hasPrevCamera, fwdDot,
 				curFov, context->prevCameraFov, context->hasPrevFov, camMvIncluded, distSq,
-				context->cameraMotionScale.GhostBusterMoveThresholdSq()))
+				context->cameraMotionScale.GhostBusterMoveThresholdSq(), sustainedTurn))
 			{
 				reset = true;
 				context->syntheticResetQuietFrames = kSyntheticResetQuietFrames;
@@ -1996,7 +2024,15 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 	else
 	{
 		currentExecRoute = ActiveExecRoute::D3D12Dxil;
-		currentExecRouteReason = "d3d12_dxil";
+		if (settings.model == MfgKernels::MfgModel && xefg_wmma::UsesD3D12Dot4Override())
+		{
+			currentExecRouteReason = xefg_wmma::Dot4SplitActive() ? "rdna2_dot4_split" : "rdna2_dot4";
+			xefg_wmma::Adopt(cmdList);
+		}
+		else
+		{
+			currentExecRouteReason = "d3d12_dxil";
+		}
 	}
 
 	auto result = XeFG::Execute(context->handle, cmdList, params, interpolationTime);

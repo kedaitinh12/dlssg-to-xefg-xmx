@@ -81,14 +81,17 @@ std::vector<uint32_t> LoadSpirvFile(const std::filesystem::path& path) noexcept
 } // namespace
 
 bool CoopMatrixRoute::SelectTile(const VkCooperativeMatrixPropertiesKHR* properties, uint32_t count,
-                                 uint32_t& m, uint32_t& n, uint32_t& k) noexcept
+                                 uint32_t& m, uint32_t& n, uint32_t& k, bool prefer16x16x32) noexcept
 {
     m = n = k = 0;
     if (!properties || !count)
         return false;
 
-    // Prefer 16x16x16 (AMD RDNA 4 / RDNA 3 WMMA Wave32), then 8x8x32 (Intel Arc / Battlemage XMX SIMD16).
+    // Prefer 16x16x32 (RDNA 4 Double-K 128-bit load) when explicitly enabled & available,
+    // then 16x16x16 (AMD RDNA 4 / RDNA 3 WMMA Wave32), then 8x8x32 (Intel Arc / Battlemage XMX SIMD16).
     // Only admit devices advertising an exact supported SINT8 x SINT8 -> SINT32 subgroup shape.
+    bool has16x16x32 = false;
+    bool has16x16x16 = false;
     bool has8x8x32 = false;
     for (uint32_t i = 0; i < count; ++i)
     {
@@ -99,15 +102,26 @@ bool CoopMatrixRoute::SelectTile(const VkCooperativeMatrixPropertiesKHR* propert
             p.CType != VK_COMPONENT_TYPE_SINT32_KHR ||
             p.ResultType != VK_COMPONENT_TYPE_SINT32_KHR)
             continue;
-        if (p.MSize == 16u && p.NSize == 16u && p.KSize == 16u)
-        {
-            m = 16u;
-            n = 16u;
-            k = 16u;
-            return true;
-        }
-        if (p.MSize == 8u && p.NSize == 8u && p.KSize == 32u)
+        if (p.MSize == 16u && p.NSize == 16u && p.KSize == 32u)
+            has16x16x32 = true;
+        else if (p.MSize == 16u && p.NSize == 16u && p.KSize == 16u)
+            has16x16x16 = true;
+        else if (p.MSize == 8u && p.NSize == 8u && p.KSize == 32u)
             has8x8x32 = true;
+    }
+    if (prefer16x16x32 && has16x16x32)
+    {
+        m = 16u;
+        n = 16u;
+        k = 32u;
+        return true;
+    }
+    if (has16x16x16)
+    {
+        m = 16u;
+        n = 16u;
+        k = 16u;
+        return true;
     }
     if (has8x8x32)
     {
@@ -190,8 +204,22 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
             return false;
         }
 
+        bool allowK32 = true;
+        {
+            wchar_t envBuf[16]{};
+            const DWORD envN = GetEnvironmentVariableW(L"XEFG_COOP_MATRIX_K32", envBuf, static_cast<DWORD>(std::size(envBuf)));
+            if (envN > 0 && envN < std::size(envBuf) &&
+                (envBuf[0] == L'0' || envBuf[0] == L'f' || envBuf[0] == L'F' || envBuf[0] == L'n' || envBuf[0] == L'N'))
+            {
+                allowK32 = false;
+            }
+        }
+        std::error_code k32DirEc;
+        const std::filesystem::path k32Dir = moduleDir / L"k32_16x16x32";
+        const bool preferK32 = allowK32 && std::filesystem::is_regular_file(k32Dir / L"coopmat_layers.tsv", k32DirEc);
+
         uint32_t m = 0, n = 0, k = 0;
-        if (!SelectTile(props.data(), propCount, m, n, k))
+        if (!SelectTile(props.data(), propCount, m, n, k, preferK32))
         {
             reason = "no_s8_matrix_shape";
             return false;
@@ -229,7 +257,7 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
         requireSubgroupSize_ = supportsWantedSubgroup;
 
         gpuArch_ = GpuArch::Generic;
-        if (devProps.properties.vendorID == 0x1002u && tileM_ == 16u && tileN_ == 16u && tileK_ == 16u && subgroupSize_ == 32u)
+        if (devProps.properties.vendorID == 0x1002u && tileM_ == 16u && tileN_ == 16u && (tileK_ == 16u || tileK_ == 32u) && subgroupSize_ == 32u)
         {
             const uint32_t devId = devProps.properties.deviceID;
             const std::string_view devName(devProps.properties.deviceName);
@@ -346,16 +374,17 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
         };
 
         const bool isXmx = (tileM_ == 8u && tileN_ == 8u && tileK_ == 32u);
+        const bool isK32 = (tileM_ == 16u && tileN_ == 16u && tileK_ == 32u);
         const std::filesystem::path xmxDir = moduleDir / L"xmx_8x8x32";
         uint32_t loadedCount = 0;
         for (size_t i = 0; i < std::size(xefg_cuda::kLayers); ++i)
         {
             const auto& layer = xefg_cuda::kLayers[i];
-            const std::filesystem::path primaryDir = isXmx ? xmxDir : (layerWantsReg(i, layer) ? regDir : moduleDir);
+            const std::filesystem::path primaryDir = isXmx ? xmxDir : (isK32 ? k32Dir : (layerWantsReg(i, layer) ? regDir : moduleDir));
             auto words = LoadSpirvFile(primaryDir / (std::string(layer.info.program) + ".spv"));
             if (words.empty())
                 words = LoadSpirvFile(primaryDir / (std::string(layer.info.kernel) + ".spv"));
-            if (words.empty() && primaryDir != moduleDir && !isXmx)
+            if (words.empty() && primaryDir != moduleDir && !isXmx && !isK32)
             {
                 words = LoadSpirvFile(moduleDir / (std::string(layer.info.program) + ".spv"));
                 if (words.empty())

@@ -57,19 +57,26 @@ New-Item -ItemType Directory -Path $Output -Force | Out-Null
 
 # Fast-path no-op when all 17 <program>.dxbc files and wmma_layers.tsv are already newer than the HLSL source
 $manifestPath = Join-Path $Output "wmma_layers.tsv"
+$splitOutDir = Join-Path $Output "dot4_split"
+$splitManifestPath = Join-Path $splitOutDir "wmma_layers.tsv"
 $srcTime = (Get-Item $Source).LastWriteTimeUtc
 $expectedProgs = @("aa016078","198d6bf8","dcd8becf","efbe3788","50f0c205","a3c3caa1","9481d452","06e97933","3ed03daf","748b0baf","cb391582","fc1b8a04","3459485","3452733","55e5d6b9","34517926","3453044")
-if ((Test-Path $manifestPath) -and ((Get-Item $manifestPath).LastWriteTimeUtc -ge $srcTime)) {
+if ((Test-Path $manifestPath) -and (Test-Path $splitManifestPath) -and
+    ((Get-Item $manifestPath).LastWriteTimeUtc -ge $srcTime) -and
+    ((Get-Item $splitManifestPath).LastWriteTimeUtc -ge $srcTime)) {
     $allCurrent = $true
-    foreach ($prog in $expectedProgs) {
-        $pf = Join-Path $Output "$prog.dxbc"
-        if (-not (Test-Path $pf) -or ((Get-Item $pf).LastWriteTimeUtc -lt $srcTime)) {
-            $allCurrent = $false
-            break
+    foreach ($dirCheck in @($Output, $splitOutDir)) {
+        foreach ($prog in $expectedProgs) {
+            $pf = Join-Path $dirCheck "$prog.dxbc"
+            if (-not (Test-Path $pf) -or ((Get-Item $pf).LastWriteTimeUtc -lt $srcTime)) {
+                $allCurrent = $false
+                break
+            }
         }
+        if (-not $allCurrent) { break }
     }
     if ($allCurrent) {
-        Write-Host "D3D12 WMMA shaders in $Output are up to date; skipping DXC compilation."
+        Write-Host "D3D12 WMMA/dot4 shaders in $Output (and dot4_split) are up to date; skipping DXC compilation."
         exit 0
     }
 }
@@ -93,46 +100,49 @@ $kernels = @(
     @{ Name="L_3453044";      Family=2; In=4;  Out=16; Bias=0; Pool=0; Relu=0; TileH=8;  ZSplit=2; AccBits=18; Nt=4; Programs=@("3453044") }
 )
 
-$tsvLines = @("program`tkernel`tfamily`tin`tout`ttile_h`tgrid_z`tbytes`tsha256")
+function Build-Dot4Set {
+    param([string]$OutDir, [string]$Label, [string[]]$ExtraDefines)
+    New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+    $tsvLines = @("program`tkernel`tfamily`tin`tout`ttile_h`tgrid_z`tbytes`tsha256")
+    foreach ($k in $kernels) {
+        $kernelOut = Join-Path $OutDir "$($k.Name).dxbc"
+        $argsList = @(
+            "-T", "cs_6_6",
+            "-E", "main",
+            "-O3",
+            "-DLAYER_FAMILY=$($k.Family)",
+            "-DLAYER_IN=$($k.In)",
+            "-DLAYER_OUT=$($k.Out)",
+            "-DLAYER_BIAS=$($k.Bias)",
+            "-DLAYER_POOL=$($k.Pool)",
+            "-DLAYER_RELU=$($k.Relu)",
+            "-DLAYER_TILE_H=$($k.TileH)",
+            "-DLAYER_ZSPLIT=$($k.ZSplit)",
+            "-DLAYER_ACC_BITS=$($k.AccBits)",
+            "-DLAYER_NT=$($k.Nt)"
+        ) + $ExtraDefines + @("-Fo", $kernelOut, $Source)
 
-foreach ($k in $kernels) {
-    $kernelOut = Join-Path $Output "$($k.Name).dxbc"
-    $argsList = @(
-        "-T", "cs_6_6",
-        "-E", "main",
-        "-O3",
-        "-DLAYER_FAMILY=$($k.Family)",
-        "-DLAYER_IN=$($k.In)",
-        "-DLAYER_OUT=$($k.Out)",
-        "-DLAYER_BIAS=$($k.Bias)",
-        "-DLAYER_POOL=$($k.Pool)",
-        "-DLAYER_RELU=$($k.Relu)",
-        "-DLAYER_TILE_H=$($k.TileH)",
-        "-DLAYER_ZSPLIT=$($k.ZSplit)",
-        "-DLAYER_ACC_BITS=$($k.AccBits)",
-        "-DLAYER_NT=$($k.Nt)",
-        "-Fo", $kernelOut,
-        $Source
-    )
+        & $dxc @argsList
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $kernelOut)) {
+            throw "dxc.exe failed compiling [$Label] $($k.Name) (exit code $LASTEXITCODE)"
+        }
 
-    & $dxc @argsList
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $kernelOut)) {
-        throw "dxc.exe failed compiling $($k.Name) (exit code $LASTEXITCODE)"
+        $bytes = (Get-Item $kernelOut).Length
+        $hash = (Get-FileHash -Path $kernelOut -Algorithm SHA256).Hash.ToLowerInvariant()
+
+        foreach ($prog in $k.Programs) {
+            $progOut = Join-Path $OutDir "$prog.dxbc"
+            Copy-Item -Path $kernelOut -Destination $progOut -Force
+            $tsvLines += "$prog`t$($k.Name)`t$($k.Family)`t$($k.In)`t$($k.Out)`t$($k.TileH)`t$($k.ZSplit)`t$bytes`t$hash"
+        }
+        Write-Host ("ok   [{0}] {1,-18} ({2} bytes, sha256={3}...)" -f $Label, "$($k.Name).dxbc", $bytes, $hash.Substring(0, 12))
     }
-
-    $bytes = (Get-Item $kernelOut).Length
-    $hash = (Get-FileHash -Path $kernelOut -Algorithm SHA256).Hash.ToLowerInvariant()
-
-    foreach ($prog in $k.Programs) {
-        $progOut = Join-Path $Output "$prog.dxbc"
-        Copy-Item -Path $kernelOut -Destination $progOut -Force
-        $tsvLines += "$prog`t$($k.Name)`t$($k.Family)`t$($k.In)`t$($k.Out)`t$($k.TileH)`t$($k.ZSplit)`t$bytes`t$hash"
-    }
-    Write-Host ("ok   {0,-18} ({1} bytes, sha256={2}...)" -f "$($k.Name).dxbc", $bytes, $hash.Substring(0, 12))
+    Set-Content -Path (Join-Path $OutDir "wmma_layers.tsv") -Value ($tsvLines -join "`n") -Encoding UTF8
+    Write-Host "Built 16 unique D3D12 dot4 kernels (17 layer overrides) [$Label] into $OutDir"
 }
 
-Set-Content -Path (Join-Path $Output "wmma_layers.tsv") -Value ($tsvLines -join "`n") -Encoding UTF8
-Write-Host "Built 16 unique D3D12 WMMA kernels (17 layer overrides) into $Output"
+Build-Dot4Set -OutDir $Output -Label "dot4-acc" -ExtraDefines @()
+Build-Dot4Set -OutDir (Join-Path $Output "dot4_split") -Label "dot4-split" -ExtraDefines @("-DDOT4_SPLIT=1")
 
 # Also build byte-identical motion-aware splat DXIL replacements (splat.1 / splat.2) into <Output>\..\replacements
 $splatSource = Join-Path $PSScriptRoot "..\src\MfgPort\splat_motion_aware.hlsl"

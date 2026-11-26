@@ -1,5 +1,6 @@
 // Ported from MFG-Unlocker source/native/xess/cuda/cuda_route.cpp, MIT licensed, see NOTICE.md.
 #include "cuda_route.h"
+#include "../Wmma/wmma_route.h"
 #include "xefg_cuda_params.h"
 #include "pipeline_blob_cache.h"
 #include "../AdapterIdentity.h"
@@ -1305,8 +1306,13 @@ HRESULT STDMETHODCALLTYPE HookCreateComputePipelineState(ID3D12Device* self, con
         ? gBlobCache.CreateCompute(desc, iid, out,
             [&](const D3D12_COMPUTE_PIPELINE_STATE_DESC* d, void** o) { return orig(self, d, iid, o); })
         : orig(self, desc, iid, out);
-    if (SUCCEEDED(result) && desc && out && *out && gState.load(std::memory_order_acquire) == State::Active)
-        Recognize(self, *desc, iid, *out, caller);
+    if (SUCCEEDED(result) && desc && out && *out)
+    {
+        if (gState.load(std::memory_order_acquire) == State::Active)
+            Recognize(self, *desc, iid, *out, caller);
+        if (providerCaller && xefg_wmma::UsesD3D12Dot4Override())
+            xefg_wmma::OnCreateComputePipelineState(self, desc, iid, *out, orig);
+    }
     return result;
 }
 

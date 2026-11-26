@@ -2,13 +2,18 @@
 #include "../AdapterIdentity.h"
 #include "../Cuda/OverlayNative.h"
 #include "../Cuda/cuda_layers.h"
+#include "../Sha256.h"
 #include <wrl/client.h>
 #include <array>
 #include <atomic>
+#include <cstring>
 #include <cwchar>
+#include <fstream>
 #include <iterator>
 #include <mutex>
 #include <string_view>
+#include <unordered_map>
+#include <vector>
 
 namespace xefg_wmma
 {
@@ -30,6 +35,202 @@ uint32_t gWaveMmaTier{};
 std::string gGpuName;
 std::string gProbeSource;
 std::string gReason;
+std::atomic<bool> gUseD3D12Dot4{false};
+std::atomic<bool> gDot4Split{false};
+std::atomic<uint32_t> gOverrideLayers{0};
+std::atomic<uint64_t> gLaunches{0};
+std::atomic<uint64_t> gFallbacks{0};
+std::atomic<uint64_t> gBinds{0};
+
+std::array<std::vector<uint8_t>, std::size(xefg_cuda::kLayers)> gOverrideBlobs{};
+
+struct OverrideEntry
+{
+    ComPtr<ID3D12PipelineState> overridePso;
+    uint8_t layerIdx{};
+};
+std::mutex gPsoMutex;
+std::unordered_map<ID3D12PipelineState*, OverrideEntry> gPsoMap;
+
+struct ActiveListLayer
+{
+    ID3D12PipelineState* stockPso{};
+    ID3D12PipelineState* overridePso{};
+    uint8_t layerIdx{};
+};
+using ResetFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*, ID3D12PipelineState*);
+using DispatchFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT);
+using SetPipelineStateFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
+
+struct ListVtableOrig
+{
+    ResetFn reset{};
+    DispatchFn dispatch{};
+    SetPipelineStateFn setPso{};
+};
+std::mutex gListMutex;
+std::unordered_map<void**, ListVtableOrig> gListVtables;
+std::unordered_map<ID3D12GraphicsCommandList*, ActiveListLayer> gActiveListLayers;
+
+constexpr int kListResetSlot = 10;
+constexpr int kListDispatchSlot = 14;
+constexpr int kListSetPipelineStateSlot = 25;
+
+bool IsEnvOff(const wchar_t* name) noexcept
+{
+    wchar_t env[16]{};
+    const DWORD len = GetEnvironmentVariableW(name, env, 16);
+    return len > 0 && len < 16 &&
+        (env[0] == L'0' || _wcsicmp(env, L"off") == 0 || _wcsicmp(env, L"false") == 0 || _wcsicmp(env, L"no") == 0);
+}
+
+bool IsEnvOn(const wchar_t* name) noexcept
+{
+    wchar_t env[16]{};
+    const DWORD len = GetEnvironmentVariableW(name, env, 16);
+    return len > 0 && len < 16 &&
+        (env[0] == L'1' || _wcsicmp(env, L"on") == 0 || _wcsicmp(env, L"true") == 0 || _wcsicmp(env, L"yes") == 0);
+}
+
+std::vector<uint8_t> LoadDxbcFile(const std::filesystem::path& path) noexcept
+{
+    try
+    {
+        std::error_code ec;
+        const auto sz = std::filesystem::file_size(path, ec);
+        if (ec || sz < 32 || sz > 4 * 1024 * 1024)
+            return {};
+        std::ifstream in(path, std::ios::binary);
+        if (!in)
+            return {};
+        std::vector<uint8_t> bytes(static_cast<size_t>(sz));
+        if (!in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(sz)))
+            return {};
+        if (std::memcmp(bytes.data(), "DXBC", 4) != 0)
+            return {};
+        return bytes;
+    }
+    catch (...)
+    {
+        return {};
+    }
+}
+
+bool MatchesKnownLayerSize(size_t byteSize) noexcept
+{
+    for (const auto& l : xefg_cuda::kLayers)
+    {
+        if (l.bytes == byteSize || (l.ownBytes && l.ownBytes == byteSize))
+            return true;
+    }
+    return false;
+}
+
+ListVtableOrig LookupListOrig(ID3D12GraphicsCommandList* self) noexcept
+{
+    if (!self)
+        return {};
+    void** vtable = *reinterpret_cast<void***>(self);
+    std::lock_guard lock(gListMutex);
+    const auto it = gListVtables.find(vtable);
+    return it != gListVtables.end() ? it->second : ListVtableOrig{};
+}
+
+HRESULT STDMETHODCALLTYPE HookListReset(ID3D12GraphicsCommandList* self, ID3D12CommandAllocator* alloc, ID3D12PipelineState* initialState)
+{
+    const auto orig = LookupListOrig(self);
+    {
+        std::lock_guard lock(gListMutex);
+        gActiveListLayers.erase(self);
+    }
+    const HRESULT hr = orig.reset ? orig.reset(self, alloc, initialState) : E_FAIL;
+    if (SUCCEEDED(hr) && initialState && gUseD3D12Dot4.load(std::memory_order_acquire))
+    {
+        ID3D12PipelineState* ov = nullptr;
+        uint8_t idx = 0;
+        {
+            std::lock_guard lock(gPsoMutex);
+            const auto it = gPsoMap.find(initialState);
+            if (it != gPsoMap.end() && it->second.overridePso)
+            {
+                ov = it->second.overridePso.Get();
+                idx = it->second.layerIdx;
+            }
+        }
+        if (ov && idx)
+        {
+            std::lock_guard lock(gListMutex);
+            gActiveListLayers[self] = {initialState, ov, idx};
+        }
+    }
+    return hr;
+}
+
+void STDMETHODCALLTYPE HookListSetPipelineState(ID3D12GraphicsCommandList* self, ID3D12PipelineState* pso)
+{
+    const auto orig = LookupListOrig(self);
+    if (gUseD3D12Dot4.load(std::memory_order_acquire))
+    {
+        ID3D12PipelineState* ov = nullptr;
+        uint8_t idx = 0;
+        if (pso)
+        {
+            std::lock_guard lock(gPsoMutex);
+            const auto it = gPsoMap.find(pso);
+            if (it != gPsoMap.end() && it->second.overridePso)
+            {
+                ov = it->second.overridePso.Get();
+                idx = it->second.layerIdx;
+            }
+        }
+        std::lock_guard lock(gListMutex);
+        if (ov && idx)
+        {
+            gActiveListLayers[self] = {pso, ov, idx};
+            gBinds.fetch_add(1, std::memory_order_relaxed);
+        }
+        else
+        {
+            gActiveListLayers.erase(self);
+        }
+    }
+    if (orig.setPso)
+        orig.setPso(self, pso);
+}
+
+void STDMETHODCALLTYPE HookListDispatch(ID3D12GraphicsCommandList* self, UINT x, UINT y, UINT z)
+{
+    const auto orig = LookupListOrig(self);
+    if (!orig.dispatch)
+        return;
+
+    if (gUseD3D12Dot4.load(std::memory_order_acquire) && gActive.load(std::memory_order_acquire))
+    {
+        ActiveListLayer active{};
+        {
+            std::lock_guard lock(gListMutex);
+            const auto it = gActiveListLayers.find(self);
+            if (it != gActiveListLayers.end())
+                active = it->second;
+        }
+        if (active.overridePso && active.layerIdx >= 1 && active.layerIdx <= std::size(xefg_cuda::kLayers))
+        {
+            const auto& layer = xefg_cuda::kLayers[active.layerIdx - 1];
+            if (xefg_cuda::DispatchShapeOk(layer, x, y, z) && orig.setPso)
+            {
+                const UINT gx = (x * layer.intelW + layer.tileW - 1) / layer.tileW;
+                const UINT gy = (y * layer.intelH + layer.tileH - 1) / layer.tileH;
+                orig.setPso(self, active.overridePso);
+                orig.dispatch(self, gx, gy, layer.gridZ);
+                orig.setPso(self, active.stockPso);
+                gLaunches.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            gFallbacks.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    orig.dispatch(self, x, y, z);
+}
 
 void Log(const char* stage, const std::string& fields) noexcept
 {
@@ -82,6 +283,20 @@ Arch DetectAmdArch(uint32_t vendorId, uint32_t deviceId, std::wstring_view descr
         description.find(L"gfx11") != std::wstring_view::npos)
     {
         return Arch::Rdna3;
+    }
+
+    if ((deviceId >= 0x73A0 && deviceId <= 0x73FF) ||
+        deviceId == 0x163F || deviceId == 0x164D || deviceId == 0x164E ||
+        description.find(L"RX 6") != std::wstring_view::npos ||
+        description.find(L"680M") != std::wstring_view::npos ||
+        description.find(L"660M") != std::wstring_view::npos ||
+        description.find(L"610M") != std::wstring_view::npos ||
+        description.find(L"Van Gogh") != std::wstring_view::npos ||
+        description.find(L"Custom GPU 0405") != std::wstring_view::npos ||
+        description.find(L"RDNA 2") != std::wstring_view::npos ||
+        description.find(L"gfx103") != std::wstring_view::npos)
+    {
+        return Arch::Rdna2;
     }
 
     return Arch::Unknown;
@@ -164,7 +379,7 @@ void SetLog(LogFunction log) noexcept
     gLog.store(log, std::memory_order_relaxed);
 }
 
-bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem::path& /*wmmaDir*/, std::string& reason) noexcept
+bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem::path& wmmaDir, std::string& reason) noexcept
 {
     std::lock_guard lock(gMutex);
     try
@@ -283,20 +498,68 @@ bool Install(ID3D12Device* device, HMODULE providerModule, const std::filesystem
             return false;
         }
 
+        bool useD3D12Dot4 = false;
+        bool dot4Split = false;
+        uint32_t loadedOverrides = 0;
+
+        if (arch == Arch::Rdna2)
+        {
+            if (IsEnvOff(L"XEFG_RDNA2_DOT4"))
+            {
+                gArch.store(arch, std::memory_order_release);
+                gReason = "rdna2_dot4_env_off";
+                gState.store(State::Disabled, std::memory_order_release);
+                Log("wmma_route", "\"state\":\"disabled\",\"arch\":\"rdna2_gfx103\",\"reason\":\"rdna2_dot4_env_off\"");
+                reason = gReason;
+                return false;
+            }
+            dot4Split = IsEnvOn(L"XEFG_WMMA_DOT4_SPLIT");
+            const std::filesystem::path shaderDir = dot4Split ? (wmmaDir / L"dot4_split") : wmmaDir;
+            for (size_t i = 0; i < std::size(xefg_cuda::kLayers); ++i)
+            {
+                const auto& l = xefg_cuda::kLayers[i];
+                auto blob = LoadDxbcFile(shaderDir / (std::string(l.info.program) + ".dxbc"));
+                if (blob.empty())
+                    blob = LoadDxbcFile(shaderDir / (std::string(l.info.kernel) + ".dxbc"));
+                if (!blob.empty())
+                {
+                    gOverrideBlobs[i] = std::move(blob);
+                    ++loadedOverrides;
+                }
+            }
+            if (loadedOverrides == 0)
+            {
+                gArch.store(arch, std::memory_order_release);
+                MarkUnavailable(dot4Split ? "no_rdna2_dot4_split_shaders" : "no_rdna2_dot4_shaders",
+                    "\"arch\":\"rdna2_gfx103\",\"dot4_split\":" + std::string(dot4Split ? "true" : "false"));
+                reason = gReason;
+                return false;
+            }
+            useD3D12Dot4 = true;
+        }
+
         gArch.store(arch, std::memory_order_release);
+        gUseD3D12Dot4.store(useD3D12Dot4, std::memory_order_release);
+        gDot4Split.store(dot4Split, std::memory_order_release);
+        gOverrideLayers.store(loadedOverrides, std::memory_order_release);
         gReason.clear();
         gActive.store(true, std::memory_order_release);
         gState.store(State::Active, std::memory_order_release);
 
+        const char* archTag = arch == Arch::Rdna4 ? "rdna4_gfx12"
+                            : arch == Arch::Rdna3 ? "rdna3_gfx11"
+                                                  : "rdna2_gfx103";
         Log("wmma_route",
-            std::string("\"state\":\"active\",\"arch\":\"") + (arch == Arch::Rdna4 ? "rdna4_gfx12" : "rdna3_gfx11") +
+            std::string("\"state\":\"active\",\"arch\":\"") + archTag +
             "\",\"vendor_hex\":\"0x1002\",\"device_id\":" + std::to_string(gDeviceId) +
             ",\"device_hex\":\"" + adapter_identity::Hex16(gDeviceId) +
             "\",\"gpu\":\"" + gGpuName +
             "\",\"source\":\"" + gProbeSource +
             "\",\"dxgi_spoofed\":" + (gDxgiSpoofed ? "true" : "false") +
             ",\"wave_mma_tier\":" + std::to_string(gWaveMmaTier) +
-            ",\"d3d12_shared_tile_overrides\":false" +
+            ",\"d3d12_shared_tile_overrides\":" + (useD3D12Dot4 ? "true" : "false") +
+            ",\"dot4_split\":" + (dot4Split ? "true" : "false") +
+            ",\"override_layers\":" + std::to_string(loadedOverrides) +
             ",\"device\":\"" + how + "\"");
         reason.clear();
         return true;
@@ -343,13 +606,115 @@ bool IsRdna4() noexcept
     return gArch.load(std::memory_order_acquire) == Arch::Rdna4;
 }
 
-void Adopt(ID3D12GraphicsCommandList* /*list*/) noexcept
+bool IsRdna2() noexcept
 {
-    // Software D3D12 cs_6_6 shared-tile DP4a overrides are intentionally disabled; D3D12 fallback and XMX Port run stock DXIL directly.
+    return gArch.load(std::memory_order_acquire) == Arch::Rdna2;
+}
+
+bool UsesD3D12Dot4Override() noexcept
+{
+    return gState.load(std::memory_order_acquire) == State::Active && gUseD3D12Dot4.load(std::memory_order_acquire);
+}
+
+bool Dot4SplitActive() noexcept
+{
+    return gDot4Split.load(std::memory_order_acquire);
+}
+
+void OnCreateComputePipelineState(ID3D12Device* device, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
+                                  REFIID iid, void* stockPsoObj, CreateComputePsoFn origCreate) noexcept
+{
+    if (!UsesD3D12Dot4Override() || !device || !desc || !stockPsoObj || !origCreate)
+        return;
+    if (!desc->CS.pShaderBytecode || !MatchesKnownLayerSize(desc->CS.BytecodeLength))
+        return;
+    try
+    {
+        sha256_util::Digest digest{};
+        if (!sha256_util::Compute(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, digest))
+            return;
+        const uint8_t layerIdx = xefg_cuda::LayerForSha256(sha256_util::LowerHex(digest));
+        if (!layerIdx || layerIdx > std::size(xefg_cuda::kLayers))
+            return;
+        const auto& blob = gOverrideBlobs[layerIdx - 1];
+        if (blob.empty())
+            return;
+
+        ComPtr<ID3D12PipelineState> stockPso;
+        if (iid == __uuidof(ID3D12PipelineState))
+        {
+            stockPso = static_cast<ID3D12PipelineState*>(stockPsoObj);
+        }
+        else
+        {
+            auto* unk = static_cast<IUnknown*>(stockPsoObj);
+            if (FAILED(unk->QueryInterface(IID_PPV_ARGS(&stockPso))) || !stockPso)
+                return;
+        }
+
+        D3D12_COMPUTE_PIPELINE_STATE_DESC ovDesc = *desc;
+        ovDesc.CS.pShaderBytecode = blob.data();
+        ovDesc.CS.BytecodeLength = blob.size();
+        ovDesc.CachedPSO = {};
+        ComPtr<ID3D12PipelineState> ovPso;
+        if (FAILED(origCreate(device, &ovDesc, IID_PPV_ARGS(&ovPso))) || !ovPso)
+            return;
+
+        std::lock_guard lock(gPsoMutex);
+        gPsoMap[stockPso.Get()] = {std::move(ovPso), layerIdx};
+    }
+    catch (...)
+    {
+    }
+}
+
+void Adopt(ID3D12GraphicsCommandList* list) noexcept
+{
+    if (!UsesD3D12Dot4Override() || !list)
+        return;
+    try
+    {
+        void** vtable = *reinterpret_cast<void***>(list);
+        if (!vtable)
+            return;
+        std::lock_guard lock(gListMutex);
+        if (gListVtables.find(vtable) != gListVtables.end())
+            return;
+
+        ListVtableOrig orig{
+            reinterpret_cast<ResetFn>(vtable[kListResetSlot]),
+            reinterpret_cast<DispatchFn>(vtable[kListDispatchSlot]),
+            reinterpret_cast<SetPipelineStateFn>(vtable[kListSetPipelineStateSlot])
+        };
+        if (!orig.reset || !orig.dispatch || !orig.setPso)
+            return;
+
+        DWORD oldProt = 0;
+        const size_t patchBytes = (kListSetPipelineStateSlot + 1) * sizeof(void*);
+        if (!VirtualProtect(vtable, patchBytes, PAGE_EXECUTE_READWRITE, &oldProt))
+            return;
+        gListVtables.emplace(vtable, orig);
+        vtable[kListResetSlot] = reinterpret_cast<void*>(&HookListReset);
+        vtable[kListDispatchSlot] = reinterpret_cast<void*>(&HookListDispatch);
+        vtable[kListSetPipelineStateSlot] = reinterpret_cast<void*>(&HookListSetPipelineState);
+        DWORD ignored = 0;
+        VirtualProtect(vtable, patchBytes, oldProt, &ignored);
+    }
+    catch (...)
+    {
+    }
 }
 
 void ForgetLayers() noexcept
 {
+    {
+        std::lock_guard lock(gListMutex);
+        gActiveListLayers.clear();
+    }
+    {
+        std::lock_guard lock(gPsoMutex);
+        gPsoMap.clear();
+    }
 }
 
 Status Snapshot() noexcept
@@ -365,10 +730,10 @@ Status Snapshot() noexcept
     s.dxgiSpoofed = gDxgiSpoofed;
     s.waveMmaTier = gWaveMmaTier;
     s.layers = static_cast<uint32_t>(std::size(xefg_cuda::kLayers));
-    s.overrideLayers = 0;
-    s.launches = 0;
-    s.fallbacks = 0;
-    s.binds = 0;
+    s.overrideLayers = gOverrideLayers.load(std::memory_order_relaxed);
+    s.launches = gLaunches.load(std::memory_order_relaxed);
+    s.fallbacks = gFallbacks.load(std::memory_order_relaxed);
+    s.binds = gBinds.load(std::memory_order_relaxed);
     try
     {
         s.gpuName = gGpuName;

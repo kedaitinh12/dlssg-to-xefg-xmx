@@ -33,7 +33,7 @@ public:
     CoopMatrixRoute& operator=(const CoopMatrixRoute&) = delete;
 
     static bool SelectTile(const VkCooperativeMatrixPropertiesKHR* properties, uint32_t count,
-                           uint32_t& m, uint32_t& n, uint32_t& k) noexcept;
+                           uint32_t& m, uint32_t& n, uint32_t& k, bool prefer16x16x32 = false) noexcept;
 
     bool Install(Device& owner, const DeviceDesc& desc, const std::filesystem::path& moduleDir,
                  const CoopMatrixOptions& options, std::string& reason) noexcept;

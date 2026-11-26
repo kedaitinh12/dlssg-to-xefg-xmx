@@ -91,6 +91,7 @@ private:
 		uint32_t syntheticResetQuietFrames = 0;
 		// Adaptive camera displacement scale (prevents meter-threshold false positives in UE cm-scale games)
 		XeFgEnabler::CameraMotionScale cameraMotionScale;
+		XeFgEnabler::CameraTurnGuard cameraTurnGuard;
 
 		// UI / HUD-less transition cooldown (DLSS Enabler XeFG: skip 10 real frames on state toggle)
 		uint32_t uiTransitionCooldown = 0;

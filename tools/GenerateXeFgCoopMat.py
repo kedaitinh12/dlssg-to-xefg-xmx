@@ -161,6 +161,9 @@ def main() -> int:
     rc = build_set(args.source, args.output / "gfx12_reg", "16x16x16-gfx12-reg", ["-DRADV_REG_ONLY=2"])
     if rc != 0:
         return rc
+    rc = build_set(args.source, args.output / "k32_16x16x32", "16x16x32", ["-DCOOP_K_COMPILED=32"])
+    if rc != 0:
+        return rc
     probe_source = args.source.parent / "xefg_coopmat_probe.comp"
     if probe_source.is_file():
         probe_spv = args.output / "matc_probe_16x16x16.spv"

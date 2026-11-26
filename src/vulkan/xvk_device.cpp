@@ -1,4 +1,5 @@
 #include "xvk_internal.h"
+#include "VulkanPolicy.h"
 #include <cstdio>
 #include <fstream>
 #include "../MfgPort/Cuda/cuda_layers.h"
@@ -951,6 +952,12 @@ D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE Device::GetResourceAllocationIn
             VkBufferCreateInfo info = BufferCreateInfo(desc);
             VkDeviceBufferMemoryRequirements query{VK_STRUCTURE_TYPE_DEVICE_BUFFER_MEMORY_REQUIREMENTS, nullptr, &info};
             vk_.vkGetDeviceBufferMemoryRequirements(device_, &query, &requirements);
+            const uint64_t safeAlign = VulkanPolicy::SafeBufferAlignment(
+                properties_.vendorID, requirements.memoryRequirements.size, requirements.memoryRequirements.alignment);
+            if (safeAlign > requirements.memoryRequirements.alignment) {
+                requirements.memoryRequirements.alignment = safeAlign;
+                requirements.memoryRequirements.size = AlignUp(requirements.memoryRequirements.size, safeAlign);
+            }
         } else {
             VkImageCreateInfo info{};
             FormatInfo format;

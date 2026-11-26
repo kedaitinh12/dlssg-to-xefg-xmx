@@ -12,7 +12,7 @@
 namespace xefg_wmma
 {
 enum class State : uint8_t { NotAttempted, Disabled, Unavailable, Active };
-enum class Arch : uint8_t { Unknown, Rdna3, Rdna4 };
+enum class Arch : uint8_t { Unknown, Rdna2, Rdna3, Rdna4 };
 
 struct Status
 {
@@ -46,6 +46,13 @@ void SetEnabled(bool enabled) noexcept;
 bool Enabled() noexcept;
 bool Supported() noexcept;
 bool IsRdna4() noexcept;
+bool IsRdna2() noexcept;
+bool UsesD3D12Dot4Override() noexcept;
+bool Dot4SplitActive() noexcept;
+#if defined(_WIN32)
+using CreateComputePsoFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
+void OnCreateComputePipelineState(ID3D12Device* device, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID iid, void* stockPso, CreateComputePsoFn origCreate) noexcept;
+#endif
 void Adopt(ID3D12GraphicsCommandList* list) noexcept;
 void ForgetLayers() noexcept;
 Status Snapshot() noexcept;

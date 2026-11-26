@@ -169,10 +169,12 @@ void HudDiffCompositeCS(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThr
     if (id.x < Width && id.y < Height)
     {
         uint base = gtid.y * 10u + gtid.x;
-        uint mask = g_sDiff[base + 0u]  | g_sDiff[base + 1u]  | g_sDiff[base + 2u]
-                  | g_sDiff[base + 10u] | g_sDiff[base + 11u] | g_sDiff[base + 12u]
-                  | g_sDiff[base + 20u] | g_sDiff[base + 21u] | g_sDiff[base + 22u];
-        bool hud = (mask != 0u);
+        // 1px anti-speckle filter (Intrinsic 4K-Oracle hygiene, 0 extra VRAM reads via 10x10 LDS):
+        // reject isolated 1-pixel specular shimmers (count3x3 <= 1) while preserving real HUD text/crosshairs (>= 2).
+        uint count3x3 = g_sDiff[base + 0u]  + g_sDiff[base + 1u]  + g_sDiff[base + 2u]
+                      + g_sDiff[base + 10u] + g_sDiff[base + 11u] + g_sDiff[base + 12u]
+                      + g_sDiff[base + 20u] + g_sDiff[base + 21u] + g_sDiff[base + 22u];
+        bool hud = (count3x3 >= 2u);
 
         if ((Flags & 1u) != 0u && hud && (id.x & 3u) == 0u && (id.y & 3u) == 0u)
         {
@@ -188,6 +190,7 @@ void HudDiffCompositeCS(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThr
             }
             else
             {
+                // Strictly write-only UAV store (never reads OutColor so BGRA8/RGB10A2 GPUs without UAV_TYPED_LOAD stay 100% safe).
                 float4 src = TexA[int2(id.xy)];
                 OutColor[id.xy] = float4(SanitizeRgb(src.rgb), IsFiniteF(src.a) ? src.a : 1.0f);
             }
@@ -366,11 +369,18 @@ bool IsHudDiffHybrid(int2 p)
 // 10x10 shared tile for 8x8 group + 1-pixel halo (5.76x fewer TexA/TexB VRAM reads)
 groupshared uint g_sDiffHybrid[100];
 groupshared uint g_hybridGroupCount;
+groupshared uint g_hybridTileHasAnyDiff;
 
 [numthreads(8, 8, 1)]
 void HybridHudCompositeCS(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID, uint gidx : SV_GroupIndex)
 {
-    if (gidx == 0u) g_hybridGroupCount = 0u;
+    if (gidx == 0u)
+    {
+        g_hybridGroupCount = 0u;
+        g_hybridTileHasAnyDiff = 0u;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
     int2 maxCoord = int2(Width - 1u, Height - 1u);
     int2 tileOrigin = int2(gid.xy * 8u) - int2(1, 1);
 
@@ -379,17 +389,24 @@ void HybridHudCompositeCS(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupT
         int tx = int(idx % 10u);
         int ty = int(idx / 10u);
         int2 q = clamp(tileOrigin + int2(tx, ty), int2(0, 0), maxCoord);
-        g_sDiffHybrid[idx] = IsHudDiffHybrid(q) ? 1u : 0u;
+        uint d = IsHudDiffHybrid(q) ? 1u : 0u;
+        g_sDiffHybrid[idx] = d;
+        if (d != 0u) InterlockedOr(g_hybridTileHasAnyDiff, 1u);
     }
     GroupMemoryBarrierWithGroupSync();
 
     if (id.x < Width && id.y < Height)
     {
-        uint base = gtid.y * 10u + gtid.x;
-        uint mask = g_sDiffHybrid[base + 0u]  | g_sDiffHybrid[base + 1u]  | g_sDiffHybrid[base + 2u]
-                  | g_sDiffHybrid[base + 10u] | g_sDiffHybrid[base + 11u] | g_sDiffHybrid[base + 12u]
-                  | g_sDiffHybrid[base + 20u] | g_sDiffHybrid[base + 21u] | g_sDiffHybrid[base + 22u];
-        bool hudDiff = (mask != 0u);
+        uint count3x3 = 0u;
+        bool hudDiff = false;
+        if (g_hybridTileHasAnyDiff != 0u)
+        {
+            uint base = gtid.y * 10u + gtid.x;
+            count3x3 = g_sDiffHybrid[base + 0u]  + g_sDiffHybrid[base + 1u]  + g_sDiffHybrid[base + 2u]
+                     + g_sDiffHybrid[base + 10u] + g_sDiffHybrid[base + 11u] + g_sDiffHybrid[base + 12u]
+                     + g_sDiffHybrid[base + 20u] + g_sDiffHybrid[base + 21u] + g_sDiffHybrid[base + 22u];
+            hudDiff = (count3x3 >= 2u);
+        }
 
         if ((Flags & 1u) != 0u && hudDiff && (id.x & 3u) == 0u && (id.y & 3u) == 0u)
         {
@@ -407,6 +424,7 @@ void HybridHudCompositeCS(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupT
             }
             else
             {
+                // Strictly write-only UAV store (zero OutColor typed UAV load).
                 float4 src = TexA[p];
                 OutColor[id.xy] = float4(SanitizeHybridRgb(src.rgb), IsFiniteF(src.a) ? src.a : 1.0f);
             }

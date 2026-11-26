@@ -65,6 +65,8 @@ namespace Plugin
 		std::atomic<int32_t> toneMapMatchMode = 0;
 		// Debug overlay (not saved): paints detected Tier 2 / Tier 3 HUD mask pixels magenta
 		std::atomic_bool hudDebugMagenta = false;
+		// Diagnostic (not saved; 0% overhead when off): hides game HUD-less input to isolate pre-FG judder vs HUD compositing
+		std::atomic_bool debugHideHudless = false;
 		// Debug split-screen comparison (not saved; 0% overhead when off): left = original real frame, right = generated/HUD-protected output
 		std::atomic_bool hudSplitCompare = false;
 		std::atomic<float> hudSplitPos = 0.5f;

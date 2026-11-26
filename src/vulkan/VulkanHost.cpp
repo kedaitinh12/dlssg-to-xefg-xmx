@@ -239,6 +239,36 @@ namespace
 			const unsigned hc = std::thread::hardware_concurrency();
 			return hc > 0u && hc <= 6u;
 		}();
+		// Alt-Tab / minimized window guard: skip pacer sleep/spin while the game window is minimized.
+		{
+			using IsIconicFn = BOOL(WINAPI*)(HWND);
+			using GetWindowThreadProcessIdFn = DWORD(WINAPI*)(HWND, DWORD*);
+			static const auto isIconicFn = [] {
+				const HMODULE u32 = GetModuleHandleW(L"user32.dll");
+				return u32 ? reinterpret_cast<IsIconicFn>(GetProcAddress(u32, "IsIconic")) : nullptr;
+			}();
+			static const auto getWndPidFn = [] {
+				const HMODULE u32 = GetModuleHandleW(L"user32.dll");
+				return u32 ? reinterpret_cast<GetWindowThreadProcessIdFn>(GetProcAddress(u32, "GetWindowThreadProcessId")) : nullptr;
+			}();
+			static std::atomic<HWND> sGameHwnd{ nullptr };
+			static const DWORD sSelfPid = GetCurrentProcessId();
+			if (isIconicFn && getWndPidFn)
+			{
+				if (HWND fg = GetForegroundWindow())
+				{
+					DWORD fgPid = 0;
+					getWndPidFn(fg, &fgPid);
+					if (fgPid == sSelfPid)
+						sGameHwnd.store(fg, std::memory_order_relaxed);
+				}
+				if (HWND gameHwnd = sGameHwnd.load(std::memory_order_relaxed))
+				{
+					if (isIconicFn(gameHwnd))
+						return;
+				}
+			}
+		}
 		State& s = S();
 		const bool underWine = WineCompat::IsWineOrProton();
 		const bool userSleepSpin = Plugin::options.pacingSpinlockSleep.load(std::memory_order_relaxed);

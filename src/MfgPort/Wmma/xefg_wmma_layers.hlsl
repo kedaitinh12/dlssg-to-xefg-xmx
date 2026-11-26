@@ -58,6 +58,22 @@
 #define LAYER_NT 4
 #endif
 
+// Standard accumulating dot4add_i8packed with weights (b) as the second operand avoids RDNA 2 (RX 6000)
+// driver miscompilation without paying the ~2% extra add of DOT4_SPLIT. Set -DDOT4_SPLIT=1 as a safety-lock
+// fallback for older RX 6000 drivers if shimmering occurs.
+#ifndef DOT4_SPLIT
+#define DOT4_SPLIT 0
+#endif
+
+int Dot4Acc(uint a, uint b, int acc)
+{
+#if DOT4_SPLIT != 0
+    return acc + dot4add_i8packed(a, b, 0);
+#else
+    return dot4add_i8packed(a, b, acc);
+#endif
+}
+
 Texture2DArray<uint4>   tInput   : register(t0);
 StructuredBuffer<uint4> tWeights : register(t1);
 StructuredBuffer<uint4> tScale   : register(t2);
@@ -367,7 +383,7 @@ void main(uint3 groupID : SV_GroupID, uint tid : SV_GroupIndex)
                             uint a = (w == 0) ? av.x : ((w == 1) ? av.y : ((w == 2) ? av.z : av.w));
                             [unroll]
                             for (int c = 0; c < 8; ++c)
-                                acc[r][py][c] = dot4add_i8packed(a, b[c], acc[r][py][c]);
+                                acc[r][py][c] = Dot4Acc(a, b[c], acc[r][py][c]);
                         }
                     }
                 }
@@ -581,7 +597,7 @@ void main(uint3 groupID : SV_GroupID, uint tid : SV_GroupIndex)
                     uint a = (w == 0) ? av.x : ((w == 1) ? av.y : ((w == 2) ? av.z : av.w));
                     [unroll]
                     for (int c = 0; c < 16; ++c)
-                        acc[r][c] = dot4add_i8packed(a, b[c], acc[r][c]);
+                        acc[r][c] = Dot4Acc(a, b[c], acc[r][c]);
                 }
             }
         }

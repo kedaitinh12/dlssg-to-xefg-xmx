@@ -1,4 +1,5 @@
 #include "xvk_internal.h"
+#include "VulkanPolicy.h"
 
 namespace xvk {
 
@@ -96,6 +97,12 @@ HRESULT Resource::Init(Heap* placedHeap, UINT64 placedOffset)
         const VkBufferCreateInfo info = BufferCreateInfo(desc_);
         if (vk.vkCreateBuffer(device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
         vk.vkGetBufferMemoryRequirements(device, buffer_, &requirements);
+        const uint64_t safeAlign = VulkanPolicy::SafeBufferAlignment(
+            device_->properties().vendorID, requirements.size, requirements.alignment);
+        if (safeAlign > requirements.alignment) {
+            requirements.alignment = safeAlign;
+            requirements.size = AlignUp(requirements.size, safeAlign);
+        }
         size_ = desc_.Width;
     } else {
         VkImageCreateInfo info{};

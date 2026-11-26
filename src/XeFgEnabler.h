@@ -19,6 +19,67 @@ namespace XeFgEnabler
 		return gameValue;
 	}
 
+	// Distinguishes sustained player mouse/stick camera turns from instant scene cuts by tracking 3D rotation-axis
+	// continuity across consecutive frames (zero GPU cost, OS-independent across DX12/Vulkan and Windows/Linux).
+	struct CameraTurnGuard
+	{
+		float prevAxis[3]{};
+		bool hasPrevAxis = false;
+		uint32_t turnStreak = 0;
+
+		void Reset() noexcept
+		{
+			prevAxis[0] = prevAxis[1] = prevAxis[2] = 0.0f;
+			hasPrevAxis = false;
+			turnStreak = 0;
+		}
+
+		// Returns true when the current frame continues a smooth same-direction camera rotation (e.g. fast mouse flick)
+		// with <= ~70 deg per frame (fwdDot >= 0.342), so GhostBuster does not falsely drop FG mid-turn.
+		bool ObserveAndCheckSustainedTurn(const float curFwd[3], const float prevFwd[3], float fwdDot) noexcept
+		{
+			if (!std::isfinite(fwdDot) || fwdDot < 0.342f || fwdDot > 0.9998f)
+			{
+				Reset();
+				return false;
+			}
+			// 3D rotation axis = prevFwd x curFwd
+			const float ax = prevFwd[1] * curFwd[2] - prevFwd[2] * curFwd[1];
+			const float ay = prevFwd[2] * curFwd[0] - prevFwd[0] * curFwd[2];
+			const float az = prevFwd[0] * curFwd[1] - prevFwd[1] * curFwd[0];
+			const float lenSq = ax * ax + ay * ay + az * az;
+			if (!std::isfinite(lenSq) || lenSq <= 1e-8f)
+			{
+				Reset();
+				return false;
+			}
+			const float invLen = 1.0f / std::sqrt(lenSq);
+			const float nx = ax * invLen;
+			const float ny = ay * invLen;
+			const float nz = az * invLen;
+
+			bool sustained = false;
+			if (hasPrevAxis)
+			{
+				const float axisDot = nx * prevAxis[0] + ny * prevAxis[1] + nz * prevAxis[2];
+				if (axisDot > 0.65f)
+				{
+					++turnStreak;
+					sustained = (turnStreak >= 1u);
+				}
+				else
+				{
+					turnStreak = 0;
+				}
+			}
+			prevAxis[0] = nx;
+			prevAxis[1] = ny;
+			prevAxis[2] = nz;
+			hasPrevAxis = true;
+			return sustained;
+		}
+	};
+
 	// Adaptive per-frame camera displacement tracker (scale-invariant across meter-scale and UE centimeter-scale engines).
 	// Uses a 5-sample median of recent non-zero camera steps so 1-2 frame teleports never inflate the baseline,
 	// while sustained movement (e.g. 5-50 cm/frame in Unreal Engine) raises thresholds automatically.
@@ -159,17 +220,18 @@ namespace XeFgEnabler
 
 	// GhostBuster anti-ghosting guard (DLSS Enabler [GhostBuster]):
 	// Forces a clean XeFG history reset when rapid disocclusion would otherwise leave ghosting trails:
-	// - Sharp single-frame camera rotation snap (> ~45 deg, cos(45 deg) ~= 0.707)
+	// - Sharp single-frame camera rotation snap (> ~45 deg, cos(45 deg) ~= 0.707), unless sustainedTurn is active
+	//   for a continuous player mouse turn (still resets on >70 deg instant cuts)
 	// - Sudden FOV / zoom / ADS jump (> 0.25 rad ~= 14.3 deg)
 	// - Missing camera motion in motion vectors (DLSSG.CameraMotionIncluded == 0) combined with camera movement
 	inline bool ShouldGhostBusterReset(bool enabled, bool hasCamera, bool hasPrevCamera, float fwdDot,
 		float curFovRad, float prevFovRad, bool hasPrevFov, bool cameraMotionIncluded, float distSq,
-		float moveThresholdSq = 4.0f) noexcept
+		float moveThresholdSq = 4.0f, bool sustainedTurn = false) noexcept
 	{
 		if (!enabled)
 			return false;
 
-		if (hasCamera && hasPrevCamera && fwdDot < 0.707f)
+		if (hasCamera && hasPrevCamera && fwdDot < (sustainedTurn ? 0.342f : 0.707f))
 			return true;
 
 		if (hasPrevFov && curFovRad > 0.01f && prevFovRad > 0.01f && std::abs(curFovRad - prevFovRad) > 0.25f)
@@ -177,7 +239,8 @@ namespace XeFgEnabler
 
 		// Require a substantial jump (> moveThreshold, default 2m / adaptive for cm engines) or sharp snap (>30 deg,
 		// cos(30 deg) ~= 0.866) when CameraMotionIncluded == 0 so ordinary movement/panning never spams resets.
-		if (!cameraMotionIncluded && hasCamera && hasPrevCamera && (distSq > moveThresholdSq || fwdDot < 0.866f))
+		if (!cameraMotionIncluded && hasCamera && hasPrevCamera &&
+			(distSq > moveThresholdSq || (!sustainedTurn && fwdDot < 0.866f)))
 			return true;
 
 		return false;

@@ -39,9 +39,13 @@
 #extension GL_KHR_shader_subgroup_shuffle : enable
 #endif
 
+#ifndef COOP_K_COMPILED
+#define COOP_K_COMPILED 16
+#endif
+
 layout(constant_id = 0) const uint COOP_M = 16;
 layout(constant_id = 1) const uint COOP_N = 16;
-layout(constant_id = 2) const uint COOP_K = 16;
+layout(constant_id = 2) const uint COOP_K = COOP_K_COMPILED;
 layout(constant_id = 3) const uint SUBGROUP_SIZE = 32;
 
 #ifndef LAYER_FAMILY
@@ -134,10 +138,25 @@ const int ROWS   = LAYER_TILE_H / 4;
 const uint SACC_STRIDE = 20u;
 const uint SACC_TILE   = 16u * SACC_STRIDE; // 320 ints per 16x16 accumulator tile
 
+#if COOP_K_COMPILED == 32
+// Double-K (16x16x32): 6 paired horizontal taps per slice/step; stride = 12 uint32 (48 B) keeps every column 16-byte aligned for RDNA 4 128-bit LDS loads while keeping Flow LDS <= 29 KB.
+const uint WSM_COL_STRIDE = 12u;
+const uint WSM_TAP_WORDS  = 16u * WSM_COL_STRIDE; // 192 words per 32x16 paired-tap matrix
+const uint WSM_BUF_WORDS  = 6u * WSM_TAP_WORDS;   // 1152 words per 6-pair buffer
+const int  WIN_TAIL_PAD   = 4;                    // 4 trailing words keep dx=2 upper K=16..31 loads in-bounds
+#else
+const uint WSM_COL_STRIDE = 5u;
+const uint WSM_TAP_WORDS  = 16u * WSM_COL_STRIDE; // 80 words per 16x16 tap matrix
+const uint WSM_BUF_WORDS  = 9u * WSM_TAP_WORDS;   // 720 words per 9-tap buffer
+const int  WIN_TAIL_PAD   = 0;
+#endif
+
 #if LAYER_FAMILY == 2
-// Flow stages one 16-channel input step at a time and 2 x (9 taps x 16x16 col-major) weight tiles (NT = 4 tiles of 8 ch = 32 ch)
-shared uint winWords[WIN * 4];
-shared uint wsmWords[2 * 9 * 80];
+// Double-buffered Flow input window + weights cut barriers in half (1 barrier/step instead of 2) while keeping LDS <= 25 KB.
+const uint FLOW_WIN_BUF_WORDS = uint(WIN * 4 + WIN_TAIL_PAD);
+const uint FLOW_WSM_BUF_WORDS = 2u * WSM_BUF_WORDS;
+shared uint winWords[2 * (WIN * 4 + WIN_TAIL_PAD)];
+shared uint wsmWords[2 * 2 * int(WSM_BUF_WORDS)];
 #if RADV_REG_ONLY == 0
 shared int  sAcc[4 * int(SACC_TILE)]; // Phased half-emission with padded stride
 #endif
@@ -145,28 +164,29 @@ shared int  sAcc[4 * int(SACC_TILE)]; // Phased half-emission with padded stride
 const int ZPER = LAYER_OUT / LAYER_ZSPLIT;
 #if (LAYER_OUT / LAYER_ZSPLIT) == 1 && LAYER_IN > 1
 #define STREAM_SLICE 1
-shared uint winWords[WIN * 4];
-shared uint wsmWords[9 * 80];
+shared uint winWords[WIN * 4 + WIN_TAIL_PAD];
+shared uint wsmWords[int(WSM_BUF_WORDS)];
 #else
 #define STREAM_SLICE 0
-shared uint winWords[LAYER_IN * WIN * 4];
-// Double-buffered weights (2 x 9 x 80 = 5.6 KB) enable software pipelining and halve workgroup barriers per slice.
-shared uint wsmWords[2 * 9 * 80];
+shared uint winWords[LAYER_IN * WIN * 4 + WIN_TAIL_PAD];
+// Double-buffered weights enable software pipelining and halve workgroup barriers per slice.
+shared uint wsmWords[2 * int(WSM_BUF_WORDS)];
 #endif
 #if RADV_REG_ONLY == 0
 shared int  sAcc[4 * PY * int(SACC_TILE)];
 #endif
 #endif
 
-int sbyte(uint w, uint k)
+#if LAYER_FAMILY == 1
+i16vec4 unpackS8x4ToI16(uint w)
 {
-	return bitfieldExtract(int(w), int(k * 8u), 8);
+	return i16vec4(
+		int16_t(bitfieldExtract(int(w),  0, 8)),
+		int16_t(bitfieldExtract(int(w),  8, 8)),
+		int16_t(bitfieldExtract(int(w), 16, 8)),
+		int16_t(bitfieldExtract(int(w), 24, 8)));
 }
-
-int div16Signed(int v)
-{
-	return v >= 0 ? (v >> 4) : -((-v) >> 4);
-}
+#endif
 
 uint uvec4Comp(uvec4 v, int k)
 {
@@ -208,17 +228,20 @@ uvec4 fetchSkip(int x, int y, int slice, ivec3 sz)
 	return texelFetch(uSkip, ivec3(x, y, slice), 0);
 }
 
-// Exact port of UpSkipBilinearWord (9*a + 3*b + 3*c + d, signed div 16 + skip clamped to 0..127)
+// Bit-exact packed i16vec4 port of UpSkipBilinearWord (9*a + 3*b + 3*c + d, signed div 16 + skip clamped to 0..127).
+// Enables 2x-throughput packed 16-bit ALU (v_pk_mul_lo_u16 / v_pk_add_i16) on RDNA 3/4; dot fits in [-2048, 2032].
 uint upSkipBilinearWord(uint aw, uint bw, uint cw, uint dw, uint sw)
 {
-	uint packed = 0u;
-	for (uint k = 0u; k < 4u; ++k)
-	{
-		int dot = 9 * sbyte(aw, k) + 3 * (sbyte(bw, k) + sbyte(cw, k)) + sbyte(dw, k);
-		int v = clamp(sbyte(sw, k) + div16Signed(dot), 0, 127);
-		packed |= (uint(v) & 0xFFu) << (k * 8u);
-	}
-	return packed;
+	i16vec4 a    = unpackS8x4ToI16(aw);
+	i16vec4 b    = unpackS8x4ToI16(bw);
+	i16vec4 c    = unpackS8x4ToI16(cw);
+	i16vec4 d    = unpackS8x4ToI16(dw);
+	i16vec4 s    = unpackS8x4ToI16(sw);
+	i16vec4 dot  = i16vec4(int16_t(9)) * a + i16vec4(int16_t(3)) * (b + c) + d;
+	i16vec4 bias = (dot >> i16vec4(int16_t(15))) & i16vec4(int16_t(15));
+	i16vec4 q    = (dot + bias) >> i16vec4(int16_t(4));
+	u16vec4 v    = u16vec4(clamp(s + q, i16vec4(int16_t(0)), i16vec4(int16_t(127))));
+	return uint(v.x) | (uint(v.y) << 8u) | (uint(v.z) << 16u) | (uint(v.w) << 24u);
 }
 #endif
 
@@ -236,7 +259,7 @@ uint requantFloat(int acc, float s, float b, int lo)
 // sits at wsmWords[tap * 64 + oc * 4 + word].
 void stagePoolWeights(int block, uint tid, uint buf)
 {
-	const uint bufOff = buf * 720u; // 9 * 80 words per weight buffer
+	const uint bufOff = buf * WSM_BUF_WORDS;
 	for (uint i = tid; i < 144u; i += gl_WorkGroupSize.x)
 	{
 		uint tap  = i / 16u;
@@ -244,11 +267,31 @@ void stagePoolWeights(int block, uint tid, uint buf)
 		uint word = rem / 4u;
 		uint s    = rem % 4u;
 		uvec4 v   = uWeights.data[uint(block) * 144u + i];
-		uint base = bufOff + tap * 80u + (4u * s) * 5u + word;
-		wsmWords[base + 0u * 5u] = v.x;
-		wsmWords[base + 1u * 5u] = v.y;
-		wsmWords[base + 2u * 5u] = v.z;
-		wsmWords[base + 3u * 5u] = v.w;
+#if COOP_K_COMPILED == 32
+		uint dy    = tap / 3u;
+		uint dx    = tap % 3u;
+		uint pair  = dy * 2u + (dx >> 1u);
+		uint kHalf = (dx == 1u) ? 4u : 0u;
+		uint base  = bufOff + pair * WSM_TAP_WORDS + (4u * s) * WSM_COL_STRIDE + kHalf + word;
+		wsmWords[base + 0u * WSM_COL_STRIDE] = v.x;
+		wsmWords[base + 1u * WSM_COL_STRIDE] = v.y;
+		wsmWords[base + 2u * WSM_COL_STRIDE] = v.z;
+		wsmWords[base + 3u * WSM_COL_STRIDE] = v.w;
+		if (dx == 2u)
+		{
+			uint zBase = base + 4u;
+			wsmWords[zBase + 0u * WSM_COL_STRIDE] = 0u;
+			wsmWords[zBase + 1u * WSM_COL_STRIDE] = 0u;
+			wsmWords[zBase + 2u * WSM_COL_STRIDE] = 0u;
+			wsmWords[zBase + 3u * WSM_COL_STRIDE] = 0u;
+		}
+#else
+		uint base = bufOff + tap * WSM_TAP_WORDS + (4u * s) * WSM_COL_STRIDE + word;
+		wsmWords[base + 0u * WSM_COL_STRIDE] = v.x;
+		wsmWords[base + 1u * WSM_COL_STRIDE] = v.y;
+		wsmWords[base + 2u * WSM_COL_STRIDE] = v.z;
+		wsmWords[base + 3u * WSM_COL_STRIDE] = v.w;
+#endif
 	}
 }
 
@@ -323,9 +366,11 @@ void emitPoolRowRadv(int r, int z, int X0, int Y0, int limitW, int limitH,
                      coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC1)
 {
 	int Y = Y0 + int(warp) + r * int(gl_WorkGroupSize.x >> 5u);
+	uvec4 myWords = uvec4(0u);
 #if RADV_REG_ONLY == 2
-	// RDNA 4 (gfx12): lane (g, p) holds rows g*8 + 0..7, so adjacent pixels 2*k and 2*k+1 live in the same lane.
+	// RDNA 4 (gfx12): lane (g, p) holds rows g*8 + 0..7; gather into lanes 0..3 / 16..19 for 1 coalesced 8-lane store.
 	uint g = lane >> 4u;
+	uint p = lane & 15u;
 	for (int k = 0; k < 4; ++k)
 	{
 		int v0 = max(matC0[2 * k],     matC1[2 * k]);
@@ -333,11 +378,14 @@ void emitPoolRowRadv(int r, int z, int X0, int Y0, int limitW, int limitH,
 		int pooled = max(v0, v1);
 		uint q = requantFloat(pooled, sLane, biLane, lo);
 		uvec4 words = radvPack16Ch(q, lane);
-		int X = X0 + int(g) * 4 + k;
-		if ((lane & 15u) == 0u && Y < limitH && X < limitW)
-			imageStore(uDst, ivec3(X, Y, z), words);
+		if (p == uint(k))
+			myWords = words;
 	}
+	int X = X0 + int(g) * 4 + int(p);
+	if (p < 4u && Y < limitH && X < limitW)
+		imageStore(uDst, ivec3(X, Y, z), myWords);
 #else
+	// RDNA 3 (gfx11): gather all 8 pooled pixels into contiguous lanes 0..7 for 1 coalesced 8-lane store.
 	for (int i = 0; i < 8; ++i)
 	{
 		int vy = max(matC0[i], matC1[i]);
@@ -345,9 +393,12 @@ void emitPoolRowRadv(int r, int z, int X0, int Y0, int limitW, int limitH,
 		int pooled = max(vy, vPeer);
 		uint q = requantFloat(pooled, sLane, biLane, lo);
 		uvec4 words = radvPack16Ch(q, lane);
-		if (lane == 0u && Y < limitH && (X0 + i) < limitW)
-			imageStore(uDst, ivec3(X0 + i, Y, z), words);
+		if (lane == uint(i))
+			myWords = words;
 	}
+	int X = X0 + int(lane);
+	if (lane < 8u && Y < limitH && X < limitW)
+		imageStore(uDst, ivec3(X, Y, z), myWords);
 #endif
 }
 #else
@@ -357,18 +408,22 @@ void emitPoolRowRadv(int r, int z, int X0, int Y0, int limitW, int limitH,
 {
 	int Y = Y0 + int(warp) + r * int(gl_WorkGroupSize.x >> 5u);
 	uint g = lane >> 4u;
+	uint p = lane & 15u;
+	uvec4 myWords = uvec4(0u);
 	for (int i = 0; i < 8; ++i)
 	{
 		uint q = requantFloat(matC0[i], sLane, biLane, lo);
 		uvec4 words = radvPack16Ch(q, lane);
-#if RADV_REG_ONLY == 2
-		int X = X0 + int(g) * 8 + i;
-#else
-		int X = X0 + int(g) + i * 2;
-#endif
-		if ((lane & 15u) == 0u && Y < limitH && X < limitW)
-			imageStore(uDst, ivec3(X, Y, z), words);
+		if (p == uint(i))
+			myWords = words;
 	}
+#if RADV_REG_ONLY == 2
+	int X = X0 + int(g) * 8 + int(p);
+#else
+	int X = X0 + int(g) + int(p) * 2;
+#endif
+	if (p < 8u && Y < limitH && X < limitW)
+		imageStore(uDst, ivec3(X, Y, z), myWords);
 }
 #endif
 #endif
@@ -386,8 +441,9 @@ uint requantFlow(int a, int ib, int neg, int lim, uint posMul, uint s1, uint s2,
 	return uint(clamp(val, -128, 127)) & 0xFFu;
 }
 
-void fillFlowWindow(int step, int X0, int Y0, int Wd, int Hd, ivec3 inSz, uint tid)
+void fillFlowWindow(int step, int X0, int Y0, int Wd, int Hd, ivec3 inSz, uint tid, uint buf)
 {
+	const uint winBufOff = buf * FLOW_WIN_BUF_WORDS;
 	for (uint e = tid; e < uint(WIN); e += gl_WorkGroupSize.x)
 	{
 		int x  = X0 - 1 + (int(e) % WIN_W);
@@ -403,16 +459,18 @@ void fillFlowWindow(int step, int X0, int Y0, int Wd, int Hd, ivec3 inSz, uint t
 			v = fetchInput(x, ys, step, inSz);
 #endif
 		}
-		winWords[e * 4u + 0u] = v.x;
-		winWords[e * 4u + 1u] = v.y;
-		winWords[e * 4u + 2u] = v.z;
-		winWords[e * 4u + 3u] = v.w;
+		uint dst = winBufOff + e * 4u;
+		winWords[dst + 0u] = v.x;
+		winWords[dst + 1u] = v.y;
+		winWords[dst + 2u] = v.z;
+		winWords[dst + 3u] = v.w;
 	}
 }
 
-// Stages weights for step `step` across NT = 4 tiles of 8 channels (two 16-channel halves h = 0, 1) into wsmWords
-void stageFlowWeights(int step, int n0, uint tid)
+// Stages weights for step `step` across NT = 4 tiles of 8 channels (two 16-channel halves h = 0, 1) into double-buffered wsmWords
+void stageFlowWeights(int step, int n0, uint tid, uint buf)
 {
+	const uint wBufOff = buf * FLOW_WSM_BUF_WORDS;
 	for (uint e = tid; e < uint(LAYER_NT * 72); e += gl_WorkGroupSize.x)
 	{
 		int nt    = int(e) / 72;
@@ -426,13 +484,33 @@ void stageFlowWeights(int step, int n0, uint tid)
 		uint idx  = uint(((z * LAYER_IN + step) * (LAYER_OUT / 4) + (c / 4) + group) * 36 + k);
 		uvec4 v   = uWeights.data[idx];
 
-		int h     = nt >> 1;
-		int ocBase = (nt & 1) * 8 + group * 4;
-		uint base = uint((h * 9 + tap) * 80 + ocBase * 5 + word);
-		wsmWords[base + 0u * 5u] = v.x;
-		wsmWords[base + 1u * 5u] = v.y;
-		wsmWords[base + 2u * 5u] = v.z;
-		wsmWords[base + 3u * 5u] = v.w;
+		uint h      = uint(nt >> 1);
+		uint ocBase = uint((nt & 1) * 8 + group * 4);
+#if COOP_K_COMPILED == 32
+		uint dy    = uint(tap) / 3u;
+		uint dx    = uint(tap) % 3u;
+		uint pair  = dy * 2u + (dx >> 1u);
+		uint kHalf = (dx == 1u) ? 4u : 0u;
+		uint base  = wBufOff + h * WSM_BUF_WORDS + pair * WSM_TAP_WORDS + ocBase * WSM_COL_STRIDE + kHalf + uint(word);
+		wsmWords[base + 0u * WSM_COL_STRIDE] = v.x;
+		wsmWords[base + 1u * WSM_COL_STRIDE] = v.y;
+		wsmWords[base + 2u * WSM_COL_STRIDE] = v.z;
+		wsmWords[base + 3u * WSM_COL_STRIDE] = v.w;
+		if (dx == 2u)
+		{
+			uint zBase = base + 4u;
+			wsmWords[zBase + 0u * WSM_COL_STRIDE] = 0u;
+			wsmWords[zBase + 1u * WSM_COL_STRIDE] = 0u;
+			wsmWords[zBase + 2u * WSM_COL_STRIDE] = 0u;
+			wsmWords[zBase + 3u * WSM_COL_STRIDE] = 0u;
+		}
+#else
+		uint base = wBufOff + h * WSM_BUF_WORDS + uint(tap) * WSM_TAP_WORDS + ocBase * WSM_COL_STRIDE + uint(word);
+		wsmWords[base + 0u * WSM_COL_STRIDE] = v.x;
+		wsmWords[base + 1u * WSM_COL_STRIDE] = v.y;
+		wsmWords[base + 2u * WSM_COL_STRIDE] = v.z;
+		wsmWords[base + 3u * WSM_COL_STRIDE] = v.w;
+#endif
 	}
 }
 
@@ -482,24 +560,28 @@ void emitFlowHalfRadv(int r, int h, int n0, int X0, int Y0, int limitW, int limi
 {
 	int y = Y0 + int(warp) + r * 4;
 	uint g = lane >> 4u;
+	uint p = lane & 15u;
+	uvec4 myWords = uvec4(0u);
 	for (int i = 0; i < 8; ++i)
 	{
 		uint q = requantFlow(matC[i], ibLane, ngLane, lim, posMul, s1, s2, roundPos, roundNeg);
 		uvec4 words = radvPack16Ch(q, lane);
+		if (p == uint(i))
+			myWords = words;
+	}
 #if RADV_REG_ONLY == 2
-		int x = X0 + int(g) * 8 + i;
+	int x = X0 + int(g) * 8 + int(p);
 #else
-		int x = X0 + int(g) + i * 2;
+	int x = X0 + int(g) + int(p) * 2;
 #endif
-		if ((lane & 15u) == 0u && y < limitH && x < limitW)
-		{
+	if (p < 8u && y < limitH && x < limitW)
+	{
 #if LAYER_OUT == 8
-			imageStore(uDst, ivec3(x, y + 1, n0 + h * 2 + 0), uvec4(words.x, words.y, words.x, words.x));
-			imageStore(uDst, ivec3(x, y + 1, n0 + h * 2 + 1), uvec4(words.z, words.w, words.z, words.z));
+		imageStore(uDst, ivec3(x, y + 1, n0 + h * 2 + 0), uvec4(myWords.x, myWords.y, myWords.x, myWords.x));
+		imageStore(uDst, ivec3(x, y + 1, n0 + h * 2 + 1), uvec4(myWords.z, myWords.w, myWords.z, myWords.z));
 #else
-			imageStore(uDst, ivec3(x, y + 1, (n0 / 2) + h), words);
+		imageStore(uDst, ivec3(x, y + 1, (n0 / 2) + h), myWords);
 #endif
-		}
 	}
 }
 #endif
@@ -533,9 +615,12 @@ void main()
 	const uint lane = tid & 31u;
 	ivec3 outSz = imageSize(uDst);
 
-	coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA;
-	coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA1;
-	coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+	coopmat<int8_t, gl_ScopeSubgroup, 16, COOP_K_COMPILED, gl_MatrixUseA> matA;
+	coopmat<int8_t, gl_ScopeSubgroup, 16, COOP_K_COMPILED, gl_MatrixUseA> matA1;
+	coopmat<int8_t, gl_ScopeSubgroup, COOP_K_COMPILED, 16, gl_MatrixUseB> matB;
+#if LAYER_FAMILY == 2
+	coopmat<int8_t, gl_ScopeSubgroup, COOP_K_COMPILED, 16, gl_MatrixUseB> matB1;
+#endif
 
 #if LAYER_FAMILY != 2
 	// ---- Family 0 (PoolConv) & Family 1 (UpSkip Decoder) ----
@@ -692,17 +777,25 @@ void main()
 			const uint wBufOff = 0u;
 #else
 			const uint curBuf = uint(slice & 1);
-			const uint wBufOff = curBuf * 720u;
+			const uint wBufOff = curBuf * WSM_BUF_WORDS;
 			if (slice + 1 < LAYER_IN)
 				stagePoolWeights(z * LAYER_IN + slice + 1, tid, curBuf ^ 1u);
 #endif
 
 			int sliceBase = (STREAM_SLICE != 0) ? 0 : (slice * WIN);
+#if COOP_K_COMPILED == 32
+			for (int tap = 0; tap < 6; ++tap)
+			{
+				int dy = tap >> 1;
+				int dx = (tap & 1) * 2;
+				coopMatLoad(matB, wsmWords, wBufOff + uint(tap) * WSM_TAP_WORDS, WSM_COL_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+#else
 			for (int tap = 0; tap < 9; ++tap)
 			{
 				int dy = tap / 3;
 				int dx = tap % 3;
-				coopMatLoad(matB, wsmWords, wBufOff + uint(tap * 80), 5u, gl_CooperativeMatrixLayoutColumnMajor);
+				coopMatLoad(matB, wsmWords, wBufOff + uint(tap) * WSM_TAP_WORDS, WSM_COL_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+#endif
 
 #if LAYER_POOL != 0
 				// Row group r = 0 (yl = warp + 0): ping-pong matA/matA1 to overlap LDS loads with WMMA
@@ -963,32 +1056,48 @@ void main()
 		coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
 
 	const ivec3 inSz = textureSize(uInput, 0);
+	fillFlowWindow(0, X0, Y0, Wd, Hd, inSz, tid, 0u);
+	stageFlowWeights(0, n0, tid, 0u);
+	barrier();
 	for (int step = 0; step < LAYER_IN; ++step)
 	{
-		fillFlowWindow(step, X0, Y0, Wd, Hd, inSz, tid);
-		stageFlowWeights(step, n0, tid);
-		barrier();
+		const uint curBuf    = uint(step & 1);
+		const uint winBufOff = curBuf * FLOW_WIN_BUF_WORDS;
+		const uint wBufOff   = curBuf * FLOW_WSM_BUF_WORDS;
+		if (step + 1 < LAYER_IN)
+		{
+			const uint nextBuf = curBuf ^ 1u;
+			fillFlowWindow(step + 1, X0, Y0, Wd, Hd, inSz, tid, nextBuf);
+			stageFlowWeights(step + 1, n0, tid, nextBuf);
+		}
 
+#if COOP_K_COMPILED == 32
+		for (int tap = 0; tap < 6; ++tap)
+		{
+			int dy = tap >> 1;
+			int dx = (tap & 1) * 2;
+#else
 		for (int tap = 0; tap < 9; ++tap)
 		{
 			int dy = tap / 3;
 			int dx = tap % 3;
+#endif
 
-			// Load both row-group A tiles once and reuse each weight half B across r=0 and r=1 (50% fewer B loads)
-			uint aOff0 = uint(((int(warp) + 0 + dy) * WIN_W + dx) * 4);
-			uint aOff1 = uint(((int(warp) + 4 + dy) * WIN_W + dx) * 4);
+			// Load both row-group A tiles and both weight halves (matB/matB1) without WAW stalls
+			uint aOff0 = winBufOff + uint(((int(warp) + 0 + dy) * WIN_W + dx) * 4);
+			uint aOff1 = winBufOff + uint(((int(warp) + 4 + dy) * WIN_W + dx) * 4);
 			coopMatLoad(matA,  winWords, aOff0, 4u, gl_CooperativeMatrixLayoutRowMajor);
 			coopMatLoad(matA1, winWords, aOff1, 4u, gl_CooperativeMatrixLayoutRowMajor);
+			coopMatLoad(matB,  wsmWords, wBufOff + uint(tap) * WSM_TAP_WORDS, WSM_COL_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+			coopMatLoad(matB1, wsmWords, wBufOff + WSM_BUF_WORDS + uint(tap) * WSM_TAP_WORDS, WSM_COL_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
 
-			coopMatLoad(matB, wsmWords, uint((0 * 9 + tap) * 80), 5u, gl_CooperativeMatrixLayoutColumnMajor);
-			matC0_0 = coopMatMulAdd(matA,  matB, matC0_0);
-			matC1_0 = coopMatMulAdd(matA1, matB, matC1_0);
-
-			coopMatLoad(matB, wsmWords, uint((1 * 9 + tap) * 80), 5u, gl_CooperativeMatrixLayoutColumnMajor);
-			matC0_1 = coopMatMulAdd(matA,  matB, matC0_1);
-			matC1_1 = coopMatMulAdd(matA1, matB, matC1_1);
+			matC0_0 = coopMatMulAdd(matA,  matB,  matC0_0);
+			matC1_0 = coopMatMulAdd(matA1, matB,  matC1_0);
+			matC0_1 = coopMatMulAdd(matA,  matB1, matC0_1);
+			matC1_1 = coopMatMulAdd(matA1, matB1, matC1_1);
 		}
-		barrier();
+		if (step + 1 < LAYER_IN)
+			barrier();
 	}
 
 	const uint roundPos = 1u << ((s1 + 31u) & 31u);
