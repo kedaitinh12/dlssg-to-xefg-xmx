@@ -74,6 +74,8 @@ namespace Plugin
 		std::atomic_bool logging = true;
 		// Opt-in DX12 DRED crash diagnostics (AutoBreadcrumbs + PageFault on TDR; 0% overhead when OFF; requires game restart)
 		std::atomic_bool forceDred = false;
+		// Opt-in lightweight crash minidump (.dmp via System32 dbghelp.dll on unhandled crash; 0% overhead when OFF)
+		std::atomic_bool crashMiniDump = false;
 		// Debug per-stage GPU time profiler (not saved; 0% overhead when off)
 		std::atomic_bool gpuProfiler = false;
 		// Ignores game-supplied DLSSG.Reset (fixes games that spam Reset=1 every frame; internal safety resets still apply)

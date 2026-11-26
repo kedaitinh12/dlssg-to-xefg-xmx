@@ -12,6 +12,9 @@ namespace Log
 	void Write(std::string_view level, std::string_view message);
 	void SetEnabled(bool enabled) noexcept;
 	bool IsEnabled() noexcept;
+	// Opt-in lightweight crash minidump (.dmp via System32 dbghelp.dll on unhandled exception).
+	void SetCrashMiniDumpEnabled(bool enabled) noexcept;
+	bool CrashMiniDumpRequestedByEnvironment() noexcept;
 	const char* DeviceRemovedName(uint32_t hresult) noexcept;
 	// Opt-in DX12 DRED (Device Removed Extended Data): enables AutoBreadcrumbs + PageFault before D3D12CreateDevice.
 	bool EnableDred() noexcept;

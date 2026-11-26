@@ -3,6 +3,7 @@
 #include "Util.h"
 
 #include <Windows.h>
+#include <DbgHelp.h>
 #include <Psapi.h>
 #include <dxgi.h>
 #include <wrl/client.h>
@@ -20,8 +21,84 @@
 namespace
 {
 	std::atomic_bool gLoggingEnabled{ true };
-	LPTOP_LEVEL_EXCEPTION_FILTER gPrevExceptionFilter = nullptr;
-	std::atomic_bool gExceptionFilterInstalled{ false };
+	std::atomic_bool gCrashMiniDumpEnabled{ false };
+	std::atomic_flag gHandlingCrash = ATOMIC_FLAG_INIT;
+	std::atomic_flag gDumpAttempted = ATOMIC_FLAG_INIT;
+	std::atomic<LPTOP_LEVEL_EXCEPTION_FILTER> gPrevExceptionFilter{};
+	using MiniDumpWriteDumpFn = decltype(&MiniDumpWriteDump);
+	constexpr auto kMiniDumpType = static_cast<MINIDUMP_TYPE>(MiniDumpWithUnloadedModules | MiniDumpWithThreadInfo);
+
+	struct CrashDumpWriter
+	{
+		MiniDumpWriteDumpFn write{};
+		std::filesystem::path path;
+
+		CrashDumpWriter()
+		{
+			path = ThisModulePath().parent_path() /
+				(L"dlssg_to_xefg_crash_" + std::to_wstring(GetCurrentProcessId()) + L".dmp");
+			if (HMODULE dbghelp = LoadLibraryExW(L"dbghelp.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32))
+			{
+				write = reinterpret_cast<MiniDumpWriteDumpFn>(GetProcAddress(dbghelp, "MiniDumpWriteDump"));
+				if (!write)
+					FreeLibrary(dbghelp);
+			}
+		}
+	};
+
+	std::atomic<const CrashDumpWriter*> gCrashDumpWriter{};
+	const std::filesystem::path* gCrashLogPath{};
+
+	// The normal logger may already hold its mutex on the crashing thread.
+	void AppendCrashLog(const char* message) noexcept
+	{
+		if (!gLoggingEnabled.load(std::memory_order_relaxed) || !gCrashLogPath)
+			return;
+		HANDLE file = CreateFileW(gCrashLogPath->c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+			nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (file != INVALID_HANDLE_VALUE)
+		{
+			DWORD written{};
+			WriteFile(file, message, static_cast<DWORD>(std::char_traits<char>::length(message)), &written, nullptr);
+			CloseHandle(file);
+		}
+	}
+
+	void WriteCrashMiniDump(EXCEPTION_POINTERS* ep) noexcept
+	{
+		if (!ep || !gCrashMiniDumpEnabled.load(std::memory_order_acquire) ||
+			gDumpAttempted.test_and_set(std::memory_order_relaxed))
+			return;
+		const auto* writer = gCrashDumpWriter.load(std::memory_order_acquire);
+		if (!writer || !writer->write)
+		{
+			AppendCrashLog("[warn] Crash minidump unavailable: MiniDumpWriteDump was not loaded.\n");
+			return;
+		}
+		HANDLE file = CreateFileW(writer->path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+			FILE_ATTRIBUTE_NORMAL, nullptr);
+		DWORD error{};
+		if (file == INVALID_HANDLE_VALUE)
+			error = GetLastError();
+		else
+		{
+			MINIDUMP_EXCEPTION_INFORMATION info{ GetCurrentThreadId(), ep, FALSE };
+			const BOOL ok = writer->write(GetCurrentProcess(), GetCurrentProcessId(), file, kMiniDumpType, &info, nullptr, nullptr);
+			if (!ok)
+				error = GetLastError();
+			CloseHandle(file);
+			if (!ok)
+				DeleteFileW(writer->path.c_str());
+			else
+			{
+				AppendCrashLog("[error] Crash minidump written next to the mod.\n");
+				return;
+			}
+		}
+		char note[100]{};
+		std::snprintf(note, sizeof(note), "[warn] Crash minidump failed (win32 error 0x%08lX)\n", error);
+		AppendCrashLog(note);
+	}
 
 	struct RtlOsVersionInfoW
 	{
@@ -105,6 +182,9 @@ namespace
 
 	LONG WINAPI CrashLogFilter(EXCEPTION_POINTERS* ep) noexcept
 	{
+		if (gHandlingCrash.test_and_set(std::memory_order_acq_rel))
+			return EXCEPTION_CONTINUE_SEARCH;
+		WriteCrashMiniDump(ep);
 		if (ep && ep->ExceptionRecord && gLoggingEnabled.load(std::memory_order_relaxed))
 		{
 			const auto* rec = ep->ExceptionRecord;
@@ -136,9 +216,14 @@ namespace
 					ExceptionCodeName(rec->ExceptionCode), rec->ExceptionCode, modName.c_str(),
 					static_cast<unsigned long long>(rva), GetCurrentThreadId());
 			}
-			Log::Write("error", msg);
+			AppendCrashLog(msg);
+			AppendCrashLog("\n");
 		}
-		return gPrevExceptionFilter ? gPrevExceptionFilter(ep) : EXCEPTION_CONTINUE_SEARCH;
+		const auto previous = gPrevExceptionFilter.load(std::memory_order_acquire);
+		const LONG result = previous ? previous(ep) : EXCEPTION_CONTINUE_SEARCH;
+		if (result == EXCEPTION_CONTINUE_EXECUTION)
+			gHandlingCrash.clear(std::memory_order_release);
+		return result;
 	}
 
 	struct LogSession
@@ -171,8 +256,17 @@ namespace
 					__DATE__, __TIME__, GetCurrentProcessId(), exeName, modName, FormatWindowsVersion()));
 			}
 
-			if (!gExceptionFilterInstalled.exchange(true, std::memory_order_acq_rel))
-				gPrevExceptionFilter = SetUnhandledExceptionFilter(CrashLogFilter);
+			if (Log::CrashMiniDumpRequestedByEnvironment())
+				Log::SetCrashMiniDumpEnabled(true);
+			// Windows cannot atomically remove a filter from a chain owned by other DLLs.
+			// Keep this callback mapped if another component saves it as its predecessor.
+			HMODULE pinned{};
+			if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+				reinterpret_cast<LPCWSTR>(&CrashLogFilter), &pinned))
+			{
+				gCrashLogPath = new std::filesystem::path(logPath);
+				gPrevExceptionFilter.store(SetUnhandledExceptionFilter(CrashLogFilter), std::memory_order_release);
+			}
 		}
 
 		~LogSession()
@@ -182,6 +276,7 @@ namespace
 				std::scoped_lock lock(mutex);
 				WriteLineLocked(file, "info", "Session end (clean exit)");
 			}
+
 		}
 	};
 
@@ -200,6 +295,32 @@ void Log::SetEnabled(bool enabled) noexcept
 bool Log::IsEnabled() noexcept
 {
 	return gLoggingEnabled.load(std::memory_order_relaxed);
+}
+
+bool Log::CrashMiniDumpRequestedByEnvironment() noexcept
+{
+	wchar_t flag[16]{};
+	const DWORD len = GetEnvironmentVariableW(L"XEFG_CRASH_MINIDUMP", flag, static_cast<DWORD>(std::size(flag)));
+	return len > 0 && len < std::size(flag) &&
+		(_wcsicmp(flag, L"1") == 0 || _wcsicmp(flag, L"on") == 0 ||
+		 _wcsicmp(flag, L"true") == 0 || _wcsicmp(flag, L"yes") == 0);
+}
+
+void Log::SetCrashMiniDumpEnabled(bool enabled) noexcept
+{
+	if (enabled)
+	{
+		try
+		{
+			// These objects must survive shutdown while the process filter can still run.
+			static const auto* writer = new CrashDumpWriter;
+			gCrashDumpWriter.store(writer, std::memory_order_release);
+		}
+		catch (...)
+		{
+		}
+	}
+	gCrashMiniDumpEnabled.store(enabled, std::memory_order_release);
 }
 
 const char* Log::DeviceRemovedName(uint32_t hresult) noexcept

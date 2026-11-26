@@ -835,6 +835,17 @@ namespace
 		HelpMarker("Writes startup diagnostics, HUD tier switches, and crash/TDR records to\n"
 				   "dlssg_to_xefg_intel_is_better.log. Turn OFF for zero disk I/O.");
 
+		bool crashDump = Plugin::options.crashMiniDump;
+		if (api->Checkbox("Crash minidump (.dmp)", &crashDump))
+		{
+			Plugin::options.crashMiniDump = crashDump;
+			Log::SetCrashMiniDumpEnabled(crashDump);
+			api->SetBool(self, "CrashMiniDump", crashDump);
+			NotifySettingChanged(NoticeKind::LiveSaved, "Crash minidump");
+		}
+		HelpMarker("Off by default. Attempts to write a compact .dmp file next to the mod\n"
+				   "on unhandled crash using System32 dbghelp.dll (or set XEFG_CRASH_MINIDUMP=1).");
+
 		bool forceDred = Plugin::options.forceDred;
 		{
 			ScopedDisable dis(isVulkan);
@@ -1024,7 +1035,7 @@ namespace
 				"NetworkPath", "HudlessUi", "CameraCutDetection", "VramGuard", "AutoVrrPacing",
 				"D3D12VulkanWmmaBridge", "UiTransitionCooldown", "GhostBuster", "PacingSpinlockSleep",
 				"DepthInvertedOverride", "JitteredMvOverride", "UiAlphaMode", "HudTierMode",
-				"ToneMapMatchMode", "IgnoreGameReset", "Logging", "ForceDRED"
+				"ToneMapMatchMode", "IgnoreGameReset", "Logging", "CrashMiniDump", "ForceDRED"
 			};
 			for (const char* key : kAllKeys)
 				api->ResetValue(self, key);
@@ -1053,7 +1064,9 @@ namespace
 			Plugin::options.ignoreGameReset = false;
 			Plugin::options.logging = true;
 			Plugin::options.forceDred = false;
+			Plugin::options.crashMiniDump = false;
 			Log::SetEnabled(true);
+			Log::SetCrashMiniDumpEnabled(false);
 			Plugin::options.hudDebugMagenta = false;
 			Plugin::options.debugHideHudless = false;
 			Plugin::options.hudSplitCompare = false;
@@ -1420,6 +1433,9 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* optiAp
 	Plugin::options.ignoreGameReset = api->GetBool(self, "IgnoreGameReset", Plugin::options.ignoreGameReset);
 	Plugin::options.logging = api->GetBool(self, "Logging", Plugin::options.logging);
 	Log::SetEnabled(Plugin::options.logging);
+	Plugin::options.crashMiniDump = Log::CrashMiniDumpRequestedByEnvironment() ||
+		api->GetBool(self, "CrashMiniDump", false);
+	Log::SetCrashMiniDumpEnabled(Plugin::options.crashMiniDump);
 	Plugin::options.forceDred = api->GetBool(self, "ForceDRED", Plugin::options.forceDred);
 	{
 		wchar_t envBuf[16]{};
