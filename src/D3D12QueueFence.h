@@ -6,6 +6,7 @@
 #include <d3d12.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -20,15 +21,23 @@
 // - Fast path when no entries await submission or queue-signal retry: atomic loads (~0 overhead).
 // - Claims awaiting signals BEFORE forwarding ExecuteCommandLists so concurrent recordings reusing the same
 //   command list address allocate a fresh FenceSignal and never inherit the older fence.
-// - Serializes per-queue ExecuteCommandLists + Signal + submitSeq so an earlier fence can never satisfy a newer
-//   submission on the same queue whose Signal() failed, and retains ComPtr<ID3D12CommandQueue> while retry work
-//   remains pending so shutdown WaitAllPending() never dereferences a released queue.
+// - Serializes per-queue ExecuteCommandLists + Signal + submitSeq + retry queue retain/release under the same
+//   per-queue submitMutex so:
+//   (1) an earlier fence can never satisfy a newer failed-Signal submission on the same queue, and
+//   (2) ReleaseRetryQueueIfEmpty can never drop a queue reference while another thread is recording a retry.
+// - Binds each cached fence to the exact queue instance & owning ID3D12Device (via private-data token + GetDevice
+//   check + stale-fence recovery) so a recreated queue/device reusing the same pointer address always gets a fresh fence.
 // - Chain-safe with D3D12VulkanWmma's vtable hook regardless of installation order.
 namespace D3D12QueueFence
 {
 	namespace detail
 	{
 		constexpr size_t kExecuteCommandListsSlot = 10;
+		// {9A4E2F61-8C1B-4D7E-A5E3-2C71F08B4D92}
+		inline constexpr GUID kQueueTokenGuid = {
+			0x9a4e2f61, 0x8c1b, 0x4d7e, { 0xa5, 0xe3, 0x2c, 0x71, 0xf0, 0x8b, 0x4d, 0x92 }
+		};
+
 		using ExecuteCommandListsFn = void (STDMETHODCALLTYPE*)(
 			ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 
@@ -42,6 +51,9 @@ namespace D3D12QueueFence
 		{
 			std::shared_ptr<std::mutex> submitMutex;
 			Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+			ID3D12Device* ownerDevice = nullptr; // identity tag only; never dereferenced
+			uint64_t queueToken = 0;
+			bool hasPrivateToken = false;
 			uint64_t nextValue = 0;
 		};
 
@@ -53,7 +65,10 @@ namespace D3D12QueueFence
 			std::atomic<bool> installed{ false };
 
 			std::mutex fenceMutex;
+			uint64_t nextQueueToken = 0;
 			std::unordered_map<ID3D12CommandQueue*, PerQueueFence> queueFences;
+			// Retired fences from queues whose pointer address was later reused by a new queue/device.
+			std::vector<std::pair<Microsoft::WRL::ComPtr<ID3D12Fence>, uint64_t>> retiredFences;
 			// Strong references kept ONLY while a queue has pending failed-Signal retry entries.
 			std::unordered_map<ID3D12CommandQueue*, Microsoft::WRL::ComPtr<ID3D12CommandQueue>> retryQueues;
 		};
@@ -88,7 +103,8 @@ namespace D3D12QueueFence
 			return slot.submitMutex;
 		}
 
-		inline void RetainRetryQueue(ID3D12CommandQueue* queue) noexcept
+		// Must be called while holding this queue's submitMutex, AFTER MarkSignalsAcceptedWithoutFence().
+		inline void RetainRetryQueueUnderSubmitLock(ID3D12CommandQueue* queue) noexcept
 		{
 			if (!queue)
 				return;
@@ -97,25 +113,49 @@ namespace D3D12QueueFence
 			s.retryQueues[queue] = queue;
 		}
 
-		inline void ReleaseRetryQueueIfEmpty(ID3D12CommandQueue* queue) noexcept
+		// Must be called while holding this queue's submitMutex, AFTER CompleteClaimedSubmits()/AttachFenceToQueueSignals().
+		// Returns the detached ComPtr so caller releases it OUTSIDE both fenceMutex and submitMutex.
+		inline Microsoft::WRL::ComPtr<ID3D12CommandQueue> DetachRetryQueueIfEmptyUnderSubmitLock(
+			ID3D12CommandQueue* queue) noexcept
 		{
-			if (!queue || DeferredDestroy::HasAwaitingQueueSignalFor(queue))
-				return;
 			Microsoft::WRL::ComPtr<ID3D12CommandQueue> released;
+			if (!queue || DeferredDestroy::HasAwaitingQueueSignalFor(queue))
+				return released;
+			State& s = S();
+			std::lock_guard lock(s.fenceMutex);
+			auto it = s.retryQueues.find(queue);
+			if (it != s.retryQueues.end())
 			{
-				State& s = S();
-				std::lock_guard lock(s.fenceMutex);
-				// Re-check under fenceMutex in case another thread just retained it.
-				if (DeferredDestroy::HasAwaitingQueueSignalFor(queue))
-					return;
-				auto it = s.retryQueues.find(queue);
-				if (it != s.retryQueues.end())
-				{
-					released = std::move(it->second);
-					s.retryQueues.erase(it);
-				}
+				released = std::move(it->second);
+				s.retryQueues.erase(it);
 			}
-			// ComPtr released outside fenceMutex.
+			return released;
+		}
+
+		inline void RetireSlotFenceLocked(State& s, PerQueueFence& slot) noexcept
+		{
+			if (slot.fence && slot.nextValue > 0)
+			{
+				const uint64_t done = slot.fence->GetCompletedValue();
+				if (done != UINT64_MAX && done < slot.nextValue)
+					s.retiredFences.emplace_back(slot.fence, slot.nextValue);
+			}
+			slot.fence.Reset();
+			slot.ownerDevice = nullptr;
+			slot.queueToken = 0;
+			slot.hasPrivateToken = false;
+			slot.nextValue = 0;
+
+			// Prune completed retired fences so the list stays tiny.
+			s.retiredFences.erase(
+				std::remove_if(s.retiredFences.begin(), s.retiredFences.end(),
+					[](const std::pair<Microsoft::WRL::ComPtr<ID3D12Fence>, uint64_t>& item) noexcept {
+						if (!item.first)
+							return true;
+						const uint64_t d = item.first->GetCompletedValue();
+						return d == UINT64_MAX || d >= item.second;
+					}),
+				s.retiredFences.end());
 		}
 
 		inline bool SignalQueuePrivateFence(ID3D12CommandQueue* queue,
@@ -123,23 +163,85 @@ namespace D3D12QueueFence
 		{
 			if (!queue)
 				return false;
+
+			// Always query the live owning device from the queue so a recreated device/queue reusing this
+			// pointer address never inherits an older device's fence.
+			Microsoft::WRL::ComPtr<ID3D12Device> dev;
+			if (FAILED(queue->GetDevice(IID_PPV_ARGS(&dev))) || !dev)
+				return false;
+
+			// Also check per-queue private-data token so a brand-new queue reusing the same address on the
+			// same device gets a fresh fence bound to its own lifetime.
+			uint64_t observedToken = 0;
+			UINT tokenSize = sizeof(observedToken);
+			const bool gotToken =
+				SUCCEEDED(queue->GetPrivateData(kQueueTokenGuid, &tokenSize, &observedToken)) &&
+				tokenSize == sizeof(observedToken);
+
 			State& s = S();
 			std::lock_guard lock(s.fenceMutex);
 			auto& slot = s.queueFences[queue];
+
+			const bool deviceChanged = slot.fence && slot.ownerDevice != dev.Get();
+			const bool queueInstanceChanged = slot.fence && slot.hasPrivateToken &&
+				(!gotToken || observedToken != slot.queueToken);
+			if (deviceChanged || queueInstanceChanged)
+				RetireSlotFenceLocked(s, slot);
+
+			bool createdFresh = false;
 			if (!slot.fence)
 			{
-				Microsoft::WRL::ComPtr<ID3D12Device> dev;
-				if (FAILED(queue->GetDevice(IID_PPV_ARGS(&dev))) || !dev)
-					return false;
 				if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&slot.fence))) || !slot.fence)
 					return false;
+				slot.ownerDevice = dev.Get();
+				slot.nextValue = 0;
+				const uint64_t newToken = ++s.nextQueueToken;
+				if (SUCCEEDED(queue->SetPrivateData(kQueueTokenGuid, sizeof(newToken), &newToken)))
+				{
+					slot.queueToken = newToken;
+					slot.hasPrivateToken = true;
+				}
+				else
+				{
+					slot.queueToken = 0;
+					slot.hasPrivateToken = false;
+				}
+				createdFresh = true;
 			}
-			const uint64_t val = ++slot.nextValue;
-			if (FAILED(queue->Signal(slot.fence.Get(), val)))
-				return false;
-			outFence = slot.fence;
-			outValue = val;
-			return true;
+
+			uint64_t val = ++slot.nextValue;
+			if (SUCCEEDED(queue->Signal(slot.fence.Get(), val)))
+			{
+				outFence = slot.fence;
+				outValue = val;
+				return true;
+			}
+
+			// If a cached fence failed to signal (e.g. reused device+queue address on a mock without private data),
+			// recreate the fence on the queue's live device and retry once.
+			if (!createdFresh)
+			{
+				RetireSlotFenceLocked(s, slot);
+				if (SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&slot.fence))) && slot.fence)
+				{
+					slot.ownerDevice = dev.Get();
+					slot.nextValue = 1;
+					const uint64_t newToken = ++s.nextQueueToken;
+					if (SUCCEEDED(queue->SetPrivateData(kQueueTokenGuid, sizeof(newToken), &newToken)))
+					{
+						slot.queueToken = newToken;
+						slot.hasPrivateToken = true;
+					}
+					if (SUCCEEDED(queue->Signal(slot.fence.Get(), 1)))
+					{
+						outFence = slot.fence;
+						outValue = 1;
+						return true;
+					}
+				}
+			}
+
+			return false;
 		}
 
 		inline void STDMETHODCALLTYPE HookExecuteCommandLists(
@@ -170,33 +272,31 @@ namespace D3D12QueueFence
 			}
 
 			auto submitMutex = GetQueueSubmitMutex(self);
-			Microsoft::WRL::ComPtr<ID3D12Fence> fence;
-			uint64_t value = 0;
-			uint64_t submitSeq = 0;
-			bool signaled = false;
+			Microsoft::WRL::ComPtr<ID3D12CommandQueue> releasedRetryQueue;
 			{
 				std::lock_guard qlock(*submitMutex);
 				orig(self, numCommandLists, ppCommandLists);
-				submitSeq = DeferredDestroy::NextQueueSubmitSeq();
-				signaled = SignalQueuePrivateFence(self, fence, value);
-				if (!signaled && !claimed.empty())
+				const uint64_t submitSeq = DeferredDestroy::NextQueueSubmitSeq();
+				Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+				uint64_t value = 0;
+				if (SignalQueuePrivateFence(self, fence, value))
 				{
-					// Retain queue lifetime and record failed-Signal submission while still holding submitMutex
-					// so any subsequent submission on this queue observes it with a strictly greater submitSeq.
-					RetainRetryQueue(self);
+					auto pred = [fence = std::move(fence), value]() noexcept -> bool {
+						const uint64_t done = fence->GetCompletedValue();
+						return done == UINT64_MAX || done >= value;
+					};
+					// Complete and detach retry queue reference under the same per-queue submitMutex so
+					// RetainRetryQueue and DetachRetryQueueIfEmpty can never race on the same queue.
+					DeferredDestroy::CompleteClaimedSubmits(std::move(claimed), std::move(pred), self, submitSeq);
+					releasedRetryQueue = DetachRetryQueueIfEmptyUnderSubmitLock(self);
+				}
+				else if (!claimed.empty())
+				{
 					DeferredDestroy::MarkSignalsAcceptedWithoutFence(self, std::move(claimed), submitSeq);
+					RetainRetryQueueUnderSubmitLock(self);
 				}
 			}
-
-			if (signaled)
-			{
-				auto pred = [fence = std::move(fence), value]() noexcept -> bool {
-					const uint64_t done = fence->GetCompletedValue();
-					return done == UINT64_MAX || done >= value;
-				};
-				DeferredDestroy::CompleteClaimedSubmits(std::move(claimed), std::move(pred), self, submitSeq);
-				ReleaseRetryQueueIfEmpty(self);
-			}
+			// releasedRetryQueue ComPtr is destroyed here, outside both fenceMutex and submitMutex.
 		}
 
 		inline bool PatchQueueVtable(ID3D12CommandQueue* queue) noexcept
@@ -286,34 +386,37 @@ namespace D3D12QueueFence
 		for (auto& queue : retrySnapshot)
 		{
 			auto submitMutex = detail::GetQueueSubmitMutex(queue.Get());
-			Microsoft::WRL::ComPtr<ID3D12Fence> fence;
-			uint64_t value = 0;
-			uint64_t seq = 0;
-			bool signaled = false;
+			Microsoft::WRL::ComPtr<ID3D12CommandQueue> releasedRetryQueue;
 			{
 				std::lock_guard qlock(*submitMutex);
-				seq = DeferredDestroy::NextQueueSubmitSeq();
-				signaled = detail::SignalQueuePrivateFence(queue.Get(), fence, value);
-			}
-			if (signaled)
-			{
-				DeferredDestroy::AttachFenceToQueueSignals(queue.Get(),
-					[fence = std::move(fence), value]() noexcept -> bool {
-						const uint64_t done = fence->GetCompletedValue();
-						return done == UINT64_MAX || done >= value;
-					}, seq);
-				detail::ReleaseRetryQueueIfEmpty(queue.Get());
+				const uint64_t seq = DeferredDestroy::NextQueueSubmitSeq();
+				Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+				uint64_t value = 0;
+				if (detail::SignalQueuePrivateFence(queue.Get(), fence, value))
+				{
+					DeferredDestroy::AttachFenceToQueueSignals(queue.Get(),
+						[fence = std::move(fence), value]() noexcept -> bool {
+							const uint64_t done = fence->GetCompletedValue();
+							return done == UINT64_MAX || done >= value;
+						}, seq);
+					releasedRetryQueue = detail::DetachRetryQueueIfEmptyUnderSubmitLock(queue.Get());
+				}
 			}
 		}
 
 		std::vector<std::pair<Microsoft::WRL::ComPtr<ID3D12Fence>, uint64_t>> snapshot;
 		{
 			std::lock_guard lock(s.fenceMutex);
-			snapshot.reserve(s.queueFences.size());
+			snapshot.reserve(s.queueFences.size() + s.retiredFences.size());
 			for (const auto& kv : s.queueFences)
 			{
 				if (kv.second.fence && kv.second.nextValue > 0)
 					snapshot.emplace_back(kv.second.fence, kv.second.nextValue);
+			}
+			for (const auto& item : s.retiredFences)
+			{
+				if (item.first && item.second > 0)
+					snapshot.push_back(item);
 			}
 		}
 		if (snapshot.empty())
