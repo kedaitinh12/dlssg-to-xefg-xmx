@@ -6,6 +6,7 @@
 #include "XeFG.h"
 #include "HudTierPolicy.h"
 #include "HudTierPass.h"
+#include "vulkan/VulkanPolicy.h"
 #include "Util.h"
 
 #include <dxgi1_4.h>
@@ -155,12 +156,9 @@ private:
 	// Adaptive VRAM Guard: cached IDXGIAdapter3 + step-down hysteresis state (zero per-frame factory overhead)
 	ComPtr<IDXGIAdapter3> vramAdapter;
 	bool vramAdapterChecked = false;
-	bool vramGuardActive = false;
-	uint32_t vramGuardStepDown = 0; // 0 = full multiplier, 1 = -1 generated frame, 2+ = clamp to 2x
-	std::chrono::steady_clock::time_point vramReleaseSince{};
-	bool vramReleasePending = false;
+	VulkanPolicy::VramGuardState vramGuard;
 	uint32_t vramPollCounter = 0;
-	uint32_t vramTightStreak = 0;
+	uint32_t vramClampHoldFrames = 0;
 
 	// 3-Tier Adaptive HUD Protection (persists across XeFG context recreations when tier changes)
 	HudTier::StateMachine hudTierState;
@@ -170,6 +168,7 @@ private:
 	bool hasLoggedHudTier = false;
 	uint32_t vramUsageMiB = 0;
 	uint32_t vramBudgetMiB = 0;
+	VulkanPolicy::VramDriftTracker vramDrift;
 
 	// Opt-in Per-Stage GPU Time Profiler (lazy-allocated ONLY when Plugin::options.gpuProfiler is enabled; 0% overhead when off)
 	struct GpuProfiler

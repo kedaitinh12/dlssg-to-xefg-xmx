@@ -48,6 +48,129 @@ HMODULE SelfModule() noexcept
 	return mod;
 }
 
+HMODULE ModuleOfAddress(const void* addr) noexcept
+{
+	if (!addr)
+		return nullptr;
+	HMODULE mod = nullptr;
+	if (!GetModuleHandleExW(
+			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			reinterpret_cast<LPCWSTR>(addr), &mod))
+		return nullptr;
+	return mod;
+}
+
+// Stability safeguard: bypasses third-party vulkan-1.dll Detours hooks (e.g. OptiScaler Vulkan_wDx12 /
+// CommandBufferStateTracker) on the private D3D12->Vulkan WMMA compute device after verifying via
+// VulkanPolicy::ShouldEnableDirectIcdBypass that VkDevice is directly backed by a known GPU ICD
+// (no handle-wrapping Vulkan layer).
+struct DirectIcdResolver
+{
+	VkDevice device = VK_NULL_HANDLE;
+	PFN_vkGetDeviceProcAddr loaderGdpa = nullptr;
+	PFN_vkGetDeviceProcAddr icdGdpa = nullptr;
+	HMODULE icdModule = nullptr;
+	uint32_t bypassedCount = 0;
+	std::string icdName;
+
+	void Reset() noexcept
+	{
+		device = VK_NULL_HANDLE;
+		loaderGdpa = nullptr;
+		icdGdpa = nullptr;
+		icdModule = nullptr;
+		bypassedCount = 0;
+		icdName.clear();
+	}
+
+	bool Init(VkDevice dev, PFN_vkGetDeviceProcAddr gdpa, bool allowBypass)
+	{
+		Reset();
+		device = dev;
+		loaderGdpa = gdpa;
+		if (!allowBypass || !dev || !gdpa)
+			return false;
+
+		const PFN_vkVoidFunction probeFn = gdpa(dev, "vkGetImageMemoryRequirements");
+		if (!probeFn)
+			return false;
+
+		HMODULE probeMod = ModuleOfAddress(reinterpret_cast<const void*>(probeFn));
+		if (!probeMod)
+			return false;
+
+		wchar_t pathBuf[MAX_PATH]{};
+		const DWORD pathLen = GetModuleFileNameW(probeMod, pathBuf, MAX_PATH);
+		if (pathLen == 0 || pathLen >= MAX_PATH)
+			return false;
+
+		const std::wstring_view pathView(pathBuf, pathLen);
+		if (!VulkanPolicy::IsKnownVulkanIcdName(pathView))
+			return false;
+
+		const auto icdGipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+			GetProcAddress(probeMod, "vk_icdGetInstanceProcAddr"));
+		if (!icdGipa)
+			return false;
+
+		const auto candGdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+			icdGipa(VK_NULL_HANDLE, "vkGetDeviceProcAddr"));
+		HMODULE candGdpaMod = candGdpa ? ModuleOfAddress(reinterpret_cast<const void*>(candGdpa)) : nullptr;
+		const PFN_vkVoidFunction icdProbeFn =
+			(candGdpa && candGdpaMod == probeMod) ? candGdpa(dev, "vkGetImageMemoryRequirements") : nullptr;
+
+		VulkanPolicy::DirectIcdInitProbe probe{};
+		probe.allowBypass = allowBypass;
+		probe.loaderProbeFn = reinterpret_cast<const void*>(probeFn);
+		probe.probeModule = static_cast<const void*>(probeMod);
+		probe.probeModulePath = pathView;
+		probe.icdGdpaFn = reinterpret_cast<const void*>(candGdpa);
+		probe.icdGdpaModule = static_cast<const void*>(candGdpaMod);
+		probe.icdProbeFn = reinterpret_cast<const void*>(icdProbeFn);
+		if (!VulkanPolicy::ShouldEnableDirectIcdBypass(probe))
+			return false;
+
+		icdModule = probeMod;
+		icdGdpa = candGdpa;
+		const size_t slash = pathView.find_last_of(L"\\/");
+		const std::wstring_view leaf = (slash == std::wstring_view::npos) ? pathView : pathView.substr(slash + 1);
+		icdName.reserve(leaf.size());
+		for (wchar_t ch : leaf)
+			icdName.push_back((ch >= 32 && ch < 127) ? static_cast<char>(ch) : '?');
+		return true;
+	}
+
+	PFN_vkVoidFunction Resolve(const char* name) noexcept
+	{
+		PFN_vkVoidFunction loaderFn = (loaderGdpa && device && name) ? loaderGdpa(device, name) : nullptr;
+		if (!icdGdpa || !icdModule || !name || !VulkanPolicy::ShouldBypassWmmaDeviceProc(name))
+			return loaderFn;
+		HMODULE loaderMod = loaderFn ? ModuleOfAddress(reinterpret_cast<const void*>(loaderFn)) : nullptr;
+		if (loaderFn && loaderMod == icdModule)
+			return loaderFn;
+		PFN_vkVoidFunction directFn = icdGdpa(device, name);
+		HMODULE directMod = directFn ? ModuleOfAddress(reinterpret_cast<const void*>(directFn)) : nullptr;
+		if (VulkanPolicy::ShouldUseDirectIcdProc(
+				name,
+				reinterpret_cast<const void*>(loaderFn),
+				static_cast<const void*>(loaderMod),
+				reinterpret_cast<const void*>(directFn),
+				static_cast<const void*>(directMod),
+				static_cast<const void*>(icdModule)))
+		{
+			++bypassedCount;
+			return directFn;
+		}
+		return loaderFn;
+	}
+
+	static PFN_vkVoidFunction VKAPI_PTR DeviceProcOverride(void* user, const char* name)
+	{
+		auto* self = static_cast<DirectIcdResolver*>(user);
+		return self ? self->Resolve(name) : nullptr;
+	}
+};
+
 std::wstring EnvString(const wchar_t* name)
 {
 	wchar_t value[64]{};
@@ -170,6 +293,15 @@ struct PostCopyRing
 {
 	ComPtr<ID3D12CommandAllocator> alloc[kRingSize];
 	ComPtr<ID3D12GraphicsCommandList> list[kRingSize];
+	ComPtr<ID3D12CommandAllocator> preTsAlloc[kRingSize];
+	ComPtr<ID3D12GraphicsCommandList> preTsList[kRingSize];
+	ComPtr<ID3D12QueryHeap> tsHeap;
+	ComPtr<ID3D12Resource> tsReadback;
+	const uint64_t* tsMapped = nullptr;
+	bool tsPending[kRingSize]{};
+	uint32_t tsFrames[kRingSize]{};
+	bool tsReady = false;
+	bool tsAttempted = false;
 	ComPtr<ID3D12CommandQueue> slotQueue[kRingSize];
 	ComPtr<ID3D12Fence> slotFence[kRingSize];
 	uint64_t doneFence[kRingSize]{};
@@ -241,6 +373,7 @@ struct Bridge
 	// Vulkan side
 	HMODULE vulkanDll = nullptr;
 	PFN_vkGetInstanceProcAddr gipa = nullptr;
+	DirectIcdResolver icdResolver;
 	VkInstance instance = VK_NULL_HANDLE;
 	VkPhysicalDevice physical = VK_NULL_HANDLE;
 	VkDevice device = VK_NULL_HANDLE;
@@ -257,6 +390,29 @@ struct Bridge
 	std::atomic<uint64_t> lastSignaledBridgeFence{ 0 };
 	uint32_t vkCursor = 0;
 	VkSemaphore sharedSemaphore = VK_NULL_HANDLE;
+
+	// Optional in-game Vulkan GPU timestamp benchmark (on by default; set XEFG_WMMA_GPU_BENCH=0 to disable).
+	PFN_vkCreateQueryPool vkCreateQueryPool = nullptr;
+	PFN_vkDestroyQueryPool vkDestroyQueryPool = nullptr;
+	PFN_vkCmdResetQueryPool vkCmdResetQueryPool = nullptr;
+	PFN_vkCmdWriteTimestamp vkCmdWriteTimestamp = nullptr;
+	PFN_vkGetQueryPoolResults vkGetQueryPoolResults = nullptr;
+	VkQueryPool gpuBenchPool = VK_NULL_HANDLE;
+	float timestampPeriodNs = 0.0f;
+	uint32_t timestampValidBits = 0;
+	bool gpuBenchSlotPending[kRingSize]{};
+	uint32_t gpuBenchSlotFrames[kRingSize]{};
+	VulkanPolicy::BatchStrideKind gpuBenchSlotStride[kRingSize]{};
+	VulkanPolicy::BatchStrideKind gpuBenchActiveStride = VulkanPolicy::BatchStrideKind::None;
+	bool stride5UnavailableWarned = false;
+	uint32_t gpuBenchMixedSkipped = 0;
+	uint32_t gpuBenchFallbackSkipped = 0;
+	std::chrono::steady_clock::time_point gpuBenchSkipLastLogAt{};
+	VulkanPolicy::GpuBenchWindow gpuBenchWindow;
+	VulkanPolicy::GpuBenchWindow d3d12BridgeBenchWindow;
+	std::atomic<uint64_t> appendSameCmdList{ 0 };
+	std::atomic<uint64_t> appendSeparateCmdList{ 0 };
+	bool globalPriorityHigh = false;
 
 #define BRIDGE_FIELD(name) PFN_##name name = nullptr;
 	BRIDGE_VK_DEV_FNS(BRIDGE_FIELD)
@@ -333,6 +489,8 @@ struct Bridge
 	std::atomic<uint64_t> paceTimeouts{ 0 };
 	std::atomic<bool> lastSkipCpuPaceWait{ false };
 	std::atomic<uint32_t> paceWaitActive{ 0 };
+	std::atomic<uint64_t> emaRealFrameUs{ 0 };
+	std::chrono::steady_clock::time_point lastScheduleAt{};
 };
 
 constexpr uint32_t kMaxRecoveryAttempts = 3u;
@@ -479,6 +637,68 @@ bool EnsurePostCopyRing(ID3D12Device* dev, D3D12_COMMAND_LIST_TYPE type, PostCop
 	}
 	ring.cursor = 0;
 	ring.ready = true;
+	return true;
+}
+
+bool EnsurePostCopyTimestampResources(ID3D12Device* dev, D3D12_COMMAND_LIST_TYPE type, PostCopyRing& ring) noexcept
+{
+	if (ring.tsReady)
+		return true;
+	if (ring.tsAttempted || !dev)
+		return false;
+	ring.tsAttempted = true;
+
+	D3D12_QUERY_HEAP_DESC qDesc{};
+	qDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+	qDesc.Count = kRingSize * 2u;
+	if (FAILED(dev->CreateQueryHeap(&qDesc, IID_PPV_ARGS(&ring.tsHeap))) || !ring.tsHeap)
+		return false;
+
+	D3D12_HEAP_PROPERTIES rbHeap{ D3D12_HEAP_TYPE_READBACK };
+	D3D12_RESOURCE_DESC rbDesc{};
+	rbDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	rbDesc.Width = static_cast<UINT64>(kRingSize) * 2u * sizeof(uint64_t);
+	rbDesc.Height = 1;
+	rbDesc.DepthOrArraySize = 1;
+	rbDesc.MipLevels = 1;
+	rbDesc.SampleDesc.Count = 1;
+	rbDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	if (FAILED(dev->CreateCommittedResource(&rbHeap, D3D12_HEAP_FLAG_NONE, &rbDesc,
+			D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&ring.tsReadback))) || !ring.tsReadback)
+	{
+		ring.tsHeap.Reset();
+		return false;
+	}
+	void* mapped = nullptr;
+	const D3D12_RANGE readRange{ 0, static_cast<SIZE_T>(rbDesc.Width) };
+	if (FAILED(ring.tsReadback->Map(0, &readRange, &mapped)) || !mapped)
+	{
+		ring.tsReadback.Reset();
+		ring.tsHeap.Reset();
+		return false;
+	}
+	ring.tsMapped = static_cast<const uint64_t*>(mapped);
+
+	for (uint32_t i = 0; i < kRingSize; ++i)
+	{
+		if (FAILED(dev->CreateCommandAllocator(type, IID_PPV_ARGS(&ring.preTsAlloc[i]))) ||
+			FAILED(dev->CreateCommandList(0, type, ring.preTsAlloc[i].Get(), nullptr, IID_PPV_ARGS(&ring.preTsList[i]))) ||
+			FAILED(ring.preTsList[i]->Close()))
+		{
+			for (uint32_t j = 0; j <= i; ++j)
+			{
+				ring.preTsList[j].Reset();
+				ring.preTsAlloc[j].Reset();
+			}
+			const D3D12_RANGE zeroRange{ 0, 0 };
+			ring.tsReadback->Unmap(0, &zeroRange);
+			ring.tsMapped = nullptr;
+			ring.tsReadback.Reset();
+			ring.tsHeap.Reset();
+			return false;
+		}
+	}
+	ring.tsReady = true;
 	return true;
 }
 
@@ -671,8 +891,22 @@ bool DrainPostCopyRingLocked(PostCopyRing& ring, uint32_t timeoutMs) noexcept
 
 void ResetPostCopyRing(PostCopyRing& ring) noexcept
 {
+	if (ring.tsReadback && ring.tsMapped)
+	{
+		const D3D12_RANGE zeroRange{ 0, 0 };
+		ring.tsReadback->Unmap(0, &zeroRange);
+	}
+	ring.tsMapped = nullptr;
+	ring.tsReadback.Reset();
+	ring.tsHeap.Reset();
+	ring.tsReady = false;
+	ring.tsAttempted = false;
 	for (uint32_t i = 0; i < kRingSize; ++i)
 	{
+		ring.preTsList[i].Reset();
+		ring.preTsAlloc[i].Reset();
+		ring.tsPending[i] = false;
+		ring.tsFrames[i] = 0;
 		ring.list[i].Reset();
 		ring.alloc[i].Reset();
 		ring.slotQueue[i].Reset();
@@ -1263,7 +1497,8 @@ bool RecordVulkanBatchLocked(PendingBatch& batch) noexcept
 		waitInfo.pSemaphores = &gBridge.sharedSemaphore;
 		waitInfo.pValues = &gBridge.vkSlotDoneFence[vkSlot];
 		const auto slotWaitStart = std::chrono::steady_clock::now();
-		const VkResult waitRes = gBridge.vkWaitSemaphores(gBridge.device, &waitInfo, 250'000'000ull);
+		const uint64_t slotTimeoutNs = VulkanPolicy::WmmaAdaptiveWaitTimeoutNs(gBridge.emaRealFrameUs.load(std::memory_order_relaxed));
+		const VkResult waitRes = gBridge.vkWaitSemaphores(gBridge.device, &waitInfo, slotTimeoutNs);
 		const auto slotWaitUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 			std::chrono::steady_clock::now() - slotWaitStart).count());
 		gBridge.totalSlotWaitUs.fetch_add(slotWaitUs, std::memory_order_relaxed);
@@ -1287,12 +1522,75 @@ bool RecordVulkanBatchLocked(PendingBatch& batch) noexcept
 		}
 	}
 
+	// Non-blocking readback of completed GPU timestamps for this slot (fence already signaled above).
+	if (gBridge.gpuBenchPool && gBridge.gpuBenchSlotPending[vkSlot])
+	{
+		gBridge.gpuBenchSlotPending[vkSlot] = false;
+		uint64_t ts[2]{};
+		if (gBridge.vkGetQueryPoolResults(
+				gBridge.device, gBridge.gpuBenchPool, vkSlot * 2u, 2u,
+				sizeof(ts), ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+		{
+			const VulkanPolicy::BatchStrideKind sampleStride = gBridge.gpuBenchSlotStride[vkSlot];
+			if (sampleStride == VulkanPolicy::BatchStrideKind::Mixed || sampleStride == VulkanPolicy::BatchStrideKind::Fallback)
+			{
+				if (sampleStride == VulkanPolicy::BatchStrideKind::Mixed)
+					++gBridge.gpuBenchMixedSkipped;
+				else
+					++gBridge.gpuBenchFallbackSkipped;
+				const auto now = std::chrono::steady_clock::now();
+				if (gBridge.gpuBenchSkipLastLogAt.time_since_epoch().count() == 0 ||
+					(now - gBridge.gpuBenchSkipLastLogAt) >= std::chrono::seconds(5))
+				{
+					Log::Info("wmma_gpu_bench excluded non-uniform batches (mixed={}, fallback={})",
+						gBridge.gpuBenchMixedSkipped, gBridge.gpuBenchFallbackSkipped);
+					gBridge.gpuBenchMixedSkipped = 0;
+					gBridge.gpuBenchFallbackSkipped = 0;
+					gBridge.gpuBenchSkipLastLogAt = now;
+				}
+			}
+			else if (sampleStride == VulkanPolicy::BatchStrideKind::Stride4 || sampleStride == VulkanPolicy::BatchStrideKind::Stride5)
+			{
+				if (gBridge.gpuBenchActiveStride != sampleStride)
+				{
+					if (gBridge.gpuBenchActiveStride == VulkanPolicy::BatchStrideKind::Stride4 ||
+						gBridge.gpuBenchActiveStride == VulkanPolicy::BatchStrideKind::Stride5)
+					{
+						Log::Info("wmma_gpu_bench stride switched {} -> {} (resetting benchmark window)",
+							VulkanPolicy::BatchStrideTag(gBridge.gpuBenchActiveStride),
+							VulkanPolicy::BatchStrideTag(sampleStride));
+					}
+					gBridge.gpuBenchActiveStride = sampleStride;
+					gBridge.gpuBenchWindow.Reset();
+					gBridge.d3d12BridgeBenchWindow.Reset();
+				}
+				const float batchMs = VulkanPolicy::ComputeGpuTimestampMs(
+					ts[0], ts[1], gBridge.timestampValidBits, gBridge.timestampPeriodNs);
+				const auto rep = gBridge.gpuBenchWindow.Sample(batchMs, gBridge.gpuBenchSlotFrames[vkSlot]);
+				if (rep.ready)
+				{
+					// Scope is XeFG::Execute only (excludes D3D12<->Vk input/output copies);
+					// amortized_per_gen_frame_ms divides batch time by gen_frames because optical flow is shared per batch.
+					Log::Info(
+						"wmma_gpu_bench \"scope\":\"xefg_execute_only\",\"stride\":{},\"batches\":{},\"gen_frames\":{},\"batch_avg_ms\":{:.3f},"
+						"\"batch_p50_ms\":{:.3f},\"batch_p95_ms\":{:.3f},\"batch_min_ms\":{:.3f},"
+						"\"batch_max_ms\":{:.3f},\"amortized_per_gen_frame_ms\":{:.3f}",
+						VulkanPolicy::BatchStrideTag(sampleStride), rep.batches, rep.genFrames, rep.batchAvgMs, rep.batchP50Ms, rep.batchP95Ms,
+						rep.batchMinMs, rep.batchMaxMs, rep.perGenFrameAvgMs);
+				}
+			}
+		}
+	}
+
 	VkCommandBuffer cmd = gBridge.cmdBufs[vkSlot];
 	gBridge.vkResetCommandBuffer(cmd, 0);
 	VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
 	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	if (gBridge.vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS)
 		return false;
+
+	if (gBridge.gpuBenchPool)
+		gBridge.vkCmdResetQueryPool(cmd, gBridge.gpuBenchPool, vkSlot * 2u, 2u);
 
 	// Open xvk recording BEFORE copyInput so any pendingInit_ (UNDEFINED -> GENERAL)
 	// layout transitions on newly created xvk resources flush before we copy frame pixels into them.
@@ -1392,9 +1690,29 @@ bool RecordVulkanBatchLocked(PendingBatch& batch) noexcept
 
 		if (listReady)
 		{
+			if (VulkanPolicy::GetWmmaLdsStrideMode() == 1 && !xvk::HasCoopMatrixStride5(gBridge.xvkDevice.Get()) &&
+				!gBridge.stride5UnavailableWarned)
+			{
+				gBridge.stride5UnavailableWarned = true;
+				Log::Warn("WMMA Stride 5 requested in menu, but stride5 SPIR-V set is unavailable; continuing on Stride 4");
+			}
+			// Use BOTTOM_OF_PIPE for both timestamps so prior input copies finish before the start mark.
+			if (gBridge.gpuBenchPool)
+			{
+				xvk::ResetCoopMatrixBatchStride(gBridge.xvkDevice.Get());
+				gBridge.vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gBridge.gpuBenchPool, vkSlot * 2u + 0u);
+			}
 			const xefgd_result_t res = XeFG::Execute(gBridge.xefgContext, gBridge.xvkList.Get(), vkParams);
 			gBridge.xvkList->Close();
 			execOk = (res == XEFGD_RESULT_SUCCESS);
+			if (gBridge.gpuBenchPool)
+			{
+				uint32_t s4 = 0u, s5 = 0u, fb = 0u;
+				xvk::ConsumeCoopMatrixBatchStride(gBridge.xvkDevice.Get(), s4, s5, fb);
+				gBridge.gpuBenchSlotStride[vkSlot] = VulkanPolicy::ClassifyBatchStride(s4, s5, fb);
+			}
+			if (execOk && gBridge.gpuBenchPool)
+				gBridge.vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gBridge.gpuBenchPool, vkSlot * 2u + 1u);
 		}
 		if (execOk)
 			xvk::EndRecording(gBridge.xvkDevice.Get());
@@ -1530,11 +1848,132 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 		? gBridge.nativeD3DDevice.Get()
 		: gBridge.d3dDevice.Get();
 
+	// Optional D3D12-side bridge stall timer (active alongside wmma_gpu_bench):
+	// records D3D12 GPU ts[0] immediately before Signal and ts[1] immediately after Wait (before post-copies)
+	// so (d3d12_stall_p50_ms - vk_exec_p50_ms) isolates pure bridge sync + context-switch overhead.
+	PostCopyRing* preparedRing = nullptr;
+	Bridge::QueueFenceEntry* preparedQf = nullptr;
+	uint32_t preparedSlot = 0;
+	bool preparedSlotReady = false;
+	bool preTsRecorded = false;
+	if (gBridge.gpuBenchPool && !batch.copies.empty())
+	{
+		const D3D12_COMMAND_LIST_TYPE qType = queue->GetDesc().Type;
+		const D3D12_COMMAND_LIST_TYPE useType = (qType == D3D12_COMMAND_LIST_TYPE_COMPUTE)
+			? D3D12_COMMAND_LIST_TYPE_COMPUTE
+			: D3D12_COMMAND_LIST_TYPE_DIRECT;
+		PostCopyRing& ring = isNativeQueue
+			? ((useType == D3D12_COMMAND_LIST_TYPE_COMPUTE) ? gBridge.nativeComputeRing : gBridge.nativeDirectRing)
+			: ((useType == D3D12_COMMAND_LIST_TYPE_COMPUTE) ? gBridge.computeRing : gBridge.directRing);
+		if (EnsurePostCopyRing(ringDev, useType, ring))
+		{
+			ReapCompletedParkedAllocsLocked(ring);
+			auto* qf = EnsureQueueFenceLocked(queue, ringDev);
+			if (qf && qf->fence)
+			{
+				const uint32_t slot = ring.cursor++ % kRingSize;
+				bool slotReady = WaitSlotOrParkedReadyLocked(ring.slotQueue[slot].Get(), ring.slotFence[slot].Get(),
+					ring.doneFence[slot], ring.slotSignalPending[slot], 500u);
+				bool slotParked = false;
+				if (!slotReady)
+				{
+					ComPtr<ID3D12CommandAllocator> spare;
+					if (ring.parkedAllocs.size() < 16u &&
+						SUCCEEDED(ringDev->CreateCommandAllocator(useType, IID_PPV_ARGS(&spare))) && spare)
+					{
+						ring.parkedAllocs.push_back({
+							std::move(ring.alloc[slot]),
+							std::move(ring.slotQueue[slot]),
+							std::move(ring.slotFence[slot]),
+							ring.doneFence[slot],
+							ring.slotSignalPending[slot],
+							std::move(ring.slotResources[slot]),
+							std::move(ring.slotImports[slot])
+						});
+						ring.alloc[slot] = std::move(spare);
+						ring.doneFence[slot] = 0;
+						ring.slotSignalPending[slot] = false;
+						ring.tsPending[slot] = false;
+						slotReady = true;
+						slotParked = true;
+						Log::Warn("D3D12->Vulkan WMMA bridge: post-copy fence timed out (500 ms), parked busy allocator (parked={})",
+							ring.parkedAllocs.size());
+					}
+				}
+				preparedRing = &ring;
+				preparedQf = qf;
+				preparedSlot = slot;
+				preparedSlotReady = slotReady;
+
+				if (slotReady && !slotParked && EnsurePostCopyTimestampResources(ringDev, useType, ring))
+				{
+					if (ring.tsPending[slot] && ring.tsMapped)
+					{
+						const uint64_t ts0 = ring.tsMapped[slot * 2u + 0u];
+						const uint64_t ts1 = ring.tsMapped[slot * 2u + 1u];
+						uint64_t qFreq = 0;
+						if (SUCCEEDED(queue->GetTimestampFrequency(&qFreq)) && qFreq > 0 && ts1 >= ts0)
+						{
+							const float stallMs = static_cast<float>(
+								static_cast<double>(ts1 - ts0) * 1000.0 / static_cast<double>(qFreq));
+							const auto rep = gBridge.d3d12BridgeBenchWindow.Sample(stallMs, ring.tsFrames[slot]);
+							if (rep.ready)
+							{
+								Log::Info(
+									"wmma_bridge_bench \"scope\":\"d3d12_signal_to_wait\",\"stride\":{},\"batches\":{},\"gen_frames\":{},"
+									"\"d3d12_stall_avg_ms\":{:.3f},\"d3d12_stall_p50_ms\":{:.3f},\"d3d12_stall_p95_ms\":{:.3f},"
+									"\"d3d12_stall_min_ms\":{:.3f},\"d3d12_stall_max_ms\":{:.3f},"
+									"\"append_same_cmdlist\":{},\"append_sep_cmdlist\":{}",
+									VulkanPolicy::BatchStrideTag(gBridge.gpuBenchActiveStride),
+									rep.batches, rep.genFrames, rep.batchAvgMs, rep.batchP50Ms, rep.batchP95Ms,
+									rep.batchMinMs, rep.batchMaxMs,
+									gBridge.appendSameCmdList.exchange(0, std::memory_order_relaxed),
+									gBridge.appendSeparateCmdList.exchange(0, std::memory_order_relaxed));
+							}
+						}
+						ring.tsPending[slot] = false;
+					}
+					if (SUCCEEDED(ring.preTsAlloc[slot]->Reset()) &&
+						SUCCEEDED(ring.preTsList[slot]->Reset(ring.preTsAlloc[slot].Get(), nullptr)))
+					{
+						ring.preTsList[slot]->EndQuery(ring.tsHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2u + 0u);
+						if (SUCCEEDED(ring.preTsList[slot]->Close()))
+						{
+							ID3D12CommandList* preLists[1] = { ring.preTsList[slot].Get() };
+							origExec(queue, 1, preLists);
+							preTsRecorded = true;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	auto sealPreTsOnEarlyExit = [&]() noexcept {
+		if (!preTsRecorded || !preparedRing || !preparedQf || !preparedQf->fence)
+			return;
+		const uint64_t qVal = ++preparedQf->nextValue;
+		preparedRing->slotQueue[preparedSlot] = queue;
+		preparedRing->slotFence[preparedSlot] = preparedQf->fence;
+		if (SUCCEEDED(queue->Signal(preparedQf->fence.Get(), qVal)))
+		{
+			preparedQf->lastSignaled = qVal;
+			preparedRing->doneFence[preparedSlot] = qVal;
+			preparedRing->slotSignalPending[preparedSlot] = false;
+		}
+		else
+		{
+			preparedRing->doneFence[preparedSlot] = qVal;
+			preparedRing->slotSignalPending[preparedSlot] = true;
+		}
+	};
+
 	// 1) D3D12 signals Vulkan that CaptureRealFrame copies are complete.
 	const uint64_t waitVal = gBridge.fenceValue.fetch_add(1, std::memory_order_acq_rel) + 1;
 	const uint64_t signalVal = gBridge.fenceValue.fetch_add(1, std::memory_order_acq_rel) + 1;
 	if (FAILED(queue->Signal(useFence, waitVal)))
 	{
+		sealPreTsOnEarlyExit();
 		gBridge.fallbacks.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
@@ -1565,12 +2004,18 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 	const VkResult submitRes = gBridge.vkQueueSubmit2(gBridge.queue, 1, &submitInfo, VK_NULL_HANDLE);
 	if (submitRes != VK_SUCCESS)
 	{
+		sealPreTsOnEarlyExit();
 		gBridge.fallbacks.fetch_add(1, std::memory_order_relaxed);
 		if (submitRes == VK_ERROR_DEVICE_LOST)
 			MarkBridgeFaultLocked("vkQueueSubmit2", static_cast<int>(submitRes));
 		return;
 	}
 	gBridge.vkSlotDoneFence[vkSlot] = signalVal;
+	if (gBridge.gpuBenchPool)
+	{
+		gBridge.gpuBenchSlotPending[vkSlot] = true;
+		gBridge.gpuBenchSlotFrames[vkSlot] = batch.frameCount;
+	}
 	const uint64_t prevSubmitted = gBridge.lastSubmittedVkFence.exchange(signalVal, std::memory_order_acq_rel);
 	gBridge.prevSubmittedVkFence.store(prevSubmitted, std::memory_order_release);
 	gBridge.lastSignaledBridgeFence.store(signalVal, std::memory_order_release);
@@ -1583,50 +2028,64 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 	// 4) Copy generated shared outputs into the game's output texture(s) on D3D12.
 	if (!batch.copies.empty())
 	{
-		const D3D12_COMMAND_LIST_TYPE qType = queue->GetDesc().Type;
-		const D3D12_COMMAND_LIST_TYPE useType = (qType == D3D12_COMMAND_LIST_TYPE_COMPUTE)
-			? D3D12_COMMAND_LIST_TYPE_COMPUTE
-			: D3D12_COMMAND_LIST_TYPE_DIRECT;
-		PostCopyRing& ring = isNativeQueue
-			? ((useType == D3D12_COMMAND_LIST_TYPE_COMPUTE) ? gBridge.nativeComputeRing : gBridge.nativeDirectRing)
-			: ((useType == D3D12_COMMAND_LIST_TYPE_COMPUTE) ? gBridge.computeRing : gBridge.directRing);
-
-		if (EnsurePostCopyRing(ringDev, useType, ring))
+		PostCopyRing* activeRing = preparedRing;
+		Bridge::QueueFenceEntry* activeQf = preparedQf;
+		uint32_t slot = preparedSlot;
+		bool slotReady = preparedSlotReady;
+		if (!activeRing)
 		{
-			ReapCompletedParkedAllocsLocked(ring);
-			// Acquire the queue's private completion fence BEFORE submitting any post-copy command list.
-			auto* qf = EnsureQueueFenceLocked(queue, ringDev);
-			if (qf && qf->fence)
+			const D3D12_COMMAND_LIST_TYPE qType = queue->GetDesc().Type;
+			const D3D12_COMMAND_LIST_TYPE useType = (qType == D3D12_COMMAND_LIST_TYPE_COMPUTE)
+				? D3D12_COMMAND_LIST_TYPE_COMPUTE
+				: D3D12_COMMAND_LIST_TYPE_DIRECT;
+			PostCopyRing& ring = isNativeQueue
+				? ((useType == D3D12_COMMAND_LIST_TYPE_COMPUTE) ? gBridge.nativeComputeRing : gBridge.nativeDirectRing)
+				: ((useType == D3D12_COMMAND_LIST_TYPE_COMPUTE) ? gBridge.computeRing : gBridge.directRing);
+
+			if (EnsurePostCopyRing(ringDev, useType, ring))
 			{
-				const uint32_t slot = ring.cursor++ % kRingSize;
-				bool slotReady = WaitSlotOrParkedReadyLocked(ring.slotQueue[slot].Get(), ring.slotFence[slot].Get(),
-					ring.doneFence[slot], ring.slotSignalPending[slot], 500u);
-				if (!slotReady)
+				ReapCompletedParkedAllocsLocked(ring);
+				auto* qf = EnsureQueueFenceLocked(queue, ringDev);
+				if (qf && qf->fence)
 				{
-					// Never reset a command allocator that the GPU may still be reading (f5low-fg ROBUSTNESS.md):
-					// park the busy allocator TOGETHER with its owning queue, private fence, doneValue, and signalPending state.
-					ComPtr<ID3D12CommandAllocator> spare;
-					if (ring.parkedAllocs.size() < 16u &&
-						SUCCEEDED(ringDev->CreateCommandAllocator(useType, IID_PPV_ARGS(&spare))) && spare)
+					slot = ring.cursor++ % kRingSize;
+					slotReady = WaitSlotOrParkedReadyLocked(ring.slotQueue[slot].Get(), ring.slotFence[slot].Get(),
+						ring.doneFence[slot], ring.slotSignalPending[slot], 500u);
+					if (!slotReady)
 					{
-						ring.parkedAllocs.push_back({
-							std::move(ring.alloc[slot]),
-							std::move(ring.slotQueue[slot]),
-							std::move(ring.slotFence[slot]),
-							ring.doneFence[slot],
-							ring.slotSignalPending[slot],
-							std::move(ring.slotResources[slot]),
-							std::move(ring.slotImports[slot])
-						});
-						ring.alloc[slot] = std::move(spare);
-						ring.doneFence[slot] = 0;
-						ring.slotSignalPending[slot] = false;
-						slotReady = true;
-						Log::Warn("D3D12->Vulkan WMMA bridge: post-copy fence timed out (500 ms), parked busy allocator (parked={})",
-							ring.parkedAllocs.size());
+						// Never reset a command allocator that the GPU may still be reading (f5low-fg ROBUSTNESS.md):
+						// park the busy allocator TOGETHER with its owning queue, private fence, doneValue, and signalPending state.
+						ComPtr<ID3D12CommandAllocator> spare;
+						if (ring.parkedAllocs.size() < 16u &&
+							SUCCEEDED(ringDev->CreateCommandAllocator(useType, IID_PPV_ARGS(&spare))) && spare)
+						{
+							ring.parkedAllocs.push_back({
+								std::move(ring.alloc[slot]),
+								std::move(ring.slotQueue[slot]),
+								std::move(ring.slotFence[slot]),
+								ring.doneFence[slot],
+								ring.slotSignalPending[slot],
+								std::move(ring.slotResources[slot]),
+								std::move(ring.slotImports[slot])
+							});
+							ring.alloc[slot] = std::move(spare);
+							ring.doneFence[slot] = 0;
+							ring.slotSignalPending[slot] = false;
+							slotReady = true;
+							Log::Warn("D3D12->Vulkan WMMA bridge: post-copy fence timed out (500 ms), parked busy allocator (parked={})",
+								ring.parkedAllocs.size());
+						}
 					}
+					activeRing = &ring;
+					activeQf = qf;
 				}
-				if (slotReady &&
+			}
+		}
+		if (activeRing && activeQf && activeQf->fence)
+		{
+			PostCopyRing& ring = *activeRing;
+			auto* qf = activeQf;
+			if (slotReady &&
 					SUCCEEDED(ring.alloc[slot]->Reset()) &&
 					SUCCEEDED(ring.list[slot]->Reset(ring.alloc[slot].Get(), nullptr)))
 				{
@@ -1641,6 +2100,14 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 					// Keep all batch SharedImports alive until THIS queue's private post-copy fence completes
 					// so ReapRetiredLocked(false) can never destroy an evicted import while Direct/Compute copy is still running.
 					ring.slotImports[slot] = batch.keptImports;
+					if (preTsRecorded && ring.tsReady && ring.tsHeap && ring.tsReadback)
+					{
+						ring.list[slot]->EndQuery(ring.tsHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2u + 1u);
+						ring.list[slot]->ResolveQueryData(ring.tsHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+							slot * 2u, 2u, ring.tsReadback.Get(), static_cast<UINT64>(slot) * 2u * sizeof(uint64_t));
+						ring.tsPending[slot] = true;
+						ring.tsFrames[slot] = batch.frameCount;
+					}
 					RecordD3D12CopiesBatched(ring.list[slot].Get(), batch.copies);
 					ring.list[slot]->Close();
 
@@ -1669,7 +2136,6 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 						ring.doneFence[slot] = qVal;
 						ring.slotSignalPending[slot] = true;
 					}
-				}
 			}
 		}
 	}
@@ -1851,6 +2317,8 @@ bool TeardownVulkanLocked() noexcept
 
 	if (gBridge.device)
 	{
+		if (gBridge.gpuBenchPool && gBridge.vkDestroyQueryPool)
+			gBridge.vkDestroyQueryPool(gBridge.device, gBridge.gpuBenchPool, nullptr);
 		if (gBridge.sharedSemaphore && gBridge.vkDestroySemaphore)
 			gBridge.vkDestroySemaphore(gBridge.device, gBridge.sharedSemaphore, nullptr);
 		if (gBridge.cmdPool && gBridge.vkDestroyCommandPool)
@@ -1858,6 +2326,25 @@ bool TeardownVulkanLocked() noexcept
 		if (gBridge.vkDestroyDevice)
 			gBridge.vkDestroyDevice(gBridge.device, nullptr);
 	}
+	gBridge.gpuBenchPool = VK_NULL_HANDLE;
+	gBridge.timestampPeriodNs = 0.0f;
+	gBridge.timestampValidBits = 0;
+	for (uint32_t i = 0; i < kRingSize; ++i)
+	{
+		gBridge.gpuBenchSlotPending[i] = false;
+		gBridge.gpuBenchSlotFrames[i] = 0;
+		gBridge.gpuBenchSlotStride[i] = VulkanPolicy::BatchStrideKind::None;
+	}
+	gBridge.gpuBenchActiveStride = VulkanPolicy::BatchStrideKind::None;
+	gBridge.stride5UnavailableWarned = false;
+	gBridge.gpuBenchMixedSkipped = 0;
+	gBridge.gpuBenchFallbackSkipped = 0;
+	gBridge.gpuBenchSkipLastLogAt = {};
+	gBridge.gpuBenchWindow.Reset();
+	gBridge.d3d12BridgeBenchWindow.Reset();
+	gBridge.appendSameCmdList.store(0, std::memory_order_relaxed);
+	gBridge.appendSeparateCmdList.store(0, std::memory_order_relaxed);
+	gBridge.globalPriorityHigh = false;
 	gBridge.sharedSemaphore = VK_NULL_HANDLE;
 	gBridge.cmdPool = VK_NULL_HANDLE;
 	for (uint32_t i = 0; i < kRingSize; ++i)
@@ -2083,6 +2570,15 @@ bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
 	}
 
 	const bool hasPipeExecExt = HasExtension(exts, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+	const bool allowHighPrio = !VulkanPolicy::IsOffWord(EnvString(L"XEFG_D3D12_VULKAN_WMMA_HIGH_PRIORITY"));
+	const char* globalPriorityExtName = nullptr;
+	if (allowHighPrio)
+	{
+		if (HasExtension(exts, VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME))
+			globalPriorityExtName = VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME;
+		else if (HasExtension(exts, VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME))
+			globalPriorityExtName = VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME;
+	}
 
 	// Query supported features so we only enable features the driver actually advertises.
 	VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pipeExecFeats{
@@ -2177,10 +2673,20 @@ bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
 		enabledExts.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
 
 	const float priority = 1.0f;
+	VkDeviceQueueGlobalPriorityCreateInfoKHR globalPrioInfo{
+		VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR, nullptr, VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR };
 	VkDeviceQueueCreateInfo qInfo{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
 	qInfo.queueFamilyIndex = chosenFamily;
 	qInfo.queueCount = 1;
 	qInfo.pQueuePriorities = &priority;
+
+	bool requestedHighPrio = false;
+	if (globalPriorityExtName)
+	{
+		enabledExts.push_back(globalPriorityExtName);
+		qInfo.pNext = &globalPrioInfo;
+		requestedHighPrio = true;
+	}
 
 	VkDeviceCreateInfo devInfo{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enableFeats };
 	devInfo.queueCreateInfoCount = 1;
@@ -2188,16 +2694,33 @@ bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
 	devInfo.enabledExtensionCount = static_cast<uint32_t>(enabledExts.size());
 	devInfo.ppEnabledExtensionNames = enabledExts.data();
 
-	if (createDevice(matchedPhys, &devInfo, nullptr, &gBridge.device) != VK_SUCCESS || !gBridge.device)
+	VkResult devRes = createDevice(matchedPhys, &devInfo, nullptr, &gBridge.device);
+	if ((devRes != VK_SUCCESS || !gBridge.device) && requestedHighPrio)
+	{
+		// Gracefully fall back to default queue priority if driver/OS returns VK_ERROR_NOT_PERMITTED_KHR.
+		enabledExts.pop_back();
+		qInfo.pNext = nullptr;
+		devInfo.enabledExtensionCount = static_cast<uint32_t>(enabledExts.size());
+		devInfo.ppEnabledExtensionNames = enabledExts.data();
+		requestedHighPrio = false;
+		devRes = createDevice(matchedPhys, &devInfo, nullptr, &gBridge.device);
+	}
+	if (devRes != VK_SUCCESS || !gBridge.device)
 		return fail("create_device_failed");
+	gBridge.globalPriorityHigh = requestedHighPrio;
+	Log::Info("D3D12->Vulkan WMMA bridge: Vulkan compute queue global_priority={}",
+		requestedHighPrio ? "HIGH" : "default");
 
 	gBridge.physical = matchedPhys;
 	gBridge.queueFamily = chosenFamily;
 	getMemProps(matchedPhys, &gBridge.memProps);
 
+	const bool allowIcdBypass = !VulkanPolicy::IsOffWord(EnvString(L"XEFG_D3D12_VULKAN_WMMA_ICD_BYPASS"));
+	gBridge.icdResolver.Init(gBridge.device, gdpa, allowIcdBypass);
+
 	bool fnsOk = true;
 #define LOAD_BRIDGE_FN(name)                                                       \
-	gBridge.name = reinterpret_cast<PFN_##name>(gdpa(gBridge.device, #name));      \
+	gBridge.name = reinterpret_cast<PFN_##name>(gBridge.icdResolver.Resolve(#name)); \
 	fnsOk &= (gBridge.name != nullptr);
 	BRIDGE_VK_DEV_FNS(LOAD_BRIDGE_FN)
 #undef LOAD_BRIDGE_FN
@@ -2205,6 +2728,33 @@ bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
 		return fail("device_functions");
 
 	gBridge.vkGetDeviceQueue(gBridge.device, chosenFamily, 0, &gBridge.queue);
+
+	// Initialize optional zero-stall GPU timestamp query pool (enabled by default; disable with XEFG_WMMA_GPU_BENCH=0).
+	const bool allowGpuBench = !VulkanPolicy::IsOffWord(EnvString(L"XEFG_WMMA_GPU_BENCH"));
+	if (allowGpuBench && fams[chosenFamily].timestampValidBits > 0u)
+	{
+		VkPhysicalDeviceProperties2 tsProps2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+		getProps2(matchedPhys, &tsProps2);
+		const float periodNs = tsProps2.properties.limits.timestampPeriod;
+		gBridge.vkCreateQueryPool = reinterpret_cast<PFN_vkCreateQueryPool>(gBridge.icdResolver.Resolve("vkCreateQueryPool"));
+		gBridge.vkDestroyQueryPool = reinterpret_cast<PFN_vkDestroyQueryPool>(gBridge.icdResolver.Resolve("vkDestroyQueryPool"));
+		gBridge.vkCmdResetQueryPool = reinterpret_cast<PFN_vkCmdResetQueryPool>(gBridge.icdResolver.Resolve("vkCmdResetQueryPool"));
+		gBridge.vkCmdWriteTimestamp = reinterpret_cast<PFN_vkCmdWriteTimestamp>(gBridge.icdResolver.Resolve("vkCmdWriteTimestamp"));
+		gBridge.vkGetQueryPoolResults = reinterpret_cast<PFN_vkGetQueryPoolResults>(gBridge.icdResolver.Resolve("vkGetQueryPoolResults"));
+		if (periodNs > 0.0f && gBridge.vkCreateQueryPool && gBridge.vkDestroyQueryPool &&
+			gBridge.vkCmdResetQueryPool && gBridge.vkCmdWriteTimestamp && gBridge.vkGetQueryPoolResults)
+		{
+			VkQueryPoolCreateInfo qci{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+			qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+			qci.queryCount = kRingSize * 2u;
+			if (gBridge.vkCreateQueryPool(gBridge.device, &qci, nullptr, &gBridge.gpuBenchPool) == VK_SUCCESS)
+			{
+				gBridge.timestampPeriodNs = periodNs;
+				gBridge.timestampValidBits = fams[chosenFamily].timestampValidBits;
+				gBridge.gpuBenchWindow.Reset();
+			}
+		}
+	}
 	if (!gBridge.queue)
 		return fail("no_queue");
 
@@ -2272,6 +2822,11 @@ bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
 	xvkDesc.physicalDevice = gBridge.physical;
 	xvkDesc.device = gBridge.device;
 	xvkDesc.getInstanceProcAddr = gBridge.gipa;
+	if (gBridge.icdResolver.icdGdpa)
+	{
+		xvkDesc.deviceProcOverride = &DirectIcdResolver::DeviceProcOverride;
+		xvkDesc.deviceProcOverrideUser = &gBridge.icdResolver;
+	}
 	xvkDesc.programModule = SelfModule();
 	xvkDesc.recorded = true;
 	xvkDesc.recordedFamily = chosenFamily;
@@ -2281,6 +2836,12 @@ bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
 
 	if (FAILED(xvk::CreateDevice(xvkDesc, IID_PPV_ARGS(&gBridge.xvkDevice))) || !gBridge.xvkDevice)
 		return fail("xvk_device_failed");
+
+	if (gBridge.icdResolver.bypassedCount > 0)
+	{
+		Log::Info("D3D12->Vulkan WMMA bridge: bypassed {} intercepted device procs directly to {}",
+			gBridge.icdResolver.bypassedCount, gBridge.icdResolver.icdName);
+	}
 
 	// Recorded xvk devices require an active xvk::BeginRecording(cmd) before
 	// CreateCommandList can open recording, so create xvkList lazily on first execute.
@@ -2854,6 +3415,20 @@ bool ScheduleBatch(
 			return false;
 		}
 
+		const auto scheduleNow = std::chrono::steady_clock::now();
+		if (gBridge.lastScheduleAt.time_since_epoch().count() != 0)
+		{
+			const auto dtUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+				scheduleNow - gBridge.lastScheduleAt).count());
+			if (dtUs >= 2'000ull && dtUs <= 100'000ull)
+			{
+				const uint64_t prev = gBridge.emaRealFrameUs.load(std::memory_order_relaxed);
+				const uint64_t next = (prev == 0u) ? dtUs : ((prev * 7ull + dtUs) / 8ull);
+				gBridge.emaRealFrameUs.store(next, std::memory_order_relaxed);
+			}
+		}
+		gBridge.lastScheduleAt = scheduleNow;
+
 		const bool directFirstOut = IsDirectGameOutputEligibleLocked(gBridge, firstGameOutput, outputState);
 		if (directFirstOut)
 		{
@@ -2902,7 +3477,8 @@ bool ScheduleBatch(
 			paceWait.pSemaphores = &waitSem;
 			paceWait.pValues = &prevVkFence;
 			const auto waitStart = std::chrono::steady_clock::now();
-			const VkResult paceRes = waitFn(waitDev, &paceWait, 50'000'000ull);
+			const uint64_t paceTimeoutNs = VulkanPolicy::WmmaAdaptiveWaitTimeoutNs(gBridge.emaRealFrameUs.load(std::memory_order_relaxed));
+			const VkResult paceRes = waitFn(waitDev, &paceWait, paceTimeoutNs);
 			const auto waitUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 				std::chrono::steady_clock::now() - waitStart).count());
 			gBridge.totalCpuWaitUs.fetch_add(waitUs, std::memory_order_relaxed);
@@ -2935,9 +3511,11 @@ bool AppendOutputCopy(
 		if (b.cmdList == cmdList)
 		{
 			b.copies.push_back({ sharedOutput, gameOutput, outputState });
+			gBridge.appendSameCmdList.fetch_add(1, std::memory_order_relaxed);
 			return true;
 		}
 	}
+	gBridge.appendSeparateCmdList.fetch_add(1, std::memory_order_relaxed);
 	return false;
 }
 

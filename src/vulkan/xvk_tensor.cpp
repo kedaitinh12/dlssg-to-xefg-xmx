@@ -2,6 +2,7 @@
 #include "xvk_internal.h"
 #include "../MfgPort/Cuda/cuda_layers.h"
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 namespace xvk
@@ -93,22 +94,41 @@ bool TensorRoute::Install(const DeviceDesc& desc, std::span<const unsigned char>
         VkCuModuleTexturingModeCreateInfoNVX texturing{VK_STRUCTURE_TYPE_CU_MODULE_TEXTURING_MODE_CREATE_INFO_NVX, nullptr, VK_TRUE};
         VkCuModuleCreateInfoNVX info{VK_STRUCTURE_TYPE_CU_MODULE_CREATE_INFO_NVX,
             &texturing, image.size(), image.data()};
+        const auto createStart = std::chrono::steady_clock::now();
+        auto elapsedMs = [&]() noexcept {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - createStart).count();
+        };
         unsigned long code{};
         moduleResult_ = CreateModule(createModule_, device_, &info, &module_, &code);
         faultCode_.store(code, std::memory_order_relaxed);
         if (moduleResult_ != VK_SUCCESS || !module_)
-        { reason = faultCode_ ? "module_create_fault" : "module_create"; return false; }
+        {
+            reason = faultCode_ ? "module_create_fault" : "module_create";
+            xefg_cuda::Report("cuda_route_vk", "\"state\":\"unavailable\",\"reason\":\"" + reason +
+                "\",\"compute_capability\":\"" + std::to_string(major) + "." + std::to_string(minor) +
+                "\",\"init_ms\":" + std::to_string(elapsedMs()));
+            return false;
+        }
         for (size_t i = 0; i < functions_.size(); ++i)
         {
             VkCuFunctionCreateInfoNVX function{VK_STRUCTURE_TYPE_CU_FUNCTION_CREATE_INFO_NVX, nullptr, module_, xefg_cuda::kKernels[i]};
             const auto result = CreateFunction(createFunction_, device_, &function, &functions_[i], &code);
             faultCode_.store(code, std::memory_order_relaxed);
-            if (result != VK_SUCCESS || !functions_[i]) { reason = faultCode_ ? "function_create_fault" : "function_create"; return false; }
+            if (result != VK_SUCCESS || !functions_[i])
+            {
+                reason = faultCode_ ? "function_create_fault" : "function_create";
+                xefg_cuda::Report("cuda_route_vk", "\"state\":\"unavailable\",\"reason\":\"" + reason +
+                    "\",\"compute_capability\":\"" + std::to_string(major) + "." + std::to_string(minor) +
+                    "\",\"init_ms\":" + std::to_string(elapsedMs()));
+                return false;
+            }
         }
         xefg_cuda::ReportVulkan(xefg_cuda::State::Active, major, minor, uint32_t(std::size(xefg_cuda::kLayers)), "");
         active_ = true;
         xefg_cuda::Report("cuda_route_vk", "\"state\":\"active\",\"reason\":\"\",\"compute_capability\":\"" + std::to_string(major) + "." + std::to_string(minor)
-            + "\",\"texturing\":\"64\",\"module\":\"fatbin\",\"params\":\"extras\",\"kernels\":16,\"full_barriers\":" + (options.fullBarriers ? "true" : "false"));
+            + "\",\"texturing\":\"64\",\"module\":\"fatbin\",\"params\":\"extras\",\"kernels\":16,\"init_ms\":" + std::to_string(elapsedMs())
+            + ",\"full_barriers\":" + (options.fullBarriers ? "true" : "false"));
         reason.clear();
         return true;
     }

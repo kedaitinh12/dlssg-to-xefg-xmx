@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -1485,12 +1486,15 @@ bool Contains(std::span<const unsigned char> bytes, const char* name)
     return std::search(bytes.begin(), bytes.end(), name, name + n) != bytes.end();
 }
 
-void MarkUnavailable(const std::string& reason)
+void MarkUnavailable(const std::string& reason, int64_t initMs = -1)
 {
     gReason = reason;
     gState.store(State::Unavailable, std::memory_order_release);
+    std::string extra;
+    if (initMs >= 0)
+        extra = ",\"init_ms\":" + std::to_string(initMs);
     Log("cuda_route", "\"state\":\"unavailable\",\"reason\":\"" + reason + "\",\"compute_capability\":\"" +
-        std::to_string(gMajor) + "." + std::to_string(gMinor) + "\"");
+        std::to_string(gMajor) + "." + std::to_string(gMinor) + "\"" + extra);
 }
 }
 
@@ -1568,6 +1572,7 @@ bool Install(ID3D12Device* device, HMODULE providerModule, std::span<const unsig
         std::string failure;
         if (!LoadNvapi(gNvapi, failure)) { MarkUnavailable(failure); reason = gReason; return false; }
         if (!ProviderRange(providerModule, gProviderBegin, gProviderEnd)) { MarkUnavailable("provider_image"); reason = gReason; return false; }
+        const auto createStart = std::chrono::steady_clock::now();
         for (size_t i = 0; i < std::size(kKernels); ++i)
         {
             void* handle{};
@@ -1579,7 +1584,9 @@ bool Install(ID3D12Device* device, HMODULE providerModule, std::span<const unsig
                     for (size_t j = 0; j < i; ++j) { gNvapi.destroy(device, gKernels[j]); gKernels[j] = nullptr; }
                 char code[16]{};
                 snprintf(code, sizeof(code), "0x%08lX", gFaultCode.load(std::memory_order_relaxed));
-                MarkUnavailable(created == kNvFault ? std::string("kernel_create_fault_") + code : std::string("kernel_create_") + kKernels[i]);
+                const auto failInitMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - createStart).count();
+                MarkUnavailable(created == kNvFault ? std::string("kernel_create_fault_") + code : std::string("kernel_create_") + kKernels[i], failInitMs);
                 reason = gReason;
                 return false;
             }
@@ -1596,8 +1603,11 @@ bool Install(ID3D12Device* device, HMODULE providerModule, std::span<const unsig
         gReason.clear();
         gActive.store(true, std::memory_order_release);
         gState.store(State::Active, std::memory_order_release);
+        const auto initMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - createStart).count();
         Log("cuda_route", "\"state\":\"active\",\"compute_capability\":\"" + std::to_string(gMajor) + "." + std::to_string(gMinor) +
             "\",\"kernels\":" + std::to_string(std::size(kKernels)) + ",\"layers\":" + std::to_string(std::size(kLayers)) +
+            ",\"init_ms\":" + std::to_string(initMs) +
             ",\"device_vtables\":" + std::to_string(gDevicePatchCount.load()) + ",\"device\":\"" + how + "\"");
         return true;
     }
@@ -1760,12 +1770,12 @@ bool Launched() noexcept
 }
 
 // Architectures with SASS in the fatbin: 7.5 (RTX 20), 8.6 (RTX 30; also runs RTX 40), 8.9 (RTX 40) and 12.0
-// (RTX 50; 12.1, GB10, is not admitted).
+// (RTX 50). Future 12.x/13.x+ GPUs JIT-compile the embedded compute_120 PTX (verified by GuardedCreate for all 16 kernels).
 // Compute capability 7.5 also covers the Turing parts without tensor cores (TU116/TU117: GTX 16, MX, T-series
 // such as the T1000); they keep the DXIL port, so 7.5 needs an RTX name or the Tesla T4.
 bool SupportedArchitecture(int major, int minor, const std::string& name) noexcept
 {
-    if ((major == 8 && (minor == 6 || minor == 9)) || (major == 12 && minor == 0)) return true;
+    if ((major == 8 && (minor == 6 || minor == 9)) || major >= 12) return true;
     if (major != 7 || minor != 5) return false;
     constexpr std::string_view t4 = " T4";
     return name.find("RTX") != std::string::npos

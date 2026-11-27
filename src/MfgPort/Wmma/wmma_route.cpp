@@ -1,4 +1,5 @@
 #include "wmma_route.h"
+#include "../../vulkan/VulkanPolicy.h"
 #include "../AdapterIdentity.h"
 #include "../Cuda/OverlayNative.h"
 #include "../Cuda/cuda_layers.h"
@@ -222,50 +223,16 @@ void MarkUnavailable(const std::string& why, const std::string& extra = {}) noex
     }
 }
 
-// Identifies AMD RDNA 4 (gfx1200/gfx1201: Radeon RX 9070 XT / 9070 / 9060 XT, PCI DeviceIDs 0x7550..0x75FF)
-// vs. AMD RDNA 3 (gfx1100..gfx1103: Radeon RX 7900 / 7800 / 7700 / 7600 / 780M / 890M, PCI DeviceIDs 0x7440..0x74FF, 0x15BF, 0x15C8, 0x150E).
+// Shared AMD RDNA 2 / RDNA 3 / RDNA 4 classifier via VulkanPolicy::ClassifyAmdArch (parity with xvk_coopmat.cpp).
 Arch DetectAmdArch(uint32_t vendorId, uint32_t deviceId, std::wstring_view description) noexcept
 {
-    if (vendorId != 0x1002)
-        return Arch::Unknown;
-
-    if ((deviceId >= 0x7550 && deviceId <= 0x75FF) ||
-        description.find(L"RX 90") != std::wstring_view::npos ||
-        description.find(L"RDNA 4") != std::wstring_view::npos ||
-        description.find(L"gfx12") != std::wstring_view::npos)
+    switch (VulkanPolicy::ClassifyAmdArch(vendorId, deviceId, description))
     {
-        return Arch::Rdna4;
+    case VulkanPolicy::AmdArch::Rdna4: return Arch::Rdna4;
+    case VulkanPolicy::AmdArch::Rdna3: return Arch::Rdna3;
+    case VulkanPolicy::AmdArch::Rdna2: return Arch::Rdna2;
+    default:                           return Arch::Unknown;
     }
-
-    if ((deviceId >= 0x7440 && deviceId <= 0x74FF) ||
-        deviceId == 0x15BF || deviceId == 0x15C8 || deviceId == 0x150E ||
-        deviceId == 0x1506 || deviceId == 0x1586 ||
-        description.find(L"RX 7") != std::wstring_view::npos ||
-        description.find(L"780M") != std::wstring_view::npos ||
-        description.find(L"880M") != std::wstring_view::npos ||
-        description.find(L"890M") != std::wstring_view::npos ||
-        description.find(L"8060S") != std::wstring_view::npos ||
-        description.find(L"8050S") != std::wstring_view::npos ||
-        description.find(L"RDNA 3") != std::wstring_view::npos ||
-        description.find(L"gfx11") != std::wstring_view::npos)
-    {
-        return Arch::Rdna3;
-    }
-
-    if ((deviceId >= 0x73A0 && deviceId <= 0x73FF) ||
-        deviceId == 0x1681 || deviceId == 0x163F || deviceId == 0x164D || deviceId == 0x164E ||
-        description.find(L"680M") != std::wstring_view::npos ||
-        description.find(L"660M") != std::wstring_view::npos ||
-        description.find(L"610M") != std::wstring_view::npos ||
-        description.find(L"Van Gogh") != std::wstring_view::npos ||
-        description.find(L"Custom GPU 0405") != std::wstring_view::npos ||
-        description.find(L"RDNA 2") != std::wstring_view::npos ||
-        description.find(L"gfx103") != std::wstring_view::npos)
-    {
-        return Arch::Rdna2;
-    }
-
-    return Arch::Unknown;
 }
 
 bool ImageOf(const void* address, std::array<wchar_t, MAX_PATH>& path, const wchar_t*& leaf, bool& system) noexcept

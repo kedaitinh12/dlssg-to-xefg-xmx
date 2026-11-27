@@ -75,6 +75,7 @@ namespace HudTier
 		bool gpuComputeAvailable = true;         // GPU compute pass available
 		bool toneMapMatchAvailable = false;      // Inline DX12 256-bin Tone-Map Matcher available (false on Vulkan)
 		bool preferTier2ForNativeIssues = false; // True if XeFG native UI composition previously stalled/failed
+		bool preferNativeForWmma = false;        // True on active D3D12->Vulkan WMMA bridge: Auto keeps hardware WMMA
 	};
 
 	struct Decision
@@ -94,12 +95,26 @@ namespace HudTier
 	{
 	public:
 		static constexpr float kBrokenDiffFraction = 0.38f;
-		static constexpr float kEmptyDiffFraction = 0.00005f;
-		static constexpr float kHealthyMinFraction = 0.0002f;
+		static constexpr float kFullScreenOverlayFraction = 0.60f;
+		// 0.0005% (~18 px at 1440p, <=1 sampled pixel at 1/16 stride): distinguishes a truly empty/duplicate
+		// HUDLess from a minimal 1 px crosshair (~30-100 px), with zero dead zone below kHealthyMinFraction.
+		static constexpr float kEmptyDiffFraction = 0.000005f;
+		static constexpr float kHealthyMinFraction = 0.000005f;
+		// Stronger threshold (0.02%, ~737 px at 1440p) required to latch everHealthy_ so a few stray tonemap/sharpen
+		// rounding pixels on a duplicate backbuffer can never permanently disable empty-HUDLess detection.
+		static constexpr float kEverHealthyMinFraction = 0.0002f;
 		static constexpr float kHealthyMaxFraction = 0.30f;
 		static constexpr uint32_t kBrokenConfirmFrames = 6u;
+		static constexpr uint32_t kHealthyOverlayConfirmFrames = 14u;
+		static constexpr uint32_t kEverHealthyConfirmFrames = 4u;
 		static constexpr uint32_t kEmptyConfirmFrames = 30u;
-		static constexpr uint32_t kRecoveryConfirmFrames = 20u;
+		static constexpr uint32_t kRecoveryConfirmFrames = 12u;
+
+		// Adaptive Tier 1 diff-guard probe cadence (shared by DX12 and Vulkan):
+		// every real frame during 8-frame warmup, 1/4 while recovering from fallback, 1/16 in steady state (>93% less GPU cost).
+		static constexpr uint64_t kWarmupGuardFrames = 8u;
+		static constexpr uint64_t kRecoveryGuardStride = 4u;
+		static constexpr uint64_t kSteadyGuardStride = 16u;
 
 		static constexpr float kStaticHudMinFraction = 0.0001f;
 		static constexpr float kStaticHudMaxFraction = 0.45f;
@@ -109,7 +124,9 @@ namespace HudTier
 			brokenStreak_ = 0;
 			emptyStreak_ = 0;
 			healthyStreak_ = 0;
+			healthyConfirmCount_ = 0;
 			matchedBrokenStreak_ = 0;
+			everHealthy_ = false;
 			gpuMarkedBroken_ = false;
 			gpuMarkedEmpty_ = false;
 			toneMapMatchFailed_ = false;
@@ -117,17 +134,77 @@ namespace HudTier
 			lastStaticFraction_ = 0.0f;
 			hasDiffSample_ = false;
 			hasStaticSample_ = false;
+			ResetHudlessSourceTracking();
+		}
+
+		// Tracks the game's active HUDLess resource identity (pointer/handle, extent, format).
+		// Tolerates up to 4 rotating swapchain/ring-buffer pointers of the same extent/format, and resets
+		// the everHealthy_ latch whenever the game switches to a different HUDLess source (e.g. menu <-> gameplay).
+		// Returns true when an active everHealthy_ latch was reset by a source change (for rate-limited logging).
+		bool NotifyHudlessSource(uint64_t resourceId, uint32_t width, uint32_t height, uint32_t format) noexcept
+		{
+			if (resourceId == 0u)
+				return false;
+
+			bool resetEverHealthy = false;
+			const bool shapeChanged = (recentHudlessCount_ > 0u) &&
+				(width != lastHudlessW_ || height != lastHudlessH_ || format != lastHudlessFmt_);
+			if (shapeChanged)
+			{
+				resetEverHealthy = everHealthy_;
+				everHealthy_ = false;
+				healthyConfirmCount_ = 0u;
+				emptyStreak_ = 0u;
+				recentHudlessCount_ = 0u;
+			}
+
+			for (uint32_t i = 0u; i < recentHudlessCount_; ++i)
+			{
+				if (recentHudlessIds_[i] == resourceId)
+					return resetEverHealthy;
+			}
+
+			if (everHealthy_ || recentHudlessCount_ >= kMaxTrackedHudlessRing)
+			{
+				// Brand-new resource pointer outside the established ring -> game switched HUDLess source.
+				resetEverHealthy = resetEverHealthy || everHealthy_;
+				everHealthy_ = false;
+				healthyConfirmCount_ = 0u;
+				emptyStreak_ = 0u;
+				recentHudlessCount_ = 0u;
+			}
+
+			recentHudlessIds_[recentHudlessCount_++] = resourceId;
+			lastHudlessW_ = width;
+			lastHudlessH_ = height;
+			lastHudlessFmt_ = format;
+			return resetEverHealthy;
+		}
+
+		// Returns whether the analyze-only 1/16-pixel HUD diff guard should run on this real frame.
+		bool ShouldRunDiffGuard(uint64_t guardFrame) const noexcept
+		{
+			if (guardFrame <= kWarmupGuardFrames)
+				return true;
+			const uint64_t stride = (gpuMarkedBroken_ || gpuMarkedEmpty_)
+				? kRecoveryGuardStride
+				: kSteadyGuardStride;
+			return (guardFrame % stride) == 0u;
 		}
 
 		// Feeds the non-blocking GPU readback of |Real - Hudless| > tolerance (1/16 sampled fraction in [0, 1]).
 		// Pass fromToneMatched = true when the sample came from Tier 3's tone-matched HUDless output.
-		void FeedHudDiffFraction(float fraction, bool fromToneMatched = false) noexcept
+		// Pass skipVerdict = true on camera-cut / reset / invalid-history transition frames to record telemetry
+		// without advancing escalation or recovery streaks.
+		void FeedHudDiffFraction(float fraction, bool fromToneMatched = false, bool skipVerdict = false) noexcept
 		{
 			if (!(fraction >= 0.0f && fraction <= 1.0f))
 				return;
 
 			lastDiffFraction_ = fraction;
 			hasDiffSample_ = true;
+			if (skipVerdict)
+				return;
 
 			if (fromToneMatched)
 			{
@@ -147,7 +224,13 @@ namespace HudTier
 			{
 				healthyStreak_ = 0;
 				emptyStreak_ = 0;
-				if (++brokenStreak_ >= kBrokenConfirmFrames)
+				// Once HUDLess is proven healthy in this session, require a longer confirmation streak on
+				// >=60% diff spikes (typical full-screen pause/map/inventory overlays) while still catching
+				// persistent mid-session HDR/exposure mismatches.
+				const uint32_t needed = (everHealthy_ && fraction >= kFullScreenOverlayFraction)
+					? kHealthyOverlayConfirmFrames
+					: kBrokenConfirmFrames;
+				if (++brokenStreak_ >= needed)
 				{
 					gpuMarkedBroken_ = true;
 					gpuMarkedEmpty_ = false;
@@ -157,7 +240,9 @@ namespace HudTier
 			{
 				healthyStreak_ = 0;
 				brokenStreak_ = 0;
-				if (++emptyStreak_ >= kEmptyConfirmFrames)
+				// Once HUDLess is proven non-empty/healthy, hidden-HUD cutscenes or photo mode (diff == 0)
+				// must not demote it as a duplicate backbuffer.
+				if (!everHealthy_ && ++emptyStreak_ >= kEmptyConfirmFrames)
 				{
 					gpuMarkedEmpty_ = true;
 				}
@@ -166,6 +251,18 @@ namespace HudTier
 			{
 				brokenStreak_ = 0;
 				emptyStreak_ = 0;
+				if (!everHealthy_)
+				{
+					if (fraction >= kEverHealthyMinFraction)
+					{
+						if (++healthyConfirmCount_ >= kEverHealthyConfirmFrames)
+							everHealthy_ = true;
+					}
+					else
+					{
+						healthyConfirmCount_ = 0;
+					}
+				}
 				if ((gpuMarkedBroken_ || gpuMarkedEmpty_) && ++healthyStreak_ >= kRecoveryConfirmFrames)
 				{
 					gpuMarkedBroken_ = false;
@@ -303,6 +400,15 @@ namespace HudTier
 				return d;
 			}
 
+			// On the D3D12->Vulkan WMMA bridge, Auto mode avoids escalating to post-HUD compute composite (Tier 2/3),
+			// which would silently disable hardware WMMA and fall back to slow DXIL. Explicit Tier 2/3 modes still work.
+			if (in.mode == Mode::Auto && in.preferNativeForWmma)
+			{
+				d.activeTier = ActiveTier::Interpolated;
+				d.reason = "wmma-auto-keep-hw-route";
+				return d;
+			}
+
 			// Tier 3 Hybrid fallback (Auto / Tier 2 when native HUDLess is missing, empty, or color/format-mismatched):
 			// - When a color/format-mismatched HUDLess is present and Tone-Map Matcher is available, run BOTH:
 			//   Tone-Map Matcher (protects dynamic, animated, semi-transparent, HDR-mismatched UI) +
@@ -346,6 +452,7 @@ namespace HudTier
 			return d;
 		}
 
+		bool EverHealthy() const noexcept { return everHealthy_; }
 		bool IsGpuMarkedBroken() const noexcept { return gpuMarkedBroken_; }
 		bool IsGpuMarkedEmpty() const noexcept { return gpuMarkedEmpty_; }
 		bool IsToneMapMatchFailed() const noexcept { return toneMapMatchFailed_; }
@@ -356,7 +463,9 @@ namespace HudTier
 		uint32_t brokenStreak_ = 0;
 		uint32_t emptyStreak_ = 0;
 		uint32_t healthyStreak_ = 0;
+		uint32_t healthyConfirmCount_ = 0;
 		uint32_t matchedBrokenStreak_ = 0;
+		bool everHealthy_ = false;
 		bool gpuMarkedBroken_ = false;
 		bool gpuMarkedEmpty_ = false;
 		bool toneMapMatchFailed_ = false;
@@ -364,5 +473,22 @@ namespace HudTier
 		float lastStaticFraction_ = 0.0f;
 		bool hasDiffSample_ = false;
 		bool hasStaticSample_ = false;
+
+		static constexpr uint32_t kMaxTrackedHudlessRing = 4u;
+		uint64_t recentHudlessIds_[kMaxTrackedHudlessRing]{};
+		uint32_t recentHudlessCount_ = 0u;
+		uint32_t lastHudlessW_ = 0u;
+		uint32_t lastHudlessH_ = 0u;
+		uint32_t lastHudlessFmt_ = 0u;
+
+		void ResetHudlessSourceTracking() noexcept
+		{
+			for (uint32_t i = 0u; i < kMaxTrackedHudlessRing; ++i)
+				recentHudlessIds_[i] = 0u;
+			recentHudlessCount_ = 0u;
+			lastHudlessW_ = 0u;
+			lastHudlessH_ = 0u;
+			lastHudlessFmt_ = 0u;
+		}
 	};
 } // namespace HudTier

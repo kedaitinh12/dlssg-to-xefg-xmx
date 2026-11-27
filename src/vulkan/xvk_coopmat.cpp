@@ -149,6 +149,14 @@ CoopMatrixRoute::~CoopMatrixRoute()
             pipeline = VK_NULL_HANDLE;
         }
     }
+    for (auto& pipeline : pipelinesStride5_)
+    {
+        if (pipeline)
+        {
+            destroyPipeline_(device_, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
     if (pipelineCache_ && destroyPipelineCache_)
     {
         destroyPipelineCache_(device_, pipelineCache_, nullptr);
@@ -262,25 +270,12 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
         gpuArch_ = GpuArch::Generic;
         if (devProps.properties.vendorID == 0x1002u && tileM_ == 16u && tileN_ == 16u && (tileK_ == 16u || tileK_ == 32u) && subgroupSize_ == 32u)
         {
-            const uint32_t devId = devProps.properties.deviceID;
-            const std::string_view devName(devProps.properties.deviceName);
-            const bool isRdna4 = (devId >= 0x7550u && devId <= 0x75FFu) ||
-                                 devName.find("gfx12") != std::string_view::npos ||
-                                 devName.find("9070") != std::string_view::npos ||
-                                 devName.find("9060") != std::string_view::npos ||
-                                 devName.find("R9700") != std::string_view::npos;
-            const bool isRdna3 = !isRdna4 && (
-                                 (devId >= 0x7440u && devId <= 0x74FFu) ||
-                                 devName.find("gfx11") != std::string_view::npos ||
-                                 devName.find("7900") != std::string_view::npos ||
-                                 devName.find("7800") != std::string_view::npos ||
-                                 devName.find("7700") != std::string_view::npos ||
-                                 devName.find("7600") != std::string_view::npos ||
-                                 devName.find("8060") != std::string_view::npos ||
-                                 devName.find("8050") != std::string_view::npos);
-            if (isRdna4)
+            const auto amdArch = VulkanPolicy::ClassifyAmdArch(
+                devProps.properties.vendorID, devProps.properties.deviceID,
+                std::string_view(devProps.properties.deviceName), /*hasWmma16x16x16Wave32=*/true);
+            if (amdArch == VulkanPolicy::AmdArch::Rdna4)
                 gpuArch_ = GpuArch::Rdna4;
-            else if (isRdna3)
+            else if (amdArch == VulkanPolicy::AmdArch::Rdna3)
                 gpuArch_ = GpuArch::Rdna3;
 
             // RX 7700 XT probe on Adrenalin 26.6.2 (LLPC) showed radv_reg + local=256 inflates VGPRs
@@ -379,7 +374,15 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
         const bool isXmx = (tileM_ == 8u && tileN_ == 8u && tileK_ == 32u);
         const bool isK32 = (tileM_ == 16u && tileN_ == 16u && tileK_ == 32u);
         const std::filesystem::path xmxDir = moduleDir / L"xmx_8x8x32";
+        const std::filesystem::path stride5Dir = moduleDir / L"stride5";
+        const std::filesystem::path stride5RegDir = (activeLayout == MatCLayout::Gfx12Reg)
+            ? (moduleDir / L"stride5_gfx12_reg")
+            : ((activeLayout == MatCLayout::Gfx11Reg) ? (moduleDir / L"stride5_radv_reg") : std::filesystem::path{});
+        std::error_code s5Ec;
+        const bool hasStride5Base = !isXmx && !isK32 && std::filesystem::is_directory(stride5Dir, s5Ec);
+        const bool hasStride5Reg = hasStride5Base && !stride5RegDir.empty() && std::filesystem::is_directory(stride5RegDir, s5Ec);
         uint32_t loadedCount = 0;
+        uint32_t loadedStride5Count = 0;
         for (size_t i = 0; i < std::size(xefg_cuda::kLayers); ++i)
         {
             const auto& layer = xefg_cuda::kLayers[i];
@@ -399,7 +402,27 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
                 spirvModules_[i] = std::move(words);
                 ++loadedCount;
             }
+
+            if (hasStride5Base)
+            {
+                const std::filesystem::path s5Primary = (layerWantsReg(i, layer) && hasStride5Reg) ? stride5RegDir : stride5Dir;
+                auto s5Words = LoadSpirvFile(s5Primary / (std::string(layer.info.program) + ".spv"));
+                if (s5Words.empty())
+                    s5Words = LoadSpirvFile(s5Primary / (std::string(layer.info.kernel) + ".spv"));
+                if (s5Words.empty() && s5Primary != stride5Dir)
+                {
+                    s5Words = LoadSpirvFile(stride5Dir / (std::string(layer.info.program) + ".spv"));
+                    if (s5Words.empty())
+                        s5Words = LoadSpirvFile(stride5Dir / (std::string(layer.info.kernel) + ".spv"));
+                }
+                if (!s5Words.empty())
+                {
+                    spirvModulesStride5_[i] = std::move(s5Words);
+                    ++loadedStride5Count;
+                }
+            }
         }
+        hasStride5_ = (loadedStride5Count == loadedCount && loadedCount > 0);
         if (loadedCount == 0)
         {
             reason = "no_coopmat_modules";
@@ -504,7 +527,7 @@ uint32_t CoopMatrixRoute::SelectWorkgroupSize(size_t layerIdx) const noexcept
     return 128u;
 }
 
-void CoopMatrixRoute::LogPipelineStats(size_t layerIdx, uint32_t localSizeX, VkPipeline pipeline) const noexcept
+void CoopMatrixRoute::LogPipelineStats(size_t layerIdx, uint32_t localSizeX, VkPipeline pipeline, uint32_t strideVal) const noexcept
 {
     if (!pipelineExecStats_ || !device_ || !pipeline || layerIdx >= std::size(xefg_cuda::kLayers))
         return;
@@ -577,7 +600,8 @@ void CoopMatrixRoute::LogPipelineStats(size_t layerIdx, uint32_t localSizeX, VkP
         xefg_cuda::Report("coopmat_isa_stats",
             "\"program\":\"" + std::string(layer.info.program) +
             "\",\"kernel\":\"" + std::string(layer.info.kernel) +
-            "\",\"local_x\":" + std::to_string(localSizeX) +
+            "\",\"stride\":" + std::to_string(strideVal) +
+            ",\"local_x\":" + std::to_string(localSizeX) +
             ",\"wave\":" + std::to_string(execs[0].subgroupSize) +
             ",\"stats\":\"" + fields + "\"");
     }
@@ -586,35 +610,41 @@ void CoopMatrixRoute::LogPipelineStats(size_t layerIdx, uint32_t localSizeX, VkP
     }
 }
 
-bool CoopMatrixRoute::EnsureLayerPipeline(Device& device, uint8_t layerIdx, PipelineState& basePso) noexcept
+bool CoopMatrixRoute::EnsureLayerPipeline(Device& device, uint8_t layerIdx, PipelineState& basePso, bool useStride5) noexcept
 {
     if (!layerIdx || layerIdx > spirvModules_.size())
         return false;
 
+    const bool s5 = useStride5 && hasStride5_;
+    auto& mods = s5 ? spirvModulesStride5_ : spirvModules_;
+    auto& pipes = s5 ? pipelinesStride5_ : pipelines_;
+    auto& readyArr = s5 ? pipelineReadyStride5_ : pipelineReady_;
+    auto& failedArr = s5 ? pipelineFailedStride5_ : pipelineFailed_;
+
     const size_t idx = layerIdx - 1;
-    if (pipelineReady_[idx].load(std::memory_order_acquire))
+    if (readyArr[idx].load(std::memory_order_acquire))
         return true;
-    if (pipelineFailed_[idx].load(std::memory_order_relaxed))
+    if (failedArr[idx].load(std::memory_order_relaxed))
         return false;
 
     std::lock_guard lock(pipelineMutex_);
-    if (pipelines_[idx])
+    if (pipes[idx])
         return true;
 
-    if (spirvModules_[idx].empty() || !basePso.layout())
+    if (mods[idx].empty() || !basePso.layout())
     {
-        pipelineFailed_[idx].store(true, std::memory_order_relaxed);
+        failedArr[idx].store(true, std::memory_order_relaxed);
         return false;
     }
 
     VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    moduleInfo.codeSize = spirvModules_[idx].size() * sizeof(uint32_t);
-    moduleInfo.pCode = spirvModules_[idx].data();
+    moduleInfo.codeSize = mods[idx].size() * sizeof(uint32_t);
+    moduleInfo.pCode = mods[idx].data();
 
     VkShaderModule shaderModule = VK_NULL_HANDLE;
     if (createShaderModule_(device_, &moduleInfo, nullptr, &shaderModule) != VK_SUCCESS || !shaderModule)
     {
-        pipelineFailed_[idx].store(true, std::memory_order_relaxed);
+        failedArr[idx].store(true, std::memory_order_relaxed);
         return false;
     }
 
@@ -662,14 +692,15 @@ bool CoopMatrixRoute::EnsureLayerPipeline(Device& device, uint8_t layerIdx, Pipe
 
     if (res != VK_SUCCESS || !created)
     {
-        pipelineFailed_[idx].store(true, std::memory_order_relaxed);
+        failedArr[idx].store(true, std::memory_order_relaxed);
         return false;
     }
 
     (void)device;
-    LogPipelineStats(idx, localSizeX, created);
-    pipelines_[idx] = created;
-    pipelineReady_[idx].store(true, std::memory_order_release);
+    const uint32_t strideVal = (tileK_ == 32u) ? 12u : (s5 ? 5u : 4u);
+    LogPipelineStats(idx, localSizeX, created, strideVal);
+    pipes[idx] = created;
+    readyArr[idx].store(true, std::memory_order_release);
     cacheDirty_.store(true, std::memory_order_relaxed);
     return true;
 }
@@ -678,7 +709,8 @@ void CoopMatrixRoute::PrecompileLayer(Device& device, uint8_t layerIdx, Pipeline
 {
     if (!active() || !layerIdx || !xefg_cuda::CoopMatrixLayerEnabled(layerIdx))
         return;
-    (void)EnsureLayerPipeline(device, layerIdx, basePso);
+    const bool useStride5 = hasStride5_ && (VulkanPolicy::GetWmmaLdsStrideMode() == 1);
+    (void)EnsureLayerPipeline(device, layerIdx, basePso, useStride5);
 }
 
 void CoopMatrixRoute::SavePipelineCache() noexcept
@@ -723,6 +755,7 @@ bool CoopMatrixRoute::TryLaunch(Device& device, VkCommandBuffer buffer, uint8_t 
 
     const auto& layer = xefg_cuda::kLayers[id - 1];
     auto fallback = [&](const char* reason) {
+        batchFallbacks_.fetch_add(1u, std::memory_order_relaxed);
         ++fallbacks_;
         xefg_cuda::CountCoopMatrix(0, 1);
         try
@@ -750,8 +783,20 @@ bool CoopMatrixRoute::TryLaunch(Device& device, VkCommandBuffer buffer, uint8_t 
         if (!t0 || !t1 || (constantMasks[2] & layer.constants) != layer.constants)
             return fallback("bindings_incomplete");
 
-        if (!EnsureLayerPipeline(device, id, basePso))
-            return fallback("no_coopmat_module");
+        const bool wantStride5 = (VulkanPolicy::GetWmmaLdsStrideMode() == 1);
+        if (wantStride5 && !hasStride5_ && !stride5MissingWarned_.exchange(true, std::memory_order_relaxed))
+        {
+            xefg_cuda::Report("coopmat_stride5_unavailable",
+                "\"reason\":\"missing_stride5_spirv\",\"fallback_stride\":4");
+        }
+        bool useStride5 = hasStride5_ && wantStride5;
+        if (!EnsureLayerPipeline(device, id, basePso, useStride5))
+        {
+            if (useStride5 && EnsureLayerPipeline(device, id, basePso, false))
+                useStride5 = false;
+            else
+                return fallback("no_coopmat_module");
+        }
 
         const auto& ranges = basePso.ranges();
         // Avoid zero-initializing 6 KB of stack memory on every WMMA Dispatch; only [0..count) are written and passed.
@@ -821,7 +866,7 @@ bool CoopMatrixRoute::TryLaunch(Device& device, VkCommandBuffer buffer, uint8_t 
                 std::string("\"program\":\"") + layer.info.program + "\",\"kernel\":\"" + layer.info.kernel + "\"");
         }
 
-        bindPipeline_(buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines_[id - 1]);
+        bindPipeline_(buffer, VK_PIPELINE_BIND_POINT_COMPUTE, useStride5 ? pipelinesStride5_[id - 1] : pipelines_[id - 1]);
         if (count)
             pushDescriptorSet_(buffer, VK_PIPELINE_BIND_POINT_COMPUTE, basePso.layout(), 0, uint32_t(count), writes.data());
 
@@ -848,6 +893,10 @@ bool CoopMatrixRoute::TryLaunch(Device& device, VkCommandBuffer buffer, uint8_t 
             barrier_(buffer, &dependency);
         }
 
+        if (useStride5)
+            batchStride5_.fetch_add(1u, std::memory_order_relaxed);
+        else
+            batchStride4_.fetch_add(1u, std::memory_order_relaxed);
         ++launches_;
         xefg_cuda::CountCoopMatrix(1, 0);
         return true;

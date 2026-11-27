@@ -55,12 +55,25 @@ public:
     uint32_t tileN() const noexcept { return tileN_; }
     uint32_t tileK() const noexcept { return tileK_; }
     uint32_t installedLayers() const noexcept { return installedLayers_; }
+    bool hasStride5() const noexcept { return hasStride5_; }
+    void ResetBatchStrideCounters() noexcept
+    {
+        batchStride4_.store(0u, std::memory_order_relaxed);
+        batchStride5_.store(0u, std::memory_order_relaxed);
+        batchFallbacks_.store(0u, std::memory_order_relaxed);
+    }
+    void ConsumeBatchStrideCounters(uint32_t& outStride4, uint32_t& outStride5, uint32_t& outFallbacks) noexcept
+    {
+        outStride4 = batchStride4_.exchange(0u, std::memory_order_relaxed);
+        outStride5 = batchStride5_.exchange(0u, std::memory_order_relaxed);
+        outFallbacks = batchFallbacks_.exchange(0u, std::memory_order_relaxed);
+    }
 
 private:
     enum class GpuArch : uint8_t { Generic, Rdna3, Rdna4 };
     uint32_t SelectWorkgroupSize(size_t layerIdx) const noexcept;
-    void LogPipelineStats(size_t layerIdx, uint32_t localSizeX, VkPipeline pipeline) const noexcept;
-    bool EnsureLayerPipeline(Device& device, uint8_t layerIdx, PipelineState& basePso) noexcept;
+    void LogPipelineStats(size_t layerIdx, uint32_t localSizeX, VkPipeline pipeline, uint32_t strideVal) const noexcept;
+    bool EnsureLayerPipeline(Device& device, uint8_t layerIdx, PipelineState& basePso, bool useStride5 = false) noexcept;
 
     VkDevice device_ = VK_NULL_HANDLE;
     PFN_vkCreateShaderModule createShaderModule_{};
@@ -93,10 +106,19 @@ private:
     std::array<VkPipeline, 17> pipelines_{};
     std::array<std::atomic<bool>, 17> pipelineReady_{};
     std::array<std::atomic<bool>, 17> pipelineFailed_{};
+    bool hasStride5_{false};
+    std::array<std::vector<uint32_t>, 17> spirvModulesStride5_{};
+    std::array<VkPipeline, 17> pipelinesStride5_{};
+    std::array<std::atomic<bool>, 17> pipelineReadyStride5_{};
+    std::array<std::atomic<bool>, 17> pipelineFailedStride5_{};
     std::array<std::atomic<bool>, 17> seen_{};
     std::atomic<bool> active_{};
     std::atomic<bool> enabled_{true};
     std::atomic<uint64_t> launches_{}, fallbacks_{};
+    std::atomic<uint32_t> batchStride4_{0};
+    std::atomic<uint32_t> batchStride5_{0};
+    std::atomic<uint32_t> batchFallbacks_{0};
+    std::atomic<bool> stride5MissingWarned_{false};
     std::mutex pipelineMutex_;
     std::mutex reasonsMutex_;
     std::set<std::string> reasons_;

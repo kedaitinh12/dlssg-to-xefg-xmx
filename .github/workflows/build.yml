@@ -145,7 +145,7 @@ jobs:
             ./tools/GenerateXeFgCuda.ps1 -Output bin\Release\xefg_mfg_programs -CudaRoot $cudaRoot -Source src\MfgPort\Cuda -AllowUnpinnedNvcc
             "rebuilt=true" >> $env:GITHUB_OUTPUT
           } else {
-            Write-Host "CUDA Toolkit unavailable on runner; keeping the extracted xefg_cuda_layers.fatbin."
+            Write-Host "::warning::CUDA Toolkit unavailable on runner; build will keep the extracted xefg_cuda_layers.fatbin without newly compiled compute_120 PTX."
             "rebuilt=false" >> $env:GITHUB_OUTPUT
           }
 

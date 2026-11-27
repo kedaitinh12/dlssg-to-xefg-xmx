@@ -87,6 +87,9 @@ void SetTensorCoresEnabled(ID3D12Device*, bool enabled) noexcept;
 bool InstallCoopMatrix(ID3D12Device*, const wchar_t* moduleDir, const CoopMatrixOptions&, std::string& reason) noexcept;
 void SetCoopMatrixEnabled(ID3D12Device*, bool enabled) noexcept;
 void FlushCoopMatrixCache(ID3D12Device*) noexcept;
+bool HasCoopMatrixStride5(ID3D12Device*) noexcept;
+void ResetCoopMatrixBatchStride(ID3D12Device*) noexcept;
+void ConsumeCoopMatrixBatchStride(ID3D12Device*, uint32_t& outStride4, uint32_t& outStride5, uint32_t& outFallbacks) noexcept;
 
 // What the device needs. The SPIR-V is version 1.6, so the device must run at Vulkan 1.3 or later.
 constexpr uint32_t kRequiredApiVersion = VK_API_VERSION_1_3;

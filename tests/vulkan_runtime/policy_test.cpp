@@ -840,6 +840,322 @@ int main()
 		CHECK(!IsValidSpirvBlob(22u, 0x07230203u));              // not 4-byte word aligned
 		CHECK(!IsValidSpirvBlob(20u, 0x43425844u));              // DXBC magic, not SPIR-V
 		CHECK(!IsValidSpirvBlob(2u * 1024u * 1024u, 0x07230203u)); // > 1 MiB rejected
+
+		// Camera near/far normalization for BOTH depthInverted=true and depthInverted=false
+		{
+			float n = 0.15f, f = 10000.0f; bool inv = false;
+			CHECK(!NormalizeCameraPlanes(n, f, inv) && Near(n, 0.15f) && Near(f, 10000.0f) && !inv);
+			float nInf = 0.15f, fInf = 0.0f; bool invInf = true;
+			CHECK(!NormalizeCameraPlanes(nInf, fInf, invInf) && Near(nInf, 0.15f) && Near(fInf, 0.0f) && invInf);
+			float nSwapT = 10000.0f, fSwapT = 0.15f; bool invT = true;
+			CHECK(NormalizeCameraPlanes(nSwapT, fSwapT, invT) && Near(nSwapT, 0.15f) && Near(fSwapT, 10000.0f) && invT);
+			float nSwapF = 10000.0f, fSwapF = 0.15f; bool invF = false;
+			CHECK(NormalizeCameraPlanes(nSwapF, fSwapF, invF) && Near(nSwapF, 0.15f) && Near(fSwapF, 10000.0f) && invF);
+			float mRefInv[16], mSwappedT[16], mSwappedF[16];
+			Projection(2.0f, 1.0f, 101.0f, 1.5707964f, true, mRefInv);
+			Projection(2.0f, 101.0f, 1.0f, 1.5707964f, true, mSwappedT);
+			Projection(2.0f, 101.0f, 1.0f, 1.5707964f, false, mSwappedF);
+			CHECK(Near(mRefInv[10], mSwappedT[10], 1e-5f) && Near(mRefInv[14], mSwappedT[14], 1e-4f));
+			CHECK(Near(mRefInv[10], mSwappedF[10], 1e-5f) && Near(mRefInv[14], mSwappedF[14], 1e-4f));
+		}
+
+		// Hardened rolling VRAM drift diagnostic (120-frame warmup, 3 consecutive rising windows, budget-% threshold)
+		{
+			constexpr uint32_t kBudget16G = 16384u; // stepMin = 128 MiB, totalMin = 512 MiB
+			VramDriftTracker t;
+			CHECK(!t.Sample(0u, kBudget16G, 8u).ready);
+			// 15 polls * 8 = 120 warmup frames skipped (startup surge ignored)
+			for (int i = 0; i < 15; ++i)
+				CHECK(!t.Sample(6000u + uint32_t(i * 100), kBudget16G, 8u).ready);
+			// First post-warmup poll captures baseline = 8000 MiB
+			CHECK(!t.Sample(8000u, kBudget16G, 8u).ready);
+			// Window 1: rises +200 MiB (8200) -> logs baseline Info (not Warn: only 1 rising window)
+			VramDriftReport r1{};
+			for (int i = 0; i < 30; ++i)
+				r1 = t.Sample(8200u, kBudget16G, 8u);
+			CHECK(r1.ready && !r1.warn && r1.baselineMiB == 8000u && r1.deltaMiB == 200 && r1.risingStreak == 1u);
+			// Window 2: rises +200 MiB (8400) -> silent (only 2 rising windows)
+			VramDriftReport r2{};
+			for (int i = 0; i < 30; ++i)
+				r2 = t.Sample(8400u, kBudget16G, 8u);
+			CHECK(!r2.ready);
+			// Window 3: rises +200 MiB (8600, total +600 >= 512) -> 3 consecutive rising windows -> WARN
+			VramDriftReport r3{};
+			for (int i = 0; i < 30; ++i)
+				r3 = t.Sample(8600u, kBudget16G, 8u);
+			CHECK(r3.ready && r3.warn && r3.deltaMiB == 600 && r3.risingStreak == 3u);
+			t.Reset();
+			CHECK(t.baselineMiB == 0u && t.warmupFrames == 0u && !t.baselineLogged);
+		}
+
+		// Shared Adaptive VRAM Guard state machine (D3D12 + Vulkan: gradual step-down, dwell, budget-% margins)
+		{
+			constexpr uint64_t kMiB = 1024ull * 1024ull;
+			// 8 GB vs 24 GB margin scaling
+			CHECK(VramGuardState::SafetyMarginBytes(8192ull * kMiB) > 200ull * kMiB);
+			CHECK(VramGuardState::SafetyMarginBytes(24576ull * kMiB) > VramGuardState::SafetyMarginBytes(8192ull * kMiB));
+			CHECK(VramGuardState::ReleaseMarginBytes(24576ull * kMiB) == 1546188226ull); // 6% of 24 GiB
+			CHECK(VramGuardState::ReleaseMarginBytes(32768ull * kMiB) == 1536ull * kMiB); // upper clamp
+
+			VramGuardState g;
+			const uint64_t budget = 16384ull * kMiB;
+			const uint64_t tightUsage = budget - VramGuardState::SafetyMarginBytes(budget) + 16ull * kMiB;
+			const uint64_t comfortUsage = budget - VramGuardState::ReleaseMarginBytes(budget) - 64ull * kMiB;
+			// Requested 3 generated frames (4x): tight steps down 3 -> 2 immediately
+			CHECK(g.Update(tightUsage, budget, 3u, 1000ull) == VramGuardState::Transition::Engaged);
+			CHECK(g.active && g.stepDown == 1u && g.EffectiveCount(3u) == 2u);
+			// Crossing 2 -> 1 requires 2 consecutive tight polls (avoids 112 ms rebuild thrash)
+			CHECK(g.Update(tightUsage, budget, 3u, 2000ull) == VramGuardState::Transition::None);
+			CHECK(g.EffectiveCount(3u) == 2u);
+			CHECK(g.Update(tightUsage, budget, 3u, 3000ull) == VramGuardState::Transition::Engaged);
+			CHECK(g.EffectiveCount(3u) == 1u);
+			// Stepping back up 1 -> 2 requires 10s dwell
+			CHECK(g.Update(comfortUsage, budget, 3u, 4000ull) == VramGuardState::Transition::None);
+			CHECK(g.Update(comfortUsage, budget, 3u, 13000ull) == VramGuardState::Transition::None);
+			CHECK(g.Update(comfortUsage, budget, 3u, 14000ull) == VramGuardState::Transition::Easing);
+			CHECK(g.EffectiveCount(3u) == 2u);
+			// Stepping back up 2 -> 3 requires 3s dwell
+			CHECK(g.Update(comfortUsage, budget, 3u, 15000ull) == VramGuardState::Transition::None);
+			CHECK(g.Update(comfortUsage, budget, 3u, 18000ull) == VramGuardState::Transition::Released);
+			CHECK(!g.active && g.stepDown == 0u && g.EffectiveCount(3u) == 3u);
+			// Adaptive WMMA wait timeout: clamp(1.5 * realFrameEma, 8 ms, 50 ms)
+			CHECK(WmmaAdaptiveWaitTimeoutNs(0u) == 25'000'000ull);       // warmup default 25 ms
+			CHECK(WmmaAdaptiveWaitTimeoutNs(4'000u) == 8'000'000ull);    // 250 fps -> 8 ms floor
+			CHECK(WmmaAdaptiveWaitTimeoutNs(16'667u) == 25'000'500ull);  // 60 fps -> 25 ms
+			CHECK(WmmaAdaptiveWaitTimeoutNs(25'000u) == 37'500'000ull);  // 40 fps -> 37.5 ms
+			CHECK(WmmaAdaptiveWaitTimeoutNs(40'000u) == 50'000'000ull);  // 25 fps -> 50 ms cap
+			CHECK(!ShouldReclaimClampedOutputs(false, 100u));
+			CHECK(!ShouldReclaimClampedOutputs(true, 23u));
+			CHECK(ShouldReclaimClampedOutputs(true, 24u));
+
+			// Slow-leak detection (10-window cumulative baseline check + warn cooldown)
+			VramDriftTracker slow;
+			for (int i = 0; i < 15; ++i) slow.Sample(8000u, 16384u, 8u);
+			slow.Sample(8000u, 16384u, 8u); // baseline = 8000 MiB
+			VramDriftReport slowRep{};
+			for (int w = 1; w <= 10; ++w)
+			{
+				for (int i = 0; i < 30; ++i)
+					slowRep = slow.Sample(8000u + uint32_t(w * 60), 16384u, 8u); // +60 MiB/window (<128 fast threshold, +600 total >= 512)
+				if (w < 10) CHECK(!slowRep.warn);
+			}
+			CHECK(slowRep.ready && slowRep.warn && slowRep.deltaMiB == 600 && slowRep.windowIndex == 10u);
+			// Cooldown prevents immediate re-warning on the next 3 windows
+			VramDriftReport cdRep{};
+			for (int w = 1; w <= 3; ++w)
+				for (int i = 0; i < 30; ++i)
+					cdRep = slow.Sample(8600u + uint32_t(w * 200), 16384u, 8u);
+			CHECK(!cdRep.warn);
+
+			// One-time +700 MiB map load then flat for 100 windows: must NOT repeat warnings after window 10
+			VramDriftTracker mapLoad;
+			for (int i = 0; i < 15; ++i) mapLoad.Sample(8000u, 16384u, 8u);
+			mapLoad.Sample(8000u, 16384u, 8u); // baseline = 8000 MiB
+			int warnCount = 0;
+			for (int w = 1; w <= 100; ++w)
+			{
+				VramDriftReport r{};
+				for (int i = 0; i < 30; ++i)
+					r = mapLoad.Sample(8700u, 16384u, 8u); // jumped +700 once, then flat forever
+				if (r.warn)
+					++warnCount;
+			}
+			CHECK(warnCount == 1); // fires at window 10 once, then 0 warnings across windows 11..100
+		}
+	}
+
+	// Vulkan ICD direct-bypass policy helpers (v15r8)
+	{
+		CHECK(VulkanPolicy::IsKnownVulkanIcdName(L"amdvlk64.dll"));
+		CHECK(VulkanPolicy::IsKnownVulkanIcdName(L"C:\\Windows\\System32\\DriverStore\\FileRepository\\u0412\\AMDVLK64.DLL"));
+		CHECK(VulkanPolicy::IsKnownVulkanIcdName(L"C:/Windows/System32/nvoglv64.dll"));
+		CHECK(VulkanPolicy::IsKnownVulkanIcdName(L"igvk64.dll"));
+		CHECK(VulkanPolicy::IsKnownVulkanIcdName(L"xe_vk64.dll"));
+		CHECK(VulkanPolicy::IsKnownVulkanIcdName(L"igxelpicd64.dll"));
+		CHECK(VulkanPolicy::IsKnownVulkanIcdName(L"winevulkan.dll"));
+		CHECK(!VulkanPolicy::IsKnownVulkanIcdName(L""));
+		CHECK(!VulkanPolicy::IsKnownVulkanIcdName(L"vulkan-1.dll"));
+		CHECK(!VulkanPolicy::IsKnownVulkanIcdName(L"C:\\Games\\OptiScaler.dll"));
+		CHECK(!VulkanPolicy::IsKnownVulkanIcdName(L"RTSSHooks64.dll"));
+
+		CHECK(!VulkanPolicy::ShouldBypassWmmaDeviceProc(""));
+		CHECK(!VulkanPolicy::ShouldBypassWmmaDeviceProc("vkDestroyDevice"));
+		CHECK(VulkanPolicy::ShouldBypassWmmaDeviceProc("vkQueueSubmit2"));
+		CHECK(VulkanPolicy::ShouldBypassWmmaDeviceProc("vkCreateCommandPool"));
+		CHECK(VulkanPolicy::ShouldBypassWmmaDeviceProc("vkCmdDispatch"));
+
+		// Pure DirectIcdResolver::Init decision tests (v15r9): no layer, wrapping layer, unknown ICD, gdpa wrong module
+		int dummyIcdMod = 0, dummyOtherMod = 0, dummyLoaderFn = 0, dummyLayerFn = 0, dummyGdpaFn = 0;
+		VulkanPolicy::DirectIcdInitProbe validProbe{};
+		validProbe.allowBypass = true;
+		validProbe.loaderProbeFn = &dummyLoaderFn;
+		validProbe.probeModule = &dummyIcdMod;
+		validProbe.probeModulePath = L"C:\\Windows\\System32\\amdvlk64.dll";
+		validProbe.icdGdpaFn = &dummyGdpaFn;
+		validProbe.icdGdpaModule = &dummyIcdMod;
+		validProbe.icdProbeFn = &dummyLoaderFn;
+		CHECK(VulkanPolicy::ShouldEnableDirectIcdBypass(validProbe));
+
+		// Wrapping layer present: loader vkGetImageMemoryRequirements != ICD vkGetImageMemoryRequirements
+		auto layerProbe = validProbe;
+		layerProbe.icdProbeFn = &dummyLayerFn;
+		CHECK(!VulkanPolicy::ShouldEnableDirectIcdBypass(layerProbe));
+
+		// Unknown ICD DLL name
+		auto unknownIcdProbe = validProbe;
+		unknownIcdProbe.probeModulePath = L"C:\\Program Files\\SomeLayer\\vk_layer_custom.dll";
+		CHECK(!VulkanPolicy::ShouldEnableDirectIcdBypass(unknownIcdProbe));
+
+		// icdGdpa points outside probeModule (wrong module / hooked gdpa)
+		auto wrongModProbe = validProbe;
+		wrongModProbe.icdGdpaModule = &dummyOtherMod;
+		CHECK(!VulkanPolicy::ShouldEnableDirectIcdBypass(wrongModProbe));
+
+		// Killswitch disabled and null-pointer guards
+		auto disabledProbe = validProbe;
+		disabledProbe.allowBypass = false;
+		CHECK(!VulkanPolicy::ShouldEnableDirectIcdBypass(disabledProbe));
+
+		auto nullLoaderProbe = validProbe;
+		nullLoaderProbe.loaderProbeFn = nullptr;
+		CHECK(!VulkanPolicy::ShouldEnableDirectIcdBypass(nullLoaderProbe));
+
+		auto nullGdpaProbe = validProbe;
+		nullGdpaProbe.icdGdpaFn = nullptr;
+		CHECK(!VulkanPolicy::ShouldEnableDirectIcdBypass(nullGdpaProbe));
+
+		auto nullIcdProbe = validProbe;
+		nullIcdProbe.icdProbeFn = nullptr;
+		CHECK(!VulkanPolicy::ShouldEnableDirectIcdBypass(nullIcdProbe));
+
+		// Pure DirectIcdResolver::Resolve decision tests
+		int dummyDirectFn = 0;
+		CHECK(VulkanPolicy::ShouldUseDirectIcdProc("vkQueueSubmit2", &dummyLayerFn, &dummyOtherMod, &dummyDirectFn, &dummyIcdMod, &dummyIcdMod));
+		CHECK(!VulkanPolicy::ShouldUseDirectIcdProc("vkQueueSubmit2", &dummyLoaderFn, &dummyIcdMod, &dummyDirectFn, &dummyIcdMod, &dummyIcdMod)); // already direct
+		CHECK(!VulkanPolicy::ShouldUseDirectIcdProc("vkDestroyDevice", &dummyLayerFn, &dummyOtherMod, &dummyDirectFn, &dummyIcdMod, &dummyIcdMod)); // always loader
+		CHECK(!VulkanPolicy::ShouldUseDirectIcdProc("vkQueueSubmit2", &dummyLayerFn, &dummyOtherMod, &dummyDirectFn, &dummyOtherMod, &dummyIcdMod)); // direct outside ICD
+		CHECK(!VulkanPolicy::ShouldUseDirectIcdProc("vkQueueSubmit2", &dummyLayerFn, &dummyOtherMod, nullptr, &dummyIcdMod, &dummyIcdMod)); // null direct
+		CHECK(VulkanPolicy::ShouldUseDirectIcdProc("vkCreateCommandPool", nullptr, nullptr, &dummyDirectFn, &dummyIcdMod, &dummyIcdMod)); // loader null, direct valid
+	}
+
+	// In-game WMMA GPU timestamp benchmark helpers (v15r10)
+	{
+		// Normal delta: 200,000 ticks * 10 ns/tick = 2.0 ms
+		const float ms1 = VulkanPolicy::ComputeGpuTimestampMs(1000000ull, 1200000ull, 64u, 10.0f);
+		CHECK(ms1 > 1.999f && ms1 < 2.001f);
+
+		// 36-bit wrap-around: (end - start) & ((1<<36)-1) = 100,000 ticks * 10 ns = 1.0 ms
+		const uint64_t start36 = (1ull << 36) - 40000ull;
+		const uint64_t end36 = 60000ull;
+		const float msWrap36 = VulkanPolicy::ComputeGpuTimestampMs(start36, end36, 36u, 10.0f);
+		CHECK(msWrap36 > 0.999f && msWrap36 < 1.001f);
+
+		// 64-bit wrap-around: 50,000 ticks * 40 ns = 2.0 ms
+		const float msWrap64 = VulkanPolicy::ComputeGpuTimestampMs(~0ull - 9999ull, 40000ull, 64u, 40.0f);
+		CHECK(msWrap64 > 1.999f && msWrap64 < 2.001f);
+
+		// Invalid inputs / outlier > 1000 ms rejected
+		CHECK(VulkanPolicy::ComputeGpuTimestampMs(0ull, 100ull, 0u, 10.0f) < 0.0f);
+		CHECK(VulkanPolicy::ComputeGpuTimestampMs(0ull, 100ull, 65u, 10.0f) < 0.0f);
+		CHECK(VulkanPolicy::ComputeGpuTimestampMs(0ull, 100ull, 64u, 0.0f) < 0.0f);
+		CHECK(VulkanPolicy::ComputeGpuTimestampMs(0ull, 200000000ull, 64u, 10.0f) < 0.0f); // 2000 ms > 1000 ms
+
+		// GpuBenchWindow: first report at 60 batches, second report at 300 batches
+		VulkanPolicy::GpuBenchWindow win;
+		VulkanPolicy::GpuBenchReport rep{};
+		for (uint32_t i = 1; i <= 59; ++i)
+		{
+			rep = win.Sample(1.5f, 3u);
+			CHECK(!rep.ready);
+		}
+		rep = win.Sample(1.5f, 3u);
+		CHECK(rep.ready);
+		CHECK(rep.batches == 60u);
+		CHECK(rep.genFrames == 3u);
+		CHECK(rep.batchAvgMs > 1.499f && rep.batchAvgMs < 1.501f);
+		CHECK(rep.perGenFrameAvgMs > 0.499f && rep.perGenFrameAvgMs < 0.501f);
+
+		// Invalid samples ignored
+		CHECK(!win.Sample(-1.0f, 3u).ready);
+		CHECK(!win.Sample(1.5f, 0u).ready);
+
+		// Second window requires 300 samples and computes percentiles accurately
+		for (uint32_t i = 1; i <= 299; ++i)
+		{
+			rep = win.Sample(static_cast<float>(i) * 0.01f, 2u);
+			CHECK(!rep.ready);
+		}
+		rep = win.Sample(3.00f, 2u);
+		CHECK(rep.ready);
+		CHECK(rep.batches == 300u);
+		CHECK(rep.batchMinMs > 0.009f && rep.batchMinMs < 0.011f);
+		CHECK(rep.batchMaxMs > 2.999f && rep.batchMaxMs < 3.001f);
+		CHECK(rep.batchP50Ms > 1.49f && rep.batchP50Ms < 1.51f);
+		CHECK(rep.batchP95Ms > 2.84f && rep.batchP95Ms < 2.86f);
+
+		// Live WMMA LDS stride mode selector (v15r12)
+		VulkanPolicy::SetWmmaLdsStrideMode(0);
+		CHECK(VulkanPolicy::GetWmmaLdsStrideMode() == 0);
+		CHECK(VulkanPolicy::WmmaLdsStrideValue(0) == 4);
+		VulkanPolicy::SetWmmaLdsStrideMode(1);
+		CHECK(VulkanPolicy::GetWmmaLdsStrideMode() == 1);
+		CHECK(VulkanPolicy::WmmaLdsStrideValue(1) == 5);
+		VulkanPolicy::SetWmmaLdsStrideMode(99); // clamps to default 0
+		CHECK(VulkanPolicy::GetWmmaLdsStrideMode() == 0);
+		CHECK(VulkanPolicy::WmmaLdsStrideValue(99) == 4);
+
+		// Actual executed per-batch stride classification (v15r14)
+		CHECK(VulkanPolicy::ClassifyBatchStride(0u, 0u) == VulkanPolicy::BatchStrideKind::None);
+		CHECK(VulkanPolicy::ClassifyBatchStride(17u, 0u) == VulkanPolicy::BatchStrideKind::Stride4);
+		CHECK(VulkanPolicy::ClassifyBatchStride(0u, 17u) == VulkanPolicy::BatchStrideKind::Stride5);
+		CHECK(VulkanPolicy::ClassifyBatchStride(10u, 7u) == VulkanPolicy::BatchStrideKind::Mixed);
+		CHECK(std::string(VulkanPolicy::BatchStrideTag(VulkanPolicy::BatchStrideKind::None)) == "none");
+		CHECK(std::string(VulkanPolicy::BatchStrideTag(VulkanPolicy::BatchStrideKind::Stride4)) == "4");
+		CHECK(std::string(VulkanPolicy::BatchStrideTag(VulkanPolicy::BatchStrideKind::Stride5)) == "5");
+		CHECK(std::string(VulkanPolicy::BatchStrideTag(VulkanPolicy::BatchStrideKind::Mixed)) == "mixed");
+		CHECK(VulkanPolicy::ClassifyBatchStride(16u, 0u, 1u) == VulkanPolicy::BatchStrideKind::Fallback);
+		CHECK(VulkanPolicy::ClassifyBatchStride(0u, 16u, 1u) == VulkanPolicy::BatchStrideKind::Fallback);
+		CHECK(VulkanPolicy::ClassifyBatchStride(8u, 8u, 1u) == VulkanPolicy::BatchStrideKind::Fallback);
+		CHECK(std::string(VulkanPolicy::BatchStrideTag(VulkanPolicy::BatchStrideKind::Fallback)) == "fallback");
+
+		// Unified AMD architecture classifier shared by D3D12 (wmma_route.cpp) and Vulkan (xvk_coopmat.cpp) (v15r16)
+		using VulkanPolicy::AmdArch;
+		using VulkanPolicy::ClassifyAmdArch;
+		// RDNA 4 discrete
+		CHECK(ClassifyAmdArch(0x1002u, 0x7550u, "AMD Radeon RX 9070 XT") == AmdArch::Rdna4);
+		CHECK(ClassifyAmdArch(0x1002u, 0x7590u, "AMD Radeon RX 9060 XT") == AmdArch::Rdna4);
+		CHECK(ClassifyAmdArch(0x1002u, 0x0000u, "AMD Radeon AI PRO R9700") == AmdArch::Rdna4);
+		// RDNA 3 / 3.5 discrete & APUs (ROG Ally / Legion Go 780M, Strix Point 890M, Strix Halo 8060S, Krackan 860M)
+		CHECK(ClassifyAmdArch(0x1002u, 0x744Cu, "AMD Radeon RX 7900 XTX") == AmdArch::Rdna3);
+		CHECK(ClassifyAmdArch(0x1002u, 0x15BFu, "AMD Radeon 780M Graphics") == AmdArch::Rdna3);
+		CHECK(ClassifyAmdArch(0x1002u, 0x15C8u, "AMD Radeon 760M Graphics") == AmdArch::Rdna3);
+		CHECK(ClassifyAmdArch(0x1002u, 0x150Eu, "AMD Radeon 890M Graphics") == AmdArch::Rdna3);
+		CHECK(ClassifyAmdArch(0x1002u, 0x1586u, "AMD Radeon 8060S Graphics") == AmdArch::Rdna3);
+		CHECK(ClassifyAmdArch(0x1002u, 0x1114u, "AMD Radeon 860M Graphics") == AmdArch::Rdna3);
+		// RADV uppercase device strings (case-insensitive matching)
+		CHECK(ClassifyAmdArch(0x1002u, 0x0000u, "AMD Radeon Graphics (RADV GFX1103_R1)") == AmdArch::Rdna3);
+		CHECK(ClassifyAmdArch(0x1002u, 0x0000u, "AMD Radeon PRO W7900") == AmdArch::Rdna3);
+		CHECK(ClassifyAmdArch(0x1002u, 0x0000u, "AMD Custom GPU 0932 (RADV VANGOGH)") == AmdArch::Rdna2);
+		// Legacy GCN 1 HD 7900 / HD 7700 must NOT misclassify as RDNA 3
+		CHECK(ClassifyAmdArch(0x1002u, 0x6798u, "AMD Radeon HD 7900 Series") == AmdArch::Unknown);
+		CHECK(ClassifyAmdArch(0x1002u, 0x683Du, "AMD Radeon HD 7700 Series") == AmdArch::Unknown);
+		// Capability fallback: unrecognized AMD device with int8 16x16x16 Wave32 coopmat is at least RDNA 3
+		CHECK(ClassifyAmdArch(0x1002u, 0x1999u, "Future AMD APU", true) == AmdArch::Rdna3);
+		CHECK(ClassifyAmdArch(0x1002u, 0x1999u, "Future AMD APU", false) == AmdArch::Unknown);
+		// RDNA 2 discrete (incl. Navi 24 RX 6500 XT / 6400 0x743F) & APUs (Steam Deck LCD 0x163F & OLED Sephiroth 0x1435)
+		CHECK(ClassifyAmdArch(0x1002u, 0x73BFu, "AMD Radeon RX 6800 XT") == AmdArch::Rdna2);
+		CHECK(ClassifyAmdArch(0x1002u, 0x743Fu, "AMD Radeon RX 6500 XT") == AmdArch::Rdna2);
+		CHECK(ClassifyAmdArch(0x1002u, 0x7422u, "AMD Radeon RX 6500M") == AmdArch::Rdna2);
+		CHECK(ClassifyAmdArch(0x1002u, 0x163Fu, "AMD Custom GPU 0405") == AmdArch::Rdna2);
+		CHECK(ClassifyAmdArch(0x1002u, 0x1435u, "AMD Custom GPU 0405") == AmdArch::Rdna2);
+		CHECK(ClassifyAmdArch(0x1002u, 0x1681u, "AMD Radeon 680M Graphics") == AmdArch::Rdna2);
+		// Wide-string overload parity for D3D12 DXGI adapter descriptions
+		CHECK(ClassifyAmdArch(0x1002u, 0x15BFu, std::wstring_view(L"AMD Radeon 780M Graphics")) == AmdArch::Rdna3);
+		CHECK(ClassifyAmdArch(0x1002u, 0x743Fu, std::wstring_view(L"AMD Radeon RX 6500 XT")) == AmdArch::Rdna2);
+		CHECK(ClassifyAmdArch(0x1002u, 0x1435u, std::wstring_view(L"AMD Custom GPU 0405")) == AmdArch::Rdna2);
+		// Non-AMD vendors always return Unknown even if coopmat flag is set
+		CHECK(ClassifyAmdArch(0x10DEu, 0x2684u, "NVIDIA GeForce RTX 4090", true) == AmdArch::Unknown);
+		CHECK(ClassifyAmdArch(0x8086u, 0xE20Bu, "Intel Arc B580", true) == AmdArch::Unknown);
 	}
 
 	std::printf("%d checks, %d failed\n", checks, failures);

@@ -178,6 +178,7 @@ namespace
 		PFN_vkCmdWriteTimestamp vkCmdWriteTimestamp = nullptr;
 		PFN_vkGetQueryPoolResults vkGetQueryPoolResults = nullptr;
 		float timestampPeriodNs = 0.0f;
+		uint32_t timestampValidBits = 64u;
 	};
 
 	// The game owns the VkDevice and destroys it before the CRT is torn down. The layer's device is kept for the life of
@@ -258,6 +259,7 @@ namespace
 		bool hudReadbackDiffFromToneMatch[2]{};
 		bool hudReadbackHasStatic[2]{};
 		uint64_t hudRealFrameCount = 0;
+		uint64_t hudDiffGuardFrameCounter = 0;
 		uint32_t hudReadbackSlot = 0;
 		bool hudResourcesReady = false;
 		uint32_t activeBatchSlot = 0;
@@ -283,18 +285,28 @@ namespace
 		VkQueryPool profPool = VK_NULL_HANDLE;
 		uint32_t profSlot = 0;
 		bool profWritten[kProfRing]{};
+		uint32_t profGenFrames[kProfRing]{};
+		VulkanPolicy::BatchStrideKind profBatchStride[kProfRing]{};
+		VulkanPolicy::BatchStrideKind coopBenchActiveStride = VulkanPolicy::BatchStrideKind::None;
+		uint32_t coopBenchMixedSkipped = 0;
+		uint32_t coopBenchFallbackSkipped = 0;
+		std::chrono::steady_clock::time_point coopBenchSkipLastLogAt{};
+		VulkanPolicy::GpuBenchWindow coopBenchWindow;
 		bool profHasReading = false;
 		float profTotalMs = 0.0f;
 		float profInterpMs = 0.0f;
 		float profHudMs = 0.0f;
 
-		// Adaptive VRAM Guard (DXGI budget via physical device LUID, identical hysteresis to DX12)
+		// Adaptive VRAM Guard (DXGI budget via physical device LUID, shared hysteresis/dwell with DX12)
 		ComPtr<IDXGIAdapter3> vramAdapter;
 		bool vramAdapterChecked = false;
-		bool vramGuardActive = false;
+		VulkanPolicy::VramGuardState vramGuard;
 		uint32_t vramPollCounter = 0;
+		uint32_t vramClampHoldFrames = 0;
+		uint32_t outputRecreateCooldownBatches = 0;
 		uint32_t vramUsageMiB = 0;
 		uint32_t vramBudgetMiB = 0;
+		VulkanPolicy::VramDriftTracker vramDrift;
 
 		uint32_t lastIndex = 0; // the previous evaluation's DLSSG.MultiFrameIndex
 		uint32_t batchCount = 0;
@@ -801,13 +813,13 @@ namespace
 			bbFormat == DXGI_FORMAT_B8G8R8A8_UNORM;
 	}
 
-	bool PollVkVramGuard(const Device& d, Feature& f) noexcept
+	bool PollVkVramGuard(const Device& d, Feature& f, uint32_t requestedCount) noexcept
 	{
 		if (!Plugin::options.vramGuard.load(std::memory_order_relaxed))
 		{
-			if (f.vramGuardActive)
+			if (f.vramGuard.active || f.vramGuard.stepDown > 0u)
 			{
-				f.vramGuardActive = false;
+				f.vramGuard.Reset();
 				Log::Info("Vulkan: Adaptive VRAM guard disabled by user, restoring full MFG multiplier");
 			}
 			return false;
@@ -830,37 +842,44 @@ namespace
 			return false;
 
 		if ((f.vramPollCounter++ & 7u) != 0)
-			return f.vramGuardActive;
+			return f.vramGuard.active;
 
 		DXGI_QUERY_VIDEO_MEMORY_INFO memInfo{};
 		if (FAILED(f.vramAdapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memInfo)) || memInfo.Budget == 0)
-			return f.vramGuardActive;
+			return f.vramGuard.active;
 
 		f.vramUsageMiB = static_cast<uint32_t>(memInfo.CurrentUsage / (1024ull * 1024ull));
 		f.vramBudgetMiB = static_cast<uint32_t>(memInfo.Budget / (1024ull * 1024ull));
-
-		constexpr uint64_t kSafetyMarginBytes = 200ull * 1024ull * 1024ull;
-		constexpr uint64_t kReleaseMarginBytes = 400ull * 1024ull * 1024ull;
-
-		if (!f.vramGuardActive)
+		if (const auto drift = f.vramDrift.Sample(f.vramUsageMiB, f.vramBudgetMiB, 8u); drift.ready)
 		{
-			if (memInfo.Budget > kSafetyMarginBytes && memInfo.CurrentUsage + kSafetyMarginBytes >= memInfo.Budget)
-			{
-				f.vramGuardActive = true;
-				Log::Warn("Vulkan: Adaptive VRAM guard engaged ({} MiB / {} MiB budget): clamping MFG temporarily to 2x",
-					f.vramUsageMiB, f.vramBudgetMiB);
-			}
+			if (drift.warn)
+				Log::Warn("Vulkan: VRAM drift check (window {}, {} consecutive rising 240-real-frame windows): {} -> {} MiB ({:+} MiB / {} MiB budget) - possible VRAM leak",
+					drift.windowIndex, drift.risingStreak, drift.baselineMiB, drift.currentMiB, drift.deltaMiB, f.vramBudgetMiB);
+			else
+				Log::Info("Vulkan: VRAM drift baseline (240 real frames post-warmup): {} -> {} MiB ({:+} MiB / {} MiB budget)",
+					drift.baselineMiB, drift.currentMiB, drift.deltaMiB, f.vramBudgetMiB);
 		}
-		else
+
+		const uint64_t nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count());
+		switch (f.vramGuard.Update(memInfo.CurrentUsage, memInfo.Budget, requestedCount, nowMs))
 		{
-			if (memInfo.Budget > kReleaseMarginBytes && memInfo.CurrentUsage + kReleaseMarginBytes < memInfo.Budget)
-			{
-				f.vramGuardActive = false;
-				Log::Info("Vulkan: Adaptive VRAM guard released ({} MiB / {} MiB budget): restoring full MFG multiplier",
-					f.vramUsageMiB, f.vramBudgetMiB);
-			}
+		case VulkanPolicy::VramGuardState::Transition::Engaged:
+			Log::Warn("Vulkan: Adaptive VRAM guard engaged ({} MiB / {} MiB budget): stepping down MFG by {} to prevent swap stutter",
+				f.vramUsageMiB, f.vramBudgetMiB, f.vramGuard.stepDown);
+			break;
+		case VulkanPolicy::VramGuardState::Transition::Easing:
+			Log::Info("Vulkan: Adaptive VRAM guard easing ({} MiB / {} MiB budget): step-down now {}",
+				f.vramUsageMiB, f.vramBudgetMiB, f.vramGuard.stepDown);
+			break;
+		case VulkanPolicy::VramGuardState::Transition::Released:
+			Log::Info("Vulkan: Adaptive VRAM guard released ({} MiB / {} MiB budget): restoring full MFG multiplier",
+				f.vramUsageMiB, f.vramBudgetMiB);
+			break;
+		default:
+			break;
 		}
-		return f.vramGuardActive;
+		return f.vramGuard.active;
 	}
 
 	// ------------------------------------------------------------------------------------------ the device
@@ -1028,6 +1047,29 @@ namespace
 			VkPhysicalDeviceProperties2 p2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
 			getProps2(d.physical, &p2);
 			d.timestampPeriodNs = p2.properties.limits.timestampPeriod;
+		}
+		if (const auto getQueueProps = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+			d.gipa(d.instance, "vkGetPhysicalDeviceQueueFamilyProperties")))
+		{
+			uint32_t qCount = 0;
+			getQueueProps(d.physical, &qCount, nullptr);
+			if (qCount > 0)
+			{
+				std::vector<VkQueueFamilyProperties> qProps(qCount);
+				getQueueProps(d.physical, &qCount, qProps.data());
+				uint32_t validBits = 0u;
+				for (const auto& qp : qProps)
+				{
+					if ((qp.queueFlags & VK_QUEUE_GRAPHICS_BIT) && qp.timestampValidBits > 0u)
+					{
+						validBits = qp.timestampValidBits;
+						break;
+					}
+					if (validBits == 0u && qp.timestampValidBits > 0u)
+						validBits = qp.timestampValidBits;
+				}
+				d.timestampValidBits = validBits;
+			}
 		}
 		if (const auto getFmtProps = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(
 			d.gipa(d.instance, "vkGetPhysicalDeviceFormatProperties")))
@@ -1390,6 +1432,7 @@ namespace
 			f.hudReadbackHasStatic[i] = false;
 		}
 		f.hudRealFrameCount = 0;
+		f.hudDiffGuardFrameCounter = 0;
 		f.hudReadbackSlot = 0;
 
 		if (d.hudPipelinesReady && SUCCEEDED(CreateTexture(d3d, f.width, f.height, DXGI_FORMAT_R8_UINT, f.staticCountTex)))
@@ -1503,6 +1546,8 @@ namespace
 		}
 
 		f.context = context;
+		f.vramDrift.Reset();
+		f.outputRecreateCooldownBatches = 0;
 		SetModelName(model);
 
 		Log::Info("Vulkan XeFG context: {}x{}, back buffer format {}{}, depth {}x{}, motion vector format {}, HUDless {}, "
@@ -1894,11 +1939,20 @@ namespace
 			return false;
 		}
 
-		const bool profWanted = Plugin::options.gpuProfiler.load(std::memory_order_relaxed) &&
+		static const bool sCoopBenchEnabled = []() noexcept {
+			wchar_t buf[16]{};
+			const DWORD n = GetEnvironmentVariableW(L"XEFG_WMMA_GPU_BENCH", buf, static_cast<DWORD>(std::size(buf)));
+			if (n > 0 && n < std::size(buf) && (buf[0] == L'0' || buf[0] == L'f' || buf[0] == L'F' || buf[0] == L'n' || buf[0] == L'N'))
+				return false;
+			return true;
+		}();
+		const bool coopBenchWanted = sCoopBenchEnabled && d.coopInstalled;
+		const bool profWanted = (Plugin::options.gpuProfiler.load(std::memory_order_relaxed) || coopBenchWanted) &&
 			d.vkCreateQueryPool && d.vkCmdResetQueryPool && d.vkCmdWriteTimestamp && d.vkGetQueryPoolResults &&
-			d.timestampPeriodNs > 0.0f;
+			d.timestampPeriodNs > 0.0f && d.timestampValidBits > 0u;
 		bool profActive = false;
 		uint32_t profBase = 0;
+		uint32_t profWriteSlot = 0;
 		if (profWanted)
 		{
 			if (!f.profPool)
@@ -1911,6 +1965,7 @@ namespace
 			if (f.profPool)
 			{
 				const uint32_t readSlot = f.profSlot % Feature::kProfRing;
+				profWriteSlot = readSlot;
 				if (f.profWritten[readSlot])
 				{
 					uint64_t ts[4]{};
@@ -1925,28 +1980,74 @@ namespace
 						f.fault = "device_lost";
 						return false;
 					}
-					else if (qRes == VK_SUCCESS && ts[3] >= ts[0])
+					else if (qRes == VK_SUCCESS)
 					{
-						const float scaleMs = d.timestampPeriodNs * 1e-6f;
-						const float tot = static_cast<float>(ts[3] - ts[0]) * scaleMs;
-						const float interp = (ts[2] >= ts[1]) ? static_cast<float>(ts[2] - ts[1]) * scaleMs : 0.0f;
-						const float hud = (ts[3] >= ts[2]) ? static_cast<float>(ts[3] - ts[2]) * scaleMs : 0.0f;
-						if (!f.profHasReading)
+						const float tot = VulkanPolicy::ComputeGpuTimestampMs(ts[0], ts[3], d.timestampValidBits, d.timestampPeriodNs);
+						const float interp = VulkanPolicy::ComputeGpuTimestampMs(ts[1], ts[2], d.timestampValidBits, d.timestampPeriodNs);
+						const float hud = VulkanPolicy::ComputeGpuTimestampMs(ts[2], ts[3], d.timestampValidBits, d.timestampPeriodNs);
+						if (tot >= 0.0f && interp >= 0.0f && hud >= 0.0f)
 						{
-							f.profTotalMs = tot;
-							f.profInterpMs = interp;
-							f.profHudMs = hud;
-							f.profHasReading = true;
+							if (!f.profHasReading)
+							{
+								f.profTotalMs = tot;
+								f.profInterpMs = interp;
+								f.profHudMs = hud;
+								f.profHasReading = true;
+							}
+							else
+							{
+								f.profTotalMs = f.profTotalMs * 0.85f + tot * 0.15f;
+								f.profInterpMs = f.profInterpMs * 0.85f + interp * 0.15f;
+								f.profHudMs = f.profHudMs * 0.85f + hud * 0.15f;
+							}
 						}
-						else
+						if (coopBenchWanted)
 						{
-							f.profTotalMs = f.profTotalMs * 0.85f + tot * 0.15f;
-							f.profInterpMs = f.profInterpMs * 0.85f + interp * 0.15f;
-							f.profHudMs = f.profHudMs * 0.85f + hud * 0.15f;
+							const auto sampleStride = f.profBatchStride[readSlot];
+							if (sampleStride == VulkanPolicy::BatchStrideKind::Mixed || sampleStride == VulkanPolicy::BatchStrideKind::Fallback)
+							{
+								if (sampleStride == VulkanPolicy::BatchStrideKind::Mixed)
+									++f.coopBenchMixedSkipped;
+								else
+									++f.coopBenchFallbackSkipped;
+								const auto now = std::chrono::steady_clock::now();
+								if (f.coopBenchSkipLastLogAt.time_since_epoch().count() == 0 ||
+									(now - f.coopBenchSkipLastLogAt) >= std::chrono::seconds(5))
+								{
+									Log::Info("coopmat_gpu_bench excluded non-uniform batches (mixed={}, fallback={})",
+										f.coopBenchMixedSkipped, f.coopBenchFallbackSkipped);
+									f.coopBenchMixedSkipped = 0;
+									f.coopBenchFallbackSkipped = 0;
+									f.coopBenchSkipLastLogAt = now;
+								}
+							}
+							else if (sampleStride == VulkanPolicy::BatchStrideKind::Stride4 || sampleStride == VulkanPolicy::BatchStrideKind::Stride5)
+							{
+								if (f.coopBenchActiveStride != sampleStride)
+								{
+									f.coopBenchActiveStride = sampleStride;
+									f.coopBenchWindow.Reset();
+								}
+								if (interp >= 0.0f)
+								{
+								const auto rep = f.coopBenchWindow.Sample(interp, f.profGenFrames[readSlot]);
+								if (rep.ready)
+								{
+									Log::Info(
+										"coopmat_gpu_bench \"scope\":\"xefg_execute_only\",\"stride\":{},\"batches\":{},\"gen_frames\":{},\"batch_avg_ms\":{:.3f},"
+										"\"batch_p50_ms\":{:.3f},\"batch_p95_ms\":{:.3f},\"batch_min_ms\":{:.3f},"
+										"\"batch_max_ms\":{:.3f},\"amortized_per_gen_frame_ms\":{:.3f}",
+										VulkanPolicy::BatchStrideTag(sampleStride), rep.batches, rep.genFrames, rep.batchAvgMs, rep.batchP50Ms, rep.batchP95Ms,
+										rep.batchMinMs, rep.batchMaxMs, rep.perGenFrameAvgMs);
+								}
+								}
+							}
 						}
 					}
 				}
 				profBase = readSlot * 4u;
+				if (coopBenchWanted && d.d3d)
+					xvk::ResetCoopMatrixBatchStride(d.d3d.Get());
 				d.vkCmdResetQueryPool(command, f.profPool, profBase, 4u);
 				d.vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, f.profPool, profBase + 0u);
 				d.vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, f.profPool, profBase + 1u);
@@ -1957,7 +2058,20 @@ namespace
 		const xefgd_result_t result = CallXeFG("Execute", [&] { return XeFG::Execute(f.context, f.list.Get(), f.exec); });
 		f.list->Close();
 		if (profActive)
+		{
 			d.vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, f.profPool, profBase + 2u);
+			f.profGenFrames[profWriteSlot] = f.exec.numInterpolatedFrames;
+			if (coopBenchWanted && d.d3d)
+			{
+				uint32_t s4 = 0u, s5 = 0u, fb = 0u;
+				xvk::ConsumeCoopMatrixBatchStride(d.d3d.Get(), s4, s5, fb);
+				f.profBatchStride[profWriteSlot] = VulkanPolicy::ClassifyBatchStride(s4, s5, fb);
+			}
+			else
+			{
+				f.profBatchStride[profWriteSlot] = VulkanPolicy::BatchStrideKind::None;
+			}
+		}
 		StageBarrier(d, command,
 			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
 			VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -2272,6 +2386,26 @@ namespace
 			}
 		}
 
+		if (rawGameHudless && !hideHudless)
+		{
+			if (f.hudTierState.NotifyHudlessSource(
+				static_cast<uint64_t>(reinterpret_cast<uintptr_t>(rawGameHudless->image)),
+				rawGameHudless->width, rawGameHudless->height, static_cast<uint32_t>(rawGameHudless->format)))
+			{
+				static uint64_t sLastVkResetLogMs = 0;
+				static uint32_t sVkResetCount = 0;
+				++sVkResetCount;
+				const uint64_t nowMs = GetTickCount64();
+				if (sLastVkResetLogMs == 0 || (nowMs - sLastVkResetLogMs) >= 5000ull)
+				{
+					Log::Info("Vulkan HUD protection: HUDLess source changed ({}x{}, VkFormat {}); reset everHealthy latch (count={})",
+						rawGameHudless->width, rawGameHudless->height, static_cast<int>(rawGameHudless->format), sVkResetCount);
+					sVkResetCount = 0;
+					sLastVkResetLogMs = nowMs;
+				}
+			}
+		}
+
 		HudTier::Inputs vkHudInputs{};
 		vkHudInputs.mode = vkHudMode;
 		vkHudInputs.hudlessUiEnabled = hudlessUiEnabled;
@@ -2516,8 +2650,10 @@ namespace
 				RecordVkToneMapMatch(d, f, command, slot, toneMatchHudless->imageView, in.backbuffer->imageView);
 			}
 
-			const bool doDiffGuard = f.hudDecision.runHudDiffGuard && !f.hudDecision.runHudDiffComposite &&
-				slot.hasHudless && slot.bbView && slot.hudlessView;
+			const bool hudTransitionFrame = !f.havePrevious || reset;
+			const bool wantDiffGuard = f.hudDecision.runHudDiffGuard && !f.hudDecision.runHudDiffComposite &&
+				slot.hasHudless && slot.bbView && slot.hudlessView && !hudTransitionFrame;
+			const bool doDiffGuard = wantDiffGuard && f.hudTierState.ShouldRunDiffGuard(++f.hudDiffGuardFrameCounter);
 			const bool doStaticUpdate = f.hudDecision.runStaticHudUpdate && slot.bbView && f.staticCountView;
 			if (doDiffGuard || doStaticUpdate)
 			{
@@ -2845,9 +2981,57 @@ namespace
 					f.stallCooldownBatches = 0;
 				}
 
-				const bool vramGuarded = PollVkVramGuard(d, f);
-				const bool vramClamped = vramGuarded && count > 1u;
-				const uint32_t effectiveCount = vramClamped ? 1u : count;
+				const bool vramGuarded = PollVkVramGuard(d, f, count);
+				uint32_t effectiveCount = vramGuarded ? f.vramGuard.EffectiveCount(count) : count;
+				bool vramClamped = effectiveCount < count;
+				f.vramClampHoldFrames = vramClamped ? (f.vramClampHoldFrames + 1u) : 0u;
+				if (VulkanPolicy::ShouldReclaimClampedOutputs(vramClamped, f.vramClampHoldFrames))
+				{
+					bool reclaimedAny = false;
+					for (uint32_t i = effectiveCount; i < MaxGenerated; ++i)
+					{
+						if (f.outputs[i])
+						{
+							f.outputs[i].Reset();
+							f.outputViews[i] = VK_NULL_HANDLE;
+							reclaimedAny = true;
+						}
+					}
+					if (reclaimedAny)
+						f.havePrevious = false;
+				}
+				// Lazily recreate any output slots previously reclaimed while VRAM guard was active.
+				if (f.outputRecreateCooldownBatches > 0u)
+				{
+					--f.outputRecreateCooldownBatches;
+					for (uint32_t i = 0; i < effectiveCount; ++i)
+					{
+						if (!f.outputs[i])
+						{
+							effectiveCount = i;
+							break;
+						}
+					}
+				}
+				else if (d.d3d && f.format != DXGI_FORMAT_UNKNOWN)
+				{
+					const VkFormat vkOutColorView = static_cast<VkFormat>(
+						VulkanPolicy::ColorStorageViewFormat(static_cast<uint32_t>(f.format), d.bgra8StorageSupported));
+					for (uint32_t i = 0; i < effectiveCount; ++i)
+					{
+						if (!f.outputs[i])
+						{
+							if (FAILED(CreateTexture(d.d3d.Get(), f.width, f.height, f.format, f.outputs[i])))
+							{
+								f.outputRecreateCooldownBatches = 120u;
+								effectiveCount = i;
+								break;
+							}
+							f.outputViews[i] = xvk::StorageImageView(f.outputs[i].Get(), vkOutColorView);
+						}
+					}
+				}
+				vramClamped = effectiveCount < count;
 
 				f.requestedBatchCount = count;
 				f.batchCount = effectiveCount;
@@ -2863,6 +3047,13 @@ namespace
 					f.batchReady = false;
 					f.havePrevious = false;
 					f.fault = "stall_cooldown";
+					VulkanHost::NotifyPaused();
+				}
+				else if (effectiveCount == 0u)
+				{
+					f.batchReady = false;
+					f.havePrevious = false;
+					f.fault = "output_recreate_failed";
 					VulkanHost::NotifyPaused();
 				}
 				else
@@ -2885,7 +3076,7 @@ namespace
 				{
 					f.havePrevious = false;
 					VulkanHost::NotifyPaused();
-					if (f.fault != "stall_cooldown" && f.fault != "ui_transition")
+					if (f.fault != "stall_cooldown" && f.fault != "ui_transition" && f.fault != "output_recreate_failed")
 					{
 						if (++f.failures <= 16)
 							Log::Error("Vulkan: batch failed ({}), index {}, count {}", f.fault, index, count);

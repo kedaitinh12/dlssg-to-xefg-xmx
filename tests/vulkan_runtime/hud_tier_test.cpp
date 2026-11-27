@@ -216,6 +216,158 @@ int main()
 		CHECK(d.useXeFgNativeUi);
 	}
 
+	// Hardware WMMA Auto preference: keep Tier 1 Native / Interpolated instead of silently falling back to DXIL
+	{
+		StateMachine sm;
+		Inputs in{};
+		in.mode = Mode::Auto;
+		in.hudlessUiEnabled = true;
+		in.hasGameHudless = false;
+		in.gpuComputeAvailable = true;
+		in.preferNativeForWmma = true;
+		const auto dAuto = sm.Evaluate(in);
+		CHECK(dAuto.activeTier == ActiveTier::Interpolated && !dAuto.runStaticHudComposite && !dAuto.runHudDiffComposite);
+
+		// Explicit Tier 3 user override still works even when WMMA is active
+		in.mode = Mode::Tier3Hybrid;
+		const auto dForced = sm.Evaluate(in);
+		CHECK(dForced.activeTier == ActiveTier::Tier3Hybrid && dForced.runStaticHudUpdate);
+
+		// With healthy HUDless, WMMA Auto stays on Tier 1 Native
+		in.mode = Mode::Auto;
+		in.hasGameHudless = true;
+		in.hudlessStructurallyValid = true;
+		in.preferTier2ForNativeIssues = false;
+		const auto dT1 = sm.Evaluate(in);
+		CHECK(dT1.activeTier == ActiveTier::Tier1Native && dT1.useXeFgNativeUi && !dT1.runHudDiffComposite);
+
+		// Stability over performance: preferTier2ForNativeIssues (native UI hang) overrides preferNativeForWmma
+		in.preferTier2ForNativeIssues = true;
+		const auto dHangGuard = sm.Evaluate(in);
+		CHECK(dHangGuard.activeTier == ActiveTier::Tier2DiffComposite && dHangGuard.runHudDiffComposite);
+	}
+
+	// 9. Transition-frame skipVerdict guard: camera cuts / resets record telemetry without advancing streaks.
+	{
+		StateMachine sm;
+		for (int i = 0; i < 10; ++i)
+			sm.FeedHudDiffFraction(0.85f, false, /*skipVerdict=*/true);
+		CHECK(!sm.IsGpuMarkedBroken());
+		CHECK(!sm.IsGpuMarkedEmpty());
+		CHECK(sm.LastDiffFraction() > 0.80f);
+	}
+
+	// 10. Small 1px crosshair (no dead zone) + stronger everHealthy_ threshold (>=0.02% x 4) + source-change reset.
+	{
+		StateMachine sm;
+		Inputs in{};
+		in.mode = Mode::Auto;
+		in.hudlessUiEnabled = true;
+		in.hasGameHudless = true;
+		in.hudlessStructurallyValid = true;
+		in.gpuComputeAvailable = true;
+
+		// Minimal 1px crosshair (~0.002% = ~70 px at 1440p) is NOT marked empty (zero dead zone),
+		// but does NOT prematurely latch everHealthy_ (prevents stray rounding pixels on duplicate backbuffers from latching).
+		for (int i = 0; i < 10; ++i)
+			sm.FeedHudDiffFraction(0.00002f, false);
+		CHECK(!sm.EverHealthy());
+		CHECK(!sm.IsGpuMarkedEmpty());
+		CHECK(sm.Evaluate(in).activeTier == ActiveTier::Tier1Native);
+
+		// Stronger evidence (>= 0.02% for 4 consecutive samples) across a 3-buffer swapchain ring latches everHealthy_.
+		sm.NotifyHudlessSource(0x1001u, 2560u, 1440u, 28u);
+		sm.FeedHudDiffFraction(0.005f, false);
+		sm.NotifyHudlessSource(0x1002u, 2560u, 1440u, 28u);
+		sm.FeedHudDiffFraction(0.005f, false);
+		sm.NotifyHudlessSource(0x1003u, 2560u, 1440u, 28u);
+		sm.FeedHudDiffFraction(0.005f, false);
+		CHECK(!sm.EverHealthy());
+		sm.NotifyHudlessSource(0x1001u, 2560u, 1440u, 28u);
+		sm.FeedHudDiffFraction(0.005f, false);
+		CHECK(sm.EverHealthy());
+
+		// Continuing within the established 3-buffer ring keeps everHealthy_ intact during hidden-HUD cutscenes.
+		for (int i = 0; i < 40; ++i)
+		{
+			sm.NotifyHudlessSource(0x1001u + static_cast<uint64_t>(i % 3), 2560u, 1440u, 28u);
+			sm.FeedHudDiffFraction(0.0f, false);
+		}
+		CHECK(sm.EverHealthy());
+		CHECK(!sm.IsGpuMarkedEmpty());
+		CHECK(sm.Evaluate(in).activeTier == ActiveTier::Tier1Native);
+
+		// Switching to a brand-new HUDLess resource (e.g. menu -> gameplay) resets everHealthy_ and returns true for logging.
+		CHECK(sm.NotifyHudlessSource(0x2001u, 2560u, 1440u, 28u));
+		CHECK(!sm.NotifyHudlessSource(0x2001u, 2560u, 1440u, 28u));
+		CHECK(!sm.EverHealthy());
+		for (int i = 0; i < 30; ++i)
+			sm.FeedHudDiffFraction(0.0f, false);
+		CHECK(sm.IsGpuMarkedEmpty());
+		CHECK(sm.Evaluate(in).activeTier == ActiveTier::Tier3Hybrid);
+
+		// Format or extent change also resets everHealthy_ and returns true.
+		StateMachine smFmt;
+		CHECK(!smFmt.NotifyHudlessSource(0x3001u, 2560u, 1440u, 28u));
+		for (int i = 0; i < 4; ++i)
+			smFmt.FeedHudDiffFraction(0.01f, false);
+		CHECK(smFmt.EverHealthy());
+		CHECK(smFmt.NotifyHudlessSource(0x3001u, 2560u, 1440u, 10u));
+		CHECK(!smFmt.EverHealthy());
+	}
+
+	// 11. Transient full-screen menu/map overlay (>=60% diff) after everHealthy_ requires extended streak (14 vs 6),
+	//     while persistent mid-session mismatch still escalates cleanly.
+	{
+		StateMachine sm;
+		for (int i = 0; i < 4; ++i)
+			sm.FeedHudDiffFraction(0.03f, false);
+		CHECK(sm.EverHealthy());
+
+		// 10 frames of pause/map overlay (75% diff) must NOT falsely trip gpuMarkedBroken_.
+		for (int i = 0; i < 10; ++i)
+			sm.FeedHudDiffFraction(0.75f, false);
+		CHECK(!sm.IsGpuMarkedBroken());
+
+		// Returning to normal gameplay clears brokenStreak_.
+		sm.FeedHudDiffFraction(0.03f, false);
+		CHECK(!sm.IsGpuMarkedBroken());
+
+		// Persistent >=60% mismatch for 14 consecutive samples still escalates.
+		for (int i = 0; i < 13; ++i)
+			sm.FeedHudDiffFraction(0.75f, false);
+		CHECK(!sm.IsGpuMarkedBroken());
+		sm.FeedHudDiffFraction(0.75f, false);
+		CHECK(sm.IsGpuMarkedBroken());
+	}
+
+	// 12. Adaptive diff-guard probe cadence: warmup every frame (<=8), steady 1/16, recovery 1/4 + faster 12-frame recovery.
+	{
+		StateMachine sm;
+		for (uint64_t f = 1; f <= 8; ++f)
+			CHECK(sm.ShouldRunDiffGuard(f));
+		CHECK(!sm.ShouldRunDiffGuard(9));
+		CHECK(!sm.ShouldRunDiffGuard(12));
+		CHECK(sm.ShouldRunDiffGuard(16));
+
+		// Trigger broken -> cadence accelerates to 1/4 for fast recovery.
+		for (int i = 0; i < 6; ++i)
+			sm.FeedHudDiffFraction(0.55f, false);
+		CHECK(sm.IsGpuMarkedBroken());
+		CHECK(sm.ShouldRunDiffGuard(12));
+		CHECK(!sm.ShouldRunDiffGuard(13));
+		CHECK(sm.ShouldRunDiffGuard(16));
+
+		// 12 healthy samples recover cleanly and return cadence to 1/16.
+		for (int i = 0; i < 11; ++i)
+			sm.FeedHudDiffFraction(0.04f, false);
+		CHECK(sm.IsGpuMarkedBroken());
+		sm.FeedHudDiffFraction(0.04f, false);
+		CHECK(!sm.IsGpuMarkedBroken());
+		CHECK(!sm.ShouldRunDiffGuard(12));
+		CHECK(sm.ShouldRunDiffGuard(16));
+	}
+
 	std::printf("hud_tier_test: %d checks, %d failed\n", gChecks, gFailures);
 	return gFailures == 0 ? 0 : 1;
 }

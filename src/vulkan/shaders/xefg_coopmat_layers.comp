@@ -145,9 +145,15 @@ const uint WSM_TAP_WORDS  = 16u * WSM_COL_STRIDE; // 192 words per 32x16 paired-
 const uint WSM_BUF_WORDS  = 6u * WSM_TAP_WORDS;   // 1152 words per 6-pair buffer
 const int  WIN_TAIL_PAD   = 4;                    // 4 trailing words keep dx=2 upper K=16..31 loads in-bounds
 #else
-const uint WSM_COL_STRIDE = 5u;
-const uint WSM_TAP_WORDS  = 16u * WSM_COL_STRIDE; // 80 words per 16x16 tap matrix
-const uint WSM_BUF_WORDS  = 9u * WSM_TAP_WORDS;   // 720 words per 9-tap buffer
+// Tight 16-byte-aligned column stride (4 uint32 = 16 B per 16xint8 column).
+// LDS reduction: default sAcc path Flow 21.9 -> 19.6 KB, L_a3c3caa1 21.9 -> 20.8 KB (no occupancy change);
+// register-only (radv_reg / gfx12_reg) Flow 16.9 -> 14.6 KB, L_a3c3caa1 16.9 -> 15.8 KB (<= 16 KB, 4 WG/CU if not VGPR-limited).
+#ifndef WSM_COL_STRIDE_VAL
+#define WSM_COL_STRIDE_VAL 4
+#endif
+const uint WSM_COL_STRIDE = uint(WSM_COL_STRIDE_VAL);
+const uint WSM_TAP_WORDS  = 16u * WSM_COL_STRIDE; // 64 words per 16x16 tap matrix
+const uint WSM_BUF_WORDS  = 9u * WSM_TAP_WORDS;   // 576 words per 9-tap buffer
 const int  WIN_TAIL_PAD   = 0;
 #endif
 
@@ -260,14 +266,14 @@ uint requantFloat(int acc, float s, float b, int lo)
 void stagePoolWeights(int block, uint tid, uint buf)
 {
 	const uint bufOff = buf * WSM_BUF_WORDS;
+#if COOP_K_COMPILED == 32
 	for (uint i = tid; i < 144u; i += gl_WorkGroupSize.x)
 	{
-		uint tap  = i / 16u;
-		uint rem  = i % 16u;
-		uint word = rem / 4u;
-		uint s    = rem % 4u;
-		uvec4 v   = uWeights.data[uint(block) * 144u + i];
-#if COOP_K_COMPILED == 32
+		uint tap   = i / 16u;
+		uint rem   = i % 16u;
+		uint word  = rem / 4u;
+		uint s     = rem % 4u;
+		uvec4 v    = uWeights.data[uint(block) * 144u + i];
 		uint dy    = tap / 3u;
 		uint dx    = tap % 3u;
 		uint pair  = dy * 2u + (dx >> 1u);
@@ -285,14 +291,29 @@ void stagePoolWeights(int block, uint tid, uint buf)
 			wsmWords[zBase + 2u * WSM_COL_STRIDE] = 0u;
 			wsmWords[zBase + 3u * WSM_COL_STRIDE] = 0u;
 		}
-#else
-		uint base = bufOff + tap * WSM_TAP_WORDS + (4u * s) * WSM_COL_STRIDE + word;
-		wsmWords[base + 0u * WSM_COL_STRIDE] = v.x;
-		wsmWords[base + 1u * WSM_COL_STRIDE] = v.y;
-		wsmWords[base + 2u * WSM_COL_STRIDE] = v.z;
-		wsmWords[base + 3u * WSM_COL_STRIDE] = v.w;
-#endif
 	}
+#else
+	// Stage one full 16-byte column (4 contiguous uint32 words) per lane so adjacent lanes write
+	// adjacent columns without 4-way LDS bank conflicts under WSM_COL_STRIDE == 4u.
+	for (uint i = tid; i < 144u; i += gl_WorkGroupSize.x)
+	{
+		uint tap = i / 16u;
+		uint oc  = i % 16u;
+		uint s   = oc / 4u;
+		uint l   = oc % 4u;
+		uint src = uint(block) * 144u + tap * 16u + s;
+		uvec4 col = uvec4(
+			uWeights.data[src +  0u][l],
+			uWeights.data[src +  4u][l],
+			uWeights.data[src +  8u][l],
+			uWeights.data[src + 12u][l]);
+		uint dst = bufOff + tap * WSM_TAP_WORDS + oc * WSM_COL_STRIDE;
+		wsmWords[dst + 0u] = col.x;
+		wsmWords[dst + 1u] = col.y;
+		wsmWords[dst + 2u] = col.z;
+		wsmWords[dst + 3u] = col.w;
+	}
+#endif
 }
 
 #if RADV_REG_ONLY == 0
@@ -471,27 +492,27 @@ void fillFlowWindow(int step, int X0, int Y0, int Wd, int Hd, ivec3 inSz, uint t
 void stageFlowWeights(int step, int n0, uint tid, uint buf)
 {
 	const uint wBufOff = buf * FLOW_WSM_BUF_WORDS;
+#if COOP_K_COMPILED == 32
 	for (uint e = tid; e < uint(LAYER_NT * 72); e += gl_WorkGroupSize.x)
 	{
-		int nt    = int(e) / 72;
-		int group = (int(e) % 72) / 36;
-		int k     = int(e) % 36;
-		int tap   = k / 4;
-		int word  = k % 4;
-		int ch    = (n0 + nt) * 8;
-		int z     = ch / LAYER_OUT;
-		int c     = ch % LAYER_OUT;
-		uint idx  = uint(((z * LAYER_IN + step) * (LAYER_OUT / 4) + (c / 4) + group) * 36 + k);
-		uvec4 v   = uWeights.data[idx];
+		int nt     = int(e) / 72;
+		int group  = (int(e) % 72) / 36;
+		int k      = int(e) % 36;
+		int tap    = k / 4;
+		int word   = k % 4;
+		int ch     = (n0 + nt) * 8;
+		int z      = ch / LAYER_OUT;
+		int c      = ch % LAYER_OUT;
+		uint idx   = uint(((z * LAYER_IN + step) * (LAYER_OUT / 4) + (c / 4) + group) * 36 + k);
+		uvec4 v    = uWeights.data[idx];
 
 		uint h      = uint(nt >> 1);
 		uint ocBase = uint((nt & 1) * 8 + group * 4);
-#if COOP_K_COMPILED == 32
-		uint dy    = uint(tap) / 3u;
-		uint dx    = uint(tap) % 3u;
-		uint pair  = dy * 2u + (dx >> 1u);
-		uint kHalf = (dx == 1u) ? 4u : 0u;
-		uint base  = wBufOff + h * WSM_BUF_WORDS + pair * WSM_TAP_WORDS + ocBase * WSM_COL_STRIDE + kHalf + uint(word);
+		uint dy     = uint(tap) / 3u;
+		uint dx     = uint(tap) % 3u;
+		uint pair   = dy * 2u + (dx >> 1u);
+		uint kHalf  = (dx == 1u) ? 4u : 0u;
+		uint base   = wBufOff + h * WSM_BUF_WORDS + pair * WSM_TAP_WORDS + ocBase * WSM_COL_STRIDE + kHalf + uint(word);
 		wsmWords[base + 0u * WSM_COL_STRIDE] = v.x;
 		wsmWords[base + 1u * WSM_COL_STRIDE] = v.y;
 		wsmWords[base + 2u * WSM_COL_STRIDE] = v.z;
@@ -504,14 +525,38 @@ void stageFlowWeights(int step, int n0, uint tid, uint buf)
 			wsmWords[zBase + 2u * WSM_COL_STRIDE] = 0u;
 			wsmWords[zBase + 3u * WSM_COL_STRIDE] = 0u;
 		}
-#else
-		uint base = wBufOff + h * WSM_BUF_WORDS + uint(tap) * WSM_TAP_WORDS + ocBase * WSM_COL_STRIDE + uint(word);
-		wsmWords[base + 0u * WSM_COL_STRIDE] = v.x;
-		wsmWords[base + 1u * WSM_COL_STRIDE] = v.y;
-		wsmWords[base + 2u * WSM_COL_STRIDE] = v.z;
-		wsmWords[base + 3u * WSM_COL_STRIDE] = v.w;
-#endif
 	}
+#else
+#if (LAYER_NT % 2) != 0
+#error "stageFlowWeights K=16 requires even LAYER_NT"
+#endif
+	// Stage one full 16-byte column (4 contiguous uint32 words) per lane to match stagePoolWeights
+	// and allow ds_store_b128 coalescing under WSM_COL_STRIDE == 4u.
+	for (uint e = tid; e < uint(LAYER_NT * 72); e += gl_WorkGroupSize.x)
+	{
+		uint h   = e / 144u;
+		uint r   = e % 144u;
+		uint tap = r / 16u;
+		uint oc  = r % 16u;
+		int  nt  = int(h * 2u + oc / 8u);
+		int  grp = int((oc % 8u) / 4u);
+		uint j   = oc % 4u;
+		int  ch  = (n0 + nt) * 8;
+		int  z   = ch / LAYER_OUT;
+		int  c   = ch % LAYER_OUT;
+		uint src = uint(((z * LAYER_IN + step) * (LAYER_OUT / 4) + (c / 4) + grp) * 36) + tap * 4u;
+		uvec4 col = uvec4(
+			uWeights.data[src + 0u][j],
+			uWeights.data[src + 1u][j],
+			uWeights.data[src + 2u][j],
+			uWeights.data[src + 3u][j]);
+		uint dst = wBufOff + h * WSM_BUF_WORDS + tap * WSM_TAP_WORDS + oc * WSM_COL_STRIDE;
+		wsmWords[dst + 0u] = col.x;
+		wsmWords[dst + 1u] = col.y;
+		wsmWords[dst + 2u] = col.z;
+		wsmWords[dst + 3u] = col.w;
+	}
+#endif
 }
 
 #if RADV_REG_ONLY == 0

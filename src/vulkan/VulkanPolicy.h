@@ -8,6 +8,8 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -82,6 +84,23 @@ namespace VulkanPolicy
 	// XeFG's camera from inputs without matrices: identity view and a left-handed perspective projection over the output
 	// aspect (row major). DLSS-G gives near, far and the vertical field of view; without them it is 60 degrees, near 0.1
 	// and far 10000. Near and far swap for inverted depth, an infinite plane is taken to its limit
+	// Normalizes pre-swapped camera planes (near > far > 0) back to near < far.
+	// If the caller reported depthInverted == false while passing near > far, the buffer itself is reversed-Z,
+	// so depthInverted is promoted to true to preserve the reversed-Z projection.
+	constexpr bool NormalizeCameraPlanes(float& cameraNear, float& cameraFar, bool& depthInverted) noexcept
+	{
+		if (cameraNear > 0.0f && cameraFar > 0.0f && cameraNear > cameraFar)
+		{
+			const float tmp = cameraNear;
+			cameraNear = cameraFar;
+			cameraFar = tmp;
+			if (!depthInverted)
+				depthInverted = true;
+			return true;
+		}
+		return false;
+	}
+
 	inline void Projection(float aspect, float cameraNear, float cameraFar, float verticalFov, bool depthInverted,
 		float out[16]) noexcept
 	{
@@ -90,6 +109,8 @@ namespace VulkanPolicy
 
 		float nearPlane = known ? cameraNear : 0.1f;
 		float farPlane = known ? cameraFar : 10000.0f;
+
+		NormalizeCameraPlanes(nearPlane, farPlane, depthInverted);
 
 		if (depthInverted)
 			std::swap(nearPlane, farPlane);
@@ -1010,5 +1031,604 @@ namespace VulkanPolicy
 	constexpr bool IsValidSpirvBlob(size_t byteSize, uint32_t firstWord) noexcept
 	{
 		return byteSize >= 20u && byteSize <= (1024u * 1024u) && (byteSize % 4u) == 0u && firstWord == 0x07230203u;
+	}
+
+	// Zero-overhead rolling VRAM drift diagnostic (reuses existing VRAM guard polls).
+	// Skips 120 warmup real frames (startup outputs/HUD/PSOs), logs one baseline snapshot at the first
+	// 240-real-frame window, and warns only on 3 consecutive rising windows exceeding budget-relative thresholds.
+	struct VramDriftReport
+	{
+		bool ready = false;
+		bool warn = false;
+		uint32_t baselineMiB = 0;
+		uint32_t currentMiB = 0;
+		int32_t deltaMiB = 0;
+		uint32_t windowIndex = 0;
+		uint32_t risingStreak = 0;
+	};
+
+	struct VramDriftTracker
+	{
+		static constexpr uint32_t kWarmupFrames = 120u;
+		static constexpr uint32_t kWindowFrames = 240u;
+		static constexpr uint32_t kWarnConsecutiveWindows = 3u;
+		static constexpr uint32_t kSlowLeakCheckInterval = 10u;
+		static constexpr uint32_t kWarnCooldownWindows = 10u;
+
+		uint32_t warmupFrames = 0;
+		uint32_t baselineMiB = 0;
+		uint32_t prevWindowMiB = 0;
+		uint32_t lastSlowCheckMiB = 0;
+		uint32_t windowFrames = 0;
+		uint32_t windowIndex = 0;
+		uint32_t risingStreak = 0;
+		uint32_t warnCooldown = 0;
+		bool baselineLogged = false;
+
+		void Reset() noexcept
+		{
+			warmupFrames = 0;
+			baselineMiB = 0;
+			prevWindowMiB = 0;
+			lastSlowCheckMiB = 0;
+			windowFrames = 0;
+			windowIndex = 0;
+			risingStreak = 0;
+			warnCooldown = 0;
+			baselineLogged = false;
+		}
+
+		VramDriftReport Sample(uint32_t usageMiB, uint32_t budgetMiB, uint32_t realFramesStep = 8u) noexcept
+		{
+			VramDriftReport out{};
+			if (usageMiB == 0u)
+				return out;
+			const uint32_t step = (realFramesStep > 0u) ? realFramesStep : 1u;
+			if (warmupFrames < kWarmupFrames)
+			{
+				warmupFrames += step;
+				return out;
+			}
+			if (baselineMiB == 0u)
+			{
+				baselineMiB = usageMiB;
+				prevWindowMiB = usageMiB;
+				lastSlowCheckMiB = usageMiB;
+				windowFrames = 0u;
+				return out;
+			}
+			windowFrames += step;
+			if (windowFrames < kWindowFrames)
+				return out;
+
+			windowFrames = 0u;
+			++windowIndex;
+			const int32_t windowDelta = static_cast<int32_t>(usageMiB) - static_cast<int32_t>(prevWindowMiB);
+			const int32_t totalDelta = static_cast<int32_t>(usageMiB) - static_cast<int32_t>(baselineMiB);
+			prevWindowMiB = usageMiB;
+
+			const int32_t stepMinMiB = static_cast<int32_t>(std::max<uint32_t>(64u, budgetMiB / 128u));
+			const int32_t totalMinMiB = static_cast<int32_t>(std::max<uint32_t>(256u, budgetMiB / 32u));
+			if (windowDelta >= stepMinMiB)
+				++risingStreak;
+			else
+				risingStreak = 0u;
+
+			if (warnCooldown > 0u)
+				--warnCooldown;
+
+			const bool isSlowBoundary = (windowIndex % kSlowLeakCheckInterval) == 0u;
+			const int32_t slowDelta = static_cast<int32_t>(usageMiB) - static_cast<int32_t>(lastSlowCheckMiB);
+			if (isSlowBoundary)
+				lastSlowCheckMiB = usageMiB;
+			const bool fastLeak = risingStreak >= kWarnConsecutiveWindows && totalDelta >= totalMinMiB;
+			const bool slowLeak = isSlowBoundary && totalDelta >= totalMinMiB && slowDelta >= stepMinMiB;
+			if ((fastLeak || slowLeak) && warnCooldown == 0u)
+			{
+				out.ready = true;
+				out.warn = true;
+				out.baselineMiB = baselineMiB;
+				out.currentMiB = usageMiB;
+				out.deltaMiB = totalDelta;
+				out.windowIndex = windowIndex;
+				out.risingStreak = risingStreak;
+				baselineLogged = true;
+				risingStreak = 0u;
+				warnCooldown = kWarnCooldownWindows;
+				return out;
+			}
+
+			if (!baselineLogged)
+			{
+				baselineLogged = true;
+				out.ready = true;
+				out.warn = false;
+				out.baselineMiB = baselineMiB;
+				out.currentMiB = usageMiB;
+				out.deltaMiB = totalDelta;
+				out.windowIndex = windowIndex;
+				out.risingStreak = risingStreak;
+			}
+			return out;
+		}
+	};
+
+	// Adaptive CPU wait cap for the D3D12->Vulkan WMMA bridge: clamp(1.5 * realFrameEma, 8 ms, 50 ms).
+	// Avoids WMMA<->DXIL flip-flopping at 30-50 native FPS while still bounding stalls below 50 ms.
+	inline constexpr uint64_t kWmmaDefaultWaitTimeoutNs = 25'000'000ull;
+	inline constexpr uint64_t kWmmaMinWaitTimeoutNs = 8'000'000ull;
+	inline constexpr uint64_t kWmmaMaxWaitTimeoutNs = 50'000'000ull;
+	inline constexpr uint32_t kVramClampReclaimFrames = 24u;
+
+	constexpr uint64_t WmmaAdaptiveWaitTimeoutNs(uint64_t emaRealFrameUs) noexcept
+	{
+		if (emaRealFrameUs == 0u)
+			return kWmmaDefaultWaitTimeoutNs;
+		const uint64_t targetNs = emaRealFrameUs * 1500ull; // 1.5x real frame time in ns
+		return std::clamp<uint64_t>(targetNs, kWmmaMinWaitTimeoutNs, kWmmaMaxWaitTimeoutNs);
+	}
+
+	constexpr bool ShouldReclaimClampedOutputs(bool vramClamped, uint32_t clampHoldFrames) noexcept
+	{
+		return vramClamped && clampHoldFrames >= kVramClampReclaimFrames;
+	}
+
+	// Shared Adaptive VRAM Guard state machine for both D3D12 (FrameGenerator) and Vulkan (VulkanRuntime).
+	// Scales margins with GPU budget (8 GB vs 16 GB vs 24 GB), steps down gradually, and enforces hysteresis +
+	// 10s dwell across the 1 <-> 2 generated-frame boundary (which triggers a ~112 ms XeFG pipeline rebuild).
+	struct VramGuardState
+	{
+		enum class Transition : uint8_t { None, Engaged, Easing, Released };
+
+		static constexpr uint64_t kMiB = 1024ull * 1024ull;
+		static constexpr uint64_t kReleaseDwellMs = 3'000ull;
+		static constexpr uint64_t kCrossOneToTwoDwellMs = 10'000ull;
+
+		bool active = false;
+		uint32_t stepDown = 0;
+		uint32_t tightStreak = 0;
+		bool releasePending = false;
+		uint64_t releaseSinceMs = 0;
+
+		void Reset() noexcept
+		{
+			active = false;
+			stepDown = 0;
+			tightStreak = 0;
+			releasePending = false;
+			releaseSinceMs = 0;
+		}
+
+		static constexpr uint32_t EffectiveForStep(uint32_t requestedCount, uint32_t step) noexcept
+		{
+			if (requestedCount <= 1u || step == 0u)
+				return requestedCount;
+			return requestedCount > step ? (requestedCount - step) : 1u;
+		}
+
+		uint32_t EffectiveCount(uint32_t requestedCount) const noexcept
+		{
+			return EffectiveForStep(requestedCount, active ? stepDown : 0u);
+		}
+
+		static constexpr uint64_t CriticalMarginBytes(uint64_t budgetBytes) noexcept
+		{
+			return std::clamp<uint64_t>((budgetBytes * 3ull) / 200ull, 100ull * kMiB, 384ull * kMiB);
+		}
+
+		static constexpr uint64_t SafetyMarginBytes(uint64_t budgetBytes) noexcept
+		{
+			return std::clamp<uint64_t>((budgetBytes * 3ull) / 100ull, 200ull * kMiB, 768ull * kMiB);
+		}
+
+		static constexpr uint64_t ReleaseMarginBytes(uint64_t budgetBytes) noexcept
+		{
+			return std::clamp<uint64_t>((budgetBytes * 6ull) / 100ull, 400ull * kMiB, 1536ull * kMiB);
+		}
+
+		Transition Update(uint64_t usageBytes, uint64_t budgetBytes, uint32_t requestedCount, uint64_t nowMs) noexcept
+		{
+			if (budgetBytes == 0u)
+				return Transition::None;
+
+			const uint64_t criticalMargin = CriticalMarginBytes(budgetBytes);
+			const uint64_t safetyMargin = SafetyMarginBytes(budgetBytes);
+			const uint64_t releaseMargin = ReleaseMarginBytes(budgetBytes);
+
+			const bool critical = budgetBytes > criticalMargin && usageBytes + criticalMargin >= budgetBytes;
+			const bool tight = budgetBytes > safetyMargin && usageBytes + safetyMargin >= budgetBytes;
+			const bool comfortable = budgetBytes > releaseMargin && usageBytes + releaseMargin < budgetBytes;
+			const uint32_t curEffective = EffectiveCount(requestedCount);
+
+			if (critical || tight)
+			{
+				releasePending = false;
+				const uint32_t nextStep = critical ? 4u : std::min<uint32_t>(stepDown + 1u, 4u);
+				const uint32_t nextEffective = EffectiveForStep(requestedCount, nextStep);
+				const bool crossesTwoToOne = !critical && curEffective >= 2u && nextEffective == 1u;
+				if (crossesTwoToOne && ++tightStreak < 2u)
+					return Transition::None;
+				tightStreak = 0u;
+				if (!active || nextStep != stepDown)
+				{
+					active = true;
+					stepDown = nextStep;
+					return Transition::Engaged;
+				}
+				return Transition::None;
+			}
+			if (active && comfortable)
+			{
+				tightStreak = 0u;
+				const uint32_t nextStep = (stepDown > 1u) ? (stepDown - 1u) : 0u;
+				const uint32_t nextEffective = EffectiveForStep(requestedCount, nextStep);
+				const uint64_t requiredDwell = (curEffective == 1u && nextEffective >= 2u) ? kCrossOneToTwoDwellMs : kReleaseDwellMs;
+				if (!releasePending)
+				{
+					releasePending = true;
+					releaseSinceMs = nowMs;
+				}
+				else if (nowMs >= releaseSinceMs && (nowMs - releaseSinceMs) >= requiredDwell)
+				{
+					releasePending = false;
+					if (stepDown > 1u)
+					{
+						--stepDown;
+						return Transition::Easing;
+					}
+					active = false;
+					stepDown = 0u;
+					return Transition::Released;
+				}
+				return Transition::None;
+			}
+			tightStreak = 0u;
+			releasePending = false;
+			return Transition::None;
+		}
+	};
+
+	// Matches known GPU Vulkan ICD DLL basenames (case-insensitive ASCII) so the internal D3D12->Vulkan WMMA bridge
+	// only resolves direct ICD device procs when a probe confirms the VkDevice is not wrapped by a Vulkan layer.
+	inline bool IsKnownVulkanIcdName(std::wstring_view path) noexcept
+	{
+		if (path.empty())
+			return false;
+		const size_t slash = path.find_last_of(L"\\/");
+		const std::wstring_view leaf = (slash == std::wstring_view::npos) ? path : path.substr(slash + 1);
+		auto eqAsciiNoCase = [](std::wstring_view a, std::wstring_view b) noexcept -> bool {
+			if (a.size() != b.size())
+				return false;
+			for (size_t i = 0; i < a.size(); ++i)
+			{
+				wchar_t ca = a[i];
+				wchar_t cb = b[i];
+				if (ca >= L'A' && ca <= L'Z') ca = static_cast<wchar_t>(ca - L'A' + L'a');
+				if (cb >= L'A' && cb <= L'Z') cb = static_cast<wchar_t>(cb - L'A' + L'a');
+				if (ca != cb)
+					return false;
+			}
+			return true;
+		};
+		return eqAsciiNoCase(leaf, L"nvoglv64.dll") ||
+		       eqAsciiNoCase(leaf, L"amdvlk64.dll") ||
+		       eqAsciiNoCase(leaf, L"igvk64.dll") ||
+		       eqAsciiNoCase(leaf, L"xe_vk64.dll") ||
+		       eqAsciiNoCase(leaf, L"igxelpicd64.dll") ||
+		       eqAsciiNoCase(leaf, L"winevulkan.dll");
+	}
+
+	// Device procs safe to resolve directly from the verified GPU ICD on the private D3D12->Vulkan WMMA bridge
+	// (bypassing third-party vulkan-1.dll Detours hooks such as OptiScaler's CommandBufferStateTracker).
+	// Keep vkDestroyDevice on the loader path so any hook that tracked vkCreateDevice cleans up cleanly.
+	inline bool ShouldBypassWmmaDeviceProc(std::string_view procName) noexcept
+	{
+		return !procName.empty() && procName != "vkDestroyDevice";
+	}
+
+	// Pure decision inputs for DirectIcdResolver::Init so handle-wrapping layer checks and module checks
+	// can be unit-tested on Linux without a live Windows Vulkan ICD.
+	struct DirectIcdInitProbe
+	{
+		bool allowBypass = false;
+		const void* loaderProbeFn = nullptr;
+		const void* probeModule = nullptr;
+		std::wstring_view probeModulePath{};
+		const void* icdGdpaFn = nullptr;
+		const void* icdGdpaModule = nullptr;
+		const void* icdProbeFn = nullptr;
+	};
+
+	inline bool ShouldEnableDirectIcdBypass(const DirectIcdInitProbe& probe) noexcept
+	{
+		if (!probe.allowBypass || !probe.loaderProbeFn || !probe.probeModule)
+			return false;
+		if (!IsKnownVulkanIcdName(probe.probeModulePath))
+			return false;
+		if (!probe.icdGdpaFn || probe.icdGdpaModule != probe.probeModule)
+			return false;
+		// Exact pointer identity on vkGetImageMemoryRequirements confirms no handle-wrapping Vulkan layer sits in between.
+		return probe.icdProbeFn == probe.loaderProbeFn;
+	}
+
+	inline bool ShouldUseDirectIcdProc(
+		std::string_view procName,
+		const void* loaderFn,
+		const void* loaderFnModule,
+		const void* directFn,
+		const void* directFnModule,
+		const void* icdModule) noexcept
+	{
+		if (!icdModule || !ShouldBypassWmmaDeviceProc(procName))
+			return false;
+		if (loaderFn && loaderFnModule == icdModule)
+			return false;
+		return directFn != nullptr && directFnModule == icdModule;
+	}
+
+	// Converts two Vulkan GPU timestamps into milliseconds, handling counter wrap-around for validBits in [1, 64].
+	// Returns -1.0f if inputs are invalid or the measured delta exceeds 1000 ms (e.g. counter discontinuity).
+	inline float ComputeGpuTimestampMs(
+		uint64_t startTicks,
+		uint64_t endTicks,
+		uint32_t timestampValidBits,
+		float timestampPeriodNs) noexcept
+	{
+		if (timestampValidBits == 0u || timestampValidBits > 64u || !(timestampPeriodNs > 0.0f))
+			return -1.0f;
+		const uint64_t mask = (timestampValidBits == 64u) ? ~0ull : ((1ull << timestampValidBits) - 1ull);
+		const uint64_t deltaTicks = (endTicks - startTicks) & mask;
+		const double ms = static_cast<double>(deltaTicks) * static_cast<double>(timestampPeriodNs) * 1e-6;
+		if (!(ms >= 0.0) || ms > 1000.0)
+			return -1.0f;
+		return static_cast<float>(ms);
+	}
+
+	struct GpuBenchReport
+	{
+		bool ready = false;
+		uint32_t batches = 0;
+		uint32_t genFrames = 0;
+		float batchAvgMs = 0.0f;
+		float batchP50Ms = 0.0f;
+		float batchP95Ms = 0.0f;
+		float batchMinMs = 0.0f;
+		float batchMaxMs = 0.0f;
+		float perGenFrameAvgMs = 0.0f;
+	};
+
+	// Fixed-capacity rolling GPU timestamp aggregator for in-game WMMA benchmarking (zero heap allocations).
+	// Emits an early report after kFirstReportBatches (60) so short test runs capture real numbers, then every kReportBatches (300).
+	struct GpuBenchWindow
+	{
+		static constexpr uint32_t kFirstReportBatches = 60u;
+		static constexpr uint32_t kReportBatches = 300u;
+
+		std::array<float, kReportBatches> samples{};
+		uint32_t count = 0;
+		uint64_t totalGenFrames = 0;
+		uint32_t lastGenFrames = 1;
+		bool reportedFirst = false;
+
+		void Reset() noexcept
+		{
+			count = 0;
+			totalGenFrames = 0;
+			lastGenFrames = 1;
+			reportedFirst = false;
+		}
+
+		GpuBenchReport Sample(float batchMs, uint32_t genFrames) noexcept
+		{
+			GpuBenchReport rep{};
+			if (!(batchMs >= 0.0f) || batchMs > 1000.0f || genFrames == 0u)
+				return rep;
+
+			if (count < kReportBatches)
+				samples[count++] = batchMs;
+			totalGenFrames += genFrames;
+			lastGenFrames = genFrames;
+
+			const uint32_t target = reportedFirst ? kReportBatches : kFirstReportBatches;
+			if (count < target)
+				return rep;
+
+			std::array<float, kReportBatches> sorted{};
+			double sum = 0.0;
+			for (uint32_t i = 0; i < count; ++i)
+			{
+				sorted[i] = samples[i];
+				sum += static_cast<double>(samples[i]);
+			}
+			std::sort(sorted.begin(), sorted.begin() + count);
+
+			rep.ready = true;
+			rep.batches = count;
+			rep.genFrames = lastGenFrames;
+			rep.batchAvgMs = static_cast<float>(sum / static_cast<double>(count));
+			rep.batchMinMs = sorted[0];
+			rep.batchMaxMs = sorted[count - 1u];
+			rep.batchP50Ms = sorted[(count - 1u) / 2u];
+			rep.batchP95Ms = sorted[((count - 1u) * 95u) / 100u];
+			rep.perGenFrameAvgMs = (totalGenFrames > 0u)
+				? static_cast<float>(sum / static_cast<double>(totalGenFrames))
+				: rep.batchAvgMs;
+
+			count = 0;
+			totalGenFrames = 0;
+			reportedFirst = true;
+			return rep;
+		}
+	};
+
+	// Live A/B selector for 16x16x16 WMMA weight LDS column stride:
+	// 0 = Stride 4 (16B aligned, default), 1 = Stride 5 (padded A/B comparison).
+	inline std::atomic<int32_t> gWmmaLdsStrideMode{ 0 };
+
+	inline void SetWmmaLdsStrideMode(int32_t mode) noexcept
+	{
+		gWmmaLdsStrideMode.store((mode == 1) ? 1 : 0, std::memory_order_release);
+	}
+
+	inline int32_t GetWmmaLdsStrideMode() noexcept
+	{
+		return gWmmaLdsStrideMode.load(std::memory_order_acquire);
+	}
+
+	inline int32_t WmmaLdsStrideValue(int32_t mode) noexcept
+	{
+		return (mode == 1) ? 5 : 4;
+	}
+
+	enum class BatchStrideKind : int32_t
+	{
+		None = 0,
+		Stride4 = 4,
+		Stride5 = 5,
+		Mixed = -1,
+		Fallback = -2,
+	};
+
+	inline BatchStrideKind ClassifyBatchStride(uint32_t stride4Dispatches, uint32_t stride5Dispatches, uint32_t fallbackDispatches = 0u) noexcept
+	{
+		if (fallbackDispatches > 0u)
+			return BatchStrideKind::Fallback;
+		if (stride4Dispatches > 0u && stride5Dispatches > 0u)
+			return BatchStrideKind::Mixed;
+		if (stride5Dispatches > 0u)
+			return BatchStrideKind::Stride5;
+		if (stride4Dispatches > 0u)
+			return BatchStrideKind::Stride4;
+		return BatchStrideKind::None;
+	}
+
+	inline const char* BatchStrideTag(BatchStrideKind kind) noexcept
+	{
+		switch (kind)
+		{
+		case BatchStrideKind::Stride4:  return "4";
+		case BatchStrideKind::Stride5:  return "5";
+		case BatchStrideKind::Mixed:    return "mixed";
+		case BatchStrideKind::Fallback: return "fallback";
+		default:                        return "none";
+		}
+	}
+
+	// Unified AMD GPU architecture classifier shared by D3D12 (wmma_route.cpp) and Vulkan (xvk_coopmat.cpp).
+	// Pass hasWmma16x16x16Wave32 = true when Vulkan VK_KHR_cooperative_matrix already confirmed int8 16x16x16/32
+	// Wave32 support: RDNA 2 has no hardware WMMA, so any unrecognized AMD GPU with that capability is at least RDNA 3.
+	enum class AmdArch : uint8_t
+	{
+		Unknown = 0,
+		Rdna2 = 2,
+		Rdna3 = 3,
+		Rdna4 = 4,
+	};
+
+	inline AmdArch ClassifyAmdArch(uint32_t vendorId, uint32_t deviceId, std::string_view name,
+		bool hasWmma16x16x16Wave32 = false) noexcept
+	{
+		if (vendorId != 0x1002u)
+			return AmdArch::Unknown;
+
+		// Normalize device name to ASCII uppercase on the stack so both Windows ("gfx11") and RADV ("GFX1103_R1", "VANGOGH") match.
+		char upBuf[128]{};
+		size_t upLen = 0;
+		for (char c : name)
+		{
+			if (upLen >= sizeof(upBuf))
+				break;
+			upBuf[upLen++] = (c >= 'a' && c <= 'z') ? static_cast<char>(c - ('a' - 'A')) : c;
+		}
+		const std::string_view up(upBuf, upLen);
+		const bool isLegacyHd = (up.find("HD ") != std::string_view::npos);
+
+		// RDNA 4 (gfx1200/gfx1201: Navi 48/44 — RX 9070 XT / 9070 / 9060 XT / R9700)
+		if ((deviceId >= 0x7550u && deviceId <= 0x75FFu) ||
+			up.find("RX 90") != std::string_view::npos ||
+			up.find("9070") != std::string_view::npos ||
+			up.find("9060") != std::string_view::npos ||
+			up.find("R9700") != std::string_view::npos ||
+			up.find("RDNA 4") != std::string_view::npos ||
+			up.find("NAVI44") != std::string_view::npos ||
+			up.find("NAVI48") != std::string_view::npos ||
+			up.find("GFX12") != std::string_view::npos)
+		{
+			return AmdArch::Rdna4;
+		}
+
+		// RDNA 3 / 3.5 (gfx1100..gfx1103 discrete + Phoenix/Hawk/Strix/Krackan APUs)
+		// Avoid bare 4-digit strings ("7900"/"7700") and exclude "HD " so legacy GCN 1 ("Radeon HD 7900/7700 Series") never misclassifies.
+		if ((deviceId >= 0x7440u && deviceId <= 0x74FFu) ||
+			deviceId == 0x15BFu || deviceId == 0x15C8u || deviceId == 0x150Eu ||
+			deviceId == 0x1506u || deviceId == 0x1586u || deviceId == 0x1114u ||
+			(!isLegacyHd && (
+				up.find("RX 7") != std::string_view::npos ||
+				up.find("PRO W7") != std::string_view::npos ||
+				up.find("780M") != std::string_view::npos ||
+				up.find("760M") != std::string_view::npos ||
+				up.find("740M") != std::string_view::npos ||
+				up.find("890M") != std::string_view::npos ||
+				up.find("880M") != std::string_view::npos ||
+				up.find("860M") != std::string_view::npos ||
+				up.find("840M") != std::string_view::npos ||
+				up.find("8060") != std::string_view::npos ||
+				up.find("8050") != std::string_view::npos ||
+				up.find("8040") != std::string_view::npos ||
+				up.find("RDNA 3") != std::string_view::npos ||
+				up.find("NAVI31") != std::string_view::npos ||
+				up.find("NAVI32") != std::string_view::npos ||
+				up.find("NAVI33") != std::string_view::npos ||
+				up.find("GFX11") != std::string_view::npos)))
+		{
+			return AmdArch::Rdna3;
+		}
+
+		// Hardware capability fallback: RDNA 2 lacks WMMA, so any AMD GPU exposing int8 16x16x16/32 Wave32 coopmat is >= RDNA 3.
+		if (hasWmma16x16x16Wave32)
+			return AmdArch::Rdna3;
+
+		// RDNA 2 (gfx103x: Navi 21/22/23 0x73A0..0x73FF, Navi 24 0x7420..0x743F incl. RX 6500 XT/6400 0x743F,
+		// Steam Deck LCD Van Gogh 0x163F, Steam Deck OLED Sephiroth 0x1435, Rembrandt 0x1681/0x164D, Raphael 0x164E)
+		if ((deviceId >= 0x73A0u && deviceId <= 0x73FFu) ||
+			(deviceId >= 0x7420u && deviceId <= 0x743Fu) ||
+			deviceId == 0x1681u || deviceId == 0x163Fu || deviceId == 0x1435u ||
+			deviceId == 0x164Du || deviceId == 0x164Eu ||
+			(!isLegacyHd && (
+				up.find("RX 6") != std::string_view::npos ||
+				up.find("PRO W6") != std::string_view::npos ||
+				up.find("680M") != std::string_view::npos ||
+				up.find("660M") != std::string_view::npos ||
+				up.find("610M") != std::string_view::npos ||
+				up.find("VAN GOGH") != std::string_view::npos ||
+				up.find("VANGOGH") != std::string_view::npos ||
+				up.find("SEPHIROTH") != std::string_view::npos ||
+				up.find("CUSTOM GPU 0405") != std::string_view::npos ||
+				up.find("CUSTOM GPU 0932") != std::string_view::npos ||
+				up.find("NAVI21") != std::string_view::npos ||
+				up.find("NAVI22") != std::string_view::npos ||
+				up.find("NAVI23") != std::string_view::npos ||
+				up.find("NAVI24") != std::string_view::npos ||
+				up.find("RDNA 2") != std::string_view::npos ||
+				up.find("GFX103") != std::string_view::npos)))
+		{
+			return AmdArch::Rdna2;
+		}
+
+		return AmdArch::Unknown;
+	}
+
+	inline AmdArch ClassifyAmdArch(uint32_t vendorId, uint32_t deviceId, std::wstring_view description,
+		bool hasWmma16x16x16Wave32 = false) noexcept
+	{
+		char ascii[128]{};
+		size_t n = 0;
+		for (wchar_t ch : description)
+		{
+			if (n >= sizeof(ascii))
+				break;
+			ascii[n++] = (ch >= 0 && ch < 128) ? static_cast<char>(ch) : '?';
+		}
+		return ClassifyAmdArch(vendorId, deviceId, std::string_view(ascii, n), hasWmma16x16x16Wave32);
 	}
 } // namespace VulkanPolicy

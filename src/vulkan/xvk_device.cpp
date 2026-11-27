@@ -1365,4 +1365,26 @@ void FlushCoopMatrixCache(ID3D12Device* device) noexcept
 {
     if (auto* own = Own<Device>(device)) own->coopmat().SavePipelineCache();
 }
+bool HasCoopMatrixStride5(ID3D12Device* device) noexcept
+{
+    auto* own = Own<Device>(device);
+    return own && own->coopmat().hasStride5();
+}
+void ResetCoopMatrixBatchStride(ID3D12Device* device) noexcept
+{
+    if (auto* own = Own<Device>(device)) own->coopmat().ResetBatchStrideCounters();
+}
+void ConsumeCoopMatrixBatchStride(ID3D12Device* device, uint32_t& outStride4, uint32_t& outStride5, uint32_t& outFallbacks) noexcept
+{
+    if (auto* own = Own<Device>(device))
+    {
+        own->coopmat().ConsumeBatchStrideCounters(outStride4, outStride5, outFallbacks);
+    }
+    else
+    {
+        outStride4 = 0u;
+        outStride5 = 0u;
+        outFallbacks = 0u;
+    }
+}
 } // namespace xvk

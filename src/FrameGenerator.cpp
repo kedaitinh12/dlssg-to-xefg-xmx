@@ -722,7 +722,7 @@ static bool IsUnrealEngine()
 
 // Left handed perspective matrix (row vectors) matching the depth buffer: inverted depth swaps near and far,
 // cameraFar == 0 means an infinite far plane
-static void GetProjectionMatrix(const NGXParameter& params, bool depthInverted, float aspectRatio, float* out)
+static void GetProjectionMatrix(const NGXParameter& params, bool depthInverted, bool allowDepthInference, float aspectRatio, float* out)
 {
 	float cameraNear = 0.0f;
 	float cameraFar = 0.0f;
@@ -731,6 +731,20 @@ static void GetProjectionMatrix(const NGXParameter& params, bool depthInverted, 
 	// Unreal doesn't pass a correct CameraViewToClip, its separate camera values are fine
 	if (!IsUnrealEngine() && CameraFromViewToClip(params, cameraNear, cameraFar, fov))
 	{
+		// Matrix values are already in depth-buffer order; infer depth polarity directly from the matrix
+		const bool inferredInverted = (cameraNear == 0.0f && cameraFar > 0.0f) ||
+			(cameraFar > 0.0f && cameraNear > cameraFar);
+		if (allowDepthInference && inferredInverted != depthInverted)
+		{
+			static bool loggedDepthMismatch = false;
+			if (!loggedDepthMismatch)
+			{
+				loggedDepthMismatch = true;
+				Log::Warn("CameraViewToClip depth polarity ({}) differs from DLSSG.DepthInverted ({}); trusting projection matrix",
+					inferredInverted ? "inverted" : "standard", depthInverted ? "inverted" : "standard");
+			}
+			depthInverted = inferredInverted;
+		}
 		if (depthInverted)
 			std::swap(cameraNear, cameraFar);
 	}
@@ -743,6 +757,9 @@ static void GetProjectionMatrix(const NGXParameter& params, bool depthInverted, 
 		// Some games pass degrees, some radians
 		if (fov > 10.0f)
 			fov *= std::numbers::pi_v<float> / 180.0f;
+
+		if (cameraFar > 0.0f)
+			VulkanPolicy::NormalizeCameraPlanes(cameraNear, cameraFar, depthInverted);
 	}
 
 	if (float paramAspectRatio = params.GetOr("DLSSG.CameraAspectRatio", 0.0f); paramAspectRatio > 0.0f)
@@ -1115,6 +1132,7 @@ bool FrameGenerator::CreateContext()
 		return false;
 	}
 
+	vramDrift.Reset();
 	newContext->sharedTexturesMode = UseWmma(settings.model) && D3D12VulkanWmma::WantsSharedTextures();
 	// Transfer global bridge/cache ownership ONLY AFTER XeFG::CreateContext() and XeFG::Init() succeeded,
 	// serialized against any deferred ~Context() so an old destructor can never reset the new live bridge.
@@ -1151,12 +1169,9 @@ bool FrameGenerator::PollVramGuard(uint32_t requestedCount) noexcept
 {
 	if (!Plugin::options.vramGuard.load(std::memory_order_relaxed))
 	{
-		if (vramGuardActive || vramGuardStepDown > 0u)
+		if (vramGuard.active || vramGuard.stepDown > 0u)
 		{
-			vramGuardActive = false;
-			vramGuardStepDown = 0u;
-			vramReleasePending = false;
-			vramTightStreak = 0u;
+			vramGuard.Reset();
 			Log::Info("Adaptive VRAM guard disabled by user, restoring full MFG multiplier");
 		}
 		return false;
@@ -1180,87 +1195,45 @@ bool FrameGenerator::PollVramGuard(uint32_t requestedCount) noexcept
 
 	// Poll every 8 real frames to keep QueryVideoMemoryInfo overhead negligible
 	if ((vramPollCounter++ & 7u) != 0)
-		return vramGuardActive;
+		return vramGuard.active;
 
 	DXGI_QUERY_VIDEO_MEMORY_INFO memInfo{};
 	if (FAILED(vramAdapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memInfo)) || memInfo.Budget == 0)
-		return vramGuardActive;
+		return vramGuard.active;
 
 	vramUsageMiB = static_cast<uint32_t>(memInfo.CurrentUsage / (1024ull * 1024ull));
 	vramBudgetMiB = static_cast<uint32_t>(memInfo.Budget / (1024ull * 1024ull));
-
-	constexpr uint64_t kCriticalMarginBytes = 100ull * 1024ull * 1024ull; // 100 MiB critical -> clamp straight to 2x
-	constexpr uint64_t kSafetyMarginBytes = 200ull * 1024ull * 1024ull;   // 200 MiB safety -> step down gradually
-	constexpr uint64_t kReleaseMarginBytes = 400ull * 1024ull * 1024ull;  // 400 MiB hysteresis + 3s dwell before stepping up
-	constexpr auto kReleaseDwell = std::chrono::seconds(3);
-	// Toggling libxess_fg.dll between 1 (2x) and 2 (3x) generated frames triggers a ~112 ms pipeline rebuild,
-	// whereas 2 <-> 3+ is 0 ms; require stronger hysteresis across the 1 <-> 2 boundary.
-	constexpr auto kCrossOneToTwoReleaseDwell = std::chrono::seconds(10);
-
-	const bool critical = memInfo.Budget > kCriticalMarginBytes && memInfo.CurrentUsage + kCriticalMarginBytes >= memInfo.Budget;
-	const bool tight = memInfo.Budget > kSafetyMarginBytes && memInfo.CurrentUsage + kSafetyMarginBytes >= memInfo.Budget;
-	const bool comfortable = memInfo.Budget > kReleaseMarginBytes && memInfo.CurrentUsage + kReleaseMarginBytes < memInfo.Budget;
-
-	auto effectiveForStep = [&](uint32_t step) noexcept -> uint32_t {
-		if (requestedCount <= 1u || step == 0u) return requestedCount;
-		return requestedCount > step ? (requestedCount - step) : 1u;
-	};
-	const uint32_t curEffective = effectiveForStep(vramGuardActive ? vramGuardStepDown : 0u);
-
-	if (critical || tight)
+	if (const auto drift = vramDrift.Sample(vramUsageMiB, vramBudgetMiB, 8u); drift.ready)
 	{
-		vramReleasePending = false;
-		const uint32_t nextStep = critical ? 4u : std::min(vramGuardStepDown + 1u, 4u);
-		const uint32_t nextEffective = effectiveForStep(nextStep);
-		const bool crossesTwoToOne = !critical && curEffective >= 2u && nextEffective == 1u;
-		if (crossesTwoToOne && ++vramTightStreak < 2u)
-			return vramGuardActive;
-		vramTightStreak = 0u;
-		if (!vramGuardActive || nextStep != vramGuardStepDown)
-		{
-			vramGuardActive = true;
-			vramGuardStepDown = nextStep;
-			Log::Warn("Adaptive VRAM guard engaged ({} MiB / {} MiB budget): stepping down MFG by {} to prevent swap stutter",
-				memInfo.CurrentUsage / (1024ull * 1024ull), memInfo.Budget / (1024ull * 1024ull), vramGuardStepDown);
-		}
-	}
-	else if (vramGuardActive && comfortable)
-	{
-		vramTightStreak = 0u;
-		const uint32_t nextStep = (vramGuardStepDown > 1u) ? (vramGuardStepDown - 1u) : 0u;
-		const uint32_t nextEffective = effectiveForStep(nextStep);
-		const auto requiredDwell = (curEffective == 1u && nextEffective >= 2u) ? kCrossOneToTwoReleaseDwell : kReleaseDwell;
-		const auto now = std::chrono::steady_clock::now();
-		if (!vramReleasePending)
-		{
-			vramReleasePending = true;
-			vramReleaseSince = now;
-		}
-		else if ((now - vramReleaseSince) >= requiredDwell)
-		{
-			vramReleasePending = false;
-			if (vramGuardStepDown > 1u)
-			{
-				--vramGuardStepDown;
-				Log::Info("Adaptive VRAM guard easing ({} MiB / {} MiB budget): step-down now {}",
-					memInfo.CurrentUsage / (1024ull * 1024ull), memInfo.Budget / (1024ull * 1024ull), vramGuardStepDown);
-			}
-			else
-			{
-				vramGuardActive = false;
-				vramGuardStepDown = 0u;
-				Log::Info("Adaptive VRAM guard released ({} MiB / {} MiB budget): restoring full MFG multiplier",
-					memInfo.CurrentUsage / (1024ull * 1024ull), memInfo.Budget / (1024ull * 1024ull));
-			}
-		}
-	}
-	else
-	{
-		vramTightStreak = 0u;
-		vramReleasePending = false;
+		if (drift.warn)
+			Log::Warn("VRAM drift check (window {}, {} consecutive rising 240-real-frame windows): {} -> {} MiB ({:+} MiB / {} MiB budget) - possible VRAM leak",
+				drift.windowIndex, drift.risingStreak, drift.baselineMiB, drift.currentMiB, drift.deltaMiB, vramBudgetMiB);
+		else
+			Log::Info("VRAM drift baseline (240 real frames post-warmup): {} -> {} MiB ({:+} MiB / {} MiB budget)",
+				drift.baselineMiB, drift.currentMiB, drift.deltaMiB, vramBudgetMiB);
 	}
 
-	return vramGuardActive;
+	const uint64_t nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count());
+	switch (vramGuard.Update(memInfo.CurrentUsage, memInfo.Budget, requestedCount, nowMs))
+	{
+	case VulkanPolicy::VramGuardState::Transition::Engaged:
+		Log::Warn("Adaptive VRAM guard engaged ({} MiB / {} MiB budget): stepping down MFG by {} to prevent swap stutter",
+			vramUsageMiB, vramBudgetMiB, vramGuard.stepDown);
+		break;
+	case VulkanPolicy::VramGuardState::Transition::Easing:
+		Log::Info("Adaptive VRAM guard easing ({} MiB / {} MiB budget): step-down now {}",
+			vramUsageMiB, vramBudgetMiB, vramGuard.stepDown);
+		break;
+	case VulkanPolicy::VramGuardState::Transition::Released:
+		Log::Info("Adaptive VRAM guard released ({} MiB / {} MiB budget): restoring full MFG multiplier",
+			vramUsageMiB, vramBudgetMiB);
+		break;
+	default:
+		break;
+	}
+
+	return vramGuard.active;
 }
 
 void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const NGXParameter& params)
@@ -1386,6 +1359,27 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 			hudTierState.FeedStaticHudFraction(staticFrac);
 	}
 
+	if (rawHudless && !hideHudless)
+	{
+		const auto hlDesc = rawHudless->GetDesc();
+		if (hudTierState.NotifyHudlessSource(
+			static_cast<uint64_t>(reinterpret_cast<uintptr_t>(rawHudless)),
+			static_cast<uint32_t>(hlDesc.Width), hlDesc.Height, static_cast<uint32_t>(hlDesc.Format)))
+		{
+			static uint64_t sLastResetLogMs = 0;
+			static uint32_t sResetCount = 0;
+			++sResetCount;
+			const uint64_t nowMs = GetTickCount64();
+			if (sLastResetLogMs == 0 || (nowMs - sLastResetLogMs) >= 5000ull)
+			{
+				Log::Info("HUD protection: HUDLess source changed ({}x{}, DXGI_FORMAT {}); reset everHealthy latch (count={})",
+					static_cast<uint32_t>(hlDesc.Width), hlDesc.Height, static_cast<uint32_t>(hlDesc.Format), sResetCount);
+				sResetCount = 0;
+				sLastResetLogMs = nowMs;
+			}
+		}
+	}
+
 	HudTier::Inputs hudInputs{};
 	hudInputs.mode = requestedHudMode;
 	hudInputs.hudlessUiEnabled = hudlessUiEnabled;
@@ -1395,6 +1389,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	hudInputs.hasSeparateUiPlane = false;
 	hudInputs.gpuComputeAvailable = hudComputeReady;
 	hudInputs.toneMapMatchAvailable = hudComputeReady && HudTierPass::IsToneMapMatchSupported(backbufferFormat);
+	hudInputs.preferNativeForWmma = UseWmma(wanted.model) && (D3D12VulkanWmma::Active() || D3D12VulkanWmma::NeedsRecovery());
 	hudDecision = hudTierState.Evaluate(hudInputs);
 
 	if (!hasLoggedHudTier || hudDecision.activeTier != loggedHudTier)
@@ -1622,6 +1617,10 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	}
 	FlushCaptureCopies(cmdList, pendingCopies, pendingCopyCount);
 
+	const bool ignoreGameReset = Plugin::options.ignoreGameReset.load(std::memory_order_relaxed);
+	const bool gameReset = !ignoreGameReset && (params.GetOr<uint32_t>("DLSSG.Reset", 0) != 0);
+	const bool hudTransitionFrame = gameReset || !previous.valid || !previous.backbuffer;
+
 	frame.matchedHudless = nullptr;
 	if (hudComputeReady && captured)
 	{
@@ -1630,17 +1629,18 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 		if (hudDecision.runToneMapMatch && hudlessCaptured && frame.hudless)
 		{
 			const int32_t tmMode = std::clamp(Plugin::options.toneMapMatchMode.load(std::memory_order_relaxed), 0, 2);
-			const bool forceRefit = !previous.valid || !previous.backbuffer || !context->pairValid;
+			const bool forceRefit = hudTransitionFrame || !context->pairValid;
 			frame.matchedHudless = hudTierPass.RecordToneMapMatch(cmdList, context->current, wantShared,
 				frame.backbuffer.Get(), XeFGInputState, frame.hudless.Get(), XeFGInputState, XeFGInputState,
 				tmMode, forceRefit);
 		}
 		// Tier 1 Native (or Tier 3 recovery monitoring): analyze-only 1/16-pixel Real vs Hudless diff guard.
-		// Probe every real frame for the first 8 frames (fast mismatch detection), then 1 in 16 real frames (>93% less GPU cost).
-		if (hudDecision.runHudDiffGuard && !hudDecision.runHudDiffComposite && hudlessCaptured && frame.hudless)
+		// Skip DLSSG.Reset / missing-previous-frame transitions, probe every frame during 8-frame warmup,
+		// 1 in 4 frames while recovering from fallback, and 1 in 16 frames in steady state (>93% less GPU cost).
+		if (hudDecision.runHudDiffGuard && !hudDecision.runHudDiffComposite && hudlessCaptured && frame.hudless && !hudTransitionFrame)
 		{
 			const uint64_t guardFrame = ++context->hudDiffGuardFrameCounter;
-			if (guardFrame <= 8u || (guardFrame % 16u) == 0u)
+			if (hudTierState.ShouldRunDiffGuard(guardFrame))
 			{
 				hudTierPass.RecordHudDiffGuard(cmdList, frame.backbuffer.Get(), XeFGInputState,
 					frame.hudless.Get(), XeFGInputState);
@@ -1649,9 +1649,8 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 		// Tier 3 Static HUD Mask: update per-pixel temporal stability map across consecutive real frames.
 		if (hudDecision.runStaticHudUpdate)
 		{
-			const bool staticReset = !previous.valid || !previous.backbuffer;
 			hudTierPass.RecordStaticHudUpdate(cmdList, frame.backbuffer.Get(), XeFGInputState,
-				previous.valid ? previous.backbuffer.Get() : nullptr, XeFGInputState, staticReset);
+				previous.valid ? previous.backbuffer.Get() : nullptr, XeFGInputState, hudTransitionFrame);
 		}
 	}
 
@@ -1672,7 +1671,8 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	std::ranges::fill(context->outputBases, data.backBuffer.base);
 
 	GetViewMatrix(params, data.viewMatrix);
-	GetProjectionMatrix(params, depthInverted, (float)settings.width / (float)settings.height,
+	const bool allowDepthInference = Plugin::options.depthInvertedOverride.load(std::memory_order_relaxed) == 0;
+	GetProjectionMatrix(params, depthInverted, allowDepthInference, (float)settings.width / (float)settings.height,
 		data.projectionMatrix);
 
 	data.outputResolution[0] = (float)settings.width;
@@ -1688,8 +1688,7 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	data.motionVectorScale[0] = (std::isfinite(mvsx) && mvsx != 0.0f) ? mvsx : 1.0f;
 	data.motionVectorScale[1] = (std::isfinite(mvsy) && mvsy != 0.0f) ? mvsy : 1.0f;
 
-	const bool ignoreGameReset = Plugin::options.ignoreGameReset.load(std::memory_order_relaxed);
-	bool reset = !ignoreGameReset && (params.GetOr<uint32_t>("DLSSG.Reset", 0) != 0);
+	bool reset = gameReset;
 
 	// Long-pause / Alt+Tab / window-minimize history reset: if >500ms elapsed between consecutive real frames,
 	// flush stale history so the first resumed frame never smears (1 GetTickCount64 subtraction/frame, ~0 overhead).
@@ -2285,7 +2284,7 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 		gpuProfiler.Mark(cmdList, 0);
 	}
 
-	bool vramGuarded = vramGuardActive;
+	bool vramGuarded = vramGuard.active;
 	if (frameIndex == 1)
 	{
 		HangWatchdog::Beat("DX12::CaptureRealFrame", true);
@@ -2299,10 +2298,27 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 	if (profileThisFrame)
 		gpuProfiler.Mark(cmdList, 1);
 
-	const bool vramClamped = vramGuarded && vramGuardStepDown > 0u && requestedCount > 1u;
-	const uint32_t effectiveCount = vramClamped
-		? (requestedCount > vramGuardStepDown ? (requestedCount - vramGuardStepDown) : 1u)
-		: requestedCount;
+	const uint32_t effectiveCount = vramGuarded ? vramGuard.EffectiveCount(requestedCount) : requestedCount;
+	const bool vramClamped = effectiveCount < requestedCount;
+	if (frameIndex == 1)
+	{
+		vramClampHoldFrames = vramClamped ? (vramClampHoldFrames + 1u) : 0u;
+		if (context && VulkanPolicy::ShouldReclaimClampedOutputs(vramClamped, vramClampHoldFrames))
+		{
+			bool reclaimedAny = false;
+			for (uint32_t i = effectiveCount; i < MaxFrames; ++i)
+			{
+				if (context->outputs[i])
+				{
+					D3D12VulkanWmma::ForgetResource(context->outputs[i].Get());
+					DeferredDestroy::Add(std::move(context->outputs[i]), /*heavy=*/false, ActiveGpuSignals());
+					reclaimedAny = true;
+				}
+			}
+			if (reclaimedAny)
+				context->pairValid = false;
+		}
+	}
 
 	if (frameIndex == 1)
 	{
