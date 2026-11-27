@@ -124,9 +124,12 @@ namespace
 		uint32_t antiLagVendor = 0;
 		bool antiLagGameOwned = false;
 		void* antiLagUpdateFn = nullptr;
+		std::unordered_map<VkSwapchainKHR, VkDevice> swapchainDevices;
 		std::atomic_bool antiLagActive = false;
 		std::atomic_bool antiLagHasOpenFrame = false;
 		std::atomic_uint64_t antiLagFrameIndex = 0;
+		std::atomic_uint32_t antiLagGenCount = 0;
+		std::atomic_uint32_t antiLagPresentsInBatch = 0;
 
 		// Dedicated lock for low-overhead present pacing
 		std::mutex pacerMutex;
@@ -832,11 +835,21 @@ namespace
 			s.ignoredInstances.erase(instance);
 			if (s.antiLagInstance == instance)
 			{
+				const VkDevice deadDev = s.antiLagDevice;
+				for (auto it = s.swapchainDevices.begin(); it != s.swapchainDevices.end(); )
+				{
+					if (it->second == deadDev)
+						it = s.swapchainDevices.erase(it);
+					else
+						++it;
+				}
 				s.antiLagDevice = VK_NULL_HANDLE;
 				s.antiLagInstance = VK_NULL_HANDLE;
 				s.antiLagUpdateFn = nullptr;
 				s.antiLagActive.store(false, std::memory_order_release);
 				s.antiLagHasOpenFrame.store(false, std::memory_order_release);
+				s.antiLagGenCount.store(0, std::memory_order_relaxed);
+				s.antiLagPresentsInBatch.store(0, std::memory_order_relaxed);
 			}
 		}
 		catch (...)
@@ -1804,6 +1817,7 @@ namespace
 			if (s.swapchains.size() >= MaxSwapchains)
 				s.swapchains.clear();
 			s.swapchains[*swapchain] = info->presentMode;
+			s.swapchainDevices[*swapchain] = device;
 			const uint32_t hz = QueryDisplayRefreshHz();
 			if (hz)
 			{
@@ -1834,6 +1848,7 @@ namespace
 			State& s = S();
 			std::lock_guard lock(s.mutex);
 			s.swapchains.erase(swapchain);
+			s.swapchainDevices.erase(swapchain);
 		}
 		next(device, swapchain, allocator);
 	}
@@ -1947,20 +1962,34 @@ namespace
 		}
 
 		// Opt-in VK_AMD_anti_lag paired PRESENT(N) -> vkQueuePresentKHR -> INPUT(N+1) markers (0% overhead when OFF).
+		// Strictly scoped to registered swapchains owned by s.antiLagDevice and to the final (real-frame) present of each MFG batch.
 		VkDevice alDevice = VK_NULL_HANDLE;
 		PFN_vkAntiLagUpdateAMD alUpdate = nullptr;
 		bool wantAntiLag = false;
+		bool swapchainOwnedByAlDevice = false;
+		bool isRealFramePresent = false;
 		const bool optInAntiLag = Plugin::options.vkAmdAntiLag.load(std::memory_order_relaxed);
 		if (prepared && (optInAntiLag || s.antiLagActive.load(std::memory_order_relaxed)))
 		{
 			std::lock_guard lock(s.mutex);
 			alDevice = s.antiLagDevice;
 			alUpdate = reinterpret_cast<PFN_vkAntiLagUpdateAMD>(s.antiLagUpdateFn);
-			wantAntiLag = VulkanPolicy::ShouldDispatchAmdAntiLag(
+			if (alDevice != VK_NULL_HANDLE && info && info->swapchainCount > 0 && info->pSwapchains)
+			{
+				const auto it = s.swapchainDevices.find(info->pSwapchains[0]);
+				swapchainOwnedByAlDevice = (it != s.swapchainDevices.end() && it->second == alDevice);
+			}
+			wantAntiLag = swapchainOwnedByAlDevice && VulkanPolicy::ShouldDispatchAmdAntiLag(
 				optInAntiLag, s.antiLagVendor, alUpdate != nullptr && alDevice != VK_NULL_HANDLE, s.antiLagGameOwned, false);
+			if (wantAntiLag)
+			{
+				const uint32_t genCount = s.antiLagGenCount.load(std::memory_order_relaxed);
+				const uint32_t presentIdx = s.antiLagPresentsInBatch.fetch_add(1, std::memory_order_relaxed) + 1u;
+				isRealFramePresent = VulkanPolicy::IsRealFramePresentForAntiLag(true, genCount, presentIdx);
+			}
 		}
 
-		if (wantAntiLag && s.antiLagHasOpenFrame.load(std::memory_order_relaxed))
+		if (wantAntiLag && isRealFramePresent && s.antiLagHasOpenFrame.load(std::memory_order_relaxed))
 		{
 			const uint64_t curFrame = s.antiLagFrameIndex.load(std::memory_order_relaxed);
 			VkAntiLagPresentationInfoAMD presInfo{
@@ -1972,7 +2001,7 @@ namespace
 
 		const VkResult presentRes = next(queue, info);
 
-		if (presentRes == VK_ERROR_DEVICE_LOST && alUpdate)
+		if (presentRes == VK_ERROR_DEVICE_LOST && swapchainOwnedByAlDevice && alUpdate)
 		{
 			std::lock_guard lock(s.mutex);
 			s.antiLagDevice = VK_NULL_HANDLE;
@@ -1980,7 +2009,7 @@ namespace
 			s.antiLagActive.store(false, std::memory_order_release);
 			s.antiLagHasOpenFrame.store(false, std::memory_order_release);
 		}
-		else if (wantAntiLag && static_cast<int32_t>(presentRes) >= 0)
+		else if (wantAntiLag && isRealFramePresent && static_cast<int32_t>(presentRes) >= 0)
 		{
 			const uint64_t nextFrame = s.antiLagFrameIndex.fetch_add(1, std::memory_order_relaxed) + 1u;
 			s.antiLagHasOpenFrame.store(true, std::memory_order_relaxed);
@@ -1991,7 +2020,8 @@ namespace
 			VkAntiLagDataAMD data{ kVkStructureTypeAntiLagDataAMD, nullptr, VK_ANTI_LAG_MODE_ON_AMD, 0u, &inputInfo };
 			alUpdate(alDevice, &data);
 		}
-		else if (!wantAntiLag && alUpdate && alDevice && s.antiLagActive.exchange(false, std::memory_order_acq_rel))
+		else if (!optInAntiLag && swapchainOwnedByAlDevice && alUpdate && alDevice &&
+			s.antiLagActive.exchange(false, std::memory_order_acq_rel))
 		{
 			s.antiLagHasOpenFrame.store(false, std::memory_order_relaxed);
 			VkAntiLagDataAMD offData{ kVkStructureTypeAntiLagDataAMD, nullptr, VK_ANTI_LAG_MODE_OFF_AMD, 0u, nullptr };
@@ -2850,6 +2880,8 @@ namespace
 void VulkanHost::NotifyBatchStart(uint32_t generatedCount) noexcept
 {
 	State& s = S();
+	s.antiLagGenCount.store(generatedCount, std::memory_order_relaxed);
+	s.antiLagPresentsInBatch.store(0, std::memory_order_relaxed);
 	if (!PacingActive(s))
 		return;
 	SetSystemTimerRaised(s, true);
@@ -2860,6 +2892,8 @@ void VulkanHost::NotifyBatchStart(uint32_t generatedCount) noexcept
 void VulkanHost::NotifyPaused() noexcept
 {
 	State& s = S();
+	s.antiLagGenCount.store(0, std::memory_order_relaxed);
+	s.antiLagPresentsInBatch.store(0, std::memory_order_relaxed);
 	SetSystemTimerRaised(s, false);
 	std::lock_guard lock(s.pacerMutex);
 	s.pacer.OnPaused();

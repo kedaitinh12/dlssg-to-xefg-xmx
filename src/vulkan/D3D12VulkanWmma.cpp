@@ -1396,7 +1396,10 @@ bool RecordVulkanBatchLocked(PendingBatch& batch) noexcept
 			gBridge.xvkList->Close();
 			execOk = (res == XEFGD_RESULT_SUCCESS);
 		}
-		xvk::EndRecording(gBridge.xvkDevice.Get());
+		if (execOk)
+			xvk::EndRecording(gBridge.xvkDevice.Get());
+		else
+			xvk::CancelRecording(gBridge.xvkDevice.Get());
 	}
 
 	if (!execOk)
@@ -1452,7 +1455,10 @@ bool RecordVulkanBatchLocked(PendingBatch& batch) noexcept
 			0, 0, nullptr, 0, nullptr, postOutCount, postOut);
 
 	if (gBridge.vkEndCommandBuffer(cmd) != VK_SUCCESS)
+	{
+		xvk::DiscardLastRecording(gBridge.xvkDevice.Get());
 		return false;
+	}
 
 	uint64_t slotToken = gBridge.nextSlotToken++;
 	if (slotToken == 0)
@@ -2397,11 +2403,13 @@ bool EnsureContext(const ContextSettings& settings) noexcept
 		if (gBridge.xefgContext && SameContextSettings(gBridge.contextSettings, settings))
 			return true;
 
-		const auto canRetryFailed = [&]() noexcept {
-			return gBridge.contextFailCount < 3u &&
-				(std::chrono::steady_clock::now() - gBridge.contextFailedAt) >= std::chrono::seconds(10);
-		};
-		if (gBridge.contextFailed && SameContextSettings(gBridge.failedContextSettings, settings) && !canRetryFailed())
+		const uint64_t failElapsedMs = gBridge.contextFailed
+			? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now() - gBridge.contextFailedAt).count())
+			: 0ull;
+		if (gBridge.contextFailed &&
+			!VulkanPolicy::CanRetryFailedWmmaContext(
+				gBridge.contextFailCount, failElapsedMs, SameContextSettings(gBridge.failedContextSettings, settings)))
 			return false;
 
 		// Drain in-flight Vulkan work with a bounded timeout so destroying any prior context and
@@ -2467,7 +2475,7 @@ bool EnsureContext(const ContextSettings& settings) noexcept
 	const xefgd_result_t createRes = XeFG::CreateContext(gBridge.xvkDevice.Get(), &ctx);
 	if (createRes != XEFGD_RESULT_SUCCESS || !ctx)
 	{
-		xvk::EndRecording(gBridge.xvkDevice.Get());
+		xvk::CancelRecording(gBridge.xvkDevice.Get());
 		gBridge.vkEndCommandBuffer(initCmd);
 		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::CreateContext failed (result {}, {} ms), falling back to D3D12",
 			static_cast<int>(createRes), elapsedMs());
@@ -2489,14 +2497,23 @@ bool EnsureContext(const ContextSettings& settings) noexcept
 		return XeFG::Init(ctx, init);
 	}();
 	Log::Info("D3D12->Vulkan WMMA bridge: XeFG::Init returned {} ({} ms)", static_cast<int>(initRes), elapsedMs());
+	if (initRes != XEFGD_RESULT_SUCCESS)
+	{
+		xvk::CancelRecording(gBridge.xvkDevice.Get());
+		gBridge.vkEndCommandBuffer(initCmd);
+		XeFG::Destroy(ctx);
+		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init failed (result {}, {} ms), falling back to D3D12",
+			static_cast<int>(initRes), elapsedMs());
+		return markFailed();
+	}
 	xvk::EndRecording(gBridge.xvkDevice.Get());
 	const VkResult endRes = gBridge.vkEndCommandBuffer(initCmd);
-
-	if (initRes != XEFGD_RESULT_SUCCESS || endRes != VK_SUCCESS)
+	if (endRes != VK_SUCCESS)
 	{
+		xvk::DiscardLastRecording(gBridge.xvkDevice.Get());
 		XeFG::Destroy(ctx);
-		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init failed (result {}, vkEnd {}, {} ms), falling back to D3D12",
-			static_cast<int>(initRes), static_cast<int>(endRes), elapsedMs());
+		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init vkEndCommandBuffer failed (vkEnd {}, {} ms), falling back to D3D12",
+			static_cast<int>(endRes), elapsedMs());
 		return markFailed();
 	}
 
@@ -2507,6 +2524,7 @@ bool EnsureContext(const ContextSettings& settings) noexcept
 	VkFence initFence = VK_NULL_HANDLE;
 	if (gBridge.vkCreateFence(gBridge.device, &fenceInfo, nullptr, &initFence) != VK_SUCCESS || !initFence)
 	{
+		xvk::DiscardLastRecording(gBridge.xvkDevice.Get());
 		XeFG::Destroy(ctx);
 		Log::Warn("D3D12->Vulkan WMMA bridge: vkCreateFence failed for XeFG::Init, falling back to D3D12");
 		return markFailed();
@@ -2524,6 +2542,7 @@ bool EnsureContext(const ContextSettings& settings) noexcept
 	const VkResult subRes = gBridge.vkQueueSubmit2(gBridge.queue, 1, &submitInfo, initFence);
 	if (subRes != VK_SUCCESS)
 	{
+		xvk::DiscardLastRecording(gBridge.xvkDevice.Get());
 		gBridge.vkDestroyFence(gBridge.device, initFence, nullptr);
 		XeFG::Destroy(ctx);
 		Log::Warn("D3D12->Vulkan WMMA bridge: XeFG::Init vkQueueSubmit2 failed (result {}, {} ms), falling back to D3D12",
@@ -2596,8 +2615,11 @@ void ResetContext() noexcept
 		return;
 	}
 	std::lock_guard lock(gBridge.mutex);
-	gBridge.contextFailed = false;
-	gBridge.contextFailCount = 0;
+	if (VulkanPolicy::ShouldResetWmmaFailedState(gBridge.xefgContext != nullptr))
+	{
+		gBridge.contextFailed = false;
+		gBridge.contextFailCount = 0;
+	}
 	if (gBridge.xefgContext)
 	{
 		if (DrainVulkanQueueLocked(500'000'000ull))
@@ -2744,11 +2766,12 @@ bool ScheduleBatch(
 	{
 		{
 			std::lock_guard lock(gBridge.mutex);
-			if (gBridge.contextFailed && SameContextSettings(gBridge.failedContextSettings, settings))
+			if (gBridge.contextFailed)
 			{
-				const bool retryReady = gBridge.contextFailCount < 3u &&
-					(std::chrono::steady_clock::now() - gBridge.contextFailedAt) >= std::chrono::seconds(10);
-				if (!retryReady)
+				const uint64_t failElapsedMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::steady_clock::now() - gBridge.contextFailedAt).count());
+				if (!VulkanPolicy::CanRetryFailedWmmaContext(
+					gBridge.contextFailCount, failElapsedMs, SameContextSettings(gBridge.failedContextSettings, settings)))
 					return false;
 			}
 		}
@@ -2818,8 +2841,13 @@ bool ScheduleBatch(
 		}
 		if (!gBridge.xefgContext || !SameContextSettings(gBridge.contextSettings, settings))
 		{
-			const bool alreadyFailed = gBridge.contextFailed && SameContextSettings(gBridge.failedContextSettings, settings) &&
-				!(gBridge.contextFailCount < 3u && (std::chrono::steady_clock::now() - gBridge.contextFailedAt) >= std::chrono::seconds(10));
+			const uint64_t failElapsedMs = gBridge.contextFailed
+				? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::steady_clock::now() - gBridge.contextFailedAt).count())
+				: 0ull;
+			const bool alreadyFailed = gBridge.contextFailed &&
+				!VulkanPolicy::CanRetryFailedWmmaContext(
+					gBridge.contextFailCount, failElapsedMs, SameContextSettings(gBridge.failedContextSettings, settings));
 			gBridge.contextReady.store(false, std::memory_order_release);
 			if (!alreadyFailed)
 				WarmupContextAsync(settings);

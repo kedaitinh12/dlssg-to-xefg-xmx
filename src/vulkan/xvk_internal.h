@@ -242,6 +242,7 @@ private:
     std::mutex mutex_;
     std::unordered_map<std::string, size_t> index_;              // DXIL SHA-256 -> embedded row
     std::vector<std::pair<std::string, std::string>> dynamicAliases_; // runtime DXIL replacement SHA-256 -> native Intel SHA-256
+    std::unordered_map<std::string, std::unique_ptr<Program>> overridePrograms_; // optional SPIR-V overrides keyed by native DXIL SHA-256
     std::unordered_map<std::string, std::unique_ptr<Program>> loaded_;
 };
 std::string Sha256(const void* data, size_t size);
@@ -746,6 +747,8 @@ public:
     VkCommandBuffer RecordingBuffer();
     bool BeginRecording(VkCommandBuffer commandBuffer);
     void EndRecording();
+    void CancelRecording();
+    void DiscardLastRecording();
     // Marks recordings the GPU has run as finished on the progress timeline (their events are set), then collects.
     void PollRecordings();
     // Adds this queue's progress signal to a submission (caller holds slot.mutex).

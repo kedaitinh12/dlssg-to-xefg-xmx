@@ -226,6 +226,18 @@ namespace VulkanPolicy
 		return optInEnabled && vendorId == 0x1002u && hasProc && !gameAlreadyEnabled && !abandoned;
 	}
 
+	// Gates VK_AMD_anti_lag Present/Input markers to registered swapchains owned by the Anti-Lag device
+	// and to the final (real-frame) present of an MFG batch (skipping intermediate interpolated presents).
+	inline bool IsRealFramePresentForAntiLag(
+		bool swapchainMatchesDevice, uint32_t generatedCount, uint32_t presentsInBatchAfter) noexcept
+	{
+		if (!swapchainMatchesDevice)
+			return false;
+		if (generatedCount == 0u)
+			return true;
+		return presentsInBatchAfter > generatedCount;
+	}
+
 	// Combined depth/stencil image views cannot be sampled by our float sampler.
 	// Callers must supply a single depth or color aspect (Vulkan bits 2 and 1).
 	inline bool SampledAspect(uint32_t aspect) noexcept { return aspect == 1 || aspect == 2; }
@@ -974,4 +986,28 @@ namespace VulkanPolicy
 			return waitNs;
 		}
 	};
+
+	// D3D12->Vulkan WMMA context-init failure backoff policy.
+	// Retries at most 3 times with a 10-second cooldown for identical context settings; retries immediately when
+	// settings change (e.g. resolution/format/model switch).
+	constexpr bool CanRetryFailedWmmaContext(uint32_t failCount, uint64_t elapsedMs, bool sameSettings) noexcept
+	{
+		if (!sameSettings)
+			return true;
+		return failCount < 3u && elapsedMs >= 10'000ull;
+	}
+
+	// ResetContext() clears failed-init backoff only when tearing down a previously working WMMA context.
+	// Menu open/close cycles in games like Forza Horizon 6 call ResetContext() repeatedly even while WMMA is
+	// already in failed/backoff state; preserving the backoff prevents repeated failed init storms.
+	constexpr bool ShouldResetWmmaFailedState(bool hadLiveContext) noexcept
+	{
+		return hadLiveContext;
+	}
+
+	// Validates a standalone SPIR-V binary blob (magic 0x07230203, 4-byte word-aligned, >= 5 header words, <= 1 MiB).
+	constexpr bool IsValidSpirvBlob(size_t byteSize, uint32_t firstWord) noexcept
+	{
+		return byteSize >= 20u && byteSize <= (1024u * 1024u) && (byteSize % 4u) == 0u && firstWord == 0x07230203u;
+	}
 } // namespace VulkanPolicy

@@ -807,6 +807,34 @@ int main()
 		CHECK(!ShouldDispatchAmdAntiLag(true, 0x1002u, false, false, false));
 		CHECK(!ShouldDispatchAmdAntiLag(true, 0x1002u, true, true, false));
 		CHECK(!ShouldDispatchAmdAntiLag(true, 0x1002u, true, false, true));
+
+		// Anti-Lag swapchain ownership + MFG real-frame gating
+		CHECK(!IsRealFramePresentForAntiLag(false, 0u, 1u)); // unregistered / foreign swapchain: never fire
+		CHECK(!IsRealFramePresentForAntiLag(false, 2u, 3u)); // unregistered swapchain even on real frame: never fire
+		CHECK(IsRealFramePresentForAntiLag(true, 0u, 1u));   // FG paused/off: every present is a real frame
+		CHECK(!IsRealFramePresentForAntiLag(true, 1u, 1u));  // 2x MFG: 1st present is interpolated -> skip
+		CHECK(IsRealFramePresentForAntiLag(true, 1u, 2u));   // 2x MFG: 2nd present is real -> fire
+		CHECK(!IsRealFramePresentForAntiLag(true, 3u, 1u));  // 4x MFG: interp 1 -> skip
+		CHECK(!IsRealFramePresentForAntiLag(true, 3u, 3u));  // 4x MFG: interp 3 -> skip
+		CHECK(IsRealFramePresentForAntiLag(true, 3u, 4u));   // 4x MFG: real frame 4 -> fire
+
+		// D3D12->Vulkan WMMA context-init failure backoff & ResetContext preservation (FH6 menu toggle storm)
+		CHECK(!CanRetryFailedWmmaContext(1u, 0ull, true));       // same settings, <10s cooldown -> skip
+		CHECK(!CanRetryFailedWmmaContext(1u, 9999ull, true));    // still inside 10s cooldown -> skip
+		CHECK(CanRetryFailedWmmaContext(1u, 10000ull, true));    // cooldown elapsed, attempt < 3 -> retry
+		CHECK(CanRetryFailedWmmaContext(2u, 15000ull, true));    // cooldown elapsed, attempt < 3 -> retry
+		CHECK(!CanRetryFailedWmmaContext(3u, 60000ull, true));   // 3 failures reached -> stop retrying same settings
+		CHECK(CanRetryFailedWmmaContext(3u, 0ull, false));       // settings changed -> retry immediately
+		CHECK(!ShouldResetWmmaFailedState(false));               // menu toggle without live context -> keep backoff
+		CHECK(ShouldResetWmmaFailedState(true));                 // tearing down working context -> reset backoff
+
+		// Standalone SPIR-V override validation (splat_motion_aware*.spv)
+		CHECK(IsValidSpirvBlob(20u, 0x07230203u));
+		CHECK(IsValidSpirvBlob(4096u, 0x07230203u));
+		CHECK(!IsValidSpirvBlob(16u, 0x07230203u));              // truncated header
+		CHECK(!IsValidSpirvBlob(22u, 0x07230203u));              // not 4-byte word aligned
+		CHECK(!IsValidSpirvBlob(20u, 0x43425844u));              // DXBC magic, not SPIR-V
+		CHECK(!IsValidSpirvBlob(2u * 1024u * 1024u, 0x07230203u)); // > 1 MiB rejected
 	}
 
 	std::printf("%d checks, %d failed\n", checks, failures);

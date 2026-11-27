@@ -2932,6 +2932,16 @@ namespace
 				}
 			}
 
+			if (d.abandoned.load(std::memory_order_acquire))
+			{
+				f.batchReady = false;
+				f.havePrevious = false;
+				f.generatedThrough = 0;
+				if (recording)
+					xvk::EndRecording(d.d3d.Get());
+				return NGX_FAIL;
+			}
+
 			f.lastIndex = index;
 
 			const bool copied = f.batchReady && index <= f.generatedThrough && index <= f.batchCount &&

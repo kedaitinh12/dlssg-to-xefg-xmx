@@ -512,7 +512,7 @@ VkCommandBuffer Device::RecordingBuffer()
 
 bool Device::BeginRecording(VkCommandBuffer commandBuffer)
 {
-    if (!recorded_ || !commandBuffer) return false;
+    if (!recorded_ || !commandBuffer || abandoned_.load(std::memory_order_acquire)) return false;
     PollRecordings();
     std::lock_guard lock(recordMutex_);
     if (recording_) return false;
@@ -531,7 +531,7 @@ void Device::EndRecording()
         std::lock_guard lock(recordMutex_);
         command = recording_;
         recording_ = VK_NULL_HANDLE;
-        if (!command) return;
+        if (!command || abandoned_.load(std::memory_order_acquire)) return;
         if (!freeEvents_.empty()) {
             event = freeEvents_.back();
             freeEvents_.pop_back();
@@ -551,6 +551,62 @@ void Device::EndRecording()
     }
     std::lock_guard lock(recordMutex_);
     epochs_.push_back({event, value});
+}
+
+void Device::CancelRecording()
+{
+    if (!recorded_) return;
+    {
+        std::lock_guard lock(recordMutex_);
+        if (!recording_) return;
+        recording_ = VK_NULL_HANDLE;
+    }
+    if (abandoned_.load(std::memory_order_acquire)) return;
+    std::vector<uint64_t> submitted(slots_.size());
+    for (size_t i = 0; i < slots_.size(); ++i) {
+        std::lock_guard lock(slots_[i]->mutex);
+        submitted[i] = slots_[i]->submitted;
+    }
+    {
+        std::lock_guard lock(graveMutex_);
+        for (auto& grave : graves_) {
+            for (size_t i = 0; i < grave.targets.size() && i < submitted.size(); ++i) {
+                if (grave.targets[i] > submitted[i])
+                    grave.targets[i] = submitted[i];
+            }
+        }
+    }
+    PollRecordings();
+}
+
+void Device::DiscardLastRecording()
+{
+    if (!recorded_ || abandoned_.load(std::memory_order_acquire)) return;
+    uint64_t droppedValue = 0;
+    {
+        std::lock_guard lock(recordMutex_);
+        if (epochs_.empty()) return;
+        const Epoch dropped = epochs_.back();
+        epochs_.pop_back();
+        freeEvents_.push_back(dropped.event);
+        droppedValue = dropped.value;
+    }
+    uint64_t newSubmitted = 0;
+    if (!slots_.empty()) {
+        QueueSlot& slot = *slots_[0];
+        std::lock_guard lock(slot.mutex);
+        if (slot.submitted == droppedValue && slot.submitted > 0)
+            --slot.submitted;
+        newSubmitted = slot.submitted;
+    }
+    {
+        std::lock_guard lock(graveMutex_);
+        for (auto& grave : graves_) {
+            if (!grave.targets.empty() && grave.targets[0] > newSubmitted)
+                grave.targets[0] = newSubmitted;
+        }
+    }
+    PollRecordings();
 }
 
 void Device::PollRecordings()
@@ -1234,6 +1290,20 @@ void EndRecording(ID3D12Device* d3d) noexcept
 {
     if (!d3d) return;
     try { Own<Device>(static_cast<ID3D12Device1*>(d3d))->EndRecording(); }
+    catch (...) {}
+}
+
+void CancelRecording(ID3D12Device* d3d) noexcept
+{
+    if (!d3d) return;
+    try { Own<Device>(static_cast<ID3D12Device1*>(d3d))->CancelRecording(); }
+    catch (...) {}
+}
+
+void DiscardLastRecording(ID3D12Device* d3d) noexcept
+{
+    if (!d3d) return;
+    try { Own<Device>(static_cast<ID3D12Device1*>(d3d))->DiscardLastRecording(); }
     catch (...) {}
 }
 

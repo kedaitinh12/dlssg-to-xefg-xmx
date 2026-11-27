@@ -1,0 +1,227 @@
+// SPDX-License-Identifier: MIT
+//
+// Vulkan GLSL 460 port of src/MfgPort/splat_motion_aware.hlsl (splat.1 / splat.2 from MFG-Unlocker).
+// Byte-identical replacement for XeFG's motion-vector splat program on Vulkan / D3D12->Vulkan WMMA:
+//   - splat_motion_aware.spv          (default, native DXIL SHA-256 3f3f91d2...)
+//   - splat_motion_aware_inverted.spv (-DSPLAT_INVERTED_DEPTH=1, native DXIL SHA-256 c3649191...)
+//
+// xvk binding contract (src/vulkan/xvk_internal.h):
+//   set = 0, binding = 0  : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE  (t0: Motion Texture2D<float2>)
+//   set = 0, binding = 1  : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE  (t1: Depth  Texture2D<float>)
+//   set = 0, binding = 64 : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER (u0: Target RWByteAddressBuffer)
+//   push_constant         : 40 bytes (10 x 32-bit constants, b0)
+#version 460
+#extension GL_EXT_samplerless_texture_functions : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+#define TILE_W 40
+#define TILE_H 48
+
+layout(local_size_x = 8, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform Constants
+{
+    uvec2 srcSize;
+    uvec2 dstSize;
+    vec2 scale;
+    ivec2 motionOffset;
+    ivec2 depthOffset;
+} pc;
+
+layout(set = 0, binding = 0) uniform texture2D Motion;
+layout(set = 0, binding = 1) uniform texture2D Depth;
+layout(set = 0, binding = 64, std430) buffer TargetBuf
+{
+    uint data[];
+} Target;
+
+shared uint tileX[TILE_W * TILE_H];
+shared uint tileY[TILE_W * TILE_H];
+shared int boxMinX;
+shared int boxMinY;
+shared int boxMaxX;
+shared int boxMaxY;
+
+bool IsFiniteFloat(float v)
+{
+    return !isnan(v) && !isinf(v);
+}
+
+vec2 LoadMotion(ivec2 coord)
+{
+    const ivec2 sz = textureSize(Motion, 0);
+    if (coord.x < 0 || coord.y < 0 || coord.x >= sz.x || coord.y >= sz.y)
+        return vec2(0.0);
+    return texelFetch(Motion, coord, 0).xy;
+}
+
+float LoadDepth(ivec2 coord)
+{
+    const ivec2 sz = textureSize(Depth, 0);
+    if (coord.x < 0 || coord.y < 0 || coord.x >= sz.x || coord.y >= sz.y)
+        return 0.0;
+    return texelFetch(Depth, coord, 0).x;
+}
+
+// Float -> IEEE-754 binary16 packing (round half up on magnitude), integer ops only.
+uint PackHalf(float value)
+{
+    const uint b = floatBitsToUint(value) + 4096u;
+    const uint e8 = b >> 23u;
+    const uint e = e8 & 255u;
+    const uint m = b & 8388607u;
+    const uint sign = (b >> 16u) & 32768u;
+    const uint normal = e > 112u ? (((e8 << 10u) + 16384u) & 31744u) | (m >> 13u) : 0u;
+    const uint denormal = (e - 102u) < 11u ? (((m + 8384512u) >> ((125u - e8) & 31u)) + 1u) >> 1u : 0u;
+    const uint overflow = e > 143u ? 32767u : 0u;
+    return sign | overflow | normal | denormal;
+}
+
+void main()
+{
+    const uvec3 group = gl_WorkGroupID;
+    const uvec3 pixel = gl_GlobalInvocationID;
+    const uint index = gl_LocalInvocationIndex;
+
+    if (index == 0u)
+    {
+        boxMinX = 0x7fffffff;
+        boxMinY = 0x7fffffff;
+        boxMaxX = -0x7fffffff;
+        boxMaxY = -0x7fffffff;
+    }
+    for (uint i = index; i < uint(TILE_W * TILE_H); i += 128u)
+    {
+        tileX[i] = 0u;
+        tileY[i] = 0u;
+    }
+
+    bool valid = false;
+    int tx = 0;
+    int ty = 0;
+    uint keyX = 0u;
+    uint keyY = 0u;
+
+    if (pixel.x < pc.srcSize.x && pixel.y < pc.srcSize.y)
+    {
+        const vec2 mv = LoadMotion(ivec2(pc.motionOffset.x + int(pixel.x), pc.motionOffset.y + int(pixel.y)));
+#if defined(SPLAT_INVERTED_DEPTH) && SPLAT_INVERTED_DEPTH != 0
+        float z = LoadDepth(ivec2(pc.depthOffset.x + int(pixel.x), pc.depthOffset.y + int(pixel.y)));
+        float keyMotionX = mv.x;
+        float keyMotionY = mv.y;
+#else
+        const float z = LoadDepth(ivec2(pc.depthOffset.x + int(pixel.x), pc.depthOffset.y + int(pixel.y)));
+#endif
+        if (IsFiniteFloat(mv.x) && IsFiniteFloat(mv.y))
+        {
+            const float maxDx = 2.0 * float(pc.srcSize.x);
+            const float maxDy = 2.0 * float(pc.srcSize.y);
+            const float dx = clamp(pc.scale.x * mv.x, -maxDx, maxDx);
+            const float dy = clamp(pc.scale.y * mv.y, -maxDy, maxDy);
+            valid = true;
+            if (pc.srcSize.x == pc.dstSize.x && pc.srcSize.y == pc.dstSize.y)
+            {
+                tx = int(floor(dx + 0.5)) + int(pixel.x);
+                ty = int(floor(dy + 0.5)) + int(pixel.y);
+            }
+            else
+            {
+                tx = int(roundEven(((float(pixel.x) + 0.5) + dx) * float(pc.dstSize.x) / float(pc.srcSize.x)));
+                ty = int(roundEven(((float(pixel.y) + 0.5) + dy) * float(pc.dstSize.y) / float(pc.srcSize.y)));
+            }
+#if defined(SPLAT_INVERTED_DEPTH) && SPLAT_INVERTED_DEPTH != 0
+            z = 1.0 - z;
+            keyMotionX = dx;
+            keyMotionY = dy;
+#else
+            const uint depthKey = min(uint(max(1.0 - z, 0.0) * 32767.0), 32767u) << 16u;
+            keyX = PackHalf(dx) | depthKey | 0x80000000u;
+            keyY = PackHalf(dy) | depthKey | 0x80000000u;
+#endif
+        }
+#if defined(SPLAT_INVERTED_DEPTH) && SPLAT_INVERTED_DEPTH != 0
+        const uint depthKey = min(uint(max(1.0 - z, 0.0) * 32767.0), 32767u) << 16u;
+        keyX = PackHalf(keyMotionX) | depthKey | 0x80000000u;
+        keyY = PackHalf(keyMotionY) | depthKey | 0x80000000u;
+#endif
+    }
+
+    memoryBarrierShared();
+    barrier();
+
+    const int x0 = max(tx, 0);
+    const int x1 = min(tx + 1, int(pc.dstSize.x) - 1);
+    const int y0 = max(ty, 0);
+    const int y1 = min(ty + 1, int(pc.dstSize.y) - 1);
+    const bool anyTap = valid && x0 <= x1 && y0 <= y1;
+
+    const int waveX0 = subgroupMin(anyTap ? x0 : 0x7fffffff);
+    const int waveY0 = subgroupMin(anyTap ? y0 : 0x7fffffff);
+    const int waveX1 = subgroupMax(anyTap ? x1 : -0x7fffffff);
+    const int waveY1 = subgroupMax(anyTap ? y1 : -0x7fffffff);
+    if (subgroupElect())
+    {
+        atomicMin(boxMinX, waveX0);
+        atomicMax(boxMaxX, waveX1);
+        atomicMin(boxMinY, waveY0);
+        atomicMax(boxMaxY, waveY1);
+    }
+
+    memoryBarrierShared();
+    barrier();
+
+    const int bx0 = boxMinX;
+    const int by0 = boxMinY;
+    const int bx1 = boxMaxX;
+    const int by1 = boxMaxY;
+    if (bx1 < bx0)
+        return;
+
+    const bool fits = (bx1 - bx0) < TILE_W && (by1 - by0) < TILE_H;
+    const int ox = fits ? bx0 : int(group.x * 8u) - (TILE_W - 8) / 2;
+    const int oy = fits ? by0 : int(group.y * 16u) - (TILE_H - 16) / 2;
+
+    if (anyTap)
+    {
+        for (uint k = 0u; k < 4u; ++k)
+        {
+            const int x = tx + int(k & 1u);
+            const int y = ty + int((k >> 1u) & 1u);
+            if (x < 0 || y < 0 || x >= int(pc.dstSize.x) || y >= int(pc.dstSize.y))
+                continue;
+            const int lx = x - ox;
+            const int ly = y - oy;
+            if (lx >= 0 && ly >= 0 && lx < TILE_W && ly < TILE_H)
+            {
+                atomicMax(tileX[ly * TILE_W + lx], keyX);
+                atomicMax(tileY[ly * TILE_W + lx], keyY);
+            }
+            else
+            {
+                atomicMax(Target.data[uint(y * int(pc.dstSize.x) + x)], keyX);
+                atomicMax(Target.data[uint((y + int(pc.dstSize.y)) * int(pc.dstSize.x) + x)], keyY);
+            }
+        }
+    }
+
+    memoryBarrierShared();
+    barrier();
+
+    const int w = fits ? (bx1 - bx0 + 1) : TILE_W;
+    const int h = fits ? (by1 - by0 + 1) : TILE_H;
+    for (int e = int(index); e < w * h; e += 128)
+    {
+        const int lx = e % w;
+        const int ly = e / w;
+        const uint vx = tileX[ly * TILE_W + lx];
+        if ((vx & 0x80000000u) == 0u)
+            continue;
+        const int x = ox + lx;
+        const int y = oy + ly;
+        if (x < 0 || y < 0 || x >= int(pc.dstSize.x) || y >= int(pc.dstSize.y))
+            continue;
+        atomicMax(Target.data[uint(y * int(pc.dstSize.x) + x)], vx);
+        atomicMax(Target.data[uint((y + int(pc.dstSize.y)) * int(pc.dstSize.x) + x)], tileY[ly * TILE_W + lx]);
+    }
+}
