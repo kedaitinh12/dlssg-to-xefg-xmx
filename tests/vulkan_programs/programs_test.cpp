@@ -16,8 +16,10 @@
 #include "vulkan/VulkanProgramLookup.h"
 #include "vulkan/VulkanInputCopy.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -720,7 +722,46 @@ static void CheckInstalled()
 	fs::remove_all(programsDirectory / "vulkan");
 	CHECK(VulkanPrograms::Installed().Usable());
 
+	// PreloadAsync after Installed() is an idempotent no-op
+	VulkanPrograms::PreloadAsync();
+	CHECK(VulkanPrograms::Loaded() == &set);
+
 	fs::remove_all(root);
+}
+
+static int CheckPreloadAsync()
+{
+	const fs::path root = MakeTemp();
+	programsDirectory = root / "xefg_mfg_programs";
+	WriteSet(programsDirectory / "vulkan", Baseline());
+
+	CHECK(VulkanPrograms::Loaded() == nullptr);
+	VulkanPrograms::PreloadAsync();
+	VulkanPrograms::PreloadAsync();
+
+	const VulkanPrograms::Set* loaded = nullptr;
+	for (int i = 0; i < 400; ++i)
+	{
+		loaded = VulkanPrograms::Loaded();
+		if (loaded != nullptr)
+			break;
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	}
+
+	CHECK(loaded != nullptr);
+	if (loaded)
+	{
+		CHECK(loaded->Usable() && loaded->programs.size() == 6);
+		CHECK(&VulkanPrograms::Installed() == loaded);
+		CHECK(Logged("info: Vulkan models: 6 programs"));
+	}
+
+	// Let the detached preload thread finish unwinding before exit under ASan/LSan.
+	std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	fs::remove_all(root);
+
+	std::printf("%d checks, %d failed\n", checks, failures);
+	return failures ? 1 : 0;
 }
 
 static int CheckInstalledMissing()
@@ -856,6 +897,9 @@ int main(int argc, char** argv)
 {
 	if (argc >= 2 && std::string(argv[1]) == "--missing")
 		return CheckInstalledMissing();
+
+	if (argc >= 2 && std::string(argv[1]) == "--preload")
+		return CheckPreloadAsync();
 
 	if (argc >= 3 && std::string(argv[1]) == "--real")
 		return RealSet(argv[2]);

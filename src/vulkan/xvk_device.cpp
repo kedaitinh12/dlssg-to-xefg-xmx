@@ -414,8 +414,17 @@ void Device::InitializeResource(VkImage image, VkImageAspectFlags aspect, VkBuff
     initBatches_.push_back({command, value});
 }
 
+void Device::Abandon() noexcept
+{
+    abandoned_.store(true, std::memory_order_release);
+    std::lock_guard lock(graveMutex_);
+    graves_.clear();
+    hasGraves_.store(false, std::memory_order_release);
+}
+
 void Device::DeferDestroy(std::function<void()> destroy)
 {
+    if (abandoned_.load(std::memory_order_acquire)) return;
     Grave grave{{}, std::move(destroy)};
     // vkprov.1: a recording still open ends as the next epoch, and its work may use the object.
     bool open = false;
@@ -437,7 +446,7 @@ void Device::DeferDestroy(std::function<void()> destroy)
 
 void Device::Collect()
 {
-    if (!hasGraves_.load(std::memory_order_acquire)) return;
+    if (abandoned_.load(std::memory_order_acquire) || !hasGraves_.load(std::memory_order_acquire)) return;
     std::vector<uint64_t> done(slots_.size());
     for (size_t i = 0; i < slots_.size(); ++i) vk_.vkGetSemaphoreCounterValue(device_, slots_[i]->timeline, &done[i]);
     std::vector<std::function<void()>> ready;
@@ -463,6 +472,7 @@ void Device::InitWait(VkSemaphore& semaphore, uint64_t& value)
 
 bool Device::WaitIdle(uint64_t timeoutNs)
 {
+    if (abandoned_.load(std::memory_order_acquire)) return false;
     if (recorded_) {
         const ULONGLONG deadline = GetTickCount64() + timeoutNs / 1000000;
         while (true) {
@@ -502,7 +512,7 @@ VkCommandBuffer Device::RecordingBuffer()
 
 bool Device::BeginRecording(VkCommandBuffer commandBuffer)
 {
-    if (!recorded_ || !commandBuffer) return false;
+    if (!recorded_ || !commandBuffer || abandoned_.load(std::memory_order_acquire)) return false;
     PollRecordings();
     std::lock_guard lock(recordMutex_);
     if (recording_) return false;
@@ -521,7 +531,7 @@ void Device::EndRecording()
         std::lock_guard lock(recordMutex_);
         command = recording_;
         recording_ = VK_NULL_HANDLE;
-        if (!command) return;
+        if (!command || abandoned_.load(std::memory_order_acquire)) return;
         if (!freeEvents_.empty()) {
             event = freeEvents_.back();
             freeEvents_.pop_back();
@@ -543,9 +553,65 @@ void Device::EndRecording()
     epochs_.push_back({event, value});
 }
 
-void Device::PollRecordings()
+void Device::CancelRecording()
 {
     if (!recorded_) return;
+    {
+        std::lock_guard lock(recordMutex_);
+        if (!recording_) return;
+        recording_ = VK_NULL_HANDLE;
+    }
+    if (abandoned_.load(std::memory_order_acquire)) return;
+    std::vector<uint64_t> submitted(slots_.size());
+    for (size_t i = 0; i < slots_.size(); ++i) {
+        std::lock_guard lock(slots_[i]->mutex);
+        submitted[i] = slots_[i]->submitted;
+    }
+    {
+        std::lock_guard lock(graveMutex_);
+        for (auto& grave : graves_) {
+            for (size_t i = 0; i < grave.targets.size() && i < submitted.size(); ++i) {
+                if (grave.targets[i] > submitted[i])
+                    grave.targets[i] = submitted[i];
+            }
+        }
+    }
+    PollRecordings();
+}
+
+void Device::DiscardLastRecording()
+{
+    if (!recorded_ || abandoned_.load(std::memory_order_acquire)) return;
+    uint64_t droppedValue = 0;
+    {
+        std::lock_guard lock(recordMutex_);
+        if (epochs_.empty()) return;
+        const Epoch dropped = epochs_.back();
+        epochs_.pop_back();
+        freeEvents_.push_back(dropped.event);
+        droppedValue = dropped.value;
+    }
+    uint64_t newSubmitted = 0;
+    if (!slots_.empty()) {
+        QueueSlot& slot = *slots_[0];
+        std::lock_guard lock(slot.mutex);
+        if (slot.submitted == droppedValue && slot.submitted > 0)
+            --slot.submitted;
+        newSubmitted = slot.submitted;
+    }
+    {
+        std::lock_guard lock(graveMutex_);
+        for (auto& grave : graves_) {
+            if (!grave.targets.empty() && grave.targets[0] > newSubmitted)
+                grave.targets[0] = newSubmitted;
+        }
+    }
+    PollRecordings();
+}
+
+void Device::PollRecordings()
+{
+    if (!recorded_ || abandoned_.load(std::memory_order_acquire)) return;
     uint64_t finished = 0;
     {
         std::lock_guard lock(recordMutex_);
@@ -1227,11 +1293,32 @@ void EndRecording(ID3D12Device* d3d) noexcept
     catch (...) {}
 }
 
+void CancelRecording(ID3D12Device* d3d) noexcept
+{
+    if (!d3d) return;
+    try { Own<Device>(static_cast<ID3D12Device1*>(d3d))->CancelRecording(); }
+    catch (...) {}
+}
+
+void DiscardLastRecording(ID3D12Device* d3d) noexcept
+{
+    if (!d3d) return;
+    try { Own<Device>(static_cast<ID3D12Device1*>(d3d))->DiscardLastRecording(); }
+    catch (...) {}
+}
+
 bool WaitRecordedIdle(ID3D12Device* d3d, uint64_t timeoutNs) noexcept
 {
     if (!d3d) return false;
     try { return Own<Device>(static_cast<ID3D12Device1*>(d3d))->WaitIdle(timeoutNs); }
     catch (...) { return false; }
+}
+
+void AbandonDevice(ID3D12Device* d3d) noexcept
+{
+    if (!d3d) return;
+    try { Own<Device>(static_cast<ID3D12Device1*>(d3d))->Abandon(); }
+    catch (...) {}
 }
 
 VkImage ImageOf(ID3D12Resource* resource) noexcept

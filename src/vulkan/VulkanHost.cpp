@@ -3,6 +3,7 @@
 
 #include "../Log.h"
 #include "../Plugin.h"
+#include "../VulkanPrograms.h"
 #include "../WineCompat.h"
 #include "VulkanPolicy.h"
 #include "VulkanFeatureChain.h"
@@ -116,6 +117,19 @@ namespace
 		std::atomic_bool presentHooked = false;
 		std::atomic_bool gdpaPresentLogged = false;
 		HMODULE(WINAPI* loadLibraryExW)(LPCWSTR, HANDLE, DWORD) = nullptr;
+
+		// Opt-in AMD Anti-Lag 2 (VK_AMD_anti_lag) paired PRESENT + INPUT markers around vkQueuePresentKHR
+		VkDevice antiLagDevice = VK_NULL_HANDLE;
+		VkInstance antiLagInstance = VK_NULL_HANDLE;
+		uint32_t antiLagVendor = 0;
+		bool antiLagGameOwned = false;
+		void* antiLagUpdateFn = nullptr;
+		std::unordered_map<VkSwapchainKHR, VkDevice> swapchainDevices;
+		std::atomic_bool antiLagActive = false;
+		std::atomic_bool antiLagHasOpenFrame = false;
+		std::atomic_uint64_t antiLagFrameIndex = 0;
+		std::atomic_uint32_t antiLagGenCount = 0;
+		std::atomic_uint32_t antiLagPresentsInBatch = 0;
 
 		// Dedicated lock for low-overhead present pacing
 		std::mutex pacerMutex;
@@ -809,6 +823,7 @@ namespace
 	{
 		if (!instance)
 			return;
+		VulkanRuntime::AbandonInstance(instance);
 		try
 		{
 			State& s = S();
@@ -818,6 +833,24 @@ namespace
 					[instance](const auto& entry) { return entry.first == instance; }),
 				s.instances.end());
 			s.ignoredInstances.erase(instance);
+			if (s.antiLagInstance == instance)
+			{
+				const VkDevice deadDev = s.antiLagDevice;
+				for (auto it = s.swapchainDevices.begin(); it != s.swapchainDevices.end(); )
+				{
+					if (it->second == deadDev)
+						it = s.swapchainDevices.erase(it);
+					else
+						++it;
+				}
+				s.antiLagDevice = VK_NULL_HANDLE;
+				s.antiLagInstance = VK_NULL_HANDLE;
+				s.antiLagUpdateFn = nullptr;
+				s.antiLagActive.store(false, std::memory_order_release);
+				s.antiLagHasOpenFrame.store(false, std::memory_order_release);
+				s.antiLagGenCount.store(0, std::memory_order_relaxed);
+				s.antiLagPresentsInBatch.store(0, std::memory_order_relaxed);
+			}
 		}
 		catch (...)
 		{
@@ -977,6 +1010,58 @@ namespace
 
 	// ------------------------------------------------------------------------------------------------ device
 
+#ifndef VK_AMD_anti_lag
+	constexpr VkStructureType kVkStructureTypePhysicalDeviceAntiLagFeaturesAMD = static_cast<VkStructureType>(1000476000);
+	constexpr VkStructureType kVkStructureTypeAntiLagDataAMD = static_cast<VkStructureType>(1000476001);
+	constexpr VkStructureType kVkStructureTypeAntiLagPresentationInfoAMD = static_cast<VkStructureType>(1000476002);
+	enum VkAntiLagModeAMD
+	{
+		VK_ANTI_LAG_MODE_DRIVER_CONTROL_AMD = 0,
+		VK_ANTI_LAG_MODE_ON_AMD = 1,
+		VK_ANTI_LAG_MODE_OFF_AMD = 2,
+	};
+	enum VkAntiLagStageAMD
+	{
+		VK_ANTI_LAG_STAGE_INPUT_AMD = 0,
+		VK_ANTI_LAG_STAGE_PRESENT_AMD = 1,
+	};
+	struct VkPhysicalDeviceAntiLagFeaturesAMD
+	{
+		VkStructureType sType;
+		void* pNext;
+		VkBool32 antiLag;
+	};
+	struct VkAntiLagPresentationInfoAMD
+	{
+		VkStructureType sType;
+		void* pNext;
+		VkAntiLagStageAMD stage;
+		uint64_t frameIndex;
+	};
+	struct VkAntiLagDataAMD
+	{
+		VkStructureType sType;
+		const void* pNext;
+		VkAntiLagModeAMD mode;
+		uint32_t maxFPS;
+		const VkAntiLagPresentationInfoAMD* pPresentationInfo;
+	};
+	typedef void(VKAPI_PTR* PFN_vkAntiLagUpdateAMD)(VkDevice device, const VkAntiLagDataAMD* pData);
+#else
+	constexpr VkStructureType kVkStructureTypePhysicalDeviceAntiLagFeaturesAMD = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD;
+	constexpr VkStructureType kVkStructureTypeAntiLagDataAMD = VK_STRUCTURE_TYPE_ANTI_LAG_DATA_AMD;
+	constexpr VkStructureType kVkStructureTypeAntiLagPresentationInfoAMD = VK_STRUCTURE_TYPE_ANTI_LAG_PRESENTATION_INFO_AMD;
+#endif
+
+	constexpr VkStructureType kVkStructureTypeDeviceGroupDeviceCreateInfo = static_cast<VkStructureType>(1000070001);
+	struct DeviceGroupDeviceCreateInfoHeader
+	{
+		VkStructureType sType;
+		const void* pNext;
+		uint32_t physicalDeviceCount;
+		const VkPhysicalDevice* pPhysicalDevices;
+	};
+
 	struct DeviceEdit
 	{
 		VkDeviceCreateInfo info{};
@@ -990,6 +1075,9 @@ namespace
 		};
 		VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop{
 			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR
+		};
+		VkPhysicalDeviceAntiLagFeaturesAMD antiLag{
+			kVkStructureTypePhysicalDeviceAntiLagFeaturesAMD, nullptr, VK_FALSE
 		};
 
 		VulkanHost::FeatureChain chain;
@@ -1164,8 +1252,11 @@ namespace
 				return Refuse(physical, "subgroup_operations");
 
 			// What the layer and the program set use
+			VkPhysicalDeviceAntiLagFeaturesAMD antiLagSupported{
+				kVkStructureTypePhysicalDeviceAntiLagFeaturesAMD, nullptr, VK_FALSE
+			};
 			VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopSupported{
-				VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR
+				VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR, &antiLagSupported
 			};
 			VkPhysicalDeviceVulkan13Features v13{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &coopSupported };
 			VkPhysicalDeviceVulkan12Features v12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &v13 };
@@ -1284,6 +1375,32 @@ namespace
 				edit->record.coopMatrixExtensions = true;
 			}
 
+			// Opt-in VK_AMD_anti_lag on AMD GPUs (OFF by default; requires GPU feature bit, single-GPU, and game not owning it).
+			const bool gameAntiLagExt = enabled("VK_AMD_anti_lag");
+			const bool gameAntiLagStruct =
+				FindStruct<VkPhysicalDeviceAntiLagFeaturesAMD>(info->pNext, kVkStructureTypePhysicalDeviceAntiLagFeaturesAMD) != nullptr;
+			const auto* devGroup =
+				FindStruct<DeviceGroupDeviceCreateInfoHeader>(info->pNext, kVkStructureTypeDeviceGroupDeviceCreateInfo);
+			const uint32_t devGroupCount = devGroup ? devGroup->physicalDeviceCount : 1u;
+			edit->record.amdAntiLagGameEnabled = gameAntiLagExt || gameAntiLagStruct;
+			const bool optInAntiLag = Plugin::options.vkAmdAntiLag.load(std::memory_order_relaxed);
+			if (VulkanPolicy::CanEnableAmdAntiLag(optInAntiLag, edit->record.vendor, offered("VK_AMD_anti_lag"),
+				antiLagSupported.antiLag == VK_TRUE, devGroupCount, gameAntiLagExt, gameAntiLagStruct))
+			{
+				edit->extensions.push_back("VK_AMD_anti_lag");
+				edit->record.amdAntiLagEnabled = true;
+				Log::Info("Vulkan: opt-in VK_AMD_anti_lag enabled on AMD GPU");
+			}
+			else if (optInAntiLag && edit->record.vendor == 0x1002u)
+			{
+				if (gameAntiLagExt || gameAntiLagStruct)
+					Log::Info("Vulkan: VK_AMD_anti_lag already configured by game/OptiScaler; skipping duplicate Anti-Lag injection");
+				else if (devGroupCount > 1u)
+					Log::Info("Vulkan: skipping opt-in VK_AMD_anti_lag on multi-GPU device group (count={})", devGroupCount);
+				else if (!antiLagSupported.antiLag)
+					Log::Info("Vulkan: skipping opt-in VK_AMD_anti_lag (physical device antiLag feature bit is false)");
+			}
+
 			// Only treat VK_NV_present_metering as hardware flip metering on Blackwell+ GPUs (deviceID >= 0x2B00).
 			// Do NOT treat VK_NV_low_latency2 (NVIDIA Reflex) or pre-Blackwell VK_NV_present_metering exposure as
 			// hardware MFG pacing, or the CPU present pacer would be falsely bypassed on RTX 20/30/40 Vulkan games.
@@ -1380,6 +1497,13 @@ namespace
 				prepend(edit->coop);
 			}
 
+			if (edit->record.amdAntiLagEnabled &&
+				!FindStruct<VkPhysicalDeviceAntiLagFeaturesAMD>(chain, kVkStructureTypePhysicalDeviceAntiLagFeaturesAMD))
+			{
+				edit->antiLag.antiLag = VK_TRUE;
+				prepend(edit->antiLag);
+			}
+
 			edit->info.pNext = head;
 			edit->record.physical = physical;
 			edit->record.gipa = gipa;
@@ -1407,6 +1531,21 @@ namespace
 
 				s.devices[device] = edit.record;
 				s.refused.erase(edit.record.physical);
+				if (edit.record.amdAntiLagEnabled && !edit.record.amdAntiLagGameEnabled && edit.record.gipa && edit.record.instance)
+				{
+					if (const auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+						edit.record.gipa(edit.record.instance, "vkGetDeviceProcAddr")))
+					{
+						if (void* fn = reinterpret_cast<void*>(gdpa(device, "vkAntiLagUpdateAMD")))
+						{
+							s.antiLagDevice = device;
+							s.antiLagInstance = edit.record.instance;
+							s.antiLagVendor = edit.record.vendor;
+							s.antiLagGameOwned = false;
+							s.antiLagUpdateFn = fn;
+						}
+					}
+				}
 			}
 
 			if (edit.record.hwPacing)
@@ -1678,6 +1817,7 @@ namespace
 			if (s.swapchains.size() >= MaxSwapchains)
 				s.swapchains.clear();
 			s.swapchains[*swapchain] = info->presentMode;
+			s.swapchainDevices[*swapchain] = device;
 			const uint32_t hz = QueryDisplayRefreshHz();
 			if (hz)
 			{
@@ -1708,6 +1848,7 @@ namespace
 			State& s = S();
 			std::lock_guard lock(s.mutex);
 			s.swapchains.erase(swapchain);
+			s.swapchainDevices.erase(swapchain);
 		}
 		next(device, swapchain, allocator);
 	}
@@ -1820,7 +1961,74 @@ namespace
 			}
 		}
 
-		return next(queue, info);
+		// Opt-in VK_AMD_anti_lag paired PRESENT(N) -> vkQueuePresentKHR -> INPUT(N+1) markers (0% overhead when OFF).
+		// Strictly scoped to registered swapchains owned by s.antiLagDevice and to the final (real-frame) present of each MFG batch.
+		VkDevice alDevice = VK_NULL_HANDLE;
+		PFN_vkAntiLagUpdateAMD alUpdate = nullptr;
+		bool wantAntiLag = false;
+		bool swapchainOwnedByAlDevice = false;
+		bool isRealFramePresent = false;
+		const bool optInAntiLag = Plugin::options.vkAmdAntiLag.load(std::memory_order_relaxed);
+		if (prepared && (optInAntiLag || s.antiLagActive.load(std::memory_order_relaxed)))
+		{
+			std::lock_guard lock(s.mutex);
+			alDevice = s.antiLagDevice;
+			alUpdate = reinterpret_cast<PFN_vkAntiLagUpdateAMD>(s.antiLagUpdateFn);
+			if (alDevice != VK_NULL_HANDLE && info && info->swapchainCount > 0 && info->pSwapchains)
+			{
+				const auto it = s.swapchainDevices.find(info->pSwapchains[0]);
+				swapchainOwnedByAlDevice = (it != s.swapchainDevices.end() && it->second == alDevice);
+			}
+			wantAntiLag = swapchainOwnedByAlDevice && VulkanPolicy::ShouldDispatchAmdAntiLag(
+				optInAntiLag, s.antiLagVendor, alUpdate != nullptr && alDevice != VK_NULL_HANDLE, s.antiLagGameOwned, false);
+			if (wantAntiLag)
+			{
+				const uint32_t genCount = s.antiLagGenCount.load(std::memory_order_relaxed);
+				const uint32_t presentIdx = s.antiLagPresentsInBatch.fetch_add(1, std::memory_order_relaxed) + 1u;
+				isRealFramePresent = VulkanPolicy::IsRealFramePresentForAntiLag(true, genCount, presentIdx);
+			}
+		}
+
+		if (wantAntiLag && isRealFramePresent && s.antiLagHasOpenFrame.load(std::memory_order_relaxed))
+		{
+			const uint64_t curFrame = s.antiLagFrameIndex.load(std::memory_order_relaxed);
+			VkAntiLagPresentationInfoAMD presInfo{
+				kVkStructureTypeAntiLagPresentationInfoAMD, nullptr, VK_ANTI_LAG_STAGE_PRESENT_AMD, curFrame
+			};
+			VkAntiLagDataAMD data{ kVkStructureTypeAntiLagDataAMD, nullptr, VK_ANTI_LAG_MODE_ON_AMD, 0u, &presInfo };
+			alUpdate(alDevice, &data);
+		}
+
+		const VkResult presentRes = next(queue, info);
+
+		if (presentRes == VK_ERROR_DEVICE_LOST && swapchainOwnedByAlDevice && alUpdate)
+		{
+			std::lock_guard lock(s.mutex);
+			s.antiLagDevice = VK_NULL_HANDLE;
+			s.antiLagUpdateFn = nullptr;
+			s.antiLagActive.store(false, std::memory_order_release);
+			s.antiLagHasOpenFrame.store(false, std::memory_order_release);
+		}
+		else if (wantAntiLag && isRealFramePresent && static_cast<int32_t>(presentRes) >= 0)
+		{
+			const uint64_t nextFrame = s.antiLagFrameIndex.fetch_add(1, std::memory_order_relaxed) + 1u;
+			s.antiLagHasOpenFrame.store(true, std::memory_order_relaxed);
+			s.antiLagActive.store(true, std::memory_order_relaxed);
+			VkAntiLagPresentationInfoAMD inputInfo{
+				kVkStructureTypeAntiLagPresentationInfoAMD, nullptr, VK_ANTI_LAG_STAGE_INPUT_AMD, nextFrame
+			};
+			VkAntiLagDataAMD data{ kVkStructureTypeAntiLagDataAMD, nullptr, VK_ANTI_LAG_MODE_ON_AMD, 0u, &inputInfo };
+			alUpdate(alDevice, &data);
+		}
+		else if (!optInAntiLag && swapchainOwnedByAlDevice && alUpdate && alDevice &&
+			s.antiLagActive.exchange(false, std::memory_order_acq_rel))
+		{
+			s.antiLagHasOpenFrame.store(false, std::memory_order_relaxed);
+			VkAntiLagDataAMD offData{ kVkStructureTypeAntiLagDataAMD, nullptr, VK_ANTI_LAG_MODE_OFF_AMD, 0u, nullptr };
+			alUpdate(alDevice, &offData);
+		}
+
+		return presentRes;
 	}
 
 	VKAPI_ATTR VkResult VKAPI_CALL HookCreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* info,
@@ -2411,6 +2619,7 @@ namespace
 
 	void InstallFromLoad(HMODULE loader) noexcept
 	{
+		bool installedNow = false;
 		try
 		{
 			State& s = S();
@@ -2425,6 +2634,7 @@ namespace
 			{
 				SetHookState(VulkanRuntime::Hooks::Installed, {});
 				Log::Info("Vulkan hooks installed on vkCreateInstance and vkCreateDevice, vulkan-1.dll was just loaded");
+				installedNow = true;
 			}
 			else
 			{
@@ -2435,6 +2645,9 @@ namespace
 		catch (...)
 		{
 		}
+
+		if (installedNow)
+			VulkanPrograms::PreloadAsync();
 	}
 
 	bool IsLoaderName(const wchar_t* name)
@@ -2514,74 +2727,82 @@ namespace
 
 void VulkanHost::Start(const char* caller)
 {
-	State& s = S();
-	std::lock_guard lock(s.install);
-
-	if (s.started)
-		return;
-
-	// Process-wide guard: even if two copies of this DLL are ever loaded from different folders in the same
-	// process, only the first one may install MinHook detours on vulkan-1.dll.
-	const std::wstring guardName = L"Local\\XeFgVulkanHostHookGuard_" + std::to_wstring(GetCurrentProcessId());
-	HANDLE guardMutex = CreateMutexW(nullptr, FALSE, guardName.c_str());
-	if (guardMutex && GetLastError() == ERROR_ALREADY_EXISTS)
+	bool shouldPreload = false;
 	{
-		CloseHandle(guardMutex);
+		State& s = S();
+		std::lock_guard lock(s.install);
+
+		if (s.started)
+			return;
+
+		// Process-wide guard: even if two copies of this DLL are ever loaded from different folders in the same
+		// process, only the first one may install MinHook detours on vulkan-1.dll.
+		const std::wstring guardName = L"Local\\XeFgVulkanHostHookGuard_" + std::to_wstring(GetCurrentProcessId());
+		HANDLE guardMutex = CreateMutexW(nullptr, FALSE, guardName.c_str());
+		if (guardMutex && GetLastError() == ERROR_ALREADY_EXISTS)
+		{
+			CloseHandle(guardMutex);
+			s.started = true;
+			Log::Info("Vulkan hooks are already owned by another instance in this process ({}); skipping duplicate install", caller);
+			return;
+		}
+		// Intentionally kept open for the lifetime of the process when this instance owns the hooks.
+
 		s.started = true;
-		Log::Info("Vulkan hooks are already owned by another instance in this process ({}); skipping duplicate install", caller);
-		return;
-	}
-	// Intentionally kept open for the lifetime of the process when this instance owns the hooks.
 
-	s.started = true;
-
-	if (const HMODULE loader = GetModuleHandleW(LoaderName))
-	{
-		std::string why;
-
-		if (InstallLoader(loader, why))
+		if (const HMODULE loader = GetModuleHandleW(LoaderName))
 		{
-			SetHookState(VulkanRuntime::Hooks::Installed, {});
-			Log::Info("Vulkan hooks installed on vkCreateInstance and vkCreateDevice ({}). A game that already has its "
-				"Vulkan device isn't covered, see the VulkanHooks notes in the readme", caller);
+			std::string why;
+
+			if (InstallLoader(loader, why))
+			{
+				SetHookState(VulkanRuntime::Hooks::Installed, {});
+				Log::Info("Vulkan hooks installed on vkCreateInstance and vkCreateDevice ({}). A game that already has its "
+					"Vulkan device isn't covered, see the VulkanHooks notes in the readme", caller);
+				shouldPreload = true;
+			}
+			else
+			{
+				SetHookState(VulkanRuntime::Hooks::Failed, why);
+				Log::Error("Vulkan hooks: {}", why);
+			}
 		}
 		else
 		{
-			SetHookState(VulkanRuntime::Hooks::Failed, why);
-			Log::Error("Vulkan hooks: {}", why);
-		}
+			std::string why;
 
-		return;
-	}
+			if (!HookLoading(why))
+			{
+				SetHookState(VulkanRuntime::Hooks::Failed, why);
+				Log::Error("Vulkan hooks: {}", why);
+				return;
+			}
 
-	std::string why;
+			SetHookState(VulkanRuntime::Hooks::Waiting, {});
+			Log::Info("vulkan-1.dll isn't loaded yet ({}), the Vulkan hooks go in when it is", caller);
 
-	if (!HookLoading(why))
-	{
-		SetHookState(VulkanRuntime::Hooks::Failed, why);
-		Log::Error("Vulkan hooks: {}", why);
-		return;
-	}
+			// It may have been loaded between the check and the hook
+			if (const HMODULE loader = GetModuleHandleW(LoaderName); loader && !s.loaderHooked)
+			{
+				std::string late;
 
-	SetHookState(VulkanRuntime::Hooks::Waiting, {});
-	Log::Info("vulkan-1.dll isn't loaded yet ({}), the Vulkan hooks go in when it is", caller);
-
-	// It may have been loaded between the check and the hook
-	if (const HMODULE loader = GetModuleHandleW(LoaderName); loader && !s.loaderHooked)
-	{
-		std::string late;
-
-		if (InstallLoader(loader, late))
-		{
-			SetHookState(VulkanRuntime::Hooks::Installed, {});
-			Log::Info("Vulkan hooks installed on vkCreateInstance and vkCreateDevice");
-		}
-		else
-		{
-			SetHookState(VulkanRuntime::Hooks::Failed, late);
-			Log::Error("Vulkan hooks: {}", late);
+				if (InstallLoader(loader, late))
+				{
+					SetHookState(VulkanRuntime::Hooks::Installed, {});
+					Log::Info("Vulkan hooks installed on vkCreateInstance and vkCreateDevice");
+					shouldPreload = true;
+				}
+				else
+				{
+					SetHookState(VulkanRuntime::Hooks::Failed, late);
+					Log::Error("Vulkan hooks: {}", late);
+				}
+			}
 		}
 	}
+
+	if (shouldPreload)
+		VulkanPrograms::PreloadAsync();
 }
 
 void VulkanHost::SetEnabled(bool enabled)
@@ -2659,6 +2880,8 @@ namespace
 void VulkanHost::NotifyBatchStart(uint32_t generatedCount) noexcept
 {
 	State& s = S();
+	s.antiLagGenCount.store(generatedCount, std::memory_order_relaxed);
+	s.antiLagPresentsInBatch.store(0, std::memory_order_relaxed);
 	if (!PacingActive(s))
 		return;
 	SetSystemTimerRaised(s, true);
@@ -2669,6 +2892,8 @@ void VulkanHost::NotifyBatchStart(uint32_t generatedCount) noexcept
 void VulkanHost::NotifyPaused() noexcept
 {
 	State& s = S();
+	s.antiLagGenCount.store(0, std::memory_order_relaxed);
+	s.antiLagPresentsInBatch.store(0, std::memory_order_relaxed);
 	SetSystemTimerRaised(s, false);
 	std::lock_guard lock(s.pacerMutex);
 	s.pacer.OnPaused();

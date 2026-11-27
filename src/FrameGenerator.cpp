@@ -9,6 +9,7 @@
 #include "MfgPort/Cuda/cuda_route.h"
 #include "MfgPort/AdapterIdentity.h"
 #include "D3D12VulkanWmma.h"
+#include "vulkan/VulkanPolicy.h"
 #include "MfgPort/Wmma/wmma_route.h"
 #include "Plugin.h"
 #include "Util.h"
@@ -1076,6 +1077,21 @@ bool FrameGenerator::CreateContext()
 	Log::Info("Creating XeFG context: {}x{}, format: {}, flags: {:X}, ui mode: {}, model: {}", settings.width,
 		settings.height, (uint32_t)settings.format, settings.initFlags, settings.uiMode, settings.model);
 
+	if (VulkanPolicy::NeedsHdrBootstrapReinit(static_cast<uint32_t>(settings.format), MaxFrames, hdrBootstrapped))
+	{
+		xefgd_init_params_t bootParams = initParams;
+		bootParams.maxInterpolatedFrames = 1;
+		if (const auto bootRes = XeFG::Init(newContext->handle, bootParams); bootRes == XEFGD_RESULT_SUCCESS)
+		{
+			hdrBootstrapped = true;
+			Log::Info("XeFG HDR10 bootstrap reinit: Init(1) -> Init({})", MaxFrames);
+		}
+		else
+		{
+			Log::Warn("XeFG HDR10 bootstrap Init(1) returned {}; continuing with Init({})", bootRes, MaxFrames);
+		}
+	}
+
 	if (auto result = XeFG::Init(newContext->handle, initParams); result != XEFGD_RESULT_SUCCESS)
 	{
 		const HRESULT removed = device ? device->GetDeviceRemovedReason() : S_OK;
@@ -1900,6 +1916,7 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 		TypedFormat(outputDesc.Format) == settings.format &&
 		context->outputs[frameIndex - 1] != nullptr)
 	{
+		Log::ScopedDredEvent dredCopyEvent(cmdList, L"dlssg-to-xefg: wmma-copy");
 		if (useVulkanWmma &&
 			D3D12VulkanWmma::AppendOutputCopy(cmdList, context->outputs[frameIndex - 1].Get(), output, OutputState))
 		{
@@ -1995,6 +2012,7 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 			nextFrame.depth.Get(), nextFrame.mvecs.Get(), nextFrame.data,
 			nextFrame.backbuffer.Get(), XeFGInputState
 		};
+		Log::ScopedDredEvent dredBatchEvent(cmdList, L"dlssg-to-xefg: wmma-batch");
 		if (D3D12VulkanWmma::ScheduleBatch(cmdList, vkSettings, vkPrev, vkNext,
 			reinterpret_cast<ID3D12Resource* const*>(context->outputs), context->outputBases, frameCount,
 			output, OutputState, callerRecording))
@@ -2033,9 +2051,12 @@ FrameGenerator::InterpolateResult FrameGenerator::Interpolate(ID3D12GraphicsComm
 	bool usedDot4 = false;
 	const bool tryDot4 = currentExecRoute == ActiveExecRoute::D3D12Dxil &&
 		settings.model == MfgKernels::MfgModel && xefg_wmma::UsesD3D12Dot4Override();
-	const auto result = tryDot4
-		? xefg_wmma::ExecuteDot4(context->handle, cmdList, params, interpolationTime, usedDot4)
-		: XeFG::Execute(context->handle, cmdList, params, interpolationTime);
+	const auto result = [&]() {
+		Log::ScopedDredEvent dredExecEvent(cmdList, tryDot4 ? L"dlssg-to-xefg: execute-dot4" : L"dlssg-to-xefg: execute");
+		return tryDot4
+			? xefg_wmma::ExecuteDot4(context->handle, cmdList, params, interpolationTime, usedDot4)
+			: XeFG::Execute(context->handle, cmdList, params, interpolationTime);
+	}();
 	if (usedDot4)
 	{
 		currentExecRoute = ActiveExecRoute::D3D12Dot4;

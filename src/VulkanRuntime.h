@@ -35,6 +35,10 @@ namespace VulkanRuntime
 	// environment or VulkanHooks=0 in OptiScaler.ini turn them off
 	void SetHooksEnabled(bool enabled);
 
+	// Marks the tracked Vulkan device as abandoned when its VkInstance is destroyed, so teardown skips
+	// calling back into a dead ICD (0% runtime overhead).
+	void AbandonInstance(const void* instance) noexcept;
+
 	enum class Hooks
 	{
 		Off,       // not started, or turned off

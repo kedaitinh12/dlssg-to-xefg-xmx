@@ -116,9 +116,14 @@ namespace VulkanPrograms
 	// that folder is xefg_mfg_programs\programs (the layout of MFG-Unlocker's build input) it is still the one next to it
 	std::filesystem::path DirectoryFor(const std::filesystem::path& programsDirectory);
 
-	// The set next to this dll (xefg_mfg_programs\vulkan), loaded once on the first call and logged. Reading and hashing
-	// the files takes a few milliseconds, so the first call belongs to start-up and not to a frame
+	// The set next to this dll (xefg_mfg_programs\vulkan), loaded once on the first call and logged. Loaded lazily on
+	// demand (or preloaded in the background via PreloadAsync() once vulkan-1.dll is present) so pure DX12 games do not
+	// pay the disk I/O and SHA-256 verification cost at start-up
 	const Set& Installed();
+
+	// Starts loading Installed() on a background thread at most once (no-op if already loaded). Call when vulkan-1.dll
+	// is present or has just been loaded so models are ready before the game creates its Vulkan device
+	void PreloadAsync() noexcept;
 
 	// The same set once Installed() has loaded it, null before. For the menu, which must not be the one that loads it
 	const Set* Loaded();

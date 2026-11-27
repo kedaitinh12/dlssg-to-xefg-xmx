@@ -188,6 +188,57 @@ namespace VulkanPolicy
 		return a != Dxgi::Unknown && a == ColorFormat(target).dxgi;
 	}
 
+	// Resolves the VkFormat used for storage image views (UAVs) in Vulkan HUD compute passes.
+	// On drivers without VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT on BGRA8_UNORM, aliases the mutable
+	// BGRA8 image as RGBA8_UNORM (same 32-bit texel layout; zero extra copy pass).
+	inline uint32_t ColorStorageViewFormat(uint32_t dxgiFormat, bool bgra8StorageSupported) noexcept
+	{
+		if (dxgiFormat == Dxgi::R10G10B10A2Unorm)
+			return Vk::A2B10G10R10UnormPack32;
+		if (dxgiFormat == Dxgi::B8G8R8A8Unorm)
+			return bgra8StorageSupported ? Vk::B8G8R8A8Unorm : Vk::R8G8B8A8Unorm;
+		return Vk::R8G8B8A8Unorm;
+	}
+
+	// One-time HDR10 (R10G10B10A2_UNORM) bootstrap reinit (1 -> maxFrames) before multi-frame (>1)
+	// XeFG::Init, inspired by XeFG-HDRReinit 1.1.0 via public C++ API without binary-patching libxess_fg.dll.
+	inline bool NeedsHdrBootstrapReinit(uint32_t dxgiFormat, uint32_t maxFrames, bool alreadyBootstrapped) noexcept
+	{
+		return !alreadyBootstrapped && maxFrames > 1u && dxgiFormat == Dxgi::R10G10B10A2Unorm;
+	}
+
+	// Decides whether VulkanHost::PrepareDevice may enable opt-in VK_AMD_anti_lag on the game's VkDevice.
+	// Requires: opt-in enabled, AMD GPU, extension offered, VkPhysicalDeviceAntiLagFeaturesAMD::antiLag == VK_TRUE,
+	// single-GPU (not a multi-GPU VkDeviceGroupDeviceCreateInfo), and neither extension nor feature struct supplied by the game.
+	inline bool CanEnableAmdAntiLag(bool optInEnabled, uint32_t vendorId, bool extOffered, bool featureSupported,
+		uint32_t deviceGroupPhysicalCount, bool gameEnabledExt, bool gamePassedFeatureStruct) noexcept
+	{
+		return optInEnabled && vendorId == 0x1002u && extOffered && featureSupported &&
+			deviceGroupPhysicalCount <= 1u && !gameEnabledExt && !gamePassedFeatureStruct;
+	}
+
+	// Decides whether VulkanHost should emit opt-in VK_AMD_anti_lag Present/Input markers.
+	// OFF by default and automatically skipped if the game already enabled VK_AMD_anti_lag itself,
+	// preventing dual-pacer stutter or hang conflicts.
+	inline bool ShouldDispatchAmdAntiLag(
+		bool optInEnabled, uint32_t vendorId, bool hasProc, bool gameAlreadyEnabled, bool abandoned) noexcept
+	{
+		return optInEnabled && vendorId == 0x1002u && hasProc && !gameAlreadyEnabled && !abandoned;
+	}
+
+	// Gates VK_AMD_anti_lag Present/Input markers to registered swapchains owned by the Anti-Lag device
+	// and strictly once to the real-frame present of an active MFG batch (skipping interpolated presents
+	// and any extra presents arriving before the next batch begins).
+	inline bool IsRealFramePresentForAntiLag(
+		bool swapchainMatchesDevice, uint32_t generatedCount, uint32_t presentsInBatchAfter) noexcept
+	{
+		if (!swapchainMatchesDevice)
+			return false;
+		if (generatedCount == 0u)
+			return true;
+		return presentsInBatchAfter == generatedCount + 1u;
+	}
+
 	// Combined depth/stencil image views cannot be sampled by our float sampler.
 	// Callers must supply a single depth or color aspect (Vulkan bits 2 and 1).
 	inline bool SampledAspect(uint32_t aspect) noexcept { return aspect == 1 || aspect == 2; }
@@ -936,4 +987,28 @@ namespace VulkanPolicy
 			return waitNs;
 		}
 	};
+
+	// D3D12->Vulkan WMMA context-init failure backoff policy.
+	// Retries at most 3 times with a 10-second cooldown for identical context settings; retries immediately when
+	// settings change (e.g. resolution/format/model switch).
+	constexpr bool CanRetryFailedWmmaContext(uint32_t failCount, uint64_t elapsedMs, bool sameSettings) noexcept
+	{
+		if (!sameSettings)
+			return true;
+		return failCount < 3u && elapsedMs >= 10'000ull;
+	}
+
+	// ResetContext() clears failed-init backoff only when tearing down a previously working WMMA context.
+	// Menu open/close cycles in games like Forza Horizon 6 call ResetContext() repeatedly even while WMMA is
+	// already in failed/backoff state; preserving the backoff prevents repeated failed init storms.
+	constexpr bool ShouldResetWmmaFailedState(bool hadLiveContext) noexcept
+	{
+		return hadLiveContext;
+	}
+
+	// Validates a standalone SPIR-V binary blob (magic 0x07230203, 4-byte word-aligned, >= 5 header words, <= 1 MiB).
+	constexpr bool IsValidSpirvBlob(size_t byteSize, uint32_t firstWord) noexcept
+	{
+		return byteSize >= 20u && byteSize <= (1024u * 1024u) && (byteSize % 4u) == 0u && firstWord == 0x07230203u;
+	}
 } // namespace VulkanPolicy

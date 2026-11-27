@@ -138,9 +138,18 @@ bool AntiLagUpdate(ID3D12Device* device, bool on, uint32_t maxFps, VkAntiLagStag
 // a recording is already open.
 bool BeginRecording(ID3D12Device* device, VkCommandBuffer commandBuffer) noexcept;
 void EndRecording(ID3D12Device* device) noexcept;
+// Closes an open recording that will never be submitted (e.g. failed init/execute) without pushing an
+// unsubmitted VkEvent epoch, clamping in-flight graves to the last submitted epoch and collecting ready ones.
+void CancelRecording(ID3D12Device* device) noexcept;
+// Reverts the most recent EndRecording() epoch when the caller failed to submit that command buffer
+// (e.g. vkEndCommandBuffer / vkCreateFence / vkQueueSubmit2 failed), preventing permanent grave/VRAM leaks.
+void DiscardLastRecording(ID3D12Device* device) noexcept;
 // Waits (bounded) until the GPU has run every recording ended so far; false on timeout or a recording never
 // submitted.
 bool WaitRecordedIdle(ID3D12Device* device, uint64_t timeoutNs) noexcept;
+// Marks the underlying xvk device as abandoned (after vkDestroyInstance or VK_ERROR_DEVICE_LOST) so
+// subsequent Resource destructors, DeferDestroy(), Collect(), and WaitIdle() skip all Vulkan ICD calls.
+void AbandonDevice(ID3D12Device* device) noexcept;
 // The VkImage behind an xvk texture (null for buffers and foreign objects). Its layout is GENERAL.
 VkImage ImageOf(ID3D12Resource* resource) noexcept;
 // Wraps an externally-owned VkImage (for example an imported D3D12 shared texture) as an xvk ID3D12Resource

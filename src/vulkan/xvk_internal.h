@@ -24,6 +24,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace xvk {
@@ -240,6 +241,8 @@ private:
     HMODULE module_ = nullptr;
     std::mutex mutex_;
     std::unordered_map<std::string, size_t> index_;              // DXIL SHA-256 -> embedded row
+    std::vector<std::pair<std::string, std::string>> dynamicAliases_; // runtime DXIL replacement SHA-256 -> native Intel SHA-256
+    std::unordered_map<std::string, std::unique_ptr<Program>> overridePrograms_; // optional SPIR-V overrides keyed by native DXIL SHA-256
     std::unordered_map<std::string, std::unique_ptr<Program>> loaded_;
 };
 std::string Sha256(const void* data, size_t size);
@@ -732,6 +735,7 @@ public:
     // Runs `destroy` once every queue has finished the work submitted before this call.
     void DeferDestroy(std::function<void()> destroy);
     void Collect();
+    void Abandon() noexcept;
     // vkprov.1 (DeviceDesc::recorded): the command buffer lists record into while a recording is open (null
     // otherwise), and the recording's bounds (xvk.h BeginRecording / EndRecording).
     bool recorded() const { return recorded_; }
@@ -743,6 +747,8 @@ public:
     VkCommandBuffer RecordingBuffer();
     bool BeginRecording(VkCommandBuffer commandBuffer);
     void EndRecording();
+    void CancelRecording();
+    void DiscardLastRecording();
     // Marks recordings the GPU has run as finished on the progress timeline (their events are set), then collects.
     void PollRecordings();
     // Adds this queue's progress signal to a submission (caller holds slot.mutex).
@@ -838,6 +844,7 @@ private:
     std::mutex graveMutex_;
     std::vector<Grave> graves_;
     std::atomic<bool> hasGraves_{false};
+    std::atomic<bool> abandoned_{false};
 
     // vkprov.1: recorded mode. One queue-less slot carries the progress timeline; each ended recording is an epoch
     // whose event, set by the GPU at the end of the caller's command buffer, moves the timeline to its value.

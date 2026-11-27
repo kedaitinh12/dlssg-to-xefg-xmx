@@ -1,8 +1,13 @@
 // Root signature (RTS0) parsing and the embedded SPIR-V program set (generate_xvk_programs.py).
 #include "xvk_internal.h"
+#include "VulkanPolicy.h"
 #include "VulkanProgramLookup.h"
+#include "../MfgKernels.h"
+#include "../MfgPort/RuntimePayload.h"
 #include "../MfgPort/Sha256.h"
 #include "../VulkanPrograms.h"
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <set>
 
@@ -170,7 +175,54 @@ void ProgramSet::Load(HMODULE module)
     const auto& set = VulkanPrograms::Installed();
     if (set.Usable())
         for (const auto& [dxil, row] : set.byDxil) index_.emplace(std::string(dxil), row);
-    Log("program set: %zu programs from xefg_mfg_programs\\vulkan, manifest %.16s", index_.size(), set.manifestSha256.c_str());
+    dynamicAliases_.clear();
+    try {
+        for (const auto& r : xess_payload::LoadReplacements(MfgKernels::ProgramsDirectory())) {
+            const std::string repHash = xess_payload::Hash(r.bytes);
+            if (!repHash.empty() && !r.nativeHash.empty())
+                dynamicAliases_.emplace_back(repHash, r.nativeHash);
+        }
+    } catch (...) {
+        // Strictly optional: dynamic replacement aliases must never block Vulkan program set loading.
+    }
+    overridePrograms_.clear();
+    try {
+        struct SplatSpvSpec { const char* file; const char* nativeHash; };
+        static constexpr SplatSpvSpec kSplatSpv[] = {
+            { "splat_motion_aware.spv",          "3f3f91d2ecd4345042f0519f7455776314be9e7730453a3fcb42c57f0acb49b5" },
+            { "splat_motion_aware_inverted.spv", "c3649191906bdd300462dbafe6add8f82b09e8e10c41e92784a209d99513224b" },
+        };
+        const auto replDir = MfgKernels::ProgramsDirectory() / "replacements";
+        std::error_code ec;
+        for (const auto& spec : kSplatSpv) {
+            const auto spvPath = replDir / spec.file;
+            if (!std::filesystem::is_regular_file(spvPath, ec)) continue;
+            std::ifstream in(spvPath, std::ios::binary | std::ios::ate);
+            if (!in) continue;
+            const auto endPos = in.tellg();
+            if (endPos < 20 || endPos > 1024 * 1024) continue;
+            const size_t sz = static_cast<size_t>(endPos);
+            if ((sz % 4u) != 0u) continue;
+            std::vector<uint32_t> words(sz / 4u);
+            in.seekg(0, std::ios::beg);
+            if (!in.read(reinterpret_cast<char*>(words.data()), static_cast<std::streamsize>(sz))) continue;
+            if (!VulkanPolicy::IsValidSpirvBlob(sz, words[0])) continue;
+            auto prog = std::make_unique<Program>();
+            prog->sha256 = spec.nativeHash;
+            prog->spirv = std::move(words);
+            prog->pushConstantBytes = 40u;
+            prog->bindings = {
+                { kSrvBase + 0u, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE },
+                { kSrvBase + 1u, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE },
+                { kUavBase + 0u, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER },
+            };
+            overridePrograms_.emplace(spec.nativeHash, std::move(prog));
+        }
+    } catch (...) {
+        // Strictly optional: SPIR-V splat overrides must never block Vulkan program set loading.
+    }
+    Log("program set: %zu programs from xefg_mfg_programs\\vulkan, manifest %.16s (%zu replacement aliases, %zu splat SPIR-V overrides)",
+        index_.size(), set.manifestSha256.c_str(), dynamicAliases_.size(), overridePrograms_.size());
 }
 
 
@@ -202,8 +254,10 @@ const Program* ProgramSet::LoadRow(size_t rowIdx, const std::string& key)
 
 const Program* ProgramSet::Find(const std::string& requested)
 {
-    const std::string sha256 = ResolveProgramHash(index_, requested);
+    const std::string sha256 = ResolveProgramHash(index_, requested, dynamicAliases_);
     std::lock_guard lock(mutex_);
+    if (auto ov = overridePrograms_.find(sha256); ov != overridePrograms_.end() && ov->second)
+        return ov->second.get();
     auto row = index_.find(sha256);
     if (row == index_.end()) return nullptr;
     return LoadRow(row->second, sha256);
@@ -211,8 +265,11 @@ const Program* ProgramSet::Find(const std::string& requested)
 
 const Program* ProgramSet::FindForRoot(const std::string& requested, const RootLayout& root)
 {
-    const std::string sha256 = ResolveProgramHash(index_, requested);
+    const std::string sha256 = ResolveProgramHash(index_, requested, dynamicAliases_);
     std::lock_guard lock(mutex_);
+    if (auto ov = overridePrograms_.find(sha256); ov != overridePrograms_.end() && ov->second &&
+        MatchesRootLayout(*ov->second, root))
+        return ov->second.get();
     auto row = index_.find(sha256);
     if (row == index_.end()) return nullptr;
     const Program* direct = LoadRow(row->second, sha256);

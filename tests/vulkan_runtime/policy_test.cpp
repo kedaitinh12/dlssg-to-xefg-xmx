@@ -8,6 +8,7 @@
 #include <cmath>
 #include "XeFgEnabler.h"
 #include "HwFlipQueue.h"
+#include "DredAttribution.h"
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -714,6 +715,131 @@ int main()
 		CHECK(std::string_view(HwFlipQueue::StateName(HwFlipQueue::State::Enabled)) == "enabled");
 		CHECK(std::string_view(HwFlipQueue::StateName(HwFlipQueue::State::Disabled)) == "disabled");
 		CHECK(std::string_view(HwFlipQueue::StateName(HwFlipQueue::State::Unknown)) == "unknown");
+	}
+
+	// DRED stage attribution (before / inside / after / no_xefg)
+	{
+		using namespace DredAttribution;
+		const auto r0 = Classify(5, 10, nullptr, 0);
+		CHECK(r0.location == Location::NoXefg && !r0.hasXefgSpan);
+
+		const ContextEntry gameOnly[] = {
+			{ 2, L"Game: ShadowPass", nullptr },
+			{ 7, L"Game: PostProcess", nullptr },
+		};
+		const auto r1 = Classify(5, 10, gameOnly, 2);
+		CHECK(r1.location == Location::NoXefg && !r1.hasXefgSpan);
+
+		const ContextEntry entries[] = {
+			{ 1,  L"Game: GBuffer", nullptr },
+			{ 5,  L"dlssg-to-xefg: wmma-batch", nullptr },
+			{ 9,  L"dlssg-to-xefg: execute", nullptr },
+			{ 15, L"Game: PresentUI", nullptr },
+		};
+
+		const auto before = Classify(3, 20, entries, 4);
+		CHECK(before.location == Location::BeforeXefg);
+		CHECK(before.hasXefgSpan && before.xefgBegin == 5 && before.xefgEnd == 14);
+		CHECK(before.activeStageW == nullptr);
+
+		const auto inside1 = Classify(6, 20, entries, 4);
+		CHECK(inside1.location == Location::InsideXefg);
+		CHECK(inside1.activeStageW != nullptr && std::wstring_view(inside1.activeStageW) == L"dlssg-to-xefg: wmma-batch");
+		CHECK(inside1.activeStageIndex == 5);
+
+		const auto inside2 = Classify(14, 20, entries, 4);
+		CHECK(inside2.location == Location::InsideXefg);
+		CHECK(inside2.activeStageW != nullptr && std::wstring_view(inside2.activeStageW) == L"dlssg-to-xefg: execute");
+		CHECK(inside2.activeStageIndex == 9);
+
+		const auto after = Classify(15, 20, entries, 4);
+		CHECK(after.location == Location::AfterXefg);
+		CHECK(after.xefgBegin == 5 && after.xefgEnd == 14);
+
+		const ContextEntry unsorted[] = {
+			{ 12, nullptr, "dlssg-to-xefg: wmma-copy" },
+			{ 4,  nullptr, "" },
+			{ 8,  nullptr, "dlssg-to-xefg: execute-dot4" },
+		};
+		const auto rt = Classify(16, 20, unsorted, 3);
+		CHECK(rt.location == Location::InsideXefg);
+		CHECK(rt.xefgBegin == 8 && rt.xefgEnd == 19);
+		CHECK(rt.activeStageA != nullptr && std::string_view(rt.activeStageA) == "dlssg-to-xefg: wmma-copy");
+		CHECK(std::string_view(LocationName(Location::InsideXefg)) == "inside_xefg");
+	}
+
+	// Vulkan HUD storage image view format resolution (BGRA8 -> RGBA8 zero-copy mutable alias fallback)
+	{
+		using namespace VulkanPolicy;
+		CHECK(ColorStorageViewFormat(Dxgi::R10G10B10A2Unorm, true) == Vk::A2B10G10R10UnormPack32);
+		CHECK(ColorStorageViewFormat(Dxgi::R10G10B10A2Unorm, false) == Vk::A2B10G10R10UnormPack32);
+		CHECK(ColorStorageViewFormat(Dxgi::R8G8B8A8Unorm, true) == Vk::R8G8B8A8Unorm);
+		CHECK(ColorStorageViewFormat(Dxgi::R8G8B8A8Unorm, false) == Vk::R8G8B8A8Unorm);
+		CHECK(ColorStorageViewFormat(Dxgi::B8G8R8A8Unorm, true) == Vk::B8G8R8A8Unorm);
+		CHECK(ColorStorageViewFormat(Dxgi::B8G8R8A8Unorm, false) == Vk::R8G8B8A8Unorm);
+		CHECK(ColorStorageViewFormat(Dxgi::Unknown, false) == Vk::R8G8B8A8Unorm);
+
+		// One-time HDR10 bootstrap reinit (1 -> maxFrames) policy
+		CHECK(NeedsHdrBootstrapReinit(Dxgi::R10G10B10A2Unorm, 5u, false));
+		CHECK(NeedsHdrBootstrapReinit(Dxgi::R10G10B10A2Unorm, 2u, false));
+		CHECK(!NeedsHdrBootstrapReinit(Dxgi::R10G10B10A2Unorm, 1u, false));
+		CHECK(!NeedsHdrBootstrapReinit(Dxgi::R10G10B10A2Unorm, 5u, true));
+		CHECK(!NeedsHdrBootstrapReinit(Dxgi::R8G8B8A8Unorm, 5u, false));
+		CHECK(!NeedsHdrBootstrapReinit(Dxgi::B8G8R8A8Unorm, 5u, false));
+		CHECK(!NeedsHdrBootstrapReinit(Dxgi::R16G16B16A16Float, 5u, false));
+
+		// Opt-in VK_AMD_anti_lag device-create guard (feature bit, single-GPU, game-owned ext/struct)
+		CHECK(CanEnableAmdAntiLag(true, 0x1002u, true, true, 1u, false, false));
+		CHECK(CanEnableAmdAntiLag(true, 0x1002u, true, true, 0u, false, false));
+		CHECK(!CanEnableAmdAntiLag(false, 0x1002u, true, true, 1u, false, false));
+		CHECK(!CanEnableAmdAntiLag(true, 0x10DEu, true, true, 1u, false, false));
+		CHECK(!CanEnableAmdAntiLag(true, 0x1002u, false, true, 1u, false, false));
+		CHECK(!CanEnableAmdAntiLag(true, 0x1002u, true, false, 1u, false, false));
+		CHECK(!CanEnableAmdAntiLag(true, 0x1002u, true, true, 2u, false, false));
+		CHECK(!CanEnableAmdAntiLag(true, 0x1002u, true, true, 1u, true, false));
+		CHECK(!CanEnableAmdAntiLag(true, 0x1002u, true, true, 1u, false, true));
+
+		// Opt-in VK_AMD_anti_lag dispatch policy (OFF by default, AMD only, skips if game already enabled it)
+		CHECK(ShouldDispatchAmdAntiLag(true, 0x1002u, true, false, false));
+		CHECK(!ShouldDispatchAmdAntiLag(false, 0x1002u, true, false, false));
+		CHECK(!ShouldDispatchAmdAntiLag(true, 0x10DEu, true, false, false));
+		CHECK(!ShouldDispatchAmdAntiLag(true, 0x8086u, true, false, false));
+		CHECK(!ShouldDispatchAmdAntiLag(true, 0x1002u, false, false, false));
+		CHECK(!ShouldDispatchAmdAntiLag(true, 0x1002u, true, true, false));
+		CHECK(!ShouldDispatchAmdAntiLag(true, 0x1002u, true, false, true));
+
+		// Anti-Lag swapchain ownership + MFG real-frame gating
+		CHECK(!IsRealFramePresentForAntiLag(false, 0u, 1u)); // unregistered / foreign swapchain: never fire
+		CHECK(!IsRealFramePresentForAntiLag(false, 2u, 3u)); // unregistered swapchain even on real frame: never fire
+		CHECK(IsRealFramePresentForAntiLag(true, 0u, 1u));   // FG paused/off: every present is a real frame
+		CHECK(!IsRealFramePresentForAntiLag(true, 1u, 1u));  // 2x MFG: 1st present is interpolated -> skip
+		CHECK(IsRealFramePresentForAntiLag(true, 1u, 2u));   // 2x MFG: 2nd present is real -> fire
+		CHECK(!IsRealFramePresentForAntiLag(true, 2u, 1u));  // 3x MFG: interp 1 -> skip
+		CHECK(!IsRealFramePresentForAntiLag(true, 2u, 2u));  // 3x MFG: interp 2 -> skip
+		CHECK(IsRealFramePresentForAntiLag(true, 2u, 3u));   // 3x MFG: real frame 3 -> fire once
+		CHECK(!IsRealFramePresentForAntiLag(true, 2u, 4u));  // 3x MFG: extra present before next batch -> skip
+		CHECK(!IsRealFramePresentForAntiLag(true, 3u, 1u));  // 4x MFG: interp 1 -> skip
+		CHECK(!IsRealFramePresentForAntiLag(true, 3u, 3u));  // 4x MFG: interp 3 -> skip
+		CHECK(IsRealFramePresentForAntiLag(true, 3u, 4u));   // 4x MFG: real frame 4 -> fire once
+		CHECK(!IsRealFramePresentForAntiLag(true, 3u, 5u));  // 4x MFG: extra present before next batch -> skip
+
+		// D3D12->Vulkan WMMA context-init failure backoff & ResetContext preservation (FH6 menu toggle storm)
+		CHECK(!CanRetryFailedWmmaContext(1u, 0ull, true));       // same settings, <10s cooldown -> skip
+		CHECK(!CanRetryFailedWmmaContext(1u, 9999ull, true));    // still inside 10s cooldown -> skip
+		CHECK(CanRetryFailedWmmaContext(1u, 10000ull, true));    // cooldown elapsed, attempt < 3 -> retry
+		CHECK(CanRetryFailedWmmaContext(2u, 15000ull, true));    // cooldown elapsed, attempt < 3 -> retry
+		CHECK(!CanRetryFailedWmmaContext(3u, 60000ull, true));   // 3 failures reached -> stop retrying same settings
+		CHECK(CanRetryFailedWmmaContext(3u, 0ull, false));       // settings changed -> retry immediately
+		CHECK(!ShouldResetWmmaFailedState(false));               // menu toggle without live context -> keep backoff
+		CHECK(ShouldResetWmmaFailedState(true));                 // tearing down working context -> reset backoff
+
+		// Standalone SPIR-V override validation (splat_motion_aware*.spv)
+		CHECK(IsValidSpirvBlob(20u, 0x07230203u));
+		CHECK(IsValidSpirvBlob(4096u, 0x07230203u));
+		CHECK(!IsValidSpirvBlob(16u, 0x07230203u));              // truncated header
+		CHECK(!IsValidSpirvBlob(22u, 0x07230203u));              // not 4-byte word aligned
+		CHECK(!IsValidSpirvBlob(20u, 0x43425844u));              // DXBC magic, not SPIR-V
+		CHECK(!IsValidSpirvBlob(2u * 1024u * 1024u, 0x07230203u)); // > 1 MiB rejected
 	}
 
 	std::printf("%d checks, %d failed\n", checks, failures);

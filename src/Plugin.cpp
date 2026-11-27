@@ -532,13 +532,19 @@ namespace
 			DrawVulkanProvider();
 	}
 
-	// The Vulkan models in xefg_mfg_programs\vulkan, read and checked when the plugin starts
+	// The Vulkan models in xefg_mfg_programs\vulkan, lazily loaded when vulkan-1.dll or the WMMA bridge is used
 	void DrawVulkanModels()
 	{
 		const auto* set = VulkanPrograms::Loaded();
 
 		if (!set)
+		{
+			api->TextDisabled("Vulkan models: deferred (loads on demand)");
+			api->ItemTooltip(
+				"Vulkan models are only read and verified when vulkan-1.dll or the D3D12-Vulkan WMMA bridge is used.\n"
+				"Pure DX12 games skip loading them to avoid start-up I/O overhead.");
 			return;
+		}
 
 		if (!set->present)
 		{
@@ -564,7 +570,7 @@ namespace
 
 		api->Text(std::format("Vulkan models: {} programs", set->programs.size()).c_str());
 		api->ItemTooltip(std::format("{}\n{}\n"
-			"Every program was checked against its SHA-256 at start-up.{}",
+			"Every program was checked against its SHA-256 when loaded.{}",
 			VulkanPrograms::Summary(*set), VulkanPrograms::PathText(set->directory),
 			VulkanRuntime::Built() ? " Vulkan games run them on this dll's own D3D12-on-Vulkan layer."
 			                       : " Running them takes the D3D12 layer of MFGUnlocker.asi (this build has none of its own).")
@@ -741,6 +747,22 @@ namespace
 		HelpMarker("Keeps Vulkan frame pacing just under your monitor refresh rate (Hz - 3)\n"
 				   "so FreeSync / G-Sync stays smooth without V-Sync input lag.\n"
 				   "Avoid combining with RTSS / NVCP / AMD Chill FPS caps to prevent double-limiting stutter.");
+
+		bool vkAmdAntiLag = Plugin::options.vkAmdAntiLag;
+
+		{
+			ScopedDisable dis(isD3D12);
+			if (api->Checkbox("AMD Anti-Lag 2 (Vulkan, experimental)", &vkAmdAntiLag))
+			{
+				Plugin::options.vkAmdAntiLag = vkAmdAntiLag;
+				api->SetBool(self, "VkAmdAntiLag", vkAmdAntiLag);
+				NotifySettingChanged(NoticeKind::RestartGame, "AMD Anti-Lag 2 (Vulkan)");
+			}
+		}
+		HelpMarker("Opt-in (OFF by default; requires game restart): enables VK_AMD_anti_lag\n"
+				   "on AMD GPUs in Vulkan games to reduce input latency during Frame Generation.\n"
+				   "WARNING: Keep OFF if the game or OptiScaler already enables Anti-Lag 2 or\n"
+				   "Reflex, as running two low-latency pacers together can cause stutter or hangs.");
 
 		bool vkWmmaBridge = Plugin::options.d3d12VulkanWmmaBridge;
 
@@ -1032,7 +1054,7 @@ namespace
 		if (api->Button("Reset Defaults"))
 		{
 			static const char* const kAllKeys[] = {
-				"NetworkPath", "HudlessUi", "CameraCutDetection", "VramGuard", "AutoVrrPacing",
+				"NetworkPath", "HudlessUi", "CameraCutDetection", "VramGuard", "AutoVrrPacing", "VkAmdAntiLag",
 				"D3D12VulkanWmmaBridge", "UiTransitionCooldown", "GhostBuster", "PacingSpinlockSleep",
 				"DepthInvertedOverride", "JitteredMvOverride", "UiAlphaMode", "HudTierMode",
 				"ToneMapMatchMode", "IgnoreGameReset", "Logging", "CrashMiniDump", "ForceDRED"
@@ -1052,6 +1074,7 @@ namespace
 			Plugin::options.cameraCutDetection = true;
 			Plugin::options.vramGuard = true;
 			Plugin::options.autoVrrPacing = false;
+			Plugin::options.vkAmdAntiLag = false;
 			Plugin::options.d3d12VulkanWmmaBridge = true;
 			Plugin::options.uiTransitionCooldown = false;
 			Plugin::options.ghostBuster = false;
@@ -1099,37 +1122,15 @@ namespace
 		return _wcsicmp(ThisModulePath().extension().c_str(), L".asi") == 0;
 	}
 
-	// Pre-read and validate xefg_mfg_programs\vulkan on a background thread during early bootstrap so
-	// OptiPluginInit doesn't stall the main thread for disk I/O when the game initializes.
-	std::once_flag preloadModelsOnce;
-
-	void StartAsyncModelPreload()
+	// Lazily pre-read and validate xefg_mfg_programs\vulkan on a background thread only when
+	// vulkan-1.dll is already loaded in the process. Pure DX12 games skip the disk I/O and SHA-256
+	// verification completely at start-up; Vulkan games that load vulkan-1.dll dynamically trigger
+	// VulkanPrograms::PreloadAsync() from VulkanHost::InstallFromLoad(), and the D3D12-Vulkan WMMA
+	// bridge loads on demand via VulkanPrograms::Installed().
+	void PreloadVulkanModelsIfLoaded() noexcept
 	{
-		std::call_once(preloadModelsOnce,
-			[]
-			{
-				try
-				{
-					std::thread(
-						[]
-						{
-							try
-							{
-								VulkanPrograms::Installed();
-							}
-							catch (const std::exception& error)
-							{
-								Log::Warn("Vulkan models (early preload): {}", error.what());
-							}
-							catch (...)
-							{
-							}
-						}).detach();
-				}
-				catch (...)
-				{
-				}
-			});
+		if (GetModuleHandleW(L"vulkan-1.dll") != nullptr)
+			VulkanPrograms::PreloadAsync();
 	}
 
 	// Legacy fallback when a user manually copies the main DLL as .asi into plugins\.
@@ -1162,7 +1163,7 @@ namespace
 		if (!IsEarlyCopy())
 		{
 			VulkanRuntime::Start("InitializeASI");
-			StartAsyncModelPreload();
+			PreloadVulkanModelsIfLoaded();
 			return;
 		}
 
@@ -1354,7 +1355,7 @@ extern "C" __declspec(dllexport) void XeFgEarlyBootstrap(const char* caller)
 		const char* tag = (caller && *caller) ? caller : "XeFgEarlyBootstrap";
 		Log::Info("XeFgEarlyBootstrap ({}), {}", tag, ThisModulePath().string());
 		VulkanRuntime::Start(tag);
-		StartAsyncModelPreload();
+		PreloadVulkanModelsIfLoaded();
 	}
 	catch (const std::exception& error)
 	{
@@ -1419,6 +1420,7 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* optiAp
 	Plugin::options.cameraCutDetection = api->GetBool(self, "CameraCutDetection", Plugin::options.cameraCutDetection);
 	Plugin::options.vramGuard = api->GetBool(self, "VramGuard", Plugin::options.vramGuard);
 	Plugin::options.autoVrrPacing = api->GetBool(self, "AutoVrrPacing", Plugin::options.autoVrrPacing);
+	Plugin::options.vkAmdAntiLag = api->GetBool(self, "VkAmdAntiLag", Plugin::options.vkAmdAntiLag);
 	Plugin::options.d3d12VulkanWmmaBridge = api->GetBool(self, "D3D12VulkanWmmaBridge", Plugin::options.d3d12VulkanWmmaBridge);
 	initialVkWmmaBridge = Plugin::options.d3d12VulkanWmmaBridge.load(std::memory_order_relaxed);
 	initialVkWmmaCaptured = true;
@@ -1458,15 +1460,10 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* optiAp
 		VulkanRuntime::SetHooksEnabled(false);
 	}
 
-	// Reads and checks the Vulkan models next to the dll now, so neither the menu nor a frame pays for it
-	try
-	{
-		VulkanPrograms::Installed();
-	}
-	catch (const std::exception& error)
-	{
-		Log::Warn("Vulkan models: {}", error.what());
-	}
+	// Lazy-load Vulkan models: only kick off background verification if vulkan-1.dll is already in the process.
+	// Dynamic vulkan-1.dll loads trigger VulkanPrograms::PreloadAsync() from VulkanHost, and the D3D12-Vulkan WMMA
+	// bridge loads on demand via VulkanPrograms::Installed().
+	PreloadVulkanModelsIfLoaded();
 
 	// Late for a game that already created its Vulkan device, which the log says when it asks for frame generation. Not
 	// from DllMain: that is why this is here and not there

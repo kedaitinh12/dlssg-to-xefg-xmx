@@ -113,6 +113,9 @@ namespace
 		std::mutex mutex;
 		bool initialized = false; // NVSDK_NGX_VULKAN_Init gave a device
 		bool ready = false;       // the layer's device, XeFG and the copy pipelines exist
+		std::atomic<bool> abandoned{ false }; // set on VK_ERROR_DEVICE_LOST / vkDestroyInstance; skips dead-ICD teardown
+		bool bgra8StorageSupported = true;    // probed once via vkGetPhysicalDeviceFormatProperties
+		bool hdrBootstrapped = false;         // one-time HDR10 1 -> MaxGenerated bootstrap reinit
 		// Why it isn't ready, a VulkanPolicy::Describe code. A refusal is final for the device and, the game having
 		// one device, for the process
 		std::string reason = "not_initialized";
@@ -1026,6 +1029,15 @@ namespace
 			getProps2(d.physical, &p2);
 			d.timestampPeriodNs = p2.properties.limits.timestampPeriod;
 		}
+		if (const auto getFmtProps = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(
+			d.gipa(d.instance, "vkGetPhysicalDeviceFormatProperties")))
+		{
+			VkFormatProperties fp{};
+			getFmtProps(d.physical, VK_FORMAT_B8G8R8A8_UNORM, &fp);
+			d.bgra8StorageSupported = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
+			if (!d.bgra8StorageSupported)
+				Log::Info("Vulkan HUD: BGRA8_UNORM lacks STORAGE_IMAGE_BIT; using zero-copy RGBA8_UNORM mutable view fallback");
+		}
 
 		if (!VulkanPrograms::Installed().Usable())
 		{
@@ -1327,9 +1339,8 @@ namespace
 				return false;
 			}
 
-			const VkFormat vkColorView = (format == DXGI_FORMAT_R10G10B10A2_UNORM)
-				? VK_FORMAT_A2B10G10R10_UNORM_PACK32
-				: (format == DXGI_FORMAT_B8G8R8A8_UNORM ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM);
+			const VkFormat vkColorView = static_cast<VkFormat>(
+				VulkanPolicy::ColorStorageViewFormat(static_cast<uint32_t>(format), gDevice.bgra8StorageSupported));
 			slot.bbView = xvk::StorageImageView(slot.backbuffer.Get(), vkColorView);
 			slot.hudlessView = slot.hudless ? xvk::StorageImageView(slot.hudless.Get(), vkColorView) : VK_NULL_HANDLE;
 			slot.depthView = xvk::StorageImageView(slot.depth.Get(), VK_FORMAT_R32_SFLOAT);
@@ -1343,9 +1354,8 @@ namespace
 			}
 		}
 
-		const VkFormat vkOutColorView = (format == DXGI_FORMAT_R10G10B10A2_UNORM)
-			? VK_FORMAT_A2B10G10R10_UNORM_PACK32
-			: (format == DXGI_FORMAT_B8G8R8A8_UNORM ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM);
+		const VkFormat vkOutColorView = static_cast<VkFormat>(
+			VulkanPolicy::ColorStorageViewFormat(static_cast<uint32_t>(format), gDevice.bgra8StorageSupported));
 		for (size_t i = 0; i < f.outputs.size(); ++i)
 		{
 			if (FAILED(CreateTexture(d3d, f.width, f.height, format, f.outputs[i])))
@@ -1457,7 +1467,25 @@ namespace
 		// Automatic: from the inputs given, the HUDless color and the UI texture
 		init.uiMode = wantedUiMode;
 
-		result = CallXeFG("Init", [&] { return XeFG::Init(context, init); });
+		{
+			MfgKernels::ScopedBypassNativeReplacements bypassNativeReplacements;
+			if (VulkanPolicy::NeedsHdrBootstrapReinit(static_cast<uint32_t>(format), MaxGenerated, d.hdrBootstrapped))
+			{
+				xefgd_init_params_t bootInit = init;
+				bootInit.maxInterpolatedFrames = 1;
+				const xefgd_result_t bootRes = CallXeFG("Init", [&] { return XeFG::Init(context, bootInit); });
+				if (bootRes == XEFGD_RESULT_SUCCESS)
+				{
+					d.hdrBootstrapped = true;
+					Log::Info("Vulkan XeFG HDR10 bootstrap reinit: Init(1) -> Init({})", MaxGenerated);
+				}
+				else
+				{
+					Log::Warn("Vulkan XeFG HDR10 bootstrap Init(1) returned {}; continuing with Init({})", bootRes, MaxGenerated);
+				}
+			}
+			result = CallXeFG("Init", [&] { return XeFG::Init(context, init); });
+		}
 
 		if (result != XEFGD_RESULT_SUCCESS)
 		{
@@ -1620,9 +1648,8 @@ namespace
 			!makeBuf(uint64_t(3u) * kBins * 4ull, f.hudTmLut, f.hudTmLutBuf))
 			return false;
 
-		const VkFormat vkColorView = (f.format == DXGI_FORMAT_R10G10B10A2_UNORM)
-			? VK_FORMAT_A2B10G10R10_UNORM_PACK32
-			: (f.format == DXGI_FORMAT_B8G8R8A8_UNORM ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM);
+		const VkFormat vkColorView = static_cast<VkFormat>(
+			VulkanPolicy::ColorStorageViewFormat(static_cast<uint32_t>(f.format), gDevice.bgra8StorageSupported));
 		for (Slot& s : f.slots)
 		{
 			if (FAILED(CreateTexture(d3d, f.width, f.height, f.format, s.matchedHudless)))
@@ -1887,8 +1914,18 @@ namespace
 				if (f.profWritten[readSlot])
 				{
 					uint64_t ts[4]{};
-					if (d.vkGetQueryPoolResults(d.device, f.profPool, readSlot * 4u, 4u, sizeof(ts), ts, sizeof(uint64_t),
-						VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[3] >= ts[0])
+					const VkResult qRes = d.vkGetQueryPoolResults(d.device, f.profPool, readSlot * 4u, 4u, sizeof(ts), ts, sizeof(uint64_t),
+						VK_QUERY_RESULT_64_BIT);
+					if (qRes == VK_ERROR_DEVICE_LOST)
+					{
+						if (!d.abandoned.exchange(true, std::memory_order_acq_rel))
+							Log::Warn("Vulkan: VK_ERROR_DEVICE_LOST detected in profiler query; abandoning device teardown");
+						if (d.d3d)
+							xvk::AbandonDevice(d.d3d.Get());
+						f.fault = "device_lost";
+						return false;
+					}
+					else if (qRes == VK_SUCCESS && ts[3] >= ts[0])
 					{
 						const float scaleMs = d.timestampPeriodNs * 1e-6f;
 						const float tot = static_cast<float>(ts[3] - ts[0]) * scaleMs;
@@ -2672,6 +2709,24 @@ namespace
 		}
 	}
 
+	bool IsDeviceAbandonedLocked(Device& d, const char* site) noexcept
+	{
+		if (d.abandoned.load(std::memory_order_acquire))
+		{
+			if (d.d3d)
+				xvk::AbandonDevice(d.d3d.Get());
+			return true;
+		}
+		if (d.d3d && FAILED(d.d3d->GetDeviceRemovedReason()))
+		{
+			if (!d.abandoned.exchange(true, std::memory_order_acq_rel))
+				Log::Warn("Vulkan: device lost/removed detected at {}; abandoning further ICD calls", site);
+			xvk::AbandonDevice(d.d3d.Get());
+			return true;
+		}
+		return false;
+	}
+
 	NGXResult CreateFeature(void* device, void*, NGXParameter*, void** feature)
 	{
 		if (!feature)
@@ -2682,6 +2737,9 @@ namespace
 		try
 		{
 			std::scoped_lock lock(gDevice.mutex);
+
+			if (IsDeviceAbandonedLocked(gDevice, "CreateFeature"))
+				return NGX_FAIL_PLATFORM_ERROR;
 
 			if (device && gDevice.device && reinterpret_cast<VkDevice>(device) != gDevice.device)
 				return NGX_FAIL_PLATFORM_ERROR;
@@ -2723,7 +2781,7 @@ namespace
 			std::scoped_lock lock(gDevice.mutex);
 			Device& d = gDevice;
 
-			if (!d.ready)
+			if (!d.ready || IsDeviceAbandonedLocked(d, "Evaluate"))
 				return NGX_FAIL_NOT_INITIALIZED;
 
 			if (!d.retiredFeatures.empty())
@@ -2874,6 +2932,16 @@ namespace
 				}
 			}
 
+			if (d.abandoned.load(std::memory_order_acquire))
+			{
+				f.batchReady = false;
+				f.havePrevious = false;
+				f.generatedThrough = 0;
+				if (recording)
+					xvk::EndRecording(d.d3d.Get());
+				return NGX_FAIL;
+			}
+
 			f.lastIndex = index;
 
 			const bool copied = f.batchReady && index <= f.generatedThrough && index <= f.batchCount &&
@@ -2952,6 +3020,11 @@ namespace
 	{
 		if (d.retiredFeatures.empty())
 			return;
+		if (IsDeviceAbandonedLocked(d, "DrainRetiredFeatures"))
+		{
+			d.retiredFeatures.clear();
+			return;
+		}
 		if (d.d3d && !xvk::WaitRecordedIdle(d.d3d.Get(), timeoutNs))
 			return;
 		for (auto& rf : d.retiredFeatures)
@@ -2974,6 +3047,15 @@ namespace
 		try
 		{
 			std::scoped_lock lock(gDevice.mutex);
+
+			if (IsDeviceAbandonedLocked(gDevice, "ReleaseFeature"))
+			{
+				gDevice.retiredFeatures.clear();
+				f->profPool = VK_NULL_HANDLE;
+				f->context = nullptr;
+				delete f;
+				return NGX_SUCCESS;
+			}
 
 			// Drain in-flight recorded command buffers before destroying XeFG's context and internal xvk resources,
 			// preventing deferred-resource buildup and XeFG "Invalid internal state" (init_-1000) after rapid
@@ -3022,9 +3104,17 @@ namespace
 		{
 			std::scoped_lock lock(gDevice.mutex);
 
+			if (IsDeviceAbandonedLocked(gDevice, "Shutdown"))
+			{
+				gDevice.retiredFeatures.clear();
+				return NGX_SUCCESS;
+			}
+
 			DrainRetiredFeaturesLocked(gDevice, 2'000'000'000ull);
 			if (gDevice.d3d)
 				xvk::WaitRecordedIdle(gDevice.d3d.Get(), 2'000'000'000ull);
+			if (!gDevice.retiredFeatures.empty())
+				Log::Warn("Vulkan Shutdown: exit retire left fences_pending={}", gDevice.retiredFeatures.size());
 
 			return NGX_SUCCESS;
 		}
@@ -3141,6 +3231,26 @@ void VulkanRuntime::Start(const char* caller)
 void VulkanRuntime::SetHooksEnabled(bool enabled)
 {
 	VulkanHost::SetEnabled(enabled);
+}
+
+void VulkanRuntime::AbandonInstance(const void* instance) noexcept
+{
+	if (!instance)
+		return;
+	try
+	{
+		std::scoped_lock lock(gDevice.mutex);
+		if (gDevice.instance && reinterpret_cast<VkInstance>(const_cast<void*>(instance)) == gDevice.instance)
+		{
+			if (!gDevice.abandoned.exchange(true, std::memory_order_acq_rel))
+				Log::Info("Vulkan: VkInstance destroyed; abandoning tracked VkDevice so teardown skips dead ICD calls");
+			if (gDevice.d3d)
+				xvk::AbandonDevice(gDevice.d3d.Get());
+		}
+	}
+	catch (...)
+	{
+	}
 }
 
 VulkanRuntime::Status VulkanRuntime::GetStatus()

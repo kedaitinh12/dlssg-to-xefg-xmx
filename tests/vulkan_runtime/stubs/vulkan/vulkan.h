@@ -1349,3 +1349,18 @@ typedef void(VKAPI_PTR* PFN_vkDestroyFence)(VkDevice, VkFence, const VkAllocatio
 typedef VkResult(VKAPI_PTR* PFN_vkWaitForFences)(VkDevice, uint32_t, const VkFence*, VkBool32, uint64_t);
 typedef VkResult(VKAPI_PTR* PFN_vkGetFenceStatus)(VkDevice, VkFence);
 typedef VkResult(VKAPI_PTR* PFN_vkQueueSubmit2)(VkQueue, uint32_t, const VkSubmitInfo2*, VkFence);
+
+typedef VkFlags VkFormatFeatureFlags;
+enum VkFormatFeatureFlagBits
+{
+	VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT = 0x00000004,
+};
+
+typedef struct VkFormatProperties
+{
+	VkFormatFeatureFlags linearTilingFeatures;
+	VkFormatFeatureFlags optimalTilingFeatures;
+	VkFormatFeatureFlags bufferFeatures;
+} VkFormatProperties;
+
+typedef void(VKAPI_PTR* PFN_vkGetPhysicalDeviceFormatProperties)(VkPhysicalDevice, VkFormat, VkFormatProperties*);

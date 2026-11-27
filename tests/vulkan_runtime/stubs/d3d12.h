@@ -210,6 +210,7 @@ struct ID3D12Device : ID3D12Object
 		const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear, REFIID riid,
 		void** resource) = 0;
 	virtual LUID GetAdapterLuid() { return LUID{}; }
+	virtual HRESULT GetDeviceRemovedReason() { return S_OK; }
 };
 
 enum D3D12_DRED_ENABLEMENT { D3D12_DRED_ENABLEMENT_FORCED_ON };

@@ -81,8 +81,12 @@ void main(uint3 group : SV_GroupID, uint3 pixel : SV_DispatchThreadID, uint inde
 #endif
         if (isfinite(mv.x) && isfinite(mv.y))
         {
-            const float dx = scale.x * mv.x;
-            const float dy = scale.y * mv.y;
+            // Clamp finite motion vectors to +/- 2x source canvas so extreme RG16F cut/sentinel values
+            // (e.g. +/-65504) cannot overflow PackHalf or blow up the group tile bounding box.
+            const float maxDx = 2.0f * float(srcSize.x);
+            const float maxDy = 2.0f * float(srcSize.y);
+            const float dx = clamp(scale.x * mv.x, -maxDx, maxDx);
+            const float dy = clamp(scale.y * mv.y, -maxDy, maxDy);
             valid = true;
             if (srcSize.x == dstSize.x && srcSize.y == dstSize.y)
             {
