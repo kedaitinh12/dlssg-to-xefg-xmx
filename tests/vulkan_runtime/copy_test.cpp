@@ -43,6 +43,13 @@ namespace xvk
     bool WaitRecordedIdle(ID3D12Device*, uint64_t) noexcept { return gFakeWaitRecordedIdleResult; }
 }
 
+static int gBypassNativeReplacementsDepth = 0;
+namespace MfgKernels
+{
+    ScopedBypassNativeReplacements::ScopedBypassNativeReplacements() noexcept { ++gBypassNativeReplacementsDepth; }
+    ScopedBypassNativeReplacements::~ScopedBypassNativeReplacements() noexcept { --gBypassNativeReplacementsDepth; }
+}
+
 static int gCreateContextCalls = 0;
 static int gInitCalls = 0;
 static int gDestroyCalls = 0;
@@ -64,6 +71,7 @@ namespace XeFG
     void SetLoggingCallback(xefgd_handle_t, xefgd_logging_level_t, xefgd_log_callback_t) {}
     xefgd_result_t Init(xefgd_handle_t, const xefgd_init_params_t&)
     {
+        assert(gBypassNativeReplacementsDepth == 1);
         ++gInitCalls;
         if (gSimulateMissingProgramOnInit)
             ++gFakeMissingProgramCount;
@@ -198,6 +206,7 @@ namespace
             assert(f.fault == "init_-1");
         }
         assert(gCreateContextCalls == 1);
+        assert(gBypassNativeReplacementsDepth == 0);
         assert(gInitCalls == 1);
         assert(gDestroyCalls == 1);
         assert(gCoopGate.load() == true);

@@ -1,19 +1,24 @@
 #include "Log.h"
+#include "DredAttribution.h"
 #include "PeVersion.h"
 #include "Util.h"
 
 #include <Windows.h>
 #include <DbgHelp.h>
 #include <Psapi.h>
+#include <d3d12.h>
 #include <dxgi.h>
 #include <wrl/client.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
+#include <cwchar>
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -22,6 +27,7 @@ namespace
 {
 	std::atomic_bool gLoggingEnabled{ true };
 	std::atomic_bool gCrashMiniDumpEnabled{ false };
+	std::atomic_bool gDredEnabled{ false };
 	std::atomic_flag gHandlingCrash = ATOMIC_FLAG_INIT;
 	std::atomic_flag gDumpAttempted = ATOMIC_FLAG_INIT;
 	std::atomic<LPTOP_LEVEL_EXCEPTION_FILTER> gPrevExceptionFilter{};
@@ -230,10 +236,12 @@ namespace
 	{
 		std::mutex mutex;
 		std::ofstream file;
+		std::filesystem::path sessionMarkerPath;
 
 		LogSession()
 		{
 			const auto logPath = ThisModulePath().replace_extension(L".log");
+			sessionMarkerPath = ThisModulePath().replace_extension(L".session");
 			wchar_t flag[8]{};
 			const DWORD len = GetEnvironmentVariableW(L"XEFG_EARLY_LOG_INITIALIZED", flag, 8);
 			const bool appended = (len > 0 && len < 8 && flag[0] == L'1');
@@ -247,13 +255,39 @@ namespace
 				file.open(logPath, std::ios::trunc);
 			}
 
+			// Previous-session unclean exit detection (0% gameplay overhead: 1 read/write on DLL init, 1 delete on clean exit).
+			std::string previousUnclean;
+			{
+				std::ifstream prev(sessionMarkerPath);
+				if (prev.is_open())
+				{
+					std::getline(prev, previousUnclean);
+					if (previousUnclean.size() > 256)
+						previousUnclean.resize(256);
+				}
+			}
+
+			const std::string exeName = NarrowModuleName(nullptr);
+			const std::string modName = ThisModulePath().filename().string();
+			{
+				std::ofstream marker(sessionMarkerPath, std::ios::trunc);
+				if (marker.is_open())
+				{
+					marker << "pid=" << GetCurrentProcessId() << " exe=" << exeName
+						<< " build=" << __DATE__ << " " << __TIME__ << "\n";
+				}
+			}
+
 			if (gLoggingEnabled.load(std::memory_order_relaxed))
 			{
-				const std::string exeName = NarrowModuleName(nullptr);
-				const std::string modName = ThisModulePath().filename().string();
 				WriteLineLocked(file, "info", std::format(
 					"Session: build {} {}, pid {}, exe {}, module {}, {}",
 					__DATE__, __TIME__, GetCurrentProcessId(), exeName, modName, FormatWindowsVersion()));
+				if (!previousUnclean.empty())
+				{
+					WriteLineLocked(file, "warn", std::format(
+						"Previous session ended uncleanly (no clean exit): {}", previousUnclean));
+				}
 			}
 
 			if (Log::CrashMiniDumpRequestedByEnvironment())
@@ -271,12 +305,13 @@ namespace
 
 		~LogSession()
 		{
+			if (!sessionMarkerPath.empty())
+				DeleteFileW(sessionMarkerPath.c_str());
 			if (gLoggingEnabled.load(std::memory_order_relaxed))
 			{
 				std::scoped_lock lock(mutex);
 				WriteLineLocked(file, "info", "Session end (clean exit)");
 			}
-
 		}
 	};
 
@@ -450,6 +485,7 @@ bool Log::EnableDred() noexcept
 			dred1->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
 			dred1->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
 			dred1->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+			gDredEnabled.store(true, std::memory_order_release);
 			if (!sEnabled.exchange(true, std::memory_order_acq_rel))
 				Info("DRED crash diagnostics enabled (AutoBreadcrumbs + PageFault + Context forced on)");
 			return true;
@@ -460,6 +496,7 @@ bool Log::EnableDred() noexcept
 		{
 			dred0->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
 			dred0->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+			gDredEnabled.store(true, std::memory_order_release);
 			if (!sEnabled.exchange(true, std::memory_order_acq_rel))
 				Info("DRED crash diagnostics enabled (AutoBreadcrumbs + PageFault forced on)");
 			return true;
@@ -471,10 +508,227 @@ bool Log::EnableDred() noexcept
 	return false;
 }
 
+bool Log::IsDredEnabled() noexcept
+{
+	return gDredEnabled.load(std::memory_order_acquire);
+}
+
+Log::ScopedDredEvent::ScopedDredEvent(ID3D12GraphicsCommandList* cmdList, const wchar_t* label) noexcept
+{
+	if (!cmdList || !label || !gDredEnabled.load(std::memory_order_relaxed))
+		return;
+	const size_t chars = std::wcslen(label);
+	if (chars == 0)
+		return;
+	cmdList_ = cmdList;
+	// PIX_EVENT_UNICODE_VERSION = 0: D3D12 DRED captures UTF-16 event strings in BreadcrumbContexts.
+	cmdList_->BeginEvent(0u, label, static_cast<UINT>((chars + 1u) * sizeof(wchar_t)));
+}
+
+Log::ScopedDredEvent::~ScopedDredEvent() noexcept
+{
+	if (cmdList_)
+		cmdList_->EndEvent();
+}
+
+namespace
+{
+	const char* DredBreadcrumbOpName(D3D12_AUTO_BREADCRUMB_OP op) noexcept
+	{
+		switch (op)
+		{
+		case D3D12_AUTO_BREADCRUMB_OP_SETMARKER: return "SetMarker";
+		case D3D12_AUTO_BREADCRUMB_OP_BEGINEVENT: return "BeginEvent";
+		case D3D12_AUTO_BREADCRUMB_OP_ENDEVENT: return "EndEvent";
+		case D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED: return "DrawInstanced";
+		case D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED: return "DrawIndexed";
+		case D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT: return "ExecuteIndirect";
+		case D3D12_AUTO_BREADCRUMB_OP_DISPATCH: return "Dispatch";
+		case D3D12_AUTO_BREADCRUMB_OP_COPYBUFFERREGION: return "CopyBufferRegion";
+		case D3D12_AUTO_BREADCRUMB_OP_COPYTEXTUREREGION: return "CopyTextureRegion";
+		case D3D12_AUTO_BREADCRUMB_OP_COPYRESOURCE: return "CopyResource";
+		case D3D12_AUTO_BREADCRUMB_OP_COPYTILES: return "CopyTiles";
+		case D3D12_AUTO_BREADCRUMB_OP_RESOLVESUBRESOURCE: return "ResolveSubresource";
+		case D3D12_AUTO_BREADCRUMB_OP_CLEARRENDERTARGETVIEW: return "ClearRTV";
+		case D3D12_AUTO_BREADCRUMB_OP_CLEARUNORDEREDACCESSVIEW: return "ClearUAV";
+		case D3D12_AUTO_BREADCRUMB_OP_CLEARDEPTHSTENCILVIEW: return "ClearDSV";
+		case D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER: return "ResourceBarrier";
+		case D3D12_AUTO_BREADCRUMB_OP_EXECUTEBUNDLE: return "ExecuteBundle";
+		case D3D12_AUTO_BREADCRUMB_OP_PRESENT: return "Present";
+		case D3D12_AUTO_BREADCRUMB_OP_RESOLVEQUERYDATA: return "ResolveQueryData";
+		case D3D12_AUTO_BREADCRUMB_OP_BEGINSUBMISSION: return "BeginSubmission";
+		case D3D12_AUTO_BREADCRUMB_OP_ENDSUBMISSION: return "EndSubmission";
+		case D3D12_AUTO_BREADCRUMB_OP_BUILDRAYTRACINGACCELERATIONSTRUCTURE: return "BuildRTAS";
+		case D3D12_AUTO_BREADCRUMB_OP_DISPATCHRAYS: return "DispatchRays";
+		default: return nullptr;
+		}
+	}
+
+	bool IsProcessShuttingDown() noexcept
+	{
+		using RtlDllShutdownInProgressFn = BOOLEAN(NTAPI*)();
+		static const auto fn = []() noexcept -> RtlDllShutdownInProgressFn {
+			HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+			return ntdll
+				? reinterpret_cast<RtlDllShutdownInProgressFn>(GetProcAddress(ntdll, "RtlDllShutdownInProgress"))
+				: nullptr;
+		}();
+		return fn && fn() != 0;
+	}
+
+	struct DredWatchdogState
+	{
+		Microsoft::WRL::ComPtr<ID3D12Device> device;
+		Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+		HANDLE eventHandle = nullptr;
+		HANDLE waitHandle = nullptr;
+		std::atomic_bool cancelled{ false };
+	};
+
+	void CALLBACK DredWatchdogCallback(PVOID parameter, BOOLEAN timerOrWaitFired) noexcept
+	{
+		try
+		{
+			auto* state = static_cast<DredWatchdogState*>(parameter);
+			if (!state || timerOrWaitFired || state->cancelled.load(std::memory_order_acquire) || !state->device)
+				return;
+			const HRESULT removed = state->device->GetDeviceRemovedReason();
+			if (SUCCEEDED(removed))
+				return;
+			Log::Error("D3D12 device removed detected by watchdog: {} ({:#010x})",
+				Log::DeviceRemovedName(static_cast<uint32_t>(removed)),
+				static_cast<uint32_t>(removed));
+			Log::DumpDred(state->device.Get());
+		}
+		catch (...)
+		{
+		}
+	}
+} // namespace
+
+Log::DredWatchdog::DredWatchdog(ID3D12Device* device) noexcept
+{
+	Arm(device);
+}
+
+Log::DredWatchdog::~DredWatchdog() noexcept
+{
+	Disarm();
+}
+
+Log::DredWatchdog::DredWatchdog(DredWatchdog&& other) noexcept
+	: state_(other.state_)
+{
+	other.state_ = nullptr;
+}
+
+Log::DredWatchdog& Log::DredWatchdog::operator=(DredWatchdog&& other) noexcept
+{
+	if (this != &other)
+	{
+		Disarm();
+		state_ = other.state_;
+		other.state_ = nullptr;
+	}
+	return *this;
+}
+
+void Log::DredWatchdog::Arm(ID3D12Device* device) noexcept
+{
+	Disarm();
+	if (!device)
+		return;
+
+	try
+	{
+		const HRESULT alreadyRemoved = device->GetDeviceRemovedReason();
+		if (FAILED(alreadyRemoved))
+		{
+			Log::Error("D3D12 device already removed while arming watchdog: {} ({:#010x})",
+				Log::DeviceRemovedName(static_cast<uint32_t>(alreadyRemoved)),
+				static_cast<uint32_t>(alreadyRemoved));
+			Log::DumpDred(device);
+			return;
+		}
+
+		// Pin this DLL so the threadpool callback code cannot be unmapped while a wait is registered.
+		static const bool pinned = []() noexcept {
+			HMODULE mod = nullptr;
+			return GetModuleHandleExW(
+				GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+				reinterpret_cast<LPCWSTR>(&DredWatchdogCallback), &mod) != 0;
+		}();
+		if (!pinned)
+			return;
+
+		auto state = std::make_unique<DredWatchdogState>();
+		state->device = device;
+		if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&state->fence))) || !state->fence)
+			return;
+
+		state->eventHandle = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+		if (!state->eventHandle)
+			return;
+
+		// Per D3D12 spec, device removal (TDR) immediately signals all pending fence completion events.
+		if (FAILED(state->fence->SetEventOnCompletion(UINT64_MAX, state->eventHandle)))
+		{
+			CloseHandle(state->eventHandle);
+			state->eventHandle = nullptr;
+			return;
+		}
+
+		if (!RegisterWaitForSingleObject(&state->waitHandle, state->eventHandle, DredWatchdogCallback,
+			state.get(), INFINITE, WT_EXECUTEONLYONCE))
+		{
+			CloseHandle(state->eventHandle);
+			state->eventHandle = nullptr;
+			return;
+		}
+
+		state_ = state.release();
+		Log::Info("D3D12 device-removed DRED watchdog armed");
+	}
+	catch (...)
+	{
+	}
+}
+
+void Log::DredWatchdog::Disarm() noexcept
+{
+	auto* state = static_cast<DredWatchdogState*>(state_);
+	if (!state)
+		return;
+	state_ = nullptr;
+	state->cancelled.store(true, std::memory_order_release);
+
+	// Never block on UnregisterWaitEx during DLL_PROCESS_DETACH / process shutdown (loader lock).
+	if (IsProcessShuttingDown())
+		return;
+
+	if (state->waitHandle)
+	{
+		UnregisterWaitEx(state->waitHandle, INVALID_HANDLE_VALUE);
+		state->waitHandle = nullptr;
+	}
+	if (state->eventHandle)
+	{
+		CloseHandle(state->eventHandle);
+		state->eventHandle = nullptr;
+	}
+	delete state;
+}
+
 void Log::DumpDred(ID3D12Device* device) noexcept
 {
-	static std::atomic_bool sDumped{ false };
-	if (!device || SUCCEEDED(device->GetDeviceRemovedReason()) || sDumped.exchange(true, std::memory_order_acq_rel))
+	static std::atomic<uintptr_t> sDumpedDevice{ 0 };
+	if (!device || SUCCEEDED(device->GetDeviceRemovedReason()))
+		return;
+	const auto devKey = reinterpret_cast<uintptr_t>(device);
+	uintptr_t prev = sDumpedDevice.load(std::memory_order_acquire);
+	if (prev == devKey)
+		return;
+	if (!sDumpedDevice.compare_exchange_strong(prev, devKey, std::memory_order_acq_rel))
 		return;
 
 	try
@@ -511,16 +765,53 @@ void Log::DumpDred(ID3D12Device* device) noexcept
 					std::string ops;
 					const UINT start = (last > 3u) ? (last - 3u) : 0u;
 					const UINT end = std::min<UINT>(n->BreadcrumbCount, last + 4u);
-					for (UINT i = start; i < end; ++i)
+					if (n->pCommandHistory)
 					{
-						if (i == last) ops += '[';
-						ops += std::to_string(static_cast<int>(n->pCommandHistory[i]));
-						ops += (i == last) ? "] " : " ";
+						for (UINT i = start; i < end; ++i)
+						{
+							if (i == last) ops += '[';
+							const auto op = n->pCommandHistory[i];
+							if (const char* name = DredBreadcrumbOpName(op))
+								ops += name;
+							else
+								ops += std::to_string(static_cast<int>(op));
+							ops += (i == last) ? "] " : " ";
+						}
 					}
-					Error("DRED unfinished list '{}' on queue '{}': {}/{} ops done; ops {}",
+					std::string ctxSuffix;
+					if (n->BreadcrumbContextsCount > 0 && n->pBreadcrumbContexts)
+					{
+						std::vector<DredAttribution::ContextEntry> entries;
+						entries.reserve(n->BreadcrumbContextsCount);
+						const wchar_t* bestCtx = nullptr;
+						UINT bestIdx = 0;
+						for (UINT c = 0; c < n->BreadcrumbContextsCount; ++c)
+						{
+							const auto& ctx = n->pBreadcrumbContexts[c];
+							entries.push_back({ ctx.BreadcrumbIndex, ctx.pContextString, nullptr });
+							if (ctx.pContextString && ctx.BreadcrumbIndex <= last &&
+								(!bestCtx || ctx.BreadcrumbIndex >= bestIdx))
+							{
+								bestCtx = ctx.pContextString;
+								bestIdx = ctx.BreadcrumbIndex;
+							}
+						}
+						const auto attr = DredAttribution::Classify(
+							last, n->BreadcrumbCount, entries.data(), entries.size());
+						if (attr.hasXefgSpan)
+						{
+							ctxSuffix += std::format("; where={} xefg=[{}..{}]",
+								DredAttribution::LocationName(attr.location), attr.xefgBegin, attr.xefgEnd);
+							if (attr.activeStageW)
+								ctxSuffix += std::format(" stage='{}'@{}", formatObjName(attr.activeStageW, nullptr), attr.activeStageIndex);
+						}
+						if (bestCtx)
+							ctxSuffix += std::format("; ctx='{}'@{}", formatObjName(bestCtx, nullptr), bestIdx);
+					}
+					Error("DRED unfinished list '{}' on queue '{}': {}/{} ops done; ops {}{}",
 						formatObjName(n->pCommandListDebugNameW, n->pCommandListDebugNameA),
 						formatObjName(n->pCommandQueueDebugNameW, n->pCommandQueueDebugNameA),
-						last, n->BreadcrumbCount, ops);
+						last, n->BreadcrumbCount, ops, ctxSuffix);
 				}
 				if (shown == 0)
 					Info("DRED: every recorded command list had finished");

@@ -24,6 +24,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace xvk {
@@ -240,6 +241,7 @@ private:
     HMODULE module_ = nullptr;
     std::mutex mutex_;
     std::unordered_map<std::string, size_t> index_;              // DXIL SHA-256 -> embedded row
+    std::vector<std::pair<std::string, std::string>> dynamicAliases_; // runtime DXIL replacement SHA-256 -> native Intel SHA-256
     std::unordered_map<std::string, std::unique_ptr<Program>> loaded_;
 };
 std::string Sha256(const void* data, size_t size);

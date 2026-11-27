@@ -8,6 +8,7 @@
 #include <cmath>
 #include "XeFgEnabler.h"
 #include "HwFlipQueue.h"
+#include "DredAttribution.h"
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -714,6 +715,87 @@ int main()
 		CHECK(std::string_view(HwFlipQueue::StateName(HwFlipQueue::State::Enabled)) == "enabled");
 		CHECK(std::string_view(HwFlipQueue::StateName(HwFlipQueue::State::Disabled)) == "disabled");
 		CHECK(std::string_view(HwFlipQueue::StateName(HwFlipQueue::State::Unknown)) == "unknown");
+	}
+
+	// DRED stage attribution (before / inside / after / no_xefg)
+	{
+		using namespace DredAttribution;
+		const auto r0 = Classify(5, 10, nullptr, 0);
+		CHECK(r0.location == Location::NoXefg && !r0.hasXefgSpan);
+
+		const ContextEntry gameOnly[] = {
+			{ 2, L"Game: ShadowPass", nullptr },
+			{ 7, L"Game: PostProcess", nullptr },
+		};
+		const auto r1 = Classify(5, 10, gameOnly, 2);
+		CHECK(r1.location == Location::NoXefg && !r1.hasXefgSpan);
+
+		const ContextEntry entries[] = {
+			{ 1,  L"Game: GBuffer", nullptr },
+			{ 5,  L"dlssg-to-xefg: wmma-batch", nullptr },
+			{ 9,  L"dlssg-to-xefg: execute", nullptr },
+			{ 15, L"Game: PresentUI", nullptr },
+		};
+
+		const auto before = Classify(3, 20, entries, 4);
+		CHECK(before.location == Location::BeforeXefg);
+		CHECK(before.hasXefgSpan && before.xefgBegin == 5 && before.xefgEnd == 14);
+		CHECK(before.activeStageW == nullptr);
+
+		const auto inside1 = Classify(6, 20, entries, 4);
+		CHECK(inside1.location == Location::InsideXefg);
+		CHECK(inside1.activeStageW != nullptr && std::wstring_view(inside1.activeStageW) == L"dlssg-to-xefg: wmma-batch");
+		CHECK(inside1.activeStageIndex == 5);
+
+		const auto inside2 = Classify(14, 20, entries, 4);
+		CHECK(inside2.location == Location::InsideXefg);
+		CHECK(inside2.activeStageW != nullptr && std::wstring_view(inside2.activeStageW) == L"dlssg-to-xefg: execute");
+		CHECK(inside2.activeStageIndex == 9);
+
+		const auto after = Classify(15, 20, entries, 4);
+		CHECK(after.location == Location::AfterXefg);
+		CHECK(after.xefgBegin == 5 && after.xefgEnd == 14);
+
+		const ContextEntry unsorted[] = {
+			{ 12, nullptr, "dlssg-to-xefg: wmma-copy" },
+			{ 4,  nullptr, "" },
+			{ 8,  nullptr, "dlssg-to-xefg: execute-dot4" },
+		};
+		const auto rt = Classify(16, 20, unsorted, 3);
+		CHECK(rt.location == Location::InsideXefg);
+		CHECK(rt.xefgBegin == 8 && rt.xefgEnd == 19);
+		CHECK(rt.activeStageA != nullptr && std::string_view(rt.activeStageA) == "dlssg-to-xefg: wmma-copy");
+		CHECK(std::string_view(LocationName(Location::InsideXefg)) == "inside_xefg");
+	}
+
+	// Vulkan HUD storage image view format resolution (BGRA8 -> RGBA8 zero-copy mutable alias fallback)
+	{
+		using namespace VulkanPolicy;
+		CHECK(ColorStorageViewFormat(Dxgi::R10G10B10A2Unorm, true) == Vk::A2B10G10R10UnormPack32);
+		CHECK(ColorStorageViewFormat(Dxgi::R10G10B10A2Unorm, false) == Vk::A2B10G10R10UnormPack32);
+		CHECK(ColorStorageViewFormat(Dxgi::R8G8B8A8Unorm, true) == Vk::R8G8B8A8Unorm);
+		CHECK(ColorStorageViewFormat(Dxgi::R8G8B8A8Unorm, false) == Vk::R8G8B8A8Unorm);
+		CHECK(ColorStorageViewFormat(Dxgi::B8G8R8A8Unorm, true) == Vk::B8G8R8A8Unorm);
+		CHECK(ColorStorageViewFormat(Dxgi::B8G8R8A8Unorm, false) == Vk::R8G8B8A8Unorm);
+		CHECK(ColorStorageViewFormat(Dxgi::Unknown, false) == Vk::R8G8B8A8Unorm);
+
+		// One-time HDR10 bootstrap reinit (1 -> maxFrames) policy
+		CHECK(NeedsHdrBootstrapReinit(Dxgi::R10G10B10A2Unorm, 5u, false));
+		CHECK(NeedsHdrBootstrapReinit(Dxgi::R10G10B10A2Unorm, 2u, false));
+		CHECK(!NeedsHdrBootstrapReinit(Dxgi::R10G10B10A2Unorm, 1u, false));
+		CHECK(!NeedsHdrBootstrapReinit(Dxgi::R10G10B10A2Unorm, 5u, true));
+		CHECK(!NeedsHdrBootstrapReinit(Dxgi::R8G8B8A8Unorm, 5u, false));
+		CHECK(!NeedsHdrBootstrapReinit(Dxgi::B8G8R8A8Unorm, 5u, false));
+		CHECK(!NeedsHdrBootstrapReinit(Dxgi::R16G16B16A16Float, 5u, false));
+
+		// Opt-in VK_AMD_anti_lag dispatch policy (OFF by default, AMD only, skips if game already enabled it)
+		CHECK(ShouldDispatchAmdAntiLag(true, 0x1002u, true, false, false));
+		CHECK(!ShouldDispatchAmdAntiLag(false, 0x1002u, true, false, false));
+		CHECK(!ShouldDispatchAmdAntiLag(true, 0x10DEu, true, false, false));
+		CHECK(!ShouldDispatchAmdAntiLag(true, 0x8086u, true, false, false));
+		CHECK(!ShouldDispatchAmdAntiLag(true, 0x1002u, false, false, false));
+		CHECK(!ShouldDispatchAmdAntiLag(true, 0x1002u, true, true, false));
+		CHECK(!ShouldDispatchAmdAntiLag(true, 0x1002u, true, false, true));
 	}
 
 	std::printf("%d checks, %d failed\n", checks, failures);

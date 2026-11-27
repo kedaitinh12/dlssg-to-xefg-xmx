@@ -24,4 +24,16 @@ namespace MfgKernels
 
 	// Folder `Install` looks in (and loaded the program set from). The optional CUDA fatbin lives beside it.
 	std::filesystem::path ProgramsDirectory();
+
+	// Temporarily skips DXIL native shader replacements (e.g. splat_motion_aware.dxil) on the current thread.
+	// Used around xvk XeFG::Init (native Vulkan and D3D12->Vulkan WMMA bridge) so xvk receives Intel's native
+	// DXIL whose SPIR-V is guaranteed to exist in xefg_mfg_programs\vulkan, while native D3D12 keeps replacements.
+	class ScopedBypassNativeReplacements
+	{
+	public:
+		ScopedBypassNativeReplacements() noexcept;
+		~ScopedBypassNativeReplacements() noexcept;
+		ScopedBypassNativeReplacements(const ScopedBypassNativeReplacements&) = delete;
+		ScopedBypassNativeReplacements& operator=(const ScopedBypassNativeReplacements&) = delete;
+	};
 } // namespace MfgKernels

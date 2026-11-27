@@ -188,6 +188,34 @@ namespace VulkanPolicy
 		return a != Dxgi::Unknown && a == ColorFormat(target).dxgi;
 	}
 
+	// Resolves the VkFormat used for storage image views (UAVs) in Vulkan HUD compute passes.
+	// On drivers without VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT on BGRA8_UNORM, aliases the mutable
+	// BGRA8 image as RGBA8_UNORM (same 32-bit texel layout; zero extra copy pass).
+	inline uint32_t ColorStorageViewFormat(uint32_t dxgiFormat, bool bgra8StorageSupported) noexcept
+	{
+		if (dxgiFormat == Dxgi::R10G10B10A2Unorm)
+			return Vk::A2B10G10R10UnormPack32;
+		if (dxgiFormat == Dxgi::B8G8R8A8Unorm)
+			return bgra8StorageSupported ? Vk::B8G8R8A8Unorm : Vk::R8G8B8A8Unorm;
+		return Vk::R8G8B8A8Unorm;
+	}
+
+	// One-time HDR10 (R10G10B10A2_UNORM) bootstrap reinit (1 -> maxFrames) before multi-frame (>1)
+	// XeFG::Init, inspired by XeFG-HDRReinit 1.1.0 via public C++ API without binary-patching libxess_fg.dll.
+	inline bool NeedsHdrBootstrapReinit(uint32_t dxgiFormat, uint32_t maxFrames, bool alreadyBootstrapped) noexcept
+	{
+		return !alreadyBootstrapped && maxFrames > 1u && dxgiFormat == Dxgi::R10G10B10A2Unorm;
+	}
+
+	// Decides whether VulkanRuntime should emit opt-in VK_AMD_anti_lag markers.
+	// OFF by default and automatically skipped if the game already enabled VK_AMD_anti_lag itself,
+	// preventing dual-pacer stutter or hang conflicts.
+	inline bool ShouldDispatchAmdAntiLag(
+		bool optInEnabled, uint32_t vendorId, bool hasProc, bool gameAlreadyEnabled, bool abandoned) noexcept
+	{
+		return optInEnabled && vendorId == 0x1002u && hasProc && !gameAlreadyEnabled && !abandoned;
+	}
+
 	// Combined depth/stencil image views cannot be sampled by our float sampler.
 	// Callers must supply a single depth or color aspect (Vulkan bits 2 and 1).
 	inline bool SampledAspect(uint32_t aspect) noexcept { return aspect == 1 || aspect == 2; }

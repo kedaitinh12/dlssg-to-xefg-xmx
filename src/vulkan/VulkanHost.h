@@ -38,6 +38,9 @@ namespace VulkanHost
 		uint32_t coopMatrixSpec = 0;
 		// Hardware flip metering / low-latency pacing (VK_NV_present_metering or VK_NV_low_latency2)
 		bool hwPacing = false;
+		// Opt-in VK_AMD_anti_lag enabled by us (never injected if the game already enabled it)
+		bool amdAntiLagEnabled = false;
+		bool amdAntiLagGameEnabled = false;
 	};
 
 	// Installs the hooks, or arranges for them to be installed when vulkan-1.dll is loaded. Later calls do nothing. Not

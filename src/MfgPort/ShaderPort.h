@@ -30,6 +30,7 @@ class ShaderPort
 	using Resize = void (*)(void*, size_t);
 
 	inline static ShaderPort* instance{};
+	inline static thread_local unsigned nativeReplacementBypassDepth{};
 
 	uintptr_t base{};
 	unsigned char* site{};
@@ -95,7 +96,7 @@ class ShaderPort
 	// match a verified byte-identical replacement (e.g., splat_motion_aware).
 	void native(const std::string& key, void* output)
 	{
-		if (replacements.empty())
+		if (replacements.empty() || nativeReplacementBypassDepth > 0)
 			return;
 
 		const auto o = reinterpret_cast<uintptr_t>(output);
@@ -227,6 +228,14 @@ class ShaderPort
 	}
 
 public:
+	static void PushNativeReplacementBypass() noexcept { ++nativeReplacementBypassDepth; }
+	static void PopNativeReplacementBypass() noexcept
+	{
+		if (nativeReplacementBypassDepth > 0)
+			--nativeReplacementBypassDepth;
+	}
+	static bool NativeReplacementBypassed() noexcept { return nativeReplacementBypassDepth > 0; }
+
 	bool hasProgram(const char* key) const { return programs.contains(key); }
 
 	ShaderPort(HMODULE module, const std::filesystem::path& programsRoot)

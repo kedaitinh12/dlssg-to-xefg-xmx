@@ -20,6 +20,10 @@ void VulkanRuntime::SetHooksEnabled(bool)
 {
 }
 
+void VulkanRuntime::AbandonInstance(const void*) noexcept
+{
+}
+
 VulkanRuntime::Status VulkanRuntime::GetStatus()
 {
 	return {};

@@ -155,3 +155,13 @@ std::filesystem::path MfgKernels::ProgramsDirectory()
 {
 	return FindPrograms();
 }
+
+MfgKernels::ScopedBypassNativeReplacements::ScopedBypassNativeReplacements() noexcept
+{
+	ShaderPort::PushNativeReplacementBypass();
+}
+
+MfgKernels::ScopedBypassNativeReplacements::~ScopedBypassNativeReplacements() noexcept
+{
+	ShaderPort::PopNativeReplacementBypass();
+}

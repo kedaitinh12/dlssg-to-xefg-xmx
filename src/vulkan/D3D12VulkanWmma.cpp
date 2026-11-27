@@ -1772,7 +1772,11 @@ bool TeardownVulkanLocked() noexcept
 	bool deviceLost = false;
 	const bool drained = DrainVulkanQueueLocked(500'000'000ull, &deviceLost);
 	if (!drained && !deviceLost)
+	{
+		Log::Warn("D3D12VulkanWmma: teardown deferred (vk_queue busy, fences_pending=init:{} slots:{})",
+			gBridge.pendingInitUploads.size(), gBridge.pendingCount.load(std::memory_order_acquire));
 		return false;
+	}
 
 	// Explicitly verify EVERY D3D12 PostCopyRing (all active slots AND parked allocators) and EVERY
 	// tracked ID3D12CommandQueue's own private completion fence finished before resetting rings or freeing imports.
@@ -1782,11 +1786,18 @@ bool TeardownVulkanLocked() noexcept
 		!DrainPostCopyRingLocked(gBridge.nativeDirectRing, 500u) ||
 		!DrainPostCopyRingLocked(gBridge.nativeComputeRing, 500u))
 		return false;
+	size_t pendingQueueFences = 0;
 	for (const auto& kv : gBridge.queueFences)
 	{
 		if (kv.second.fence && kv.second.lastSignaled &&
 			!WaitFenceCpu(kv.second.fence.Get(), gBridge.fenceEvent, kv.second.lastSignaled, 500u))
-			return false;
+			++pendingQueueFences;
+	}
+	if (pendingQueueFences > 0)
+	{
+		Log::Warn("D3D12VulkanWmma: teardown deferred (d3d12 fences_pending={} slots={})",
+			pendingQueueFences, gBridge.pendingCount.load(std::memory_order_acquire));
+		return false;
 	}
 
 	// Verify any timed-out matC probe on gBridge.device has completed BEFORE tearing down any
@@ -1796,6 +1807,8 @@ bool TeardownVulkanLocked() noexcept
 		return false;
 
 	// Clean up any remaining pendingInitUploads (only reachable here if deviceLost == true).
+	if (!gBridge.pendingInitUploads.empty())
+		Log::Warn("D3D12VulkanWmma: exit retire under deviceLost with init fences_pending={}", gBridge.pendingInitUploads.size());
 	for (auto& pi : gBridge.pendingInitUploads)
 	{
 		if (pi.fence && gBridge.device && gBridge.vkDestroyFence)
@@ -2284,6 +2297,29 @@ bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
 	gBridge.d3dDevice = d3dDevice;
 	gBridge.nativeD3DDevice = UnwrapNativeDevice(d3dDevice);
 
+	// Live shared-handle texture interop probe (Stuffed Turkey technique, 0% runtime overhead):
+	// Verify D3D12_HEAP_FLAG_SHARED -> VK_KHR_external_memory_win32 texture import works on this driver/GPU
+	// before arming the bridge, avoiding first-frame fallback or hang on hybrid-GPU / Wine setups.
+	{
+		D3D12_HEAP_PROPERTIES probeHeap{ D3D12_HEAP_TYPE_DEFAULT };
+		D3D12_RESOURCE_DESC probeDesc{ D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 64, 1, 1,
+			DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+			D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS };
+		ComPtr<ID3D12Resource> probeTex;
+		if (FAILED(d3dDevice->CreateCommittedResource(&probeHeap, D3D12_HEAP_FLAG_SHARED, &probeDesc,
+			D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&probeTex))) || !probeTex)
+		{
+			return fail("shared_texture_probe_create_failed");
+		}
+		auto probeImp = GetOrImportLocked(gBridge, probeTex.Get(), true);
+		gBridge.imports.erase(probeTex.Get());
+		if (!probeImp)
+			return fail("shared_texture_probe_failed");
+		DestroyImport(gBridge, *probeImp);
+		probeImp.reset();
+		probeTex.Reset();
+	}
+
 	bool hookedQueue = false;
 	auto tryHookQueue = [&](ID3D12Device* dev, D3D12_COMMAND_LIST_TYPE type) {
 		if (!dev)
@@ -2448,7 +2484,10 @@ bool EnsureContext(const ContextSettings& settings) noexcept
 	init.visibleNodeMask = 1;
 	init.uiMode = settings.uiMode;
 
-	const xefgd_result_t initRes = XeFG::Init(ctx, init);
+	const xefgd_result_t initRes = [&] {
+		MfgKernels::ScopedBypassNativeReplacements bypassNativeReplacements;
+		return XeFG::Init(ctx, init);
+	}();
 	Log::Info("D3D12->Vulkan WMMA bridge: XeFG::Init returned {} ({} ms)", static_cast<int>(initRes), elapsedMs());
 	xvk::EndRecording(gBridge.xvkDevice.Get());
 	const VkResult endRes = gBridge.vkEndCommandBuffer(initCmd);

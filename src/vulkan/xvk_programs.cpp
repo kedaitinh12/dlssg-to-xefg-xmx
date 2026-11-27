@@ -1,6 +1,8 @@
 // Root signature (RTS0) parsing and the embedded SPIR-V program set (generate_xvk_programs.py).
 #include "xvk_internal.h"
 #include "VulkanProgramLookup.h"
+#include "../MfgKernels.h"
+#include "../MfgPort/RuntimePayload.h"
 #include "../MfgPort/Sha256.h"
 #include "../VulkanPrograms.h"
 #include <map>
@@ -170,7 +172,18 @@ void ProgramSet::Load(HMODULE module)
     const auto& set = VulkanPrograms::Installed();
     if (set.Usable())
         for (const auto& [dxil, row] : set.byDxil) index_.emplace(std::string(dxil), row);
-    Log("program set: %zu programs from xefg_mfg_programs\\vulkan, manifest %.16s", index_.size(), set.manifestSha256.c_str());
+    dynamicAliases_.clear();
+    try {
+        for (const auto& r : xess_payload::LoadReplacements(MfgKernels::ProgramsDirectory())) {
+            const std::string repHash = xess_payload::Hash(r.bytes);
+            if (!repHash.empty() && !r.nativeHash.empty())
+                dynamicAliases_.emplace_back(repHash, r.nativeHash);
+        }
+    } catch (...) {
+        // Strictly optional: dynamic replacement aliases must never block Vulkan program set loading.
+    }
+    Log("program set: %zu programs from xefg_mfg_programs\\vulkan, manifest %.16s (%zu replacement aliases)",
+        index_.size(), set.manifestSha256.c_str(), dynamicAliases_.size());
 }
 
 
@@ -202,7 +215,7 @@ const Program* ProgramSet::LoadRow(size_t rowIdx, const std::string& key)
 
 const Program* ProgramSet::Find(const std::string& requested)
 {
-    const std::string sha256 = ResolveProgramHash(index_, requested);
+    const std::string sha256 = ResolveProgramHash(index_, requested, dynamicAliases_);
     std::lock_guard lock(mutex_);
     auto row = index_.find(sha256);
     if (row == index_.end()) return nullptr;
@@ -211,7 +224,7 @@ const Program* ProgramSet::Find(const std::string& requested)
 
 const Program* ProgramSet::FindForRoot(const std::string& requested, const RootLayout& root)
 {
-    const std::string sha256 = ResolveProgramHash(index_, requested);
+    const std::string sha256 = ResolveProgramHash(index_, requested, dynamicAliases_);
     std::lock_guard lock(mutex_);
     auto row = index_.find(sha256);
     if (row == index_.end()) return nullptr;

@@ -24,4 +24,22 @@ std::string ResolveProgramHash(const Index& index, const std::string& requested)
     }
     return requested;
 }
+
+template<class Index, class Aliases>
+std::string ResolveProgramHash(const Index& index, const std::string& requested, const Aliases& extraAliases)
+{
+    const std::string resolved = ResolveProgramHash(index, requested);
+    if (index.find(resolved) != index.end()) return resolved;
+    for (const auto& [replacement, intel] : extraAliases) {
+        if (requested == replacement) {
+            const std::string viaIntel = ResolveProgramHash(index, intel);
+            if (index.find(viaIntel) != index.end()) return viaIntel;
+        }
+        if (requested == intel) {
+            const std::string viaRep = ResolveProgramHash(index, replacement);
+            if (index.find(viaRep) != index.end()) return viaRep;
+        }
+    }
+    return requested;
+}
 } // namespace xvk

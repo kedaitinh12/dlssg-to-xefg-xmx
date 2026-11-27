@@ -3,6 +3,7 @@
 
 #include "../Log.h"
 #include "../Plugin.h"
+#include "../VulkanPrograms.h"
 #include "../WineCompat.h"
 #include "VulkanPolicy.h"
 #include "VulkanFeatureChain.h"
@@ -809,6 +810,7 @@ namespace
 	{
 		if (!instance)
 			return;
+		VulkanRuntime::AbandonInstance(instance);
 		try
 		{
 			State& s = S();
@@ -977,6 +979,18 @@ namespace
 
 	// ------------------------------------------------------------------------------------------------ device
 
+#ifndef VK_AMD_anti_lag
+	constexpr VkStructureType kVkStructureTypePhysicalDeviceAntiLagFeaturesAMD = static_cast<VkStructureType>(1000476000);
+	struct VkPhysicalDeviceAntiLagFeaturesAMD
+	{
+		VkStructureType sType;
+		void* pNext;
+		VkBool32 antiLag;
+	};
+#else
+	constexpr VkStructureType kVkStructureTypePhysicalDeviceAntiLagFeaturesAMD = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD;
+#endif
+
 	struct DeviceEdit
 	{
 		VkDeviceCreateInfo info{};
@@ -990,6 +1004,9 @@ namespace
 		};
 		VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop{
 			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR
+		};
+		VkPhysicalDeviceAntiLagFeaturesAMD antiLag{
+			kVkStructureTypePhysicalDeviceAntiLagFeaturesAMD, nullptr, VK_FALSE
 		};
 
 		VulkanHost::FeatureChain chain;
@@ -1284,6 +1301,23 @@ namespace
 				edit->record.coopMatrixExtensions = true;
 			}
 
+			// Opt-in VK_AMD_anti_lag on AMD GPUs (OFF by default; never injected if game already enabled it).
+			const bool gameAntiLag = enabled("VK_AMD_anti_lag");
+			edit->record.amdAntiLagGameEnabled = gameAntiLag;
+			if (Plugin::options.vkAmdAntiLag.load(std::memory_order_relaxed) && edit->record.vendor == 0x1002u && offered("VK_AMD_anti_lag"))
+			{
+				if (gameAntiLag)
+				{
+					Log::Info("Vulkan: VK_AMD_anti_lag already enabled by game/OptiScaler; skipping duplicate Anti-Lag injection");
+				}
+				else
+				{
+					edit->extensions.push_back("VK_AMD_anti_lag");
+					edit->record.amdAntiLagEnabled = true;
+					Log::Info("Vulkan: opt-in VK_AMD_anti_lag enabled on AMD GPU");
+				}
+			}
+
 			// Only treat VK_NV_present_metering as hardware flip metering on Blackwell+ GPUs (deviceID >= 0x2B00).
 			// Do NOT treat VK_NV_low_latency2 (NVIDIA Reflex) or pre-Blackwell VK_NV_present_metering exposure as
 			// hardware MFG pacing, or the CPU present pacer would be falsely bypassed on RTX 20/30/40 Vulkan games.
@@ -1378,6 +1412,13 @@ namespace
 			{
 				edit->coop.cooperativeMatrix = VK_TRUE;
 				prepend(edit->coop);
+			}
+
+			if (edit->record.amdAntiLagEnabled &&
+				!FindStruct<VkPhysicalDeviceAntiLagFeaturesAMD>(chain, kVkStructureTypePhysicalDeviceAntiLagFeaturesAMD))
+			{
+				edit->antiLag.antiLag = VK_TRUE;
+				prepend(edit->antiLag);
 			}
 
 			edit->info.pNext = head;
@@ -2411,6 +2452,7 @@ namespace
 
 	void InstallFromLoad(HMODULE loader) noexcept
 	{
+		bool installedNow = false;
 		try
 		{
 			State& s = S();
@@ -2425,6 +2467,7 @@ namespace
 			{
 				SetHookState(VulkanRuntime::Hooks::Installed, {});
 				Log::Info("Vulkan hooks installed on vkCreateInstance and vkCreateDevice, vulkan-1.dll was just loaded");
+				installedNow = true;
 			}
 			else
 			{
@@ -2435,6 +2478,9 @@ namespace
 		catch (...)
 		{
 		}
+
+		if (installedNow)
+			VulkanPrograms::PreloadAsync();
 	}
 
 	bool IsLoaderName(const wchar_t* name)
@@ -2514,74 +2560,82 @@ namespace
 
 void VulkanHost::Start(const char* caller)
 {
-	State& s = S();
-	std::lock_guard lock(s.install);
-
-	if (s.started)
-		return;
-
-	// Process-wide guard: even if two copies of this DLL are ever loaded from different folders in the same
-	// process, only the first one may install MinHook detours on vulkan-1.dll.
-	const std::wstring guardName = L"Local\\XeFgVulkanHostHookGuard_" + std::to_wstring(GetCurrentProcessId());
-	HANDLE guardMutex = CreateMutexW(nullptr, FALSE, guardName.c_str());
-	if (guardMutex && GetLastError() == ERROR_ALREADY_EXISTS)
+	bool shouldPreload = false;
 	{
-		CloseHandle(guardMutex);
+		State& s = S();
+		std::lock_guard lock(s.install);
+
+		if (s.started)
+			return;
+
+		// Process-wide guard: even if two copies of this DLL are ever loaded from different folders in the same
+		// process, only the first one may install MinHook detours on vulkan-1.dll.
+		const std::wstring guardName = L"Local\\XeFgVulkanHostHookGuard_" + std::to_wstring(GetCurrentProcessId());
+		HANDLE guardMutex = CreateMutexW(nullptr, FALSE, guardName.c_str());
+		if (guardMutex && GetLastError() == ERROR_ALREADY_EXISTS)
+		{
+			CloseHandle(guardMutex);
+			s.started = true;
+			Log::Info("Vulkan hooks are already owned by another instance in this process ({}); skipping duplicate install", caller);
+			return;
+		}
+		// Intentionally kept open for the lifetime of the process when this instance owns the hooks.
+
 		s.started = true;
-		Log::Info("Vulkan hooks are already owned by another instance in this process ({}); skipping duplicate install", caller);
-		return;
-	}
-	// Intentionally kept open for the lifetime of the process when this instance owns the hooks.
 
-	s.started = true;
-
-	if (const HMODULE loader = GetModuleHandleW(LoaderName))
-	{
-		std::string why;
-
-		if (InstallLoader(loader, why))
+		if (const HMODULE loader = GetModuleHandleW(LoaderName))
 		{
-			SetHookState(VulkanRuntime::Hooks::Installed, {});
-			Log::Info("Vulkan hooks installed on vkCreateInstance and vkCreateDevice ({}). A game that already has its "
-				"Vulkan device isn't covered, see the VulkanHooks notes in the readme", caller);
+			std::string why;
+
+			if (InstallLoader(loader, why))
+			{
+				SetHookState(VulkanRuntime::Hooks::Installed, {});
+				Log::Info("Vulkan hooks installed on vkCreateInstance and vkCreateDevice ({}). A game that already has its "
+					"Vulkan device isn't covered, see the VulkanHooks notes in the readme", caller);
+				shouldPreload = true;
+			}
+			else
+			{
+				SetHookState(VulkanRuntime::Hooks::Failed, why);
+				Log::Error("Vulkan hooks: {}", why);
+			}
 		}
 		else
 		{
-			SetHookState(VulkanRuntime::Hooks::Failed, why);
-			Log::Error("Vulkan hooks: {}", why);
-		}
+			std::string why;
 
-		return;
-	}
+			if (!HookLoading(why))
+			{
+				SetHookState(VulkanRuntime::Hooks::Failed, why);
+				Log::Error("Vulkan hooks: {}", why);
+				return;
+			}
 
-	std::string why;
+			SetHookState(VulkanRuntime::Hooks::Waiting, {});
+			Log::Info("vulkan-1.dll isn't loaded yet ({}), the Vulkan hooks go in when it is", caller);
 
-	if (!HookLoading(why))
-	{
-		SetHookState(VulkanRuntime::Hooks::Failed, why);
-		Log::Error("Vulkan hooks: {}", why);
-		return;
-	}
+			// It may have been loaded between the check and the hook
+			if (const HMODULE loader = GetModuleHandleW(LoaderName); loader && !s.loaderHooked)
+			{
+				std::string late;
 
-	SetHookState(VulkanRuntime::Hooks::Waiting, {});
-	Log::Info("vulkan-1.dll isn't loaded yet ({}), the Vulkan hooks go in when it is", caller);
-
-	// It may have been loaded between the check and the hook
-	if (const HMODULE loader = GetModuleHandleW(LoaderName); loader && !s.loaderHooked)
-	{
-		std::string late;
-
-		if (InstallLoader(loader, late))
-		{
-			SetHookState(VulkanRuntime::Hooks::Installed, {});
-			Log::Info("Vulkan hooks installed on vkCreateInstance and vkCreateDevice");
-		}
-		else
-		{
-			SetHookState(VulkanRuntime::Hooks::Failed, late);
-			Log::Error("Vulkan hooks: {}", late);
+				if (InstallLoader(loader, late))
+				{
+					SetHookState(VulkanRuntime::Hooks::Installed, {});
+					Log::Info("Vulkan hooks installed on vkCreateInstance and vkCreateDevice");
+					shouldPreload = true;
+				}
+				else
+				{
+					SetHookState(VulkanRuntime::Hooks::Failed, late);
+					Log::Error("Vulkan hooks: {}", late);
+				}
+			}
 		}
 	}
+
+	if (shouldPreload)
+		VulkanPrograms::PreloadAsync();
 }
 
 void VulkanHost::SetEnabled(bool enabled)

@@ -14,6 +14,8 @@
 #include "Log.h"
 #include "MfgKernels.h"
 #include "MfgPort/Sha256.h"
+#include <mutex>
+#include <thread>
 #endif
 
 namespace
@@ -648,6 +650,48 @@ const VulkanPrograms::Set& VulkanPrograms::Installed()
 	published.store(&set, std::memory_order_release);
 
 	return set;
+}
+
+void VulkanPrograms::PreloadAsync() noexcept
+{
+	if (published.load(std::memory_order_acquire) != nullptr)
+		return;
+
+	static std::once_flag preloadOnce;
+	try
+	{
+		std::call_once(preloadOnce,
+			[]
+			{
+				if (published.load(std::memory_order_acquire) != nullptr)
+					return;
+
+				try
+				{
+					std::thread(
+						[]
+						{
+							try
+							{
+								(void)Installed();
+							}
+							catch (const std::exception& error)
+							{
+								Log::Warn("Vulkan models (preload): {}", error.what());
+							}
+							catch (...)
+							{
+							}
+						}).detach();
+				}
+				catch (...)
+				{
+				}
+			});
+	}
+	catch (...)
+	{
+	}
 }
 
 const VulkanPrograms::Set* VulkanPrograms::Loaded()

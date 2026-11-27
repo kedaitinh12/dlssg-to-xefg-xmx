@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Log.h"
 #include "NGX.h"
 #include "XeFgEnabler.h"
 #include "XeFG.h"
@@ -21,7 +22,7 @@ public:
 	// 6x
 	static constexpr uint32_t MaxFrames = 5;
 
-	explicit FrameGenerator(ID3D12Device* device) : device(device) {}
+	explicit FrameGenerator(ID3D12Device* device) : device(device), dredWatchdog(device) {}
 
 	// Called once per generated frame, DLSSG.MultiFrameIndex 1 starts a new real frame
 	NGXResult Evaluate(ID3D12GraphicsCommandList* cmdList, const NGXParameter& params);
@@ -133,10 +134,12 @@ private:
 		float interpolationTime = 0.0f, bool callerRecording = false);
 
 	ComPtr<ID3D12Device> device;
+	Log::DredWatchdog dredWatchdog;
 	Settings settings;
 	std::shared_ptr<Context> context;
 	bool createFailed = false; // retried when the settings change
-	bool portedModelInitFailed = false; // auto-fallback to DP4a model 18 if ported model 16 fails XeFG::Init (e.g. VKD3D-Proton)
+	bool portedModelInitFailed = false;
+	bool hdrBootstrapped = false; // auto-fallback to DP4a model 18 if ported model 16 fails XeFG::Init (e.g. VKD3D-Proton)
 
 	// The menu path last seen, and the route launches since the context or the path changed. A few generated frames
 	// later they say whether the selected path really runs on tensor cores
