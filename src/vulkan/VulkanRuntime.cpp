@@ -108,41 +108,6 @@ namespace
 	X(vkDestroyDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateShaderModule)      \
 	X(vkDestroyShaderModule) X(vkCreateComputePipelines) X(vkDestroyPipeline) X(vkCmdCopyBuffer) X(vkCmdFillBuffer)
 
-#ifndef VK_AMD_anti_lag
-	constexpr VkStructureType kVkStructureTypeAntiLagDataAMD = static_cast<VkStructureType>(1000476001);
-	constexpr VkStructureType kVkStructureTypeAntiLagPresentationInfoAMD = static_cast<VkStructureType>(1000476002);
-	enum VkAntiLagModeAMD
-	{
-		VK_ANTI_LAG_MODE_DRIVER_CONTROL_AMD = 0,
-		VK_ANTI_LAG_MODE_ON_AMD = 1,
-		VK_ANTI_LAG_MODE_OFF_AMD = 2,
-	};
-	enum VkAntiLagStageAMD
-	{
-		VK_ANTI_LAG_STAGE_INPUT_AMD = 0,
-		VK_ANTI_LAG_STAGE_PRESENT_AMD = 1,
-	};
-	struct VkAntiLagPresentationInfoAMD
-	{
-		VkStructureType sType;
-		void* pNext;
-		VkAntiLagStageAMD stage;
-		uint64_t frameIndex;
-	};
-	struct VkAntiLagDataAMD
-	{
-		VkStructureType sType;
-		const void* pNext;
-		VkAntiLagModeAMD mode;
-		uint32_t maxFPS;
-		const VkAntiLagPresentationInfoAMD* pPresentationInfo;
-	};
-	typedef void(VKAPI_PTR* PFN_vkAntiLagUpdateAMD)(VkDevice device, const VkAntiLagDataAMD* pData);
-#else
-	constexpr VkStructureType kVkStructureTypeAntiLagDataAMD = VK_STRUCTURE_TYPE_ANTI_LAG_DATA_AMD;
-	constexpr VkStructureType kVkStructureTypeAntiLagPresentationInfoAMD = VK_STRUCTURE_TYPE_ANTI_LAG_PRESENTATION_INFO_AMD;
-#endif
-
 	struct Device
 	{
 		std::mutex mutex;
@@ -213,12 +178,6 @@ namespace
 		PFN_vkCmdWriteTimestamp vkCmdWriteTimestamp = nullptr;
 		PFN_vkGetQueryPoolResults vkGetQueryPoolResults = nullptr;
 		float timestampPeriodNs = 0.0f;
-
-		// Opt-in AMD Anti-Lag 2 (VK_AMD_anti_lag; OFF by default, skipped when game already owns it)
-		PFN_vkAntiLagUpdateAMD vkAntiLagUpdateAMD = nullptr;
-		bool amdAntiLagGameEnabled = false;
-		bool amdAntiLagActive = false;
-		uint64_t antiLagFrameIndex = 0;
 	};
 
 	// The game owns the VkDevice and destroys it before the CRT is torn down. The layer's device is kept for the life of
@@ -1063,9 +1022,6 @@ namespace
 		d.vkCmdResetQueryPool = reinterpret_cast<PFN_vkCmdResetQueryPool>(gdpa(d.device, "vkCmdResetQueryPool"));
 		d.vkCmdWriteTimestamp = reinterpret_cast<PFN_vkCmdWriteTimestamp>(gdpa(d.device, "vkCmdWriteTimestamp"));
 		d.vkGetQueryPoolResults = reinterpret_cast<PFN_vkGetQueryPoolResults>(gdpa(d.device, "vkGetQueryPoolResults"));
-		d.amdAntiLagGameEnabled = record.amdAntiLagGameEnabled;
-		if (record.amdAntiLagEnabled && !record.amdAntiLagGameEnabled)
-			d.vkAntiLagUpdateAMD = reinterpret_cast<PFN_vkAntiLagUpdateAMD>(gdpa(d.device, "vkAntiLagUpdateAMD"));
 		if (const auto getProps2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
 			d.gipa(d.instance, "vkGetPhysicalDeviceProperties2")))
 		{
@@ -1964,6 +1920,10 @@ namespace
 					{
 						if (!d.abandoned.exchange(true, std::memory_order_acq_rel))
 							Log::Warn("Vulkan: VK_ERROR_DEVICE_LOST detected in profiler query; abandoning device teardown");
+						if (d.d3d)
+							xvk::AbandonDevice(d.d3d.Get());
+						f.fault = "device_lost";
+						return false;
 					}
 					else if (qRes == VK_SUCCESS && ts[3] >= ts[0])
 					{
@@ -2752,11 +2712,16 @@ namespace
 	bool IsDeviceAbandonedLocked(Device& d, const char* site) noexcept
 	{
 		if (d.abandoned.load(std::memory_order_acquire))
+		{
+			if (d.d3d)
+				xvk::AbandonDevice(d.d3d.Get());
 			return true;
+		}
 		if (d.d3d && FAILED(d.d3d->GetDeviceRemovedReason()))
 		{
 			if (!d.abandoned.exchange(true, std::memory_order_acq_rel))
 				Log::Warn("Vulkan: device lost/removed detected at {}; abandoning further ICD calls", site);
+			xvk::AbandonDevice(d.d3d.Get());
 			return true;
 		}
 		return false;
@@ -2874,33 +2839,6 @@ namespace
 			}
 			else if (VulkanPolicy::NewBatch(index, f.lastIndex, count, f.requestedBatchCount, f.batches))
 			{
-				const bool wantAntiLag = VulkanPolicy::ShouldDispatchAmdAntiLag(
-					Plugin::options.vkAmdAntiLag.load(std::memory_order_relaxed),
-					d.vendor, d.vkAntiLagUpdateAMD != nullptr, d.amdAntiLagGameEnabled,
-					d.abandoned.load(std::memory_order_acquire));
-				if (wantAntiLag)
-				{
-					VkAntiLagPresentationInfoAMD presInfo{
-						kVkStructureTypeAntiLagPresentationInfoAMD, nullptr,
-						VK_ANTI_LAG_STAGE_INPUT_AMD, ++d.antiLagFrameIndex
-					};
-					VkAntiLagDataAMD antiLagData{
-						kVkStructureTypeAntiLagDataAMD, nullptr,
-						VK_ANTI_LAG_MODE_ON_AMD, 0u, &presInfo
-					};
-					d.vkAntiLagUpdateAMD(d.device, &antiLagData);
-					d.amdAntiLagActive = true;
-				}
-				else if (d.amdAntiLagActive && d.vkAntiLagUpdateAMD && !d.abandoned.load(std::memory_order_acquire))
-				{
-					VkAntiLagDataAMD antiLagOff{
-						kVkStructureTypeAntiLagDataAMD, nullptr,
-						VK_ANTI_LAG_MODE_OFF_AMD, 0u, nullptr
-					};
-					d.vkAntiLagUpdateAMD(d.device, &antiLagOff);
-					d.amdAntiLagActive = false;
-				}
-
 				if (resetRequested)
 				{
 					f.consecutiveFailures = 0;
@@ -3296,6 +3234,8 @@ void VulkanRuntime::AbandonInstance(const void* instance) noexcept
 		{
 			if (!gDevice.abandoned.exchange(true, std::memory_order_acq_rel))
 				Log::Info("Vulkan: VkInstance destroyed; abandoning tracked VkDevice so teardown skips dead ICD calls");
+			if (gDevice.d3d)
+				xvk::AbandonDevice(gDevice.d3d.Get());
 		}
 	}
 	catch (...)

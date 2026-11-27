@@ -41,6 +41,7 @@ namespace xvk
     }
     VkBuffer BufferOf(ID3D12Resource*) noexcept { return VK_NULL_HANDLE; }
     bool WaitRecordedIdle(ID3D12Device*, uint64_t) noexcept { return gFakeWaitRecordedIdleResult; }
+    void AbandonDevice(ID3D12Device*) noexcept {}
 }
 
 static int gBypassNativeReplacementsDepth = 0;

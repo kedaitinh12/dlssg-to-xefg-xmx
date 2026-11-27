@@ -207,7 +207,17 @@ namespace VulkanPolicy
 		return !alreadyBootstrapped && maxFrames > 1u && dxgiFormat == Dxgi::R10G10B10A2Unorm;
 	}
 
-	// Decides whether VulkanRuntime should emit opt-in VK_AMD_anti_lag markers.
+	// Decides whether VulkanHost::PrepareDevice may enable opt-in VK_AMD_anti_lag on the game's VkDevice.
+	// Requires: opt-in enabled, AMD GPU, extension offered, VkPhysicalDeviceAntiLagFeaturesAMD::antiLag == VK_TRUE,
+	// single-GPU (not a multi-GPU VkDeviceGroupDeviceCreateInfo), and neither extension nor feature struct supplied by the game.
+	inline bool CanEnableAmdAntiLag(bool optInEnabled, uint32_t vendorId, bool extOffered, bool featureSupported,
+		uint32_t deviceGroupPhysicalCount, bool gameEnabledExt, bool gamePassedFeatureStruct) noexcept
+	{
+		return optInEnabled && vendorId == 0x1002u && extOffered && featureSupported &&
+			deviceGroupPhysicalCount <= 1u && !gameEnabledExt && !gamePassedFeatureStruct;
+	}
+
+	// Decides whether VulkanHost should emit opt-in VK_AMD_anti_lag Present/Input markers.
 	// OFF by default and automatically skipped if the game already enabled VK_AMD_anti_lag itself,
 	// preventing dual-pacer stutter or hang conflicts.
 	inline bool ShouldDispatchAmdAntiLag(

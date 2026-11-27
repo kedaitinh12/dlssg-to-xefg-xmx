@@ -734,6 +734,7 @@ public:
     // Runs `destroy` once every queue has finished the work submitted before this call.
     void DeferDestroy(std::function<void()> destroy);
     void Collect();
+    void Abandon() noexcept;
     // vkprov.1 (DeviceDesc::recorded): the command buffer lists record into while a recording is open (null
     // otherwise), and the recording's bounds (xvk.h BeginRecording / EndRecording).
     bool recorded() const { return recorded_; }
@@ -840,6 +841,7 @@ private:
     std::mutex graveMutex_;
     std::vector<Grave> graves_;
     std::atomic<bool> hasGraves_{false};
+    std::atomic<bool> abandoned_{false};
 
     // vkprov.1: recorded mode. One queue-less slot carries the progress timeline; each ended recording is an epoch
     // whose event, set by the GPU at the end of the caller's command buffer, moves the timeline to its value.

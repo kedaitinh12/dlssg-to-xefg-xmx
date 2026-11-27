@@ -414,8 +414,17 @@ void Device::InitializeResource(VkImage image, VkImageAspectFlags aspect, VkBuff
     initBatches_.push_back({command, value});
 }
 
+void Device::Abandon() noexcept
+{
+    abandoned_.store(true, std::memory_order_release);
+    std::lock_guard lock(graveMutex_);
+    graves_.clear();
+    hasGraves_.store(false, std::memory_order_release);
+}
+
 void Device::DeferDestroy(std::function<void()> destroy)
 {
+    if (abandoned_.load(std::memory_order_acquire)) return;
     Grave grave{{}, std::move(destroy)};
     // vkprov.1: a recording still open ends as the next epoch, and its work may use the object.
     bool open = false;
@@ -437,7 +446,7 @@ void Device::DeferDestroy(std::function<void()> destroy)
 
 void Device::Collect()
 {
-    if (!hasGraves_.load(std::memory_order_acquire)) return;
+    if (abandoned_.load(std::memory_order_acquire) || !hasGraves_.load(std::memory_order_acquire)) return;
     std::vector<uint64_t> done(slots_.size());
     for (size_t i = 0; i < slots_.size(); ++i) vk_.vkGetSemaphoreCounterValue(device_, slots_[i]->timeline, &done[i]);
     std::vector<std::function<void()>> ready;
@@ -463,6 +472,7 @@ void Device::InitWait(VkSemaphore& semaphore, uint64_t& value)
 
 bool Device::WaitIdle(uint64_t timeoutNs)
 {
+    if (abandoned_.load(std::memory_order_acquire)) return false;
     if (recorded_) {
         const ULONGLONG deadline = GetTickCount64() + timeoutNs / 1000000;
         while (true) {
@@ -545,7 +555,7 @@ void Device::EndRecording()
 
 void Device::PollRecordings()
 {
-    if (!recorded_) return;
+    if (!recorded_ || abandoned_.load(std::memory_order_acquire)) return;
     uint64_t finished = 0;
     {
         std::lock_guard lock(recordMutex_);
@@ -1232,6 +1242,13 @@ bool WaitRecordedIdle(ID3D12Device* d3d, uint64_t timeoutNs) noexcept
     if (!d3d) return false;
     try { return Own<Device>(static_cast<ID3D12Device1*>(d3d))->WaitIdle(timeoutNs); }
     catch (...) { return false; }
+}
+
+void AbandonDevice(ID3D12Device* d3d) noexcept
+{
+    if (!d3d) return;
+    try { Own<Device>(static_cast<ID3D12Device1*>(d3d))->Abandon(); }
+    catch (...) {}
 }
 
 VkImage ImageOf(ID3D12Resource* resource) noexcept

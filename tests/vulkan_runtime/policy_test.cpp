@@ -788,6 +788,17 @@ int main()
 		CHECK(!NeedsHdrBootstrapReinit(Dxgi::B8G8R8A8Unorm, 5u, false));
 		CHECK(!NeedsHdrBootstrapReinit(Dxgi::R16G16B16A16Float, 5u, false));
 
+		// Opt-in VK_AMD_anti_lag device-create guard (feature bit, single-GPU, game-owned ext/struct)
+		CHECK(CanEnableAmdAntiLag(true, 0x1002u, true, true, 1u, false, false));
+		CHECK(CanEnableAmdAntiLag(true, 0x1002u, true, true, 0u, false, false));
+		CHECK(!CanEnableAmdAntiLag(false, 0x1002u, true, true, 1u, false, false));
+		CHECK(!CanEnableAmdAntiLag(true, 0x10DEu, true, true, 1u, false, false));
+		CHECK(!CanEnableAmdAntiLag(true, 0x1002u, false, true, 1u, false, false));
+		CHECK(!CanEnableAmdAntiLag(true, 0x1002u, true, false, 1u, false, false));
+		CHECK(!CanEnableAmdAntiLag(true, 0x1002u, true, true, 2u, false, false));
+		CHECK(!CanEnableAmdAntiLag(true, 0x1002u, true, true, 1u, true, false));
+		CHECK(!CanEnableAmdAntiLag(true, 0x1002u, true, true, 1u, false, true));
+
 		// Opt-in VK_AMD_anti_lag dispatch policy (OFF by default, AMD only, skips if game already enabled it)
 		CHECK(ShouldDispatchAmdAntiLag(true, 0x1002u, true, false, false));
 		CHECK(!ShouldDispatchAmdAntiLag(false, 0x1002u, true, false, false));

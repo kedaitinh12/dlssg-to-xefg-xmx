@@ -118,6 +118,16 @@ namespace
 		std::atomic_bool gdpaPresentLogged = false;
 		HMODULE(WINAPI* loadLibraryExW)(LPCWSTR, HANDLE, DWORD) = nullptr;
 
+		// Opt-in AMD Anti-Lag 2 (VK_AMD_anti_lag) paired PRESENT + INPUT markers around vkQueuePresentKHR
+		VkDevice antiLagDevice = VK_NULL_HANDLE;
+		VkInstance antiLagInstance = VK_NULL_HANDLE;
+		uint32_t antiLagVendor = 0;
+		bool antiLagGameOwned = false;
+		void* antiLagUpdateFn = nullptr;
+		std::atomic_bool antiLagActive = false;
+		std::atomic_bool antiLagHasOpenFrame = false;
+		std::atomic_uint64_t antiLagFrameIndex = 0;
+
 		// Dedicated lock for low-overhead present pacing
 		std::mutex pacerMutex;
 		VulkanPolicy::PresentPacer pacer;
@@ -820,6 +830,14 @@ namespace
 					[instance](const auto& entry) { return entry.first == instance; }),
 				s.instances.end());
 			s.ignoredInstances.erase(instance);
+			if (s.antiLagInstance == instance)
+			{
+				s.antiLagDevice = VK_NULL_HANDLE;
+				s.antiLagInstance = VK_NULL_HANDLE;
+				s.antiLagUpdateFn = nullptr;
+				s.antiLagActive.store(false, std::memory_order_release);
+				s.antiLagHasOpenFrame.store(false, std::memory_order_release);
+			}
 		}
 		catch (...)
 		{
@@ -981,15 +999,55 @@ namespace
 
 #ifndef VK_AMD_anti_lag
 	constexpr VkStructureType kVkStructureTypePhysicalDeviceAntiLagFeaturesAMD = static_cast<VkStructureType>(1000476000);
+	constexpr VkStructureType kVkStructureTypeAntiLagDataAMD = static_cast<VkStructureType>(1000476001);
+	constexpr VkStructureType kVkStructureTypeAntiLagPresentationInfoAMD = static_cast<VkStructureType>(1000476002);
+	enum VkAntiLagModeAMD
+	{
+		VK_ANTI_LAG_MODE_DRIVER_CONTROL_AMD = 0,
+		VK_ANTI_LAG_MODE_ON_AMD = 1,
+		VK_ANTI_LAG_MODE_OFF_AMD = 2,
+	};
+	enum VkAntiLagStageAMD
+	{
+		VK_ANTI_LAG_STAGE_INPUT_AMD = 0,
+		VK_ANTI_LAG_STAGE_PRESENT_AMD = 1,
+	};
 	struct VkPhysicalDeviceAntiLagFeaturesAMD
 	{
 		VkStructureType sType;
 		void* pNext;
 		VkBool32 antiLag;
 	};
+	struct VkAntiLagPresentationInfoAMD
+	{
+		VkStructureType sType;
+		void* pNext;
+		VkAntiLagStageAMD stage;
+		uint64_t frameIndex;
+	};
+	struct VkAntiLagDataAMD
+	{
+		VkStructureType sType;
+		const void* pNext;
+		VkAntiLagModeAMD mode;
+		uint32_t maxFPS;
+		const VkAntiLagPresentationInfoAMD* pPresentationInfo;
+	};
+	typedef void(VKAPI_PTR* PFN_vkAntiLagUpdateAMD)(VkDevice device, const VkAntiLagDataAMD* pData);
 #else
 	constexpr VkStructureType kVkStructureTypePhysicalDeviceAntiLagFeaturesAMD = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD;
+	constexpr VkStructureType kVkStructureTypeAntiLagDataAMD = VK_STRUCTURE_TYPE_ANTI_LAG_DATA_AMD;
+	constexpr VkStructureType kVkStructureTypeAntiLagPresentationInfoAMD = VK_STRUCTURE_TYPE_ANTI_LAG_PRESENTATION_INFO_AMD;
 #endif
+
+	constexpr VkStructureType kVkStructureTypeDeviceGroupDeviceCreateInfo = static_cast<VkStructureType>(1000070001);
+	struct DeviceGroupDeviceCreateInfoHeader
+	{
+		VkStructureType sType;
+		const void* pNext;
+		uint32_t physicalDeviceCount;
+		const VkPhysicalDevice* pPhysicalDevices;
+	};
 
 	struct DeviceEdit
 	{
@@ -1181,8 +1239,11 @@ namespace
 				return Refuse(physical, "subgroup_operations");
 
 			// What the layer and the program set use
+			VkPhysicalDeviceAntiLagFeaturesAMD antiLagSupported{
+				kVkStructureTypePhysicalDeviceAntiLagFeaturesAMD, nullptr, VK_FALSE
+			};
 			VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopSupported{
-				VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR
+				VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR, &antiLagSupported
 			};
 			VkPhysicalDeviceVulkan13Features v13{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &coopSupported };
 			VkPhysicalDeviceVulkan12Features v12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &v13 };
@@ -1301,21 +1362,30 @@ namespace
 				edit->record.coopMatrixExtensions = true;
 			}
 
-			// Opt-in VK_AMD_anti_lag on AMD GPUs (OFF by default; never injected if game already enabled it).
-			const bool gameAntiLag = enabled("VK_AMD_anti_lag");
-			edit->record.amdAntiLagGameEnabled = gameAntiLag;
-			if (Plugin::options.vkAmdAntiLag.load(std::memory_order_relaxed) && edit->record.vendor == 0x1002u && offered("VK_AMD_anti_lag"))
+			// Opt-in VK_AMD_anti_lag on AMD GPUs (OFF by default; requires GPU feature bit, single-GPU, and game not owning it).
+			const bool gameAntiLagExt = enabled("VK_AMD_anti_lag");
+			const bool gameAntiLagStruct =
+				FindStruct<VkPhysicalDeviceAntiLagFeaturesAMD>(info->pNext, kVkStructureTypePhysicalDeviceAntiLagFeaturesAMD) != nullptr;
+			const auto* devGroup =
+				FindStruct<DeviceGroupDeviceCreateInfoHeader>(info->pNext, kVkStructureTypeDeviceGroupDeviceCreateInfo);
+			const uint32_t devGroupCount = devGroup ? devGroup->physicalDeviceCount : 1u;
+			edit->record.amdAntiLagGameEnabled = gameAntiLagExt || gameAntiLagStruct;
+			const bool optInAntiLag = Plugin::options.vkAmdAntiLag.load(std::memory_order_relaxed);
+			if (VulkanPolicy::CanEnableAmdAntiLag(optInAntiLag, edit->record.vendor, offered("VK_AMD_anti_lag"),
+				antiLagSupported.antiLag == VK_TRUE, devGroupCount, gameAntiLagExt, gameAntiLagStruct))
 			{
-				if (gameAntiLag)
-				{
-					Log::Info("Vulkan: VK_AMD_anti_lag already enabled by game/OptiScaler; skipping duplicate Anti-Lag injection");
-				}
-				else
-				{
-					edit->extensions.push_back("VK_AMD_anti_lag");
-					edit->record.amdAntiLagEnabled = true;
-					Log::Info("Vulkan: opt-in VK_AMD_anti_lag enabled on AMD GPU");
-				}
+				edit->extensions.push_back("VK_AMD_anti_lag");
+				edit->record.amdAntiLagEnabled = true;
+				Log::Info("Vulkan: opt-in VK_AMD_anti_lag enabled on AMD GPU");
+			}
+			else if (optInAntiLag && edit->record.vendor == 0x1002u)
+			{
+				if (gameAntiLagExt || gameAntiLagStruct)
+					Log::Info("Vulkan: VK_AMD_anti_lag already configured by game/OptiScaler; skipping duplicate Anti-Lag injection");
+				else if (devGroupCount > 1u)
+					Log::Info("Vulkan: skipping opt-in VK_AMD_anti_lag on multi-GPU device group (count={})", devGroupCount);
+				else if (!antiLagSupported.antiLag)
+					Log::Info("Vulkan: skipping opt-in VK_AMD_anti_lag (physical device antiLag feature bit is false)");
 			}
 
 			// Only treat VK_NV_present_metering as hardware flip metering on Blackwell+ GPUs (deviceID >= 0x2B00).
@@ -1448,6 +1518,21 @@ namespace
 
 				s.devices[device] = edit.record;
 				s.refused.erase(edit.record.physical);
+				if (edit.record.amdAntiLagEnabled && !edit.record.amdAntiLagGameEnabled && edit.record.gipa && edit.record.instance)
+				{
+					if (const auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+						edit.record.gipa(edit.record.instance, "vkGetDeviceProcAddr")))
+					{
+						if (void* fn = reinterpret_cast<void*>(gdpa(device, "vkAntiLagUpdateAMD")))
+						{
+							s.antiLagDevice = device;
+							s.antiLagInstance = edit.record.instance;
+							s.antiLagVendor = edit.record.vendor;
+							s.antiLagGameOwned = false;
+							s.antiLagUpdateFn = fn;
+						}
+					}
+				}
 			}
 
 			if (edit.record.hwPacing)
@@ -1861,7 +1946,59 @@ namespace
 			}
 		}
 
-		return next(queue, info);
+		// Opt-in VK_AMD_anti_lag paired PRESENT(N) -> vkQueuePresentKHR -> INPUT(N+1) markers (0% overhead when OFF).
+		VkDevice alDevice = VK_NULL_HANDLE;
+		PFN_vkAntiLagUpdateAMD alUpdate = nullptr;
+		bool wantAntiLag = false;
+		const bool optInAntiLag = Plugin::options.vkAmdAntiLag.load(std::memory_order_relaxed);
+		if (prepared && (optInAntiLag || s.antiLagActive.load(std::memory_order_relaxed)))
+		{
+			std::lock_guard lock(s.mutex);
+			alDevice = s.antiLagDevice;
+			alUpdate = reinterpret_cast<PFN_vkAntiLagUpdateAMD>(s.antiLagUpdateFn);
+			wantAntiLag = VulkanPolicy::ShouldDispatchAmdAntiLag(
+				optInAntiLag, s.antiLagVendor, alUpdate != nullptr && alDevice != VK_NULL_HANDLE, s.antiLagGameOwned, false);
+		}
+
+		if (wantAntiLag && s.antiLagHasOpenFrame.load(std::memory_order_relaxed))
+		{
+			const uint64_t curFrame = s.antiLagFrameIndex.load(std::memory_order_relaxed);
+			VkAntiLagPresentationInfoAMD presInfo{
+				kVkStructureTypeAntiLagPresentationInfoAMD, nullptr, VK_ANTI_LAG_STAGE_PRESENT_AMD, curFrame
+			};
+			VkAntiLagDataAMD data{ kVkStructureTypeAntiLagDataAMD, nullptr, VK_ANTI_LAG_MODE_ON_AMD, 0u, &presInfo };
+			alUpdate(alDevice, &data);
+		}
+
+		const VkResult presentRes = next(queue, info);
+
+		if (presentRes == VK_ERROR_DEVICE_LOST && alUpdate)
+		{
+			std::lock_guard lock(s.mutex);
+			s.antiLagDevice = VK_NULL_HANDLE;
+			s.antiLagUpdateFn = nullptr;
+			s.antiLagActive.store(false, std::memory_order_release);
+			s.antiLagHasOpenFrame.store(false, std::memory_order_release);
+		}
+		else if (wantAntiLag && static_cast<int32_t>(presentRes) >= 0)
+		{
+			const uint64_t nextFrame = s.antiLagFrameIndex.fetch_add(1, std::memory_order_relaxed) + 1u;
+			s.antiLagHasOpenFrame.store(true, std::memory_order_relaxed);
+			s.antiLagActive.store(true, std::memory_order_relaxed);
+			VkAntiLagPresentationInfoAMD inputInfo{
+				kVkStructureTypeAntiLagPresentationInfoAMD, nullptr, VK_ANTI_LAG_STAGE_INPUT_AMD, nextFrame
+			};
+			VkAntiLagDataAMD data{ kVkStructureTypeAntiLagDataAMD, nullptr, VK_ANTI_LAG_MODE_ON_AMD, 0u, &inputInfo };
+			alUpdate(alDevice, &data);
+		}
+		else if (!wantAntiLag && alUpdate && alDevice && s.antiLagActive.exchange(false, std::memory_order_acq_rel))
+		{
+			s.antiLagHasOpenFrame.store(false, std::memory_order_relaxed);
+			VkAntiLagDataAMD offData{ kVkStructureTypeAntiLagDataAMD, nullptr, VK_ANTI_LAG_MODE_OFF_AMD, 0u, nullptr };
+			alUpdate(alDevice, &offData);
+		}
+
+		return presentRes;
 	}
 
 	VKAPI_ATTR VkResult VKAPI_CALL HookCreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* info,
