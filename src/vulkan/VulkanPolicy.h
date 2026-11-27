@@ -227,7 +227,8 @@ namespace VulkanPolicy
 	}
 
 	// Gates VK_AMD_anti_lag Present/Input markers to registered swapchains owned by the Anti-Lag device
-	// and to the final (real-frame) present of an MFG batch (skipping intermediate interpolated presents).
+	// and strictly once to the real-frame present of an active MFG batch (skipping interpolated presents
+	// and any extra presents arriving before the next batch begins).
 	inline bool IsRealFramePresentForAntiLag(
 		bool swapchainMatchesDevice, uint32_t generatedCount, uint32_t presentsInBatchAfter) noexcept
 	{
@@ -235,7 +236,7 @@ namespace VulkanPolicy
 			return false;
 		if (generatedCount == 0u)
 			return true;
-		return presentsInBatchAfter > generatedCount;
+		return presentsInBatchAfter == generatedCount + 1u;
 	}
 
 	// Combined depth/stencil image views cannot be sampled by our float sampler.

@@ -814,9 +814,14 @@ int main()
 		CHECK(IsRealFramePresentForAntiLag(true, 0u, 1u));   // FG paused/off: every present is a real frame
 		CHECK(!IsRealFramePresentForAntiLag(true, 1u, 1u));  // 2x MFG: 1st present is interpolated -> skip
 		CHECK(IsRealFramePresentForAntiLag(true, 1u, 2u));   // 2x MFG: 2nd present is real -> fire
+		CHECK(!IsRealFramePresentForAntiLag(true, 2u, 1u));  // 3x MFG: interp 1 -> skip
+		CHECK(!IsRealFramePresentForAntiLag(true, 2u, 2u));  // 3x MFG: interp 2 -> skip
+		CHECK(IsRealFramePresentForAntiLag(true, 2u, 3u));   // 3x MFG: real frame 3 -> fire once
+		CHECK(!IsRealFramePresentForAntiLag(true, 2u, 4u));  // 3x MFG: extra present before next batch -> skip
 		CHECK(!IsRealFramePresentForAntiLag(true, 3u, 1u));  // 4x MFG: interp 1 -> skip
 		CHECK(!IsRealFramePresentForAntiLag(true, 3u, 3u));  // 4x MFG: interp 3 -> skip
-		CHECK(IsRealFramePresentForAntiLag(true, 3u, 4u));   // 4x MFG: real frame 4 -> fire
+		CHECK(IsRealFramePresentForAntiLag(true, 3u, 4u));   // 4x MFG: real frame 4 -> fire once
+		CHECK(!IsRealFramePresentForAntiLag(true, 3u, 5u));  // 4x MFG: extra present before next batch -> skip
 
 		// D3D12->Vulkan WMMA context-init failure backoff & ResetContext preservation (FH6 menu toggle storm)
 		CHECK(!CanRetryFailedWmmaContext(1u, 0ull, true));       // same settings, <10s cooldown -> skip
