@@ -2311,7 +2311,8 @@ NGXResult FrameGenerator::Evaluate(ID3D12GraphicsCommandList* cmdList, const NGX
 				if (context->outputs[i])
 				{
 					D3D12VulkanWmma::ForgetResource(context->outputs[i].Get());
-					DeferredDestroy::Add(std::move(context->outputs[i]), /*heavy=*/false, ActiveGpuSignals());
+					DeferredDestroy::Add(std::make_shared<ComPtr<ID3D12Resource>>(std::move(context->outputs[i])),
+						/*heavy=*/false, ActiveGpuSignals());
 					reclaimedAny = true;
 				}
 			}
