@@ -262,15 +262,19 @@ int main()
 		for (const wchar_t* word : { L"0", L"off", L"OFF", L"Off", L"false", L"FALSE", L"fAlSe" })
 			CHECK(IsOffWord(word) && !IsOnWord(word));
 
-		for (const wchar_t* word : { L"", L"1", L"on", L"true", L"no", L"disabled", L"of", L"offf", L" off", L"off ", L"00",
-			     L"-0", L"fals" })
+		// cmd's `set NAME=0 && %command%` leaves "0 " in the environment: blanks around the word still count
+		for (const wchar_t* word : { L"0 ", L" 0", L"\t0", L"off ", L" off", L"  FALSE\t", L"\t off \t" })
+			CHECK(IsOffWord(word) && !IsOnWord(word));
+
+		for (const wchar_t* word : { L"", L" ", L"\t", L"1", L"on", L"true", L"no", L"disabled", L"of", L"offf", L"o ff",
+			     L"0 0", L"00", L"-0", L"fals", L"\"0\"", L"0\r", L"0\n" })
 			CHECK(!IsOffWord(word));
 
 		// XEFG_TENSOR_CORES_VULKAN_BARRIERS: 1, on and true turn it on
-		for (const wchar_t* word : { L"1", L"on", L"ON", L"On", L"true", L"TRUE", L"tRuE" })
+		for (const wchar_t* word : { L"1", L"on", L"ON", L"On", L"true", L"TRUE", L"tRuE", L" 1", L"1 ", L"\ton\t" })
 			CHECK(IsOnWord(word) && !IsOffWord(word));
 
-		for (const wchar_t* word : { L"", L"0", L"off", L"yes", L"y", L"enabled", L"11", L" 1", L"1 ", L"tru", L"truee" })
+		for (const wchar_t* word : { L"", L" ", L"0", L"off", L"yes", L"y", L"enabled", L"11", L"1 1", L"tru", L"truee" })
 			CHECK(!IsOnWord(word));
 
 		// XEFG_TENSOR_CORES_MASK: hexadecimal, a bit per layer of the table of 17, anything else is every layer

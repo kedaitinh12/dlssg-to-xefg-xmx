@@ -300,17 +300,30 @@ namespace VulkanPolicy
 
 			return true;
 		}
+
+		// cmd's `set NAME=0 && ...` keeps the space before && in the value, so spaces and tabs around a word are dropped
+		inline std::wstring_view TrimBlanks(std::wstring_view value) noexcept
+		{
+			while (!value.empty() && (value.front() == L' ' || value.front() == L'\t'))
+				value.remove_prefix(1);
+			while (!value.empty() && (value.back() == L' ' || value.back() == L'\t'))
+				value.remove_suffix(1);
+			return value;
+		}
 	} // namespace Detail
 
-	// A switch of the environment turned off: 0, off or false in any case. An empty value, or any other word, is not
+	// A switch of the environment turned off: 0, off or false in any case, blanks around it ignored. An empty value, or
+	// any other word, is not
 	inline bool IsOffWord(std::wstring_view value) noexcept
 	{
+		value = Detail::TrimBlanks(value);
 		return Detail::SameWord(value, L"0") || Detail::SameWord(value, L"off") || Detail::SameWord(value, L"false");
 	}
 
-	// A switch of the environment turned on: 1, on or true in any case
+	// A switch of the environment turned on: 1, on or true in any case, blanks around it ignored
 	inline bool IsOnWord(std::wstring_view value) noexcept
 	{
+		value = Detail::TrimBlanks(value);
 		return Detail::SameWord(value, L"1") || Detail::SameWord(value, L"on") || Detail::SameWord(value, L"true");
 	}
 
