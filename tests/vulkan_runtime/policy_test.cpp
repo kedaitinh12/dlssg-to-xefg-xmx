@@ -712,6 +712,37 @@ int main()
 		CHECK(XeFgEnabler::ShouldGhostBusterReset(true, true, true, 0.20f, 1.0f, 1.0f, true, true, 0.0f, 4.0f, true));
 		// FOV jump STILL resets even during a sustained turn:
 		CHECK(XeFgEnabler::ShouldGhostBusterReset(true, true, true, 0.642788f, 1.4f, 1.0f, true, true, 0.0f, 4.0f, true));
+		// Camera finiteness & FOV ULP boundary (UniversalScalers-Vulkan temporal lifecycle hardening)
+		const float qnan = std::numeric_limits<float>::quiet_NaN();
+		const float pinf = std::numeric_limits<float>::infinity();
+		CHECK(XeFgEnabler::IsFiniteCameraPose(1.0f, 2.0f, 3.0f, 0.0f, 0.0f, 1.0f));
+		CHECK(!XeFgEnabler::IsFiniteCameraPose(qnan, 2.0f, 3.0f, 0.0f, 0.0f, 1.0f));
+		CHECK(!XeFgEnabler::IsFiniteCameraPose(1.0f, 2.0f, 3.0f, 0.0f, pinf, 1.0f));
+		CHECK(XeFgEnabler::ShouldGhostBusterReset(true, true, true, qnan, 1.0f, 1.0f, true, true, 0.0f, 4.0f, false));
+		CHECK(XeFgEnabler::ShouldGhostBusterReset(true, true, true, 1.0f, 1.0f, 1.0f, true, true, pinf, 4.0f, false));
+		// Nominal +0.25f FOV delta rounded 1 ULP upward must not false-trigger a reset
+		const float fovBase = 1.0f;
+		const float fovExactPlus1Ulp = std::nextafter(fovBase + 0.25f, 2.0f);
+		CHECK(!XeFgEnabler::ShouldGhostBusterReset(true, true, true, 1.0f, fovExactPlus1Ulp, fovBase, true, true, 0.0f, 4.0f, false));
+		CHECK(XeFgEnabler::ShouldGhostBusterReset(true, true, true, 1.0f, fovBase + 0.26f, fovBase, true, true, 0.0f, 4.0f, false));
+		CHECK(!XeFgEnabler::ShouldGhostBusterReset(true, true, true, 1.0f, qnan, fovBase, true, true, 0.0f, 4.0f, false));
+		// Sustained NaN camera coordinates (e.g. 20 frames of cutscene/menu): must reset strictly once, not every 5 frames
+		{
+			bool hasPrevCam = true;
+			uint32_t quietFrames = 0u;
+			uint32_t resetCount = 0u;
+			for (int frame = 0; frame < 20; ++frame)
+			{
+				bool frameReset = false;
+				if (quietFrames > 0u)
+					--quietFrames;
+				XeFgEnabler::HandleNonFiniteCameraPose(true, frameReset, hasPrevCam, quietFrames, 4u);
+				if (frameReset)
+					++resetCount;
+			}
+			CHECK(resetCount == 1u);
+			CHECK(!hasPrevCam);
+		}
 	}
 
 	// HwFlipQueue state helper
@@ -1160,6 +1191,24 @@ int main()
 		// Non-AMD vendors always return Unknown even if coopmat flag is set
 		CHECK(ClassifyAmdArch(0x10DEu, 0x2684u, "NVIDIA GeForce RTX 4090", true) == AmdArch::Unknown);
 		CHECK(ClassifyAmdArch(0x8086u, 0xE20Bu, "Intel Arc B580", true) == AmdArch::Unknown);
+	}
+
+	{
+		using VulkanPolicy::ClassifyDotProductTier;
+		using VulkanPolicy::DotProductCaps;
+		using VulkanPolicy::DotProductTier;
+		using VulkanPolicy::DotProductTierName;
+		CHECK(ClassifyDotProductTier({ false, true, true }) == DotProductTier::Unsupported);
+		CHECK(ClassifyDotProductTier({ true, false, false }) == DotProductTier::Emulated);
+		// RDNA 2 / Navi2 pattern: DotProductInput4x8BitPacked accelerated without native s8
+		CHECK(ClassifyDotProductTier({ true, false, true }) == DotProductTier::Packed4x8);
+		CHECK(ClassifyDotProductTier({ true, true, false }) == DotProductTier::Signed8Only);
+		CHECK(std::strcmp(DotProductTierName(DotProductTier::Signed8Only), "signed8") == 0);
+		CHECK(ClassifyDotProductTier({ true, true, true }) == DotProductTier::Native8BitAndPacked);
+		CHECK(std::strcmp(DotProductTierName(DotProductTier::Unsupported), "unsupported") == 0);
+		CHECK(std::strcmp(DotProductTierName(DotProductTier::Emulated), "emulated") == 0);
+		CHECK(std::strcmp(DotProductTierName(DotProductTier::Packed4x8), "packed4x8") == 0);
+		CHECK(std::strcmp(DotProductTierName(DotProductTier::Native8BitAndPacked), "native8+packed4x8") == 0);
 	}
 
 	std::printf("%d checks, %d failed\n", checks, failures);

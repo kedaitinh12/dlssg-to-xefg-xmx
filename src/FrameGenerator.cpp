@@ -1730,8 +1730,11 @@ void FrameGenerator::CaptureRealFrame(ID3D12GraphicsCommandList* cmdList, const 
 	{
 		const XMFLOAT3 curPos = GetVector(params, "DLSSG.CameraPosX", "DLSSG.CameraPosY", "DLSSG.CameraPosZ");
 		const XMFLOAT3 curFwd = GetVector(params, "DLSSG.CameraFwdX", "DLSSG.CameraFwdY", "DLSSG.CameraFwdZ");
-		const float fwdLenSq = curFwd.x * curFwd.x + curFwd.y * curFwd.y + curFwd.z * curFwd.z;
-		const bool hasCamera = fwdLenSq > 1e-6f;
+		const bool cameraFinite = XeFgEnabler::IsFiniteCameraPose(curPos.x, curPos.y, curPos.z, curFwd.x, curFwd.y, curFwd.z);
+		const float fwdLenSq = cameraFinite ? (curFwd.x * curFwd.x + curFwd.y * curFwd.y + curFwd.z * curFwd.z) : 0.0f;
+		const bool hasCamera = cameraFinite && fwdLenSq > 1e-6f;
+		if (!cameraFinite)
+			XeFgEnabler::HandleNonFiniteCameraPose(camCutOn, reset, context->hasPrevCamera, context->syntheticResetQuietFrames, kSyntheticResetQuietFrames);
 		float curFov = params.GetOr("DLSSG.CameraFOV", 0.0f);
 		if (!std::isfinite(curFov))
 			curFov = 0.0f;

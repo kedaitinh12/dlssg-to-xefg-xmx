@@ -139,6 +139,7 @@ typedef enum VkStructureType
 	VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 = 1000059000,
 	VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 = 1000059001,
 	VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES = 1000280000,
+	VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES = 1000280001,
 	VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES = 1000207000,
 	VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES = 1000211000,
 	VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES = 1000314007,
@@ -653,6 +654,18 @@ typedef struct VkPhysicalDeviceShaderIntegerDotProductFeatures
 	void* pNext;
 	VkBool32 shaderIntegerDotProduct;
 } VkPhysicalDeviceShaderIntegerDotProductFeatures;
+
+typedef struct VkPhysicalDeviceShaderIntegerDotProductProperties
+{
+	VkStructureType sType;
+	void* pNext;
+	VkBool32 integerDotProduct8BitUnsignedAccelerated;
+	VkBool32 integerDotProduct8BitSignedAccelerated;
+	VkBool32 integerDotProduct8BitMixedSignednessAccelerated;
+	VkBool32 integerDotProduct4x8BitPackedUnsignedAccelerated;
+	VkBool32 integerDotProduct4x8BitPackedSignedAccelerated;
+	VkBool32 integerDotProduct4x8BitPackedMixedSignednessAccelerated;
+} VkPhysicalDeviceShaderIntegerDotProductProperties;
 
 typedef struct VkPhysicalDeviceVulkanMemoryModelFeatures
 {

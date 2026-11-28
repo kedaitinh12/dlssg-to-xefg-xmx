@@ -2495,14 +2495,23 @@ namespace
 		if (camCutOn || ghostBusterOn)
 		{
 			auto finiteOr = [](float v, float fallback) noexcept { return std::isfinite(v) ? v : fallback; };
-			const float px = finiteOr(parameters.GetOr<float>("DLSSG.CameraPosX", 0.0f), 0.0f);
-			const float py = finiteOr(parameters.GetOr<float>("DLSSG.CameraPosY", 0.0f), 0.0f);
-			const float pz = finiteOr(parameters.GetOr<float>("DLSSG.CameraPosZ", 0.0f), 0.0f);
-			const float fx = finiteOr(parameters.GetOr<float>("DLSSG.CameraFwdX", 0.0f), 0.0f);
-			const float fy = finiteOr(parameters.GetOr<float>("DLSSG.CameraFwdY", 0.0f), 0.0f);
-			const float fz = finiteOr(parameters.GetOr<float>("DLSSG.CameraFwdZ", 0.0f), 0.0f);
-			const float fwdLenSq = fx * fx + fy * fy + fz * fz;
-			const bool hasCamera = fwdLenSq > 1e-6f;
+			const float rawPx = parameters.GetOr<float>("DLSSG.CameraPosX", 0.0f);
+			const float rawPy = parameters.GetOr<float>("DLSSG.CameraPosY", 0.0f);
+			const float rawPz = parameters.GetOr<float>("DLSSG.CameraPosZ", 0.0f);
+			const float rawFx = parameters.GetOr<float>("DLSSG.CameraFwdX", 0.0f);
+			const float rawFy = parameters.GetOr<float>("DLSSG.CameraFwdY", 0.0f);
+			const float rawFz = parameters.GetOr<float>("DLSSG.CameraFwdZ", 0.0f);
+			const bool cameraFinite = XeFgEnabler::IsFiniteCameraPose(rawPx, rawPy, rawPz, rawFx, rawFy, rawFz);
+			const float px = cameraFinite ? rawPx : 0.0f;
+			const float py = cameraFinite ? rawPy : 0.0f;
+			const float pz = cameraFinite ? rawPz : 0.0f;
+			const float fx = cameraFinite ? rawFx : 0.0f;
+			const float fy = cameraFinite ? rawFy : 0.0f;
+			const float fz = cameraFinite ? rawFz : 0.0f;
+			const float fwdLenSq = cameraFinite ? (fx * fx + fy * fy + fz * fz) : 0.0f;
+			const bool hasCamera = cameraFinite && fwdLenSq > 1e-6f;
+			if (!cameraFinite)
+				XeFgEnabler::HandleNonFiniteCameraPose(camCutOn, reset, f.hasPrevCamera, f.syntheticResetQuietFrames, kSyntheticResetQuietFrames);
 			float curFov = finiteOr(parameters.GetOr<float>("DLSSG.CameraFOV", 0.0f), 0.0f);
 			if (curFov > 10.0f)
 				curFov *= 3.14159265358979323846f / 180.0f;

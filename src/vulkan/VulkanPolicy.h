@@ -1644,4 +1644,55 @@ namespace VulkanPolicy
 		}
 		return ClassifyAmdArch(vendorId, deviceId, std::string_view(ascii, n), hasWmma16x16x16Wave32);
 	}
+
+	// Hardware acceleration classification for VK_KHR_shader_integer_dot_product (Vulkan 1.3 core):
+	// Distinguishes genuine hardware DP4a (including RDNA 2 / Navi2 DotProductInput4x8BitPacked without shaderInt8)
+	// from software-emulated shaderIntegerDotProduct support.
+	struct DotProductCaps
+	{
+		bool featureSupported = false;
+		bool signed8BitAccelerated = false;
+		bool packed4x8SignedAccelerated = false;
+	};
+
+	enum class DotProductTier : uint8_t
+	{
+		Unsupported = 0,
+		Emulated = 1,
+		Signed8Only = 2,
+		Packed4x8 = 3,
+		Native8BitAndPacked = 4,
+	};
+
+	inline DotProductTier ClassifyDotProductTier(const DotProductCaps& caps) noexcept
+	{
+		if (!caps.featureSupported)
+			return DotProductTier::Unsupported;
+		if (caps.signed8BitAccelerated && caps.packed4x8SignedAccelerated)
+			return DotProductTier::Native8BitAndPacked;
+		if (caps.packed4x8SignedAccelerated)
+			return DotProductTier::Packed4x8;
+		if (caps.signed8BitAccelerated)
+			return DotProductTier::Signed8Only;
+		return DotProductTier::Emulated;
+	}
+
+	inline const char* DotProductTierName(DotProductTier tier) noexcept
+	{
+		switch (tier)
+		{
+		case DotProductTier::Unsupported:
+			return "unsupported";
+		case DotProductTier::Emulated:
+			return "emulated";
+		case DotProductTier::Signed8Only:
+			return "signed8";
+		case DotProductTier::Packed4x8:
+			return "packed4x8";
+		case DotProductTier::Native8BitAndPacked:
+			return "native8+packed4x8";
+		default:
+			return "unknown";
+		}
+	}
 } // namespace VulkanPolicy

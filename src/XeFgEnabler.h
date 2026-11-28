@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cmath>
+#include <limits>
 #include <cstdint>
 
 namespace XeFgEnabler
@@ -209,6 +210,28 @@ namespace XeFgEnabler
 	//   for a continuous player mouse turn (still resets on >70 deg instant cuts)
 	// - Sudden FOV / zoom / ADS jump (> 0.25 rad ~= 14.3 deg)
 	// - Missing camera motion in motion vectors (DLSSG.CameraMotionIncluded == 0) combined with camera movement
+	// Finite check for 6-DOF camera telemetry (UniversalScalers-Vulkan temporal lifecycle pattern):
+	// Reject NaN/Inf camera coordinates before they poison prevCameraPos/prevCameraFwd or bypass > threshold checks.
+	inline bool IsFiniteCameraPose(float px, float py, float pz, float fx, float fy, float fz) noexcept
+	{
+		return std::isfinite(px) && std::isfinite(py) && std::isfinite(pz) &&
+		       std::isfinite(fx) && std::isfinite(fy) && std::isfinite(fz);
+	}
+
+	// Handles a frame with NaN/Inf camera coordinates: triggers at most one camera-cut reset on the valid->NaN
+	// transition and clears hasPrevCamera so sustained NaN (e.g. cutscenes/menus) never re-triggers resets every
+	// quietWindow+1 frames, and the first valid frame after NaN seeds a fresh baseline instead of diffing stale state.
+	inline void HandleNonFiniteCameraPose(bool camCutOn, bool& reset, bool& hasPrevCamera,
+		uint32_t& quietFrames, uint32_t quietWindow) noexcept
+	{
+		if (camCutOn && !reset && hasPrevCamera && quietFrames == 0u)
+		{
+			reset = true;
+			quietFrames = quietWindow;
+		}
+		hasPrevCamera = false;
+	}
+
 	inline bool ShouldGhostBusterReset(bool enabled, bool hasCamera, bool hasPrevCamera, float fwdDot,
 		float curFovRad, float prevFovRad, bool hasPrevFov, bool cameraMotionIncluded, float distSq,
 		float moveThresholdSq = 4.0f, bool sustainedTurn = false) noexcept
@@ -216,11 +239,23 @@ namespace XeFgEnabler
 		if (!enabled)
 			return false;
 
-		if (hasCamera && hasPrevCamera && fwdDot < (sustainedTurn ? 0.342f : 0.707f))
-			return true;
+		if (hasCamera && hasPrevCamera)
+		{
+			if (!std::isfinite(fwdDot) || !std::isfinite(distSq))
+				return true;
 
-		if (hasPrevFov && curFovRad > 0.01f && prevFovRad > 0.01f && std::abs(curFovRad - prevFovRad) > 0.25f)
-			return true;
+			if (fwdDot < (sustainedTurn ? 0.342f : 0.707f))
+				return true;
+		}
+
+		if (hasPrevFov && std::isfinite(curFovRad) && std::isfinite(prevFovRad) &&
+			curFovRad > 0.01f && prevFovRad > 0.01f)
+		{
+			const float maxFov = (std::abs(curFovRad) > std::abs(prevFovRad)) ? std::abs(curFovRad) : std::abs(prevFovRad);
+			const float fovEps = 8.0f * std::numeric_limits<float>::epsilon() * ((maxFov > 1.0f) ? maxFov : 1.0f);
+			if (std::abs(curFovRad - prevFovRad) > 0.25f + fovEps)
+				return true;
+		}
 
 		// Require a substantial jump (> moveThreshold, default 2m / adaptive for cm engines) or sharp snap (>30 deg,
 		// cos(30 deg) ~= 0.866) when CameraMotionIncluded == 0 so ordinary movement/panning never spams resets.

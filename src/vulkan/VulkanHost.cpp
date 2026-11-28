@@ -1235,7 +1235,12 @@ namespace
 			if (!properties2 || !features2 || !familiesFn || !extensionsFn)
 				return Refuse(physical, "instance_functions");
 
-			VkPhysicalDeviceVulkan11Properties v11Properties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES };
+			VkPhysicalDeviceShaderIntegerDotProductProperties dotProps{
+				VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES
+			};
+			VkPhysicalDeviceVulkan11Properties v11Properties{
+				VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES, &dotProps
+			};
 			VkPhysicalDeviceProperties2 properties{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &v11Properties };
 			properties2(physical, &properties);
 
@@ -1266,6 +1271,18 @@ namespace
 			if (!v12.timelineSemaphore || !v13.synchronization2 || !v13.maintenance4 || !v13.shaderIntegerDotProduct ||
 				!supported.features.shaderStorageImageExtendedFormats)
 				return Refuse(physical, "device_features");
+
+			edit->record.dotProductSigned8Accelerated = (dotProps.integerDotProduct8BitSignedAccelerated == VK_TRUE);
+			edit->record.dotProductPacked4x8Accelerated = (dotProps.integerDotProduct4x8BitPackedSignedAccelerated == VK_TRUE);
+			const auto dp4aTier = VulkanPolicy::ClassifyDotProductTier({
+				true,
+				edit->record.dotProductSigned8Accelerated,
+				edit->record.dotProductPacked4x8Accelerated
+			});
+			Log::Info("Vulkan DP4a probe: tier={}, s8_accel={}, packed4x8_accel={}",
+				VulkanPolicy::DotProductTierName(dp4aTier),
+				edit->record.dotProductSigned8Accelerated ? 1 : 0,
+				edit->record.dotProductPacked4x8Accelerated ? 1 : 0);
 
 			uint32_t count = 0;
 			extensionsFn(physical, nullptr, &count, nullptr);

@@ -41,6 +41,9 @@ namespace VulkanHost
 		// Opt-in VK_AMD_anti_lag enabled by us (never injected if the game already enabled it)
 		bool amdAntiLagEnabled = false;
 		bool amdAntiLagGameEnabled = false;
+		// Diagnostic-only hardware DP4a acceleration properties (logged at device creation; not gating execution)
+		bool dotProductSigned8Accelerated = false;
+		bool dotProductPacked4x8Accelerated = false;
 	};
 
 	// Installs the hooks, or arranges for them to be installed when vulkan-1.dll is loaded. Later calls do nothing. Not
