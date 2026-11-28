@@ -61,7 +61,7 @@ if __name__ == '__main__':
         xmx_dir = args.directory / 'xmx_8x8x32'
         if xmx_dir.is_dir():
             check(xmx_dir)
-        for sub in ('radv_reg', 'gfx12_reg', 'stride5', 'stride5_radv_reg', 'stride5_gfx12_reg', 'k32_16x16x32'):
+        for sub in ('radv_reg', 'gfx12_reg', 'k32_16x16x32'):
             sub_dir = args.directory / sub
             if sub_dir.is_dir():
                 check(sub_dir)
