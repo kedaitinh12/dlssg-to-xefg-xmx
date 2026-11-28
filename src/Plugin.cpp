@@ -9,6 +9,7 @@
 #include "VulkanRuntime.h"
 #include "XeFG.h"
 #include "loader/EarlyLoaderCore.h"
+#include "loader/SessionMarkerWin.h"
 #include "optiscaler_plugin.h"
 #include "vulkan/VulkanPolicy.h"
 
@@ -1186,6 +1187,10 @@ namespace
 
 	void StartFromAsiImpl()
 	{
+		// Crash reporters and web helpers beside the game's exe: no hooks, no runtime (see EarlyLoaderCore.h)
+		if (EarlyLoader::IsCurrentProcessHelper())
+			return;
+
 		const auto self = ThisModulePath();
 		Log::Info("InitializeASI, {}", self.string());
 
@@ -1382,6 +1387,9 @@ extern "C" __declspec(dllexport) void XeFgEarlyBootstrap(const char* caller)
 {
 	try
 	{
+		if (EarlyLoader::IsCurrentProcessHelper())
+			return;
+
 		const char* tag = (caller && *caller) ? caller : "XeFgEarlyBootstrap";
 		Log::Info("XeFgEarlyBootstrap ({}), {}", tag, ThisModulePath().string());
 		VulkanRuntime::Start(tag);

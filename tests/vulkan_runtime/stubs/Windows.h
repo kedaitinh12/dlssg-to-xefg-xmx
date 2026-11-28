@@ -130,6 +130,13 @@ extern "C++"
 		void* pfnCompletionRoutine, void* lpArgToCompletionRoutine, BOOL fResume);
 	DWORD WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds);
 	BOOL CloseHandle(HANDLE hObject);
+	// The .session marker's owner check (src/loader/SessionMarkerWin.h)
+	#define PROCESS_QUERY_LIMITED_INFORMATION 0x1000
+	#define STILL_ACTIVE 259L
+	#define ERROR_ACCESS_DENIED 5L
+	HANDLE OpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId);
+	BOOL GetExitCodeProcess(HANDLE hProcess, DWORD* lpExitCode);
+	BOOL QueryFullProcessImageNameW(HANDLE hProcess, DWORD dwFlags, wchar_t* lpExeName, DWORD* lpdwSize);
 	#define FILE_SHARE_READ 0x00000001
 	#define FILE_SHARE_WRITE 0x00000002
 	#define FILE_SHARE_DELETE 0x00000004

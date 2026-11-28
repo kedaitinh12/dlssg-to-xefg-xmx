@@ -2,6 +2,7 @@
 #include "DredAttribution.h"
 #include "PeVersion.h"
 #include "Util.h"
+#include "loader/SessionMarkerWin.h"
 
 #include <Windows.h>
 #include <DbgHelp.h>
@@ -240,40 +241,41 @@ namespace
 
 		LogSession()
 		{
+			// Crash reporters and web helpers beside the game's exe can load this DLL too. They write nothing: no log,
+			// no marker, so the game's log header and its unclean-exit detection survive them.
+			if (EarlyLoader::IsCurrentProcessHelper())
+			{
+				gLoggingEnabled.store(false, std::memory_order_release);
+				return;
+			}
+
 			const auto logPath = ThisModulePath().replace_extension(L".log");
-			sessionMarkerPath = ThisModulePath().replace_extension(L".session");
+			const auto markerPath = ThisModulePath().replace_extension(L".session");
 			wchar_t flag[8]{};
 			const DWORD len = GetEnvironmentVariableW(L"XEFG_EARLY_LOG_INITIALIZED", flag, 8);
 			const bool appended = (len > 0 && len < 8 && flag[0] == L'1');
 			if (appended)
-			{
 				SetEnvironmentVariableW(L"XEFG_EARLY_LOG_INITIALIZED", nullptr);
-				file.open(logPath, std::ios::app);
-			}
-			else
-			{
-				file.open(logPath, std::ios::trunc);
-			}
 
-			// Previous-session unclean exit detection (0% gameplay overhead: 1 read/write on DLL init, 1 delete on clean exit).
-			std::string previousUnclean;
-			{
-				std::ifstream prev(sessionMarkerPath);
-				if (prev.is_open())
-				{
-					std::getline(prev, previousUnclean);
-					if (previousUnclean.size() > 256)
-						previousUnclean.resize(256);
-				}
-			}
+			// Previous-session unclean exit detection (0% gameplay overhead: 1 read/write on DLL init, 1 delete on clean
+			// exit). A marker whose process is still running belongs to that process (the game, seen from some other
+			// program loading this DLL): it is not an unclean exit, and neither the marker nor the log is ours to reset.
+			const DWORD selfPid = GetCurrentProcessId();
+			const auto marker = EarlyLoader::ReadSessionMarker(markerPath);
+			const auto decision = EarlyLoader::DecideSession(marker.pid, EarlyLoader::IsMarkerOwnerAlive(marker),
+				selfPid, appended);
+			file.open(logPath, decision.truncateLog ? std::ios::trunc : std::ios::app);
+			const std::string previousUnclean = decision.reportPreviousUnclean ? marker.line : std::string();
 
 			const std::string exeName = NarrowModuleName(nullptr);
 			const std::string modName = ThisModulePath().filename().string();
+			if (decision.takeMarker)
 			{
-				std::ofstream marker(sessionMarkerPath, std::ios::trunc);
-				if (marker.is_open())
+				sessionMarkerPath = markerPath;
+				std::ofstream markerOut(sessionMarkerPath, std::ios::trunc);
+				if (markerOut.is_open())
 				{
-					marker << "pid=" << GetCurrentProcessId() << " exe=" << exeName
+					markerOut << "pid=" << selfPid << " exe=" << exeName
 						<< " build=" << __DATE__ << " " << __TIME__ << "\n";
 				}
 			}
@@ -305,7 +307,10 @@ namespace
 
 		~LogSession()
 		{
-			if (!sessionMarkerPath.empty())
+			// Only our own marker: another process may have taken it over since (it found ours gone, or never had it)
+			if (!sessionMarkerPath.empty() &&
+				EarlyLoader::ShouldDeleteMarkerAtExit(EarlyLoader::ReadSessionMarker(sessionMarkerPath).pid,
+					GetCurrentProcessId()))
 				DeleteFileW(sessionMarkerPath.c_str());
 			if (gLoggingEnabled.load(std::memory_order_relaxed))
 			{

@@ -504,4 +504,156 @@ namespace EarlyLoader
 
 		return result;
 	}
+
+	// ------------------------------------------------------------------ helper processes and the .session marker
+
+	// Helper processes that live beside a game's exe and so load OptiScaler (and through it this mod) too. They must
+	// not hand off to the main DLL, open the shared log or touch the game's .session marker.
+	inline constexpr std::wstring_view kHelperProcessExes[] = {
+		L"CrashClientReporter.exe",
+		L"CrashReportClient.exe",
+		L"CrashReportClientEditor.exe",
+		L"UnrealCEFSubProcess.exe",
+		L"EpicWebHelper.exe",
+		L"UnityCrashHandler64.exe",
+		L"UnityCrashHandler32.exe",
+		L"BsSndRpt64.exe",
+		L"BsSndRpt.exe",
+	};
+
+	namespace detail
+	{
+		inline wchar_t LowerAsciiW(wchar_t c) noexcept
+		{
+			return (c >= L'A' && c <= L'Z') ? static_cast<wchar_t>(c - L'A' + L'a') : c;
+		}
+
+		inline bool EqualsIgnoreCaseAsciiW(std::wstring_view a, std::wstring_view b) noexcept
+		{
+			if (a.size() != b.size())
+				return false;
+			for (size_t i = 0; i < a.size(); ++i)
+			{
+				if (LowerAsciiW(a[i]) != LowerAsciiW(b[i]))
+					return false;
+			}
+			return true;
+		}
+
+		inline std::wstring_view FileNameOf(std::wstring_view path) noexcept
+		{
+			const size_t slash = path.find_last_of(L"\\/");
+			return slash == std::wstring_view::npos ? path : path.substr(slash + 1);
+		}
+
+		inline std::string_view FileNameOf(std::string_view path) noexcept
+		{
+			const size_t slash = path.find_last_of("\\/");
+			return slash == std::string_view::npos ? path : path.substr(slash + 1);
+		}
+	} // namespace detail
+
+	// The exe's file name, or a full path to it, any case
+	inline bool IsHelperProcessExe(std::wstring_view exePathOrName) noexcept
+	{
+		const std::wstring_view name = detail::FileNameOf(exePathOrName);
+		for (const std::wstring_view helper : kHelperProcessExes)
+		{
+			if (detail::EqualsIgnoreCaseAsciiW(name, helper))
+				return true;
+		}
+		return false;
+	}
+
+	// The marker's single line: "pid=<n> exe=<name> build=<date> <time>"
+	struct SessionMarkerInfo
+	{
+		uint32_t pid = 0;
+		std::string exe;
+		std::string line; // as read, for the log
+	};
+
+	inline SessionMarkerInfo ParseSessionMarker(std::string_view line)
+	{
+		SessionMarkerInfo info;
+		info.line.assign(line.data(), line.size());
+		while (!info.line.empty() && (info.line.back() == '\r' || info.line.back() == '\n'))
+			info.line.pop_back();
+		const auto field = [&](std::string_view key) -> std::string_view {
+			size_t at = 0;
+			while ((at = line.find(key, at)) != std::string_view::npos)
+			{
+				if (at == 0 || line[at - 1] == ' ')
+				{
+					const size_t begin = at + key.size();
+					const size_t end = line.find(' ', begin);
+					return line.substr(begin, end == std::string_view::npos ? std::string_view::npos : end - begin);
+				}
+				at += key.size();
+			}
+			return {};
+		};
+
+		const std::string_view pid = field("pid=");
+		uint64_t value = 0;
+		bool digits = !pid.empty() && pid.size() <= 10;
+		for (const char c : pid)
+		{
+			if (c < '0' || c > '9')
+			{
+				digits = false;
+				break;
+			}
+			value = value * 10u + static_cast<uint64_t>(c - '0');
+		}
+		if (digits && value <= 0xFFFFFFFFull)
+			info.pid = static_cast<uint32_t>(value);
+
+		const std::string_view exe = field("exe=");
+		info.exe.assign(exe.data(), exe.size());
+		while (!info.exe.empty() && (info.exe.back() == '\r' || info.exe.back() == '\n'))
+			info.exe.pop_back();
+		return info;
+	}
+
+	// Whether the marker's exe names the same program as a running process's image path (file names compared, any case)
+	inline bool SameExeName(std::string_view markerExe, std::string_view processImage) noexcept
+	{
+		return !markerExe.empty() && !processImage.empty() &&
+			detail::EqualsIgnoreCaseAscii(detail::FileNameOf(markerExe), detail::FileNameOf(processImage));
+	}
+
+	// What a process starting up does about the log and the .session marker it shares with every other process
+	// loading this mod from the same folder
+	struct SessionDecision
+	{
+		bool reportPreviousUnclean = false; // the marker's process is gone: it never reached its clean exit
+		bool takeMarker = false;            // write our own pid into the marker (and delete it again at exit)
+		bool truncateLog = false;           // start the log afresh instead of appending to it
+	};
+
+	// markerPid: from the marker, 0 when there is none or it can't be read. markerOwnerAlive: that pid is a running
+	// process of the marker's exe (a reused pid running something else counts as gone). logAlreadyStarted: the early
+	// loader already opened the log for this process, so the DLL appends to it.
+	inline SessionDecision DecideSession(uint32_t markerPid, bool markerOwnerAlive, uint32_t selfPid,
+		bool logAlreadyStarted) noexcept
+	{
+		SessionDecision d;
+		if (markerPid != 0 && markerPid != selfPid && markerOwnerAlive)
+		{
+			// Another live process (the game) owns the log and the marker: leave both alone, add to the log
+			return d;
+		}
+
+		d.reportPreviousUnclean = markerPid != 0 && markerPid != selfPid;
+		d.takeMarker = true;
+		d.truncateLog = !logAlreadyStarted;
+		return d;
+	}
+
+	// At a clean exit the marker is deleted only if it is still ours
+	inline bool ShouldDeleteMarkerAtExit(uint32_t markerPid, uint32_t selfPid) noexcept
+	{
+		return markerPid != 0 && markerPid == selfPid;
+	}
 } // namespace EarlyLoader

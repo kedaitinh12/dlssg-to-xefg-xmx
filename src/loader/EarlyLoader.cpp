@@ -1,4 +1,5 @@
 #include "EarlyLoaderCore.h"
+#include "SessionMarkerWin.h"
 #include "../optiscaler_plugin.h"
 
 #include <Windows.h>
@@ -69,7 +70,15 @@ namespace
 			return;
 		gUnifiedLogPath = dllPath;
 		gUnifiedLogPath.replace_extension(L".log");
-		std::ofstream file(gUnifiedLogPath, std::ios::trunc);
+
+		// A process outside the helper list (an unknown launcher or reporter) must not wipe the log of the game that
+		// owns the .session marker and is still running: append to it instead.
+		auto markerPath = dllPath;
+		markerPath.replace_extension(L".session");
+		const auto marker = EarlyLoader::ReadSessionMarker(markerPath);
+		const auto decision = EarlyLoader::DecideSession(marker.pid, EarlyLoader::IsMarkerOwnerAlive(marker),
+			GetCurrentProcessId(), /*logAlreadyStarted=*/false);
+		std::ofstream file(gUnifiedLogPath, decision.truncateLog ? std::ios::trunc : std::ios::app);
 		if (file)
 		{
 			for (const auto& line : gBufferedLines)
@@ -143,6 +152,11 @@ namespace
 
 	void BootstrapImpl()
 	{
+		// Crash reporters and web helpers beside the game's exe load OptiScaler too. They get nothing: no hand-off to
+		// the main DLL, no log, no .session marker.
+		if (EarlyLoader::IsCurrentProcessHelper())
+			return;
+
 		const auto self = LoaderModulePath();
 		WriteLog("info", std::format("EarlyLoader starting from {}", self.string()));
 

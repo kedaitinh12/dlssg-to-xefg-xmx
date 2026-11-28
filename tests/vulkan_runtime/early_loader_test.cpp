@@ -197,6 +197,84 @@ namespace
 		assert(sel.path == legacyDll);
 		assert(sel.legacyMatch);
 	}
+	void TestHelperProcesses()
+	{
+		using EarlyLoader::IsHelperProcessExe;
+		for (const wchar_t* exe : { L"CrashClientReporter.exe", L"crashclientreporter.EXE", L"CrashReportClient.exe",
+			     L"UnrealCEFSubProcess.exe", L"EpicWebHelper.exe", L"UnityCrashHandler64.exe", L"BsSndRpt64.exe",
+			     L"C:\\Program Files\\Neverness To Everness\\Client\\WindowsNoEditor\\HT\\Binaries\\win64\\CrashClientReporter.exe",
+			     L"D:/Games/x/Engine/Binaries/Win64/CRASHREPORTCLIENT.exe" })
+			assert(IsHelperProcessExe(exe));
+
+		for (const wchar_t* exe : { L"", L"HTGame.exe", L"b1-Win64-Shipping.exe", L"CrashClientReporter.exe.bak",
+			     L"MyCrashClientReporter.exe", L"CrashClientReporter", L"C:\\CrashClientReporter.exe\\HTGame.exe" })
+			assert(!IsHelperProcessExe(exe));
+	}
+
+	void TestSessionMarker()
+	{
+		using EarlyLoader::ParseSessionMarker;
+		auto m = ParseSessionMarker("pid=2764 exe=HTGame.exe build=Nov 27 2026 22:29:17");
+		assert(m.pid == 2764 && m.exe == "HTGame.exe");
+		assert(m.line == "pid=2764 exe=HTGame.exe build=Nov 27 2026 22:29:17");
+
+		m = ParseSessionMarker("pid=6192 exe=CrashClientReporter.exe build=x\r\n");
+		assert(m.pid == 6192 && m.exe == "CrashClientReporter.exe" && m.line.back() == 'x');
+
+		m = ParseSessionMarker("pid=12 exe=Game.exe\r");
+		assert(m.pid == 12 && m.exe == "Game.exe");
+
+		// No marker, garbage, or a pid that is not a whole decimal number: nobody owns it
+		for (const char* bad : { "", "garbage", "pid=", "pid=-5 exe=a.exe", "pid=12a exe=a.exe", "pid=99999999999 exe=a.exe",
+			     "xpid=12 exe=a.exe", "pid = 12" })
+			assert(ParseSessionMarker(bad).pid == 0);
+
+		assert(ParseSessionMarker("exe=a.exe pid=77").pid == 77);
+		assert(ParseSessionMarker("pid=4294967295 exe=a.exe").pid == 4294967295u);
+
+		using EarlyLoader::SameExeName;
+		assert(SameExeName("HTGame.exe", "C:\\Games\\NTE\\HT\\Binaries\\win64\\htgame.exe"));
+		assert(SameExeName("HTGame.exe", "HTGame.exe"));
+		assert(!SameExeName("HTGame.exe", "C:\\Windows\\System32\\svchost.exe")); // reused pid
+		assert(!SameExeName("", "HTGame.exe"));
+		assert(!SameExeName("HTGame.exe", ""));
+	}
+
+	void TestSessionDecision()
+	{
+		using EarlyLoader::DecideSession;
+		constexpr uint32_t self = 6192;
+
+		// No marker: a fresh session takes the marker and starts the log afresh (or appends after the early loader)
+		auto d = DecideSession(0, false, self, false);
+		assert(!d.reportPreviousUnclean && d.takeMarker && d.truncateLog);
+		d = DecideSession(0, false, self, true);
+		assert(!d.reportPreviousUnclean && d.takeMarker && !d.truncateLog);
+
+		// The game (pid 2764) still runs and owns the marker: a crash reporter neither reports it, takes it nor
+		// truncates the log; it appends
+		d = DecideSession(2764, true, self, false);
+		assert(!d.reportPreviousUnclean && !d.takeMarker && !d.truncateLog);
+		d = DecideSession(2764, true, self, true);
+		assert(!d.reportPreviousUnclean && !d.takeMarker && !d.truncateLog);
+
+		// The marker's process is gone (or its pid now runs another program): that session ended uncleanly
+		d = DecideSession(2764, false, self, false);
+		assert(d.reportPreviousUnclean && d.takeMarker && d.truncateLog);
+		d = DecideSession(2764, false, self, true);
+		assert(d.reportPreviousUnclean && d.takeMarker && !d.truncateLog);
+
+		// Our own pid in the marker (the early loader's copy, or a reused pid of ours): not unclean
+		d = DecideSession(self, true, self, true);
+		assert(!d.reportPreviousUnclean && d.takeMarker && !d.truncateLog);
+		d = DecideSession(self, false, self, false);
+		assert(!d.reportPreviousUnclean && d.takeMarker && d.truncateLog);
+
+		using EarlyLoader::ShouldDeleteMarkerAtExit;
+		assert(ShouldDeleteMarkerAtExit(self, self));
+		assert(!ShouldDeleteMarkerAtExit(2764, self)); // the game took it over: leave it
+		assert(!ShouldDeleteMarkerAtExit(0, self));    // gone or unreadable
+	}
 } // namespace
 
 int main()
@@ -210,8 +288,11 @@ int main()
 	TestPeExportInspection(tempRoot);
 	TestRenamedFolderAndIniPriority(tempRoot);
 	TestLegacyFallback(tempRoot);
+	TestHelperProcesses();
+	TestSessionMarker();
+	TestSessionDecision();
 
 	fs::remove_all(tempRoot, ec);
-	std::cout << "early loader: ini parsing, PE export check, renamed folder/dll, priority, legacy fallback: PASS\n";
+	std::cout << "early loader: ini parsing, PE export check, renamed folder/dll, priority, legacy fallback, helper processes, .session marker: PASS\n";
 	return 0;
 }

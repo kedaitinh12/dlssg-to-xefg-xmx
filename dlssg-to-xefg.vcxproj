@@ -124,6 +124,7 @@
     <ClInclude Include="src\AmdFlipMeterReg.h" />
     <ClInclude Include="src\XeFgEnabler.h" />
     <ClInclude Include="src\loader\EarlyLoaderCore.h" />
+    <ClInclude Include="src\loader\SessionMarkerWin.h" />
     <ClInclude Include="src\Log.h" />
     <ClInclude Include="src\MfgKernels.h" />
     <ClInclude Include="src\MfgPort\AdapterIdentity.h" />
