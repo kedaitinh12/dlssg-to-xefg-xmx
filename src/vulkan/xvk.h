@@ -91,6 +91,23 @@ bool HasCoopMatrixStride5(ID3D12Device*) noexcept;
 void ResetCoopMatrixBatchStride(ID3D12Device*) noexcept;
 void ConsumeCoopMatrixBatchStride(ID3D12Device*, uint32_t& outStride4, uint32_t& outStride5, uint32_t& outFallbacks) noexcept;
 
+// Optional per-layer GPU timestamps of the cooperative-matrix route (diagnostic, XEFG_COOP_MATRIX_LAYER_BENCH=1). The
+// caller owns the query pool and a range of capacity queries starting at firstQuery, reset on the command buffer before
+// recording. While installed, every cooperative-matrix launch is bracketed by two BOTTOM_OF_PIPE timestamps and its layer
+// id (1-based) recorded; launches past the range are counted in dropped. Install before XeFG records into the command
+// buffer and uninstall (nullptr) right after, on the recording thread.
+struct CoopMatrixLayerTimestamps
+{
+    static constexpr uint32_t kMaxPairs = 256;
+    VkQueryPool pool = VK_NULL_HANDLE;
+    uint32_t firstQuery = 0;
+    uint32_t capacity = 0; // queries, at most 2 * kMaxPairs
+    uint32_t used = 0;     // queries written, always even
+    uint32_t dropped = 0;
+    uint8_t layer[kMaxPairs]{};
+};
+void SetCoopMatrixLayerTimestamps(ID3D12Device*, CoopMatrixLayerTimestamps* timestamps) noexcept;
+
 // What the device needs. The SPIR-V is version 1.6, so the device must run at Vulkan 1.3 or later.
 constexpr uint32_t kRequiredApiVersion = VK_API_VERSION_1_3;
 

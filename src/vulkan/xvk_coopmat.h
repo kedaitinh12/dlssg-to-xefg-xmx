@@ -62,6 +62,8 @@ public:
         batchStride5_.store(0u, std::memory_order_relaxed);
         batchFallbacks_.store(0u, std::memory_order_relaxed);
     }
+    // Per-layer timestamps for the batch being recorded (see xvk.h); nullptr turns them off. Recording thread only.
+    void SetLayerTimestamps(CoopMatrixLayerTimestamps* timestamps) noexcept { layerTimestamps_ = timestamps; }
     void ConsumeBatchStrideCounters(uint32_t& outStride4, uint32_t& outStride5, uint32_t& outFallbacks) noexcept
     {
         outStride4 = batchStride4_.exchange(0u, std::memory_order_relaxed);
@@ -90,6 +92,8 @@ private:
     PFN_vkCmdPushDescriptorSetKHR pushDescriptorSet_{};
     PFN_vkCmdPushConstants pushConstants_{};
     PFN_vkCmdDispatch dispatch_{};
+    PFN_vkCmdWriteTimestamp writeTimestamp_{};
+    CoopMatrixLayerTimestamps* layerTimestamps_ = nullptr;
     PFN_vkCmdPipelineBarrier2 barrier_{};
     PFN_vkGetPipelineExecutablePropertiesKHR getPipelineExecProps_{};
     PFN_vkGetPipelineExecutableStatisticsKHR getPipelineExecStats_{};

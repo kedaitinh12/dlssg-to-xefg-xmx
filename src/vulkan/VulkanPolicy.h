@@ -1474,6 +1474,95 @@ namespace VulkanPolicy
 		}
 	};
 
+	// Per-layer GPU time of the cooperative-matrix layers (XEFG_COOP_MATRIX_LAYER_BENCH=1): sums each layer's timestamped
+	// dispatches per batch and reports, every kReportBatches batches, each layer's mean ms per batch, launches per batch
+	// and share of the timed total. Layers are 1-based ids into the 17-entry layer table; zero heap allocations.
+	struct CoopLayerBenchWindow
+	{
+		static constexpr uint32_t kLayers = 17u;
+		static constexpr uint32_t kReportBatches = 300u;
+
+		struct Entry
+		{
+			uint8_t layer = 0;          // 1-based
+			float msPerBatch = 0.0f;    // mean over the window's batches
+			float launchesPerBatch = 0.0f;
+			float sharePercent = 0.0f;  // of the timed total
+		};
+
+		struct Report
+		{
+			bool ready = false;
+			uint32_t batches = 0;
+			uint32_t genFrames = 0;
+			float timedMsPerBatch = 0.0f;   // all timed layers together
+			float droppedPerBatch = 0.0f;   // launches not timed: the batch's query range was full
+			uint32_t entryCount = 0;        // layers seen in the window, sorted by msPerBatch, largest first
+			std::array<Entry, kLayers> entries{};
+		};
+
+		std::array<double, kLayers> sumMs{};
+		std::array<uint32_t, kLayers> launches{};
+		uint64_t dropped = 0;
+		uint32_t batches = 0;
+		uint32_t lastGenFrames = 0;
+
+		void Reset() noexcept
+		{
+			sumMs.fill(0.0);
+			launches.fill(0u);
+			dropped = 0;
+			batches = 0;
+			lastGenFrames = 0;
+		}
+
+		// One timed launch of layer (1-based); out-of-range layers and invalid times are ignored
+		void AddLaunch(uint8_t layer, float ms) noexcept
+		{
+			if (layer == 0u || layer > kLayers || !(ms >= 0.0f) || ms > 1000.0f)
+				return;
+			sumMs[layer - 1u] += static_cast<double>(ms);
+			++launches[layer - 1u];
+		}
+
+		// Closes a batch; reports once kReportBatches batches have been closed, then starts a new window
+		Report EndBatch(uint32_t genFrames, uint32_t droppedLaunches) noexcept
+		{
+			Report rep{};
+			++batches;
+			dropped += droppedLaunches;
+			if (genFrames)
+				lastGenFrames = genFrames;
+			if (batches < kReportBatches)
+				return rep;
+
+			double total = 0.0;
+			for (const double s : sumMs)
+				total += s;
+
+			rep.ready = true;
+			rep.batches = batches;
+			rep.genFrames = lastGenFrames;
+			rep.timedMsPerBatch = static_cast<float>(total / batches);
+			rep.droppedPerBatch = static_cast<float>(static_cast<double>(dropped) / batches);
+			for (uint32_t i = 0; i < kLayers; ++i)
+			{
+				if (launches[i] == 0u)
+					continue;
+				Entry& e = rep.entries[rep.entryCount++];
+				e.layer = static_cast<uint8_t>(i + 1u);
+				e.msPerBatch = static_cast<float>(sumMs[i] / batches);
+				e.launchesPerBatch = static_cast<float>(static_cast<double>(launches[i]) / batches);
+				e.sharePercent = total > 0.0 ? static_cast<float>(sumMs[i] * 100.0 / total) : 0.0f;
+			}
+			std::stable_sort(rep.entries.begin(), rep.entries.begin() + rep.entryCount,
+				[](const Entry& a, const Entry& b) noexcept { return a.msPerBatch > b.msPerBatch; });
+
+			Reset();
+			return rep;
+		}
+	};
+
 	// Live A/B selector for 16x16x16 WMMA weight LDS column stride:
 	// 0 = Stride 4 (16B aligned, default), 1 = Stride 5 (padded A/B comparison).
 	inline std::atomic<int32_t> gWmmaLdsStrideMode{ 0 };

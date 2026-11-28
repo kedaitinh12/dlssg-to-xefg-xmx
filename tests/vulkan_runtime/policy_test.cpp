@@ -1211,6 +1211,58 @@ int main()
 		CHECK(std::strcmp(DotProductTierName(DotProductTier::Native8BitAndPacked), "native8+packed4x8") == 0);
 	}
 
+	// ---- per-layer cooperative-matrix timing window (XEFG_COOP_MATRIX_LAYER_BENCH)
+	{
+		using VulkanPolicy::CoopLayerBenchWindow;
+		CoopLayerBenchWindow w;
+		// Layer 3 runs twice per batch at 0.5 ms, layer 10 once at 0.25 ms, layer 15 once at 1.0 ms
+		for (uint32_t b = 0; b + 1u < CoopLayerBenchWindow::kReportBatches; ++b)
+		{
+			w.AddLaunch(3, 0.5f);
+			w.AddLaunch(3, 0.5f);
+			w.AddLaunch(10, 0.25f);
+			w.AddLaunch(15, 1.0f);
+			CHECK(!w.EndBatch(3, b == 0 ? 2u : 0u).ready);
+		}
+		w.AddLaunch(3, 0.5f);
+		w.AddLaunch(3, 0.5f);
+		w.AddLaunch(10, 0.25f);
+		w.AddLaunch(15, 1.0f);
+		// Ignored: layer 0, layer past the table, negative or absurd times
+		w.AddLaunch(0, 1.0f);
+		w.AddLaunch(18, 1.0f);
+		w.AddLaunch(5, -1.0f);
+		w.AddLaunch(5, 5000.0f);
+		w.AddLaunch(5, std::numeric_limits<float>::quiet_NaN());
+		const auto rep = w.EndBatch(3, 0u);
+		CHECK(rep.ready);
+		CHECK(rep.batches == CoopLayerBenchWindow::kReportBatches);
+		CHECK(rep.genFrames == 3u);
+		CHECK(rep.entryCount == 3u);
+		CHECK(std::fabs(rep.timedMsPerBatch - 2.25f) < 1e-4f);
+		CHECK(std::fabs(rep.droppedPerBatch - 2.0f / CoopLayerBenchWindow::kReportBatches) < 1e-6f);
+		// Sorted by ms per batch, largest first: layer 3 (1.0 ms, 2 launches) ties layer 15 (1.0 ms, 1 launch); stable
+		// order keeps the lower id first
+		CHECK(rep.entries[0].layer == 3u && std::fabs(rep.entries[0].msPerBatch - 1.0f) < 1e-4f);
+		CHECK(std::fabs(rep.entries[0].launchesPerBatch - 2.0f) < 1e-4f);
+		CHECK(rep.entries[1].layer == 15u && std::fabs(rep.entries[1].launchesPerBatch - 1.0f) < 1e-4f);
+		CHECK(rep.entries[2].layer == 10u && std::fabs(rep.entries[2].msPerBatch - 0.25f) < 1e-4f);
+		CHECK(std::fabs(rep.entries[0].sharePercent - 100.0f / 2.25f) < 1e-2f);
+		CHECK(std::fabs(rep.entries[0].sharePercent + rep.entries[1].sharePercent + rep.entries[2].sharePercent - 100.0f) < 1e-2f);
+		// The window starts over
+		CHECK(w.batches == 0u && w.launches[2] == 0u && w.dropped == 0u);
+		w.AddLaunch(7, 0.1f);
+		CHECK(!w.EndBatch(2, 0u).ready);
+		w.Reset();
+		CHECK(w.batches == 0u && w.launches[6] == 0u);
+		// A window with nothing timed still reports, empty
+		CoopLayerBenchWindow empty;
+		CoopLayerBenchWindow::Report last{};
+		for (uint32_t b = 0; b < CoopLayerBenchWindow::kReportBatches; ++b)
+			last = empty.EndBatch(0u, 1u);
+		CHECK(last.ready && last.entryCount == 0u && last.timedMsPerBatch == 0.0f && std::fabs(last.droppedPerBatch - 1.0f) < 1e-6f);
+	}
+
 	std::printf("%d checks, %d failed\n", checks, failures);
 	return failures ? 1 : 0;
 }

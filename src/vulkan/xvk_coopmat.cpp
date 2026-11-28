@@ -309,6 +309,7 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
         LOAD_FN(pushDescriptorSet_, vkCmdPushDescriptorSetKHR);
         LOAD_FN(pushConstants_, vkCmdPushConstants);
         LOAD_FN(dispatch_, vkCmdDispatch);
+        LOAD_FN(writeTimestamp_, vkCmdWriteTimestamp);
         LOAD_FN(barrier_, vkCmdPipelineBarrier2);
         if (desc.pipelineExecutableProperties)
         {
@@ -880,7 +881,22 @@ bool CoopMatrixRoute::TryLaunch(Device& device, VkCommandBuffer buffer, uint8_t 
 
         const uint32_t gx = (x * layer.intelW + layer.tileW - 1) / layer.tileW;
         const uint32_t gy = (y * layer.intelH + layer.tileH - 1) / layer.tileH;
+        // Diagnostic per-layer timing: BOTTOM_OF_PIPE on both sides adds no barrier, the start mark lands when the work
+        // recorded before this launch has finished, so the pair measures this launch's own span on the critical path.
+        CoopMatrixLayerTimestamps* const stamps = layerTimestamps_;
+        const bool timed = stamps && stamps->pool != VK_NULL_HANDLE && writeTimestamp_ &&
+            stamps->used + 2u <= stamps->capacity && stamps->used / 2u < CoopMatrixLayerTimestamps::kMaxPairs;
+        if (stamps && !timed)
+            ++stamps->dropped;
+        if (timed)
+            writeTimestamp_(buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stamps->pool, stamps->firstQuery + stamps->used);
         dispatch_(buffer, gx, gy, layer.gridZ);
+        if (timed)
+        {
+            writeTimestamp_(buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stamps->pool, stamps->firstQuery + stamps->used + 1u);
+            stamps->layer[stamps->used / 2u] = id;
+            stamps->used += 2u;
+        }
 
         if (options_.fullBarriers)
         {

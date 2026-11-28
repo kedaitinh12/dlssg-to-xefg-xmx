@@ -1374,6 +1374,10 @@ void ResetCoopMatrixBatchStride(ID3D12Device* device) noexcept
 {
     if (auto* own = Own<Device>(device)) own->coopmat().ResetBatchStrideCounters();
 }
+void SetCoopMatrixLayerTimestamps(ID3D12Device* device, CoopMatrixLayerTimestamps* timestamps) noexcept
+{
+    if (auto* own = Own<Device>(device)) own->coopmat().SetLayerTimestamps(timestamps);
+}
 void ConsumeCoopMatrixBatchStride(ID3D12Device* device, uint32_t& outStride4, uint32_t& outStride5, uint32_t& outFallbacks) noexcept
 {
     if (auto* own = Own<Device>(device))

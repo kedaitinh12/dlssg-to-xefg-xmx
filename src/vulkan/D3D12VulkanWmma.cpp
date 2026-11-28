@@ -5,6 +5,7 @@
 #include "../FrameGenerator.h"
 #include "../Log.h"
 #include "../Plugin.h"
+#include "../MfgPort/Cuda/cuda_layers.h"
 #include "../MfgPort/Cuda/cuda_route.h"
 #include "../MfgKernels.h"
 #include "../VulkanPrograms.h"
@@ -21,6 +22,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <format>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -36,6 +38,7 @@ namespace
 using Microsoft::WRL::ComPtr;
 
 constexpr uint32_t kRingSize = 8;
+constexpr uint32_t kLayerBenchQueriesPerSlot = 2u * xvk::CoopMatrixLayerTimestamps::kMaxPairs;
 constexpr uint32_t kMaxFrames = FrameGenerator::MaxFrames;
 constexpr int kExecuteCommandListsSlot = 10;
 
@@ -410,6 +413,13 @@ struct Bridge
 	std::chrono::steady_clock::time_point gpuBenchSkipLastLogAt{};
 	VulkanPolicy::GpuBenchWindow gpuBenchWindow;
 	VulkanPolicy::GpuBenchWindow d3d12BridgeBenchWindow;
+	// Opt-in per-layer cooperative-matrix timing (XEFG_COOP_MATRIX_LAYER_BENCH=1): its own pool, kLayerBenchQueriesPerSlot
+	// queries per ring slot, read back only after the slot's fence has signaled.
+	VkQueryPool layerBenchPool = VK_NULL_HANDLE;
+	xvk::CoopMatrixLayerTimestamps layerBenchSlot[kRingSize]{};
+	bool layerBenchSlotPending[kRingSize]{};
+	uint32_t layerBenchSlotFrames[kRingSize]{};
+	VulkanPolicy::CoopLayerBenchWindow layerBenchWindow;
 	std::atomic<uint64_t> appendSameCmdList{ 0 };
 	std::atomic<uint64_t> appendSeparateCmdList{ 0 };
 	bool globalPriorityHigh = false;
@@ -1582,6 +1592,43 @@ bool RecordVulkanBatchLocked(PendingBatch& batch) noexcept
 		}
 	}
 
+	// Per-layer timing of this slot's previous batch (its fence has signaled above): non-blocking, uniform batches only
+	if (gBridge.layerBenchPool && gBridge.layerBenchSlotPending[vkSlot])
+	{
+		gBridge.layerBenchSlotPending[vkSlot] = false;
+		xvk::CoopMatrixLayerTimestamps& stamps = gBridge.layerBenchSlot[vkSlot];
+		const VulkanPolicy::BatchStrideKind kind = gBridge.gpuBenchSlotStride[vkSlot];
+		const bool uniform = kind == VulkanPolicy::BatchStrideKind::Stride4 || kind == VulkanPolicy::BatchStrideKind::Stride5;
+		uint64_t ts[kLayerBenchQueriesPerSlot]{};
+		if (uniform && stamps.used >= 2u && stamps.used <= kLayerBenchQueriesPerSlot &&
+			gBridge.vkGetQueryPoolResults(gBridge.device, gBridge.layerBenchPool, stamps.firstQuery, stamps.used,
+				sizeof(uint64_t) * stamps.used, ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+		{
+			for (uint32_t pair = 0; pair < stamps.used / 2u; ++pair)
+			{
+				gBridge.layerBenchWindow.AddLaunch(stamps.layer[pair], VulkanPolicy::ComputeGpuTimestampMs(
+					ts[pair * 2u], ts[pair * 2u + 1u], gBridge.timestampValidBits, gBridge.timestampPeriodNs));
+			}
+			const auto rep = gBridge.layerBenchWindow.EndBatch(gBridge.layerBenchSlotFrames[vkSlot], stamps.dropped);
+			if (rep.ready)
+			{
+				std::string layers;
+				for (uint32_t i = 0; i < rep.entryCount; ++i)
+				{
+					const auto& e = rep.entries[i];
+					const auto& info = xefg_cuda::kLayers[e.layer - 1u].info;
+					layers += std::format("{}{{\"kernel\":\"{}\",\"program\":\"{}\",\"ms_per_batch\":{:.3f},"
+						"\"launches_per_batch\":{:.2f},\"share_pct\":{:.1f}}}",
+						i ? "," : "", info.kernel, info.program, e.msPerBatch, e.launchesPerBatch, e.sharePercent);
+				}
+				Log::Info("coopmat_layer_bench \"stride\":{},\"batches\":{},\"gen_frames\":{},\"timed_ms_per_batch\":{:.3f},"
+					"\"dropped_per_batch\":{:.2f},\"layers\":[{}]",
+					VulkanPolicy::BatchStrideTag(kind), rep.batches, rep.genFrames, rep.timedMsPerBatch, rep.droppedPerBatch,
+					layers);
+			}
+		}
+	}
+
 	VkCommandBuffer cmd = gBridge.cmdBufs[vkSlot];
 	gBridge.vkResetCommandBuffer(cmd, 0);
 	VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
@@ -1591,6 +1638,11 @@ bool RecordVulkanBatchLocked(PendingBatch& batch) noexcept
 
 	if (gBridge.gpuBenchPool)
 		gBridge.vkCmdResetQueryPool(cmd, gBridge.gpuBenchPool, vkSlot * 2u, 2u);
+	if (gBridge.layerBenchPool)
+	{
+		gBridge.layerBenchSlotPending[vkSlot] = false;
+		gBridge.vkCmdResetQueryPool(cmd, gBridge.layerBenchPool, vkSlot * kLayerBenchQueriesPerSlot, kLayerBenchQueriesPerSlot);
+	}
 
 	// Open xvk recording BEFORE copyInput so any pendingInit_ (UNDEFINED -> GENERAL)
 	// layout transitions on newly created xvk resources flush before we copy frame pixels into them.
@@ -1702,8 +1754,19 @@ bool RecordVulkanBatchLocked(PendingBatch& batch) noexcept
 				xvk::ResetCoopMatrixBatchStride(gBridge.xvkDevice.Get());
 				gBridge.vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gBridge.gpuBenchPool, vkSlot * 2u + 0u);
 			}
+			if (gBridge.layerBenchPool)
+			{
+				xvk::CoopMatrixLayerTimestamps& stamps = gBridge.layerBenchSlot[vkSlot];
+				stamps = {};
+				stamps.pool = gBridge.layerBenchPool;
+				stamps.firstQuery = vkSlot * kLayerBenchQueriesPerSlot;
+				stamps.capacity = kLayerBenchQueriesPerSlot;
+				xvk::SetCoopMatrixLayerTimestamps(gBridge.xvkDevice.Get(), &stamps);
+			}
 			const xefgd_result_t res = XeFG::Execute(gBridge.xefgContext, gBridge.xvkList.Get(), vkParams);
 			gBridge.xvkList->Close();
+			if (gBridge.layerBenchPool)
+				xvk::SetCoopMatrixLayerTimestamps(gBridge.xvkDevice.Get(), nullptr);
 			execOk = (res == XEFGD_RESULT_SUCCESS);
 			if (gBridge.gpuBenchPool)
 			{
@@ -1923,12 +1986,13 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 									"wmma_bridge_bench \"scope\":\"d3d12_signal_to_wait\",\"stride\":{},\"batches\":{},\"gen_frames\":{},"
 									"\"d3d12_stall_avg_ms\":{:.3f},\"d3d12_stall_p50_ms\":{:.3f},\"d3d12_stall_p95_ms\":{:.3f},"
 									"\"d3d12_stall_min_ms\":{:.3f},\"d3d12_stall_max_ms\":{:.3f},"
-									"\"append_same_cmdlist\":{},\"append_sep_cmdlist\":{}",
+									"\"append_same_cmdlist\":{},\"append_sep_cmdlist\":{},\"direct_zero_copy_outs\":{}",
 									VulkanPolicy::BatchStrideTag(gBridge.gpuBenchActiveStride),
 									rep.batches, rep.genFrames, rep.batchAvgMs, rep.batchP50Ms, rep.batchP95Ms,
 									rep.batchMinMs, rep.batchMaxMs,
 									gBridge.appendSameCmdList.exchange(0, std::memory_order_relaxed),
-									gBridge.appendSeparateCmdList.exchange(0, std::memory_order_relaxed));
+									gBridge.appendSeparateCmdList.exchange(0, std::memory_order_relaxed),
+									gBridge.directZeroCopyOuts.exchange(0, std::memory_order_relaxed));
 							}
 						}
 						ring.tsPending[slot] = false;
@@ -2015,6 +2079,11 @@ void SubmitBatchOnQueue(ID3D12CommandQueue* queue, ExecuteCommandListsFn origExe
 	{
 		gBridge.gpuBenchSlotPending[vkSlot] = true;
 		gBridge.gpuBenchSlotFrames[vkSlot] = batch.frameCount;
+	}
+	if (gBridge.layerBenchPool)
+	{
+		gBridge.layerBenchSlotPending[vkSlot] = gBridge.layerBenchSlot[vkSlot].used >= 2u;
+		gBridge.layerBenchSlotFrames[vkSlot] = batch.frameCount;
 	}
 	const uint64_t prevSubmitted = gBridge.lastSubmittedVkFence.exchange(signalVal, std::memory_order_acq_rel);
 	gBridge.prevSubmittedVkFence.store(prevSubmitted, std::memory_order_release);
@@ -2319,6 +2388,8 @@ bool TeardownVulkanLocked() noexcept
 	{
 		if (gBridge.gpuBenchPool && gBridge.vkDestroyQueryPool)
 			gBridge.vkDestroyQueryPool(gBridge.device, gBridge.gpuBenchPool, nullptr);
+		if (gBridge.layerBenchPool && gBridge.vkDestroyQueryPool)
+			gBridge.vkDestroyQueryPool(gBridge.device, gBridge.layerBenchPool, nullptr);
 		if (gBridge.sharedSemaphore && gBridge.vkDestroySemaphore)
 			gBridge.vkDestroySemaphore(gBridge.device, gBridge.sharedSemaphore, nullptr);
 		if (gBridge.cmdPool && gBridge.vkDestroyCommandPool)
@@ -2327,6 +2398,14 @@ bool TeardownVulkanLocked() noexcept
 			gBridge.vkDestroyDevice(gBridge.device, nullptr);
 	}
 	gBridge.gpuBenchPool = VK_NULL_HANDLE;
+	gBridge.layerBenchPool = VK_NULL_HANDLE;
+	gBridge.layerBenchWindow.Reset();
+	for (uint32_t i = 0; i < kRingSize; ++i)
+	{
+		gBridge.layerBenchSlot[i] = {};
+		gBridge.layerBenchSlotPending[i] = false;
+		gBridge.layerBenchSlotFrames[i] = 0;
+	}
 	gBridge.timestampPeriodNs = 0.0f;
 	gBridge.timestampValidBits = 0;
 	for (uint32_t i = 0; i < kRingSize; ++i)
@@ -2753,6 +2832,25 @@ bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
 				gBridge.timestampPeriodNs = periodNs;
 				gBridge.timestampValidBits = fams[chosenFamily].timestampValidBits;
 				gBridge.gpuBenchWindow.Reset();
+
+				// Per-layer timing is off by default: no pool, no timestamps in the command buffers
+				if (VulkanPolicy::IsOnWord(EnvString(L"XEFG_COOP_MATRIX_LAYER_BENCH")))
+				{
+					VkQueryPoolCreateInfo lci{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+					lci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+					lci.queryCount = kRingSize * kLayerBenchQueriesPerSlot;
+					if (gBridge.vkCreateQueryPool(gBridge.device, &lci, nullptr, &gBridge.layerBenchPool) == VK_SUCCESS)
+					{
+						gBridge.layerBenchWindow.Reset();
+						Log::Info("D3D12->Vulkan WMMA bridge: per-layer cooperative-matrix timing on ({} queries per batch)",
+							kLayerBenchQueriesPerSlot);
+					}
+					else
+					{
+						gBridge.layerBenchPool = VK_NULL_HANDLE;
+						Log::Warn("D3D12->Vulkan WMMA bridge: XEFG_COOP_MATRIX_LAYER_BENCH set but the query pool could not be created");
+					}
+				}
 			}
 		}
 	}
