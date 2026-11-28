@@ -2570,7 +2570,8 @@ bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
 	}
 
 	const bool hasPipeExecExt = HasExtension(exts, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
-	const bool allowHighPrio = !VulkanPolicy::IsOffWord(EnvString(L"XEFG_D3D12_VULKAN_WMMA_HIGH_PRIORITY"));
+	// Opt-in only: RDNA 4 Windows A/B tests showed no measurable gain from HIGH over default priority.
+	const bool allowHighPrio = VulkanPolicy::IsOnWord(EnvString(L"XEFG_D3D12_VULKAN_WMMA_HIGH_PRIORITY"));
 	const char* globalPriorityExtName = nullptr;
 	if (allowHighPrio)
 	{
@@ -2709,7 +2710,7 @@ bool InstallLocked(ID3D12Device* d3dDevice, std::string& reason) noexcept
 		return fail("create_device_failed");
 	gBridge.globalPriorityHigh = requestedHighPrio;
 	Log::Info("D3D12->Vulkan WMMA bridge: Vulkan compute queue global_priority={}",
-		requestedHighPrio ? "HIGH" : "default");
+		requestedHighPrio ? "HIGH (opt-in)" : "default");
 
 	gBridge.physical = matchedPhys;
 	gBridge.queueFamily = chosenFamily;

@@ -780,29 +780,8 @@ namespace
 				   "Keep ON for best speed; turn OFF if a specific game freezes or crashes.\n"
 				   "Requires clicking 'Save Settings' and restarting the game.");
 
-		bool wmmaNetworkActive = false;
-		{
-			std::scoped_lock lock(mutex);
-			wmmaNetworkActive = (status.network == Plugin::Network::Wmma);
-		}
-		if (wmmaNetworkActive)
-		{
-			static const char* const WmmaStrideNames[] = { "Stride 4 (16B aligned)", "Stride 5 (padded)" };
-			int32_t wmmaStrideMode = (Plugin::options.wmmaLdsStride.load(std::memory_order_relaxed) == 1) ? 1 : 0;
-			if (api->Combo("WMMA LDS stride (A/B)", &wmmaStrideMode, WmmaStrideNames, 2, nullptr))
-			{
-				wmmaStrideMode = (wmmaStrideMode == 1) ? 1 : 0;
-				Plugin::options.wmmaLdsStride.store(wmmaStrideMode, std::memory_order_relaxed);
-				VulkanPolicy::SetWmmaLdsStrideMode(wmmaStrideMode);
-				NotifySettingChanged(NoticeKind::LiveTemp, "WMMA LDS stride (A/B)");
-			}
-			HelpMarker("Diagnostic A/B toggle (not saved): switches AMD RDNA 3/4 WMMA 16x16x16 weight LDS stride live.\n"
-					   "- Stride 4: tight 16-byte aligned columns (default).\n"
-					   "- Stride 5: padded columns for direct A/B comparison in wmma_gpu_bench.\n"
-					   "Note: switching to Stride 5 for the first time compiles 17 pipelines on the render thread\n"
-					   "(brief one-time hitch; does not affect GPU benchmark timings).");
-		}
-		else if (Plugin::options.wmmaLdsStride.load(std::memory_order_relaxed) != 0)
+		// AMD RDNA 3/4 WMMA uses Stride 4 (16B aligned) exclusively; keep stride mode pinned to 0.
+		if (Plugin::options.wmmaLdsStride.load(std::memory_order_relaxed) != 0)
 		{
 			Plugin::options.wmmaLdsStride.store(0, std::memory_order_relaxed);
 			VulkanPolicy::SetWmmaLdsStrideMode(0);

@@ -379,7 +379,9 @@ bool CoopMatrixRoute::Install(Device& owner, const DeviceDesc& desc, const std::
             ? (moduleDir / L"stride5_gfx12_reg")
             : ((activeLayout == MatCLayout::Gfx11Reg) ? (moduleDir / L"stride5_radv_reg") : std::filesystem::path{});
         std::error_code s5Ec;
-        const bool hasStride5Base = !isXmx && !isK32 && std::filesystem::is_directory(stride5Dir, s5Ec);
+        // Stride 4 (16B aligned) is locked for RDNA 3/4; skip probing/loading stride5* SPIR-V sets.
+        const bool hasStride5Base = false;
+        (void)stride5Dir; (void)s5Ec;
         const bool hasStride5Reg = hasStride5Base && !stride5RegDir.empty() && std::filesystem::is_directory(stride5RegDir, s5Ec);
         uint32_t loadedCount = 0;
         uint32_t loadedStride5Count = 0;
